@@ -1119,8 +1119,9 @@ enum PivKeyCmd {
     /// The file password comes first: keyroost opens the file and checks it
     /// against the slot before it asks for the management key, so a file
     /// this key can't take is refused before anything is written.
-    /// Legacy-encrypted files open too. Then the certificate and the key are
-    /// written, and the slot is tested with the PIN as `piv test` does.
+    /// Legacy-encrypted files open too. The PIN is checked next, then the
+    /// certificate and the key are written, and the slot is tested as `piv
+    /// test` does.
     /// Authority certificates in the file are not written to the card;
     /// `--chain-out` saves them. An imported key can't be attested as
     /// generated on this key.
@@ -11400,55 +11401,52 @@ const P12_FILE_PASSWORD: Spec = Spec::current("file password", "file-password").
 /// Open a PKCS#12 file with its password, in the words `piv key import`
 /// shows.
 fn open_p12(bytes: &[u8], password: &str) -> Result<keyroost_p12::Contents, String> {
+    keyroost_p12::open(bytes, Some(password)).map_err(p12_error_message)
+}
+
+/// A PKCS#12 reading error as a plain sentence.
+fn p12_error_message(e: keyroost_p12::P12Error) -> String {
     use keyroost_p12::P12Error;
-    keyroost_p12::open(bytes, Some(password)).map_err(|e| match e {
+    match e {
         P12Error::WrongPassword => "Wrong password for this file.".to_string(),
         P12Error::NoKey => "The file has no private key to import.".to_string(),
-        P12Error::Malformed(_) => format!("This isn't a .p12/.pfx file keyroost can read ({e})."),
+        P12Error::Malformed(what) => {
+            format!("This isn't a .p12/.pfx file keyroost can read ({what}).")
+        }
+        P12Error::Unsupported("PBMAC1") => "This file uses a newer integrity check (PBMAC1) \
+            that keyroost can't read yet. Export it again with the default or the legacy \
+            PKCS#12 settings."
+            .to_string(),
+        P12Error::Unsupported("file has no integrity check") => "This file has no integrity \
+            check and holds an unencrypted key, so keyroost won't import it. Export it again \
+            with a password."
+            .to_string(),
+        P12Error::Unsupported(what) => {
+            format!("This file uses something keyroost can't import yet: {what}.")
+        }
         e => format!("This file can't be imported: {e}."),
-    })
+    }
 }
 
 /// One line per entry of a PKCS#12 file, numbered from 1 as `--entry` takes
-/// them: the label, the key type, and whether a certificate came with it.
-/// Labels come from the file, so they are made safe to print.
+/// them, in the words the app's list uses
+/// ([`keyroost_transport::piv_import::entry_labels`]). Labels come from the
+/// file, so they are made safe to print.
 fn p12_entry_lines(contents: &keyroost_p12::Contents) -> Vec<String> {
-    contents
-        .entries
+    keyroost_transport::piv_import::entry_labels(contents)
         .iter()
         .enumerate()
-        .map(|(i, e)| {
-            let label = e
-                .label
-                .as_deref()
-                .filter(|l| !l.is_empty())
-                .map(sanitize_terminal)
-                .unwrap_or_else(|| "(no name)".to_string());
-            let cert = if e.certificate.is_some() {
-                ""
-            } else {
-                ", no certificate"
-            };
-            format!("  {}) {label} ({}{cert})", i + 1, e.key.alg().label())
-        })
+        .map(|(i, label)| format!("  {}) {}", i + 1, sanitize_terminal(label)))
         .collect()
 }
 
 /// The `--entry` check, which needs no card: a file with several keys and
 /// no `--entry` is listed, and a number that isn't in the file is refused,
-/// before any key is selected. The same answer `plan_import` gives.
+/// before any key is selected (the choice `plan_import` makes).
 fn check_p12_entry(contents: &keyroost_p12::Contents, entry: Option<usize>) -> Result<(), String> {
-    use keyroost_transport::piv_import::ImportRefusal;
-    let n = contents.entries.len();
-    let refusal = match entry {
-        Some(c) if c == 0 || c > n => ImportRefusal::EntryOutOfRange {
-            asked: c,
-            available: n,
-        },
-        None if n > 1 => ImportRefusal::ChooseEntry(Vec::new()),
-        _ => return Ok(()),
-    };
-    Err(import_refusal_error(&refusal, contents))
+    keyroost_transport::piv_import::choose_entry(contents, entry)
+        .map(|_| ())
+        .map_err(|r| import_refusal_error(&r, contents))
 }
 
 /// An import refusal in the CLI's words: the entries listed with `--entry`
@@ -11475,15 +11473,16 @@ fn import_refusal_error(
 
 /// The warnings `piv key import` prints before it asks for the management
 /// key, as `piv key generate` does: an import, or a PIN or touch policy, that
-/// keyroost's list has no entry for on this key. A policy value this key is
-/// known to refuse stops the import (there is no `--force` here).
+/// keyroost's list has no entry for on this key. `plan_import` has already
+/// refused what the list marks unsupported; should one still turn up, it is
+/// refused here too (this command has no `--force`).
 fn import_gate_warnings(
     s: &mut keyroost_transport::PivSession<'_>,
     alg: keyroost_piv::KeyAlg,
     pin_policy: keyroost_piv::PinPolicy,
     touch_policy: keyroost_piv::TouchPolicy,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    use keyroost_piv::compat::{PivExtension, PivQuirk};
+) -> Result<Vec<String>, String> {
+    use keyroost_piv::compat::{FeatureGate, PivExtension};
     use keyroost_piv::{PinPolicy, TouchPolicy};
     let mut gates = vec![PivExtension::ImportKey(alg)];
     if pin_policy != PinPolicy::Default {
@@ -11494,26 +11493,18 @@ fn import_gate_warnings(
     }
     let mut warnings = Vec::new();
     for gate in gates {
-        warnings.extend(check_piv_feature(s, gate, false)?);
-    }
-    let quirks = s.quirks();
-    for (quirk, selected, label) in [
-        (
-            PivQuirk::SlotPinPolicyOnceNotSupported,
-            pin_policy == PinPolicy::Once,
-            "PIN policy \"once\"",
-        ),
-        (
-            PivQuirk::SlotTouchPolicyCachedNotSupported,
-            touch_policy == TouchPolicy::Cached,
-            "Touch policy \"cached\"",
-        ),
-    ] {
-        if selected && quirks.contains(&quirk) {
-            return Err(format!(
-                "{label} is known to be unsupported on this device. Nothing was written."
-            )
-            .into());
+        let needs = gate.requirement();
+        match s.feature_gate(gate) {
+            FeatureGate::Supported => {}
+            FeatureGate::Unverified => {
+                warnings.push(format!("{needs} {}", FeatureGate::UNVERIFIED_SUFFIX));
+            }
+            FeatureGate::Unsupported => {
+                return Err(format!(
+                    "{needs} {} Nothing was written.",
+                    FeatureGate::INCOMPATIBLE_SUFFIX
+                ))
+            }
         }
     }
     Ok(warnings)
@@ -21695,6 +21686,27 @@ mod cli_tests {
             e.starts_with("This isn't a .p12/.pfx file keyroost can read ("),
             "{e}"
         );
+        assert!(!e.contains("not a valid PKCS#12 file"), "{e}");
+        use keyroost_p12::P12Error;
+        assert_eq!(
+            p12_error_message(P12Error::Unsupported("PBMAC1")),
+            "This file uses a newer integrity check (PBMAC1) that keyroost can't read yet. \
+             Export it again with the default or the legacy PKCS#12 settings."
+        );
+        assert_eq!(
+            p12_error_message(P12Error::Unsupported("file has no integrity check")),
+            "This file has no integrity check and holds an unencrypted key, so keyroost \
+             won't import it. Export it again with a password."
+        );
+        assert_eq!(
+            p12_error_message(P12Error::Unsupported("multi-prime RSA")),
+            "This file uses something keyroost can't import yet: multi-prime RSA."
+        );
+        // A real file without a MAC takes the same path.
+        let macless = include_bytes!("../../keyroost-p12/tests/fixtures/macless-plain-key.p12");
+        assert!(open_p12(macless, "")
+            .unwrap_err()
+            .starts_with("This file has no integrity check"));
         // A file saved with an empty password opens with an empty answer.
         assert_eq!(open_p12(P12_EMPTY_PASSWORD, "").unwrap().entries.len(), 1);
     }
@@ -21703,10 +21715,12 @@ mod cli_tests {
     fn piv_key_import_lists_entries_until_one_is_picked() {
         let contents = open_p12(P12_TWO_ENTRIES, P12_PASSWORD).unwrap();
         let e = check_p12_entry(&contents, None).unwrap_err();
+        // The file's label, the key type and the certificate's subject.
         assert_eq!(
             e,
             "The file holds 2 keys; pick one with --entry N. Nothing was written.\n  \
-             1) first (RSA-2048)\n  2) second (ECC P-256)"
+             1) first (RSA-2048; certificate: rsa2048)\n  \
+             2) second (ECC P-256; certificate: second)"
         );
         for pick in [1, 2] {
             assert!(check_p12_entry(&contents, Some(pick)).is_ok());

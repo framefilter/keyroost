@@ -8,7 +8,7 @@
 use core::fmt;
 
 use keyroost_p12::{Contents, Entry, KeyParts};
-use keyroost_piv::compat::{self, FeatureGate, PivExtension};
+use keyroost_piv::compat::{self, FeatureGate, PivExtension, PivQuirk};
 use keyroost_piv::fingerprint::AppletFingerprint;
 use keyroost_piv::{
     ImportBodyError, ImportKey, ImportLayout, ImportParts, KeyAlg, PinPolicy, PublicKey, Slot,
@@ -61,6 +61,12 @@ pub enum ImportRefusal {
     KeyNotEncodable(ImportBodyError),
     TouchPolicyNotSupported,
     PinPolicyNotSupported,
+    /// The device takes PIN policies, but not "once" (a quirk of some
+    /// firmware).
+    PinPolicyOnceNotSupported,
+    /// The device takes touch policies, but not "cached" (a quirk of some
+    /// firmware).
+    TouchPolicyCachedNotSupported,
 }
 
 impl fmt::Display for ImportRefusal {
@@ -100,16 +106,80 @@ impl fmt::Display for ImportRefusal {
             Self::PinPolicyNotSupported => {
                 f.write_str("This device doesn't support a PIN policy for imported keys.")
             }
+            Self::PinPolicyOnceNotSupported => {
+                f.write_str("This device doesn't support PIN policy \"once\".")
+            }
+            Self::TouchPolicyCachedNotSupported => {
+                f.write_str("This device doesn't support touch policy \"cached\".")
+            }
         }
     }
 }
 
 impl std::error::Error for ImportRefusal {}
 
+/// The common name of a certificate's subject, else the whole subject.
+fn subject_name(der: &[u8]) -> String {
+    use keyroost_piv::x509_parse::{parse_subject_dn, DnAttr};
+    match parse_subject_dn(der) {
+        Ok(dn) => dn
+            .rdns
+            .iter()
+            .find(|(attr, v)| *attr == DnAttr::CommonName && !v.is_empty())
+            .map_or_else(|| dn.to_string(), |(_, v)| v.clone()),
+        Err(_) => "unreadable subject".to_string(),
+    }
+}
+
+/// How an entry is shown when there is a choice to make: the file's own
+/// label, the key type, and the certificate's subject, e.g.
+/// `first (RSA-2048; certificate: Alice)`. Two keys of one type with no
+/// label still differ by their certificates. The text comes from the file:
+/// a terminal caller sanitizes it before printing.
 fn entry_label(index: usize, entry: &Entry) -> String {
-    match &entry.label {
+    let name = match &entry.label {
         Some(label) if !label.is_empty() => label.clone(),
-        _ => format!("entry {} ({})", index + 1, entry.key.alg().label()),
+        _ => format!("entry {}", index + 1),
+    };
+    let cert = entry.certificate.as_deref().map_or_else(
+        || "no certificate".to_string(),
+        |der| format!("certificate: {}", subject_name(der)),
+    );
+    format!("{name} ({}; {cert})", entry.key.alg().label())
+}
+
+/// Every entry as shown when there is a choice to make, in file order
+/// (numbered from 1 when shown): the file's own label, the key type and the
+/// certificate's subject, e.g. `first (RSA-2048; certificate: Alice)`. The
+/// text comes from the file: a terminal caller sanitizes it before printing.
+#[must_use]
+pub fn entry_labels(contents: &Contents) -> Vec<String> {
+    contents
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| entry_label(i, e))
+        .collect()
+}
+
+/// The entry `choice` (1-based) picks, or the only one when there is no
+/// choice to make. Needs no card, so a caller can ask before selecting one.
+///
+/// # Errors
+/// [`ImportRefusal::NoKey`], [`ImportRefusal::EntryOutOfRange`], or
+/// [`ImportRefusal::ChooseEntry`] (with [`entry_labels`]) for several
+/// entries and no choice.
+pub fn choose_entry(contents: &Contents, choice: Option<usize>) -> Result<&Entry, ImportRefusal> {
+    let entries = &contents.entries;
+    match (entries.len(), choice) {
+        (0, _) => Err(ImportRefusal::NoKey),
+        (n, Some(c)) if c == 0 || c > n => Err(ImportRefusal::EntryOutOfRange {
+            asked: c,
+            available: n,
+        }),
+        (_, Some(c)) => Ok(&entries[c - 1]),
+        (1, None) => Ok(&entries[0]),
+        (_, None) => Err(ImportRefusal::ChooseEntry(entry_labels(contents))),
     }
 }
 
@@ -117,7 +187,8 @@ fn entry_label(index: usize, entry: &Entry) -> String {
 ///
 /// `choice` is 1-based (as typed, or a dropdown index plus one). Checks run in
 /// this order so the most useful message wins: entry choice, key type, slot,
-/// RSA exponent, then policies. A non-default PIN or touch policy is refused
+/// RSA exponent, then policies (the extension, then a value the firmware is
+/// known to refuse). A non-default PIN or touch policy is refused
 /// where the applet is known not to take it; where support is merely unverified
 /// it is allowed, as `piv key generate` does.
 #[allow(clippy::too_many_arguments)]
@@ -131,27 +202,7 @@ pub fn plan_import<'a>(
     pin_policy: PinPolicy,
     touch_policy: TouchPolicy,
 ) -> Result<ImportPlan<'a>, ImportRefusal> {
-    let entries = &contents.entries;
-    let entry = match (entries.len(), choice) {
-        (0, _) => return Err(ImportRefusal::NoKey),
-        (n, Some(c)) if c == 0 || c > n => {
-            return Err(ImportRefusal::EntryOutOfRange {
-                asked: c,
-                available: n,
-            })
-        }
-        (_, Some(c)) => &entries[c - 1],
-        (1, None) => &entries[0],
-        (_, None) => {
-            return Err(ImportRefusal::ChooseEntry(
-                entries
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| entry_label(i, e))
-                    .collect(),
-            ))
-        }
-    };
+    let entry = choose_entry(contents, choice)?;
 
     let alg = entry.key.alg();
     let gate = |ext| compat::resolve(ext, fp, applet_version, firmware_version);
@@ -178,6 +229,17 @@ pub fn plan_import<'a>(
         && gate(PivExtension::SlotTouchPolicy) == FeatureGate::Unsupported
     {
         return Err(ImportRefusal::TouchPolicyNotSupported);
+    }
+    // Narrower than the gates above, as `piv key generate` checks: a device
+    // can take policies in general yet refuse one value.
+    let quirks = compat::resolve_quirks(fp, applet_version, firmware_version);
+    if pin_policy == PinPolicy::Once && quirks.contains(&PivQuirk::SlotPinPolicyOnceNotSupported) {
+        return Err(ImportRefusal::PinPolicyOnceNotSupported);
+    }
+    if touch_policy == TouchPolicy::Cached
+        && quirks.contains(&PivQuirk::SlotTouchPolicyCachedNotSupported)
+    {
+        return Err(ImportRefusal::TouchPolicyCachedNotSupported);
     }
 
     Ok(ImportPlan {
@@ -254,6 +316,9 @@ pub struct ImportReport {
 pub enum ImportFailure {
     /// A last check before the first write failed; nothing was written.
     Refused(ImportRefusal),
+    /// The PIN, checked before the first write so a wrong one costs nothing
+    /// on the card, was not accepted; nothing was written.
+    PinNotVerified(TransportError),
     /// The certificate step failed, so the key was not written. The step is
     /// storing the entry's certificate (`storing_certificate`), or for a
     /// key-only entry deleting the slot's old one. `slot_key_unchanged` is
@@ -330,6 +395,24 @@ impl fmt::Display for ImportFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused(r) => write!(f, "{r} Nothing was changed on the card."),
+            Self::PinNotVerified(error) => {
+                match error {
+                    TransportError::PivPinRejected {
+                        tries_remaining: Some(1),
+                    } => f.write_str("Wrong PIN (1 try left).")?,
+                    TransportError::PivPinRejected {
+                        tries_remaining: Some(n),
+                    } => write!(f, "Wrong PIN ({n} tries left).")?,
+                    TransportError::PivPinRejected {
+                        tries_remaining: None,
+                    } => f.write_str("The PIN was refused; it may be blocked.")?,
+                    TransportError::PivBadPinLength => {
+                        f.write_str("The PIN must be 6 to 8 characters.")?
+                    }
+                    e => write!(f, "The PIN couldn't be checked: {e}.")?,
+                }
+                f.write_str(" Nothing was written.")
+            }
             Self::CertificateNotStored {
                 slot,
                 error,
@@ -436,7 +519,8 @@ impl std::error::Error for ImportFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Refused(r) => Some(r),
-            Self::CertificateNotStored { error, .. }
+            Self::PinNotVerified(error)
+            | Self::CertificateNotStored { error, .. }
             | Self::KeyNotWritten { error, .. }
             | Self::SelfTestNotRun { error, .. } => Some(error),
             Self::SelfTestFailed(_) => None,
@@ -457,6 +541,7 @@ pub(crate) trait ImportCard {
         compression: CertCompression,
     ) -> Result<CertImport, TransportError>;
     fn clear_certificate(&mut self, slot: Slot) -> Result<(), TransportError>;
+    fn verify_pin(&mut self, pin: &[u8]) -> Result<(), TransportError>;
     /// Send an IMPORT ASYMMETRIC KEY body.
     fn write_key(&mut self, slot: Slot, alg_id: u8, body: &[u8]) -> Result<(), TransportError>;
     /// Note the key just written, for firmware that can't report it.
@@ -488,6 +573,10 @@ impl ImportCard for PivSession<'_> {
         PivSession::clear_certificate(self, slot)
     }
 
+    fn verify_pin(&mut self, pin: &[u8]) -> Result<(), TransportError> {
+        PivSession::verify_pin(self, pin)
+    }
+
     fn write_key(&mut self, slot: Slot, alg_id: u8, body: &[u8]) -> Result<(), TransportError> {
         PivSession::write_import_key(self, slot, alg_id, body)
     }
@@ -513,8 +602,9 @@ impl ImportCard for PivSession<'_> {
 /// authenticated; `pin`, when given, is used for the self-test only.
 ///
 /// The order keeps the slot consistent at every step:
-/// 1. Checks with no card writes: the certificate belongs to the key, and the
-///    key fits the applet's layout.
+/// 1. Checks with no card writes: the certificate belongs to the key, the
+///    key fits the applet's layout, and the PIN (when given) is accepted, so
+///    a wrong PIN stops the import before anything is written.
 /// 2. The certificate is stored without the old-key match guard of
 ///    [`PivSession::import_certificate`] (it belongs to the new key). For a
 ///    key-only entry the slot's old certificate is deleted instead. On
@@ -567,6 +657,11 @@ fn run_import_with(
     };
     let body = keyroost_piv::import_key_body(&key, plan.pin_policy, plan.touch_policy)
         .map_err(|e| ImportFailure::Refused(ImportRefusal::KeyNotEncodable(e)))?;
+    // A correct VERIFY costs no try; the self-test verifies again as it goes.
+    if let Some(pin) = pin {
+        card.verify_pin(pin)
+            .map_err(ImportFailure::PinNotVerified)?;
+    }
 
     // 2. The certificate (or, for a key-only entry, no certificate).
     let cert = match &entry.certificate {
@@ -698,10 +793,87 @@ mod tests {
     fn two_entries_need_a_choice_listing_labels() {
         let c = load("two-entries");
         match yk(&c, None, Slot::Authentication).unwrap_err() {
-            ImportRefusal::ChooseEntry(labels) => assert_eq!(labels.len(), 2),
+            ImportRefusal::ChooseEntry(labels) => {
+                assert_eq!(labels, entry_labels(&c));
+                assert!(
+                    labels[0].starts_with("first (RSA-2048; certificate: ")
+                        && labels[1].starts_with("second (ECC P-256; certificate: "),
+                    "{labels:?}"
+                );
+            }
             other => panic!("{other:?}"),
         }
         assert!(yk(&c, Some(2), Slot::Authentication).is_ok());
+    }
+
+    #[test]
+    fn unlabeled_entries_differ_by_their_certificates() {
+        let mut c = load("two-entries");
+        for e in &mut c.entries {
+            e.label = None;
+        }
+        let labels = entry_labels(&c);
+        assert!(
+            labels[0].starts_with("entry 1 (RSA-2048; certificate: "),
+            "{labels:?}"
+        );
+        assert!(
+            labels[1].starts_with("entry 2 (ECC P-256; certificate: "),
+            "{labels:?}"
+        );
+        let subjects: Vec<&str> = labels
+            .iter()
+            .map(|l| l.split("certificate: ").nth(1).unwrap())
+            .collect();
+        assert_ne!(subjects[0], subjects[1], "{labels:?}");
+        c.entries[1].certificate = None;
+        assert_eq!(entry_labels(&c)[1], "entry 2 (ECC P-256; no certificate)");
+    }
+
+    #[test]
+    fn choose_entry_is_the_plans_choice() {
+        let c = load("two-entries");
+        assert!(std::ptr::eq(
+            choose_entry(&c, Some(2)).unwrap(),
+            yk(&c, Some(2), Slot::Authentication).unwrap().entry
+        ));
+        assert_eq!(
+            choose_entry(&c, None).unwrap_err(),
+            ImportRefusal::ChooseEntry(entry_labels(&c))
+        );
+        let one = load("rsa2048-modern");
+        assert!(std::ptr::eq(
+            choose_entry(&one, None).unwrap(),
+            &one.entries[0]
+        ));
+    }
+
+    #[test]
+    fn a_policy_value_the_firmware_refuses_is_refused() {
+        let c = load("rsa2048-modern");
+        let plan = |applet: &'static [u8], pin, touch| {
+            plan_import(
+                &c,
+                None,
+                Slot::Authentication,
+                AppletFingerprint::YubiKey,
+                Some(applet),
+                None,
+                pin,
+                touch,
+            )
+        };
+        // YubiKey firmware 4.0-4.2 takes touch policies, but not "cached".
+        assert_eq!(
+            plan(&[4, 1], PinPolicy::Default, TouchPolicy::Cached).unwrap_err(),
+            ImportRefusal::TouchPolicyCachedNotSupported
+        );
+        assert!(plan(&[4, 1], PinPolicy::Default, TouchPolicy::Always).is_ok());
+        assert!(plan(&[5, 7, 1], PinPolicy::Default, TouchPolicy::Cached).is_ok());
+        assert_eq!(
+            ImportRefusal::TouchPolicyCachedNotSupported.to_string(),
+            "This device doesn't support touch policy \"cached\"."
+        );
     }
 
     #[test]
@@ -947,6 +1119,11 @@ mod run_tests {
         /// APDU-level send path, each APDU answered from here in order
         /// (`9000` once it runs out).
         apdus: Option<VecDeque<Answer>>,
+        /// PINs presented to VERIFY before the writes (kept apart from
+        /// `calls`, which are the slot's operations).
+        pins_verified: Vec<Vec<u8>>,
+        /// `Some(tries)`: VERIFY answers "wrong PIN".
+        pin_rejected: Option<Option<u8>>,
     }
 
     /// One scripted answer to an APDU.
@@ -979,6 +1156,8 @@ mod run_tests {
                     (SelfTest::Sign, Outcome::Passed),
                 ]),
                 apdus: None,
+                pins_verified: Vec::new(),
+                pin_rejected: None,
             }
         }
     }
@@ -1026,6 +1205,14 @@ mod run_tests {
                 Ok(())
             } else {
                 Err(apdu_err("piv clear certificate", 0x6A80))
+            }
+        }
+
+        fn verify_pin(&mut self, pin: &[u8]) -> Result<(), TransportError> {
+            self.pins_verified.push(pin.to_vec());
+            match self.pin_rejected {
+                Some(tries_remaining) => Err(TransportError::PivPinRejected { tries_remaining }),
+                None => Ok(()),
             }
         }
 
@@ -1097,6 +1284,57 @@ mod run_tests {
                 Call::SelfTest { .. } => "self-test",
             })
             .collect()
+    }
+
+    #[test]
+    fn a_wrong_pin_stops_before_any_write() {
+        for (name, tries, want) in [
+            (
+                "rsa2048-modern",
+                Some(2),
+                "Wrong PIN (2 tries left). Nothing was written.",
+            ),
+            (
+                "key-only",
+                Some(1),
+                "Wrong PIN (1 try left). Nothing was written.",
+            ),
+            (
+                "rsa2048-modern",
+                None,
+                "The PIN was refused; it may be blocked. Nothing was written.",
+            ),
+        ] {
+            let c = load(name);
+            let plan = yk_plan(&c);
+            let mut card = FakeCard {
+                pin_rejected: Some(tries),
+                ..FakeCard::default()
+            };
+            let e = run(&mut card, &plan).unwrap_err();
+            assert!(matches!(e, ImportFailure::PinNotVerified(_)), "{e:?}");
+            assert_eq!(e.to_string(), want);
+            // No certificate stored or cleared, no key written, no test.
+            assert!(card.calls.is_empty(), "{name}: {:?}", card.calls);
+            assert_eq!(card.pins_verified, [PIN.to_vec()]);
+        }
+    }
+
+    #[test]
+    fn the_pin_is_checked_before_the_writes_and_again_in_the_test() {
+        let c = load("rsa2048-modern");
+        let plan = yk_plan(&c);
+        let mut card = FakeCard::default();
+        run(&mut card, &plan).unwrap();
+        assert_eq!(card.pins_verified, [PIN.to_vec()]);
+        assert!(matches!(
+            card.calls.last(),
+            Some(Call::SelfTest { pin: Some(p), .. }) if p == PIN
+        ));
+        // Without a PIN nothing is verified up front.
+        let mut card = FakeCard::default();
+        run_import_with(&mut card, &plan, CertCompression::Auto, None).unwrap();
+        assert!(card.pins_verified.is_empty());
     }
 
     #[test]
