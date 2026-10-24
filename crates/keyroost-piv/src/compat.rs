@@ -2312,6 +2312,18 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   family has never attempted to mimic a Yubico extension APDU, and GET PIV
 ///   PROPERTIES / INJECT PKI KEY carry no PIN/touch-policy fields of their
 ///   own to stand in for these two.
+/// * [`PivExtension::ImportKey`] — `Verdict::KnownUnsupportedSince` for
+///   every [`crate::KeyAlg`] at the universal `[]` version, on the same
+///   standing-pattern reasoning: keyroost imports a key with Yubico's IMPORT
+///   ASYMMETRIC KEY extension (`INS FEh`), while HID documents its own
+///   INJECT PKI KEY (`INS D8h`,
+///   <https://docs.hidglobal.com/crescendo/api/low-level/inject-pki-key.htm>)
+///   for this, which keyroost doesn't implement. Not confirmed on hardware.
+///   Refusing up front keeps the slot as it was: the import writes the
+///   certificate before the key. Shared with
+///   `HID_CRESCENDO_C4000_APPLET_VERDICTS` and
+///   [`HID_CRESCENDO_GENERIC_APPLET_VERDICTS`], as the pattern is the
+///   vendor's, not one model's.
 /// * [`PivExtension::SlotKeyAlgorithm`] — C2300's own GENERATE KEY PAIR
 ///   reference
 ///   (<https://docs.hidglobal.com/crescendo/api/low-level/generate-key-pair.htm>)
@@ -2357,6 +2369,15 @@ const HID_CRESCENDO_C2300_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
@@ -2454,9 +2475,11 @@ const HID_CRESCENDO_C4000_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 /// * [`PivExtension::ResetGlobal`]'s RESET CARD reference
 ///   (<https://docs.hidglobal.com/crescendo/api/c4000/reset-card.htm>) is
 ///   C4000's own page, distinct from (but equivalent to) C2300's.
-/// * [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] — same
-///   `Verdict::KnownUnsupportedSince` row as
-///   `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s — see its doc.
+/// * [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] and
+///   [`PivExtension::ImportKey`] — same `Verdict::KnownUnsupportedSince` row
+///   as `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s — see its doc (C4000's own
+///   INJECT PKI KEY page:
+///   <https://docs.hidglobal.com/crescendo/api/c4000/inject-pki-key.htm>).
 /// * [`PivExtension::SlotKeyAlgorithm`] — unlike every row above, this one
 ///   *is* confirmed from C4000's own dedicated reference rather than assumed
 ///   from C2300's:
@@ -2504,6 +2527,15 @@ const HID_CRESCENDO_C4000_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
@@ -2566,7 +2598,8 @@ const HID_CRESCENDO_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::Merg
 ///
 /// * [`PivExtension::MoveKey`], [`PivExtension::Reset`],
 ///   [`PivExtension::SetPinPukRetries`], [`PivExtension::SlotPinPolicy`],
-///   [`PivExtension::SlotTouchPolicy`] — share one row:
+///   [`PivExtension::SlotTouchPolicy`], [`PivExtension::ImportKey`] — share
+///   one row:
 ///   `Verdict::KnownUnsupportedSince` at the universal `[]` version, shared
 ///   with `HID_CRESCENDO_C2300_APPLET_VERDICTS`/`HID_CRESCENDO_C4000_APPLET_VERDICTS`:
 ///   the reasoning ("never implements a Yubico extension APDU, always ships
@@ -2610,6 +2643,15 @@ const HID_CRESCENDO_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SetPinPukRetries,
             PivExtension::SlotPinPolicy,
             PivExtension::SlotTouchPolicy,
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
@@ -3182,7 +3224,8 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 ///   at firmware `[1, 8]` (piv-authenticator >= 0.3.6) and
 ///   `Verdict::KnownUnsupported` below it; every other algorithm
 ///   `Verdict::KnownUnsupportedSince` at `[]`. Source-verified in
-///   piv-authenticator's `import_asymmetric_key`, not yet hardware-verified.
+///   piv-authenticator's `import_asymmetric_key`; RSA-2048 into 9A is
+///   hardware-verified on firmware 1.9.1, RSA-3072/4096 not yet.
 ///   [`resolve`] additionally clamps import to the `SlotKeyAlgorithm` verdict.
 const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
@@ -3206,7 +3249,7 @@ const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
     },
     // `piv-authenticator`'s import command (`import_asymmetric_key`, since
     // 0.3.6, first shipped in firmware 1.8) takes RSA-2048/3072/4096 only, in
-    // slot 9A only — source-verified, not yet hardware-verified. Firmware
+    // slot 9A only — source-verified; RSA-2048 hardware-verified on 1.9.1. Firmware
     // before 1.8 has no import command at all (source-verified), hence the
     // `[]` `KnownUnsupported` below it. Every other `ImportKey` algorithm is
     // in the row above.
@@ -8224,6 +8267,29 @@ mod tests {
                             assert_eq!(imp, FeatureGate::Unsupported, "{fp:?} {alg:?} {a:?} {f:?}");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_refuses_import() {
+        // HID documents its own INJECT PKI KEY, not Yubico's IMPORT
+        // ASYMMETRIC KEY: every algorithm is refused up front, on every
+        // model, whatever version is read.
+        for variant in [
+            HidCrescendoVariant::C2300,
+            HidCrescendoVariant::C4000,
+            HidCrescendoVariant::Generic,
+        ] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            for alg in KeyAlg::ALL {
+                for v in [None, Some(&[][..]), Some(&[2, 0][..])] {
+                    assert_eq!(
+                        resolve(PivExtension::ImportKey(alg), fp, v, None),
+                        FeatureGate::Unsupported,
+                        "{variant:?} {alg:?} {v:?}"
+                    );
                 }
             }
         }
