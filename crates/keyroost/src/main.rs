@@ -2331,13 +2331,6 @@ fn piv_reset_global_alternative_available(
     reset_global_gate == FeatureGate::Supported && reset_gate != FeatureGate::Supported
 }
 
-/// Whether the Generate Key modal's "Policy other than `default` requires
-/// YubiKey or compatible token." caveat still needs to be shown below the
-/// PIN/touch policy combos: true unless *both* gates are confirmed
-/// [`keyroost_piv::compat::FeatureGate::Supported`] — at that point the caveat is stale noise on a
-/// device already known to handle non-default policies, and the per-row
-/// warning marker / disabled-combo hover above already cover the
-/// unverified/unsupported cases on their own.
 /// The Import dialog's note when "Enable Anyway" is on for this key yet a
 /// policy row stays greyed out: the override relaxes Generate, not import.
 /// `None` otherwise.
@@ -2353,6 +2346,13 @@ fn piv_import_override_note(
         .then_some("Enable Anyway doesn't apply to importing.")
 }
 
+/// Whether the Generate Key modal's "Policy other than `default` requires
+/// YubiKey or compatible token." caveat still needs to be shown below the
+/// PIN/touch policy combos: true unless *both* gates are confirmed
+/// [`keyroost_piv::compat::FeatureGate::Supported`] — at that point the caveat is stale noise on a
+/// device already known to handle non-default policies, and the per-row
+/// warning marker / disabled-combo hover above already cover the
+/// unverified/unsupported cases on their own.
 fn piv_policy_caveat_hint_needed(
     pin_policy_gate: keyroost_piv::compat::FeatureGate,
     touch_policy_gate: keyroost_piv::compat::FeatureGate,
