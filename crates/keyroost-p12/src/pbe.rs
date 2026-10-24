@@ -14,12 +14,51 @@ use crate::ber::{children, Tlv};
 use crate::kdf::{bmp_password, pkcs12_kdf, Hash};
 use crate::P12Error;
 
-/// Most KDF iterations accepted; a hostile file could otherwise stall us.
-pub(crate) const MAX_ITERATIONS: u32 = if cfg!(feature = "fuzzing") {
-    1_000
-} else {
-    10_000_000
-};
+/// Most KDF iterations accepted for one derivation; a hostile file could
+/// otherwise stall us.
+pub(crate) const MAX_ITERATIONS: u32 = if cfg!(fuzzing) { 1_000 } else { 10_000_000 };
+
+/// Most KDF iterations one [`crate::open`] call runs in total, across every
+/// encrypted part, the MAC and both empty-password candidates: a file with
+/// many bags must not add up to a stall either.
+pub(crate) const WORK_BUDGET: u64 = if cfg!(fuzzing) { 10_000 } else { 20_000_000 };
+
+/// The [`P12Error::Unsupported`] text for a file that asks for more key
+/// derivation than one [`crate::open`] call runs (20,000,000 iterations in
+/// all).
+pub const TOO_MUCH_WORK: &str = "too much password-hashing work";
+
+/// What is left of [`WORK_BUDGET`]. Each derivation is charged before it
+/// runs, so an over-budget file is refused without doing the work.
+pub(crate) struct Work {
+    left: u64,
+}
+
+impl Work {
+    pub(crate) fn new() -> Self {
+        Self::with_budget(WORK_BUDGET)
+    }
+
+    pub(crate) fn with_budget(left: u64) -> Self {
+        Self { left }
+    }
+
+    /// How much of the budget is left.
+    #[cfg(test)]
+    pub(crate) fn left(&self) -> u64 {
+        self.left
+    }
+
+    /// Charge one derivation of `iterations` rounds.
+    pub(crate) fn spend(&mut self, iterations: u32) -> Result<(), P12Error> {
+        let n = u64::from(iterations);
+        if n > self.left {
+            return Err(P12Error::Unsupported(TOO_MUCH_WORK));
+        }
+        self.left -= n;
+        Ok(())
+    }
+}
 
 // DER-encoded OID contents.
 const PBE_3DES: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x01, 0x03];
@@ -99,11 +138,13 @@ fn check_iterations(n: u32) -> Result<u32, P12Error> {
 }
 
 /// Decrypt `ciphertext` under the scheme named by `alg` (an AlgorithmIdentifier
-/// SEQUENCE). A padding failure reads as a wrong password.
+/// SEQUENCE), charging the key derivation to `work`. A padding failure reads
+/// as a wrong password.
 pub(crate) fn decrypt(
     alg: &Tlv<'_>,
     ciphertext: &[u8],
     password: Option<&str>,
+    work: &mut Work,
 ) -> Result<Zeroizing<Vec<u8>>, P12Error> {
     if alg.tag != TAG_SEQUENCE {
         return Err(bad("algorithm identifier is not a SEQUENCE"));
@@ -111,7 +152,7 @@ pub(crate) fn decrypt(
     let kids = children(&alg.value)?;
     let id = alg_id(&kids)?;
     if id.oid == PBES2 {
-        return decrypt_pbes2(id.params, ciphertext, password);
+        return decrypt_pbes2(id.params, ciphertext, password, work);
     }
     let legacy = match id.oid {
         o if o == PBE_3DES => Legacy::TripleDes,
@@ -119,7 +160,7 @@ pub(crate) fn decrypt(
         o if o == PBE_RC2_40 => Legacy::Rc2(40),
         _ => return Err(P12Error::Unsupported("encryption algorithm")),
     };
-    decrypt_legacy(legacy, id.params, ciphertext, password)
+    decrypt_legacy(legacy, id.params, ciphertext, password, work)
 }
 
 #[derive(Clone, Copy)]
@@ -134,6 +175,7 @@ fn decrypt_legacy(
     params: Option<&Tlv<'_>>,
     ciphertext: &[u8],
     password: Option<&str>,
+    work: &mut Work,
 ) -> Result<Zeroizing<Vec<u8>>, P12Error> {
     let params = params.ok_or_else(|| bad("missing PBE parameters"))?;
     if params.tag != TAG_SEQUENCE {
@@ -150,6 +192,9 @@ fn decrypt_legacy(
         Legacy::TripleDes => 24,
         Legacy::Rc2(bits) => bits / 8,
     };
+    // Two derivations: the key and the IV.
+    work.spend(iterations)?;
+    work.spend(iterations)?;
     let pw = bmp_password(password);
     let key = pkcs12_kdf(Hash::Sha1, &pw, &salt.value, 1, iterations, key_len);
     let iv = pkcs12_kdf(Hash::Sha1, &pw, &salt.value, 2, iterations, 8);
@@ -169,6 +214,7 @@ fn decrypt_pbes2(
     params: Option<&Tlv<'_>>,
     ciphertext: &[u8],
     password: Option<&str>,
+    work: &mut Work,
 ) -> Result<Zeroizing<Vec<u8>>, P12Error> {
     let params = params.ok_or_else(|| bad("missing PBES2 parameters"))?;
     if params.tag != TAG_SEQUENCE {
@@ -237,6 +283,7 @@ fn decrypt_pbes2(
         return Err(bad("unexpected PBKDF2 parameter"));
     }
 
+    work.spend(iterations)?;
     // PBES2 uses the password as plain UTF-8, not a BMPString.
     let pw = Zeroizing::new(password.unwrap_or("").as_bytes().to_vec());
     let key = match prf {
@@ -303,7 +350,7 @@ mod tests {
     fn run(alg_hex: &str, ct_hex: &str, pw: Option<&str>) -> Result<Vec<u8>, P12Error> {
         let alg = unhex(alg_hex);
         let (tlv, _) = read_tlv(&alg).unwrap();
-        decrypt(&tlv, &unhex(ct_hex), pw).map(|z| z.to_vec())
+        decrypt(&tlv, &unhex(ct_hex), pw, &mut Work::new()).map(|z| z.to_vec())
     }
 
     // RFC 2268 section 5: key 88bca90e90875a, 64 effective bits.
@@ -427,6 +474,35 @@ mod tests {
             got,
             Err(P12Error::Unsupported("iteration count above 10,000,000"))
         );
+    }
+
+    #[test]
+    fn work_is_charged_before_the_derivation_runs() {
+        // 3DES at 2048 iterations costs 4096 (key and IV): one short of that
+        // is refused, and nothing is left over afterwards.
+        let alg = unhex("301c060a2a864886f70d010c0103300e0408010203040506070802020800");
+        let (tlv, _) = read_tlv(&alg).unwrap();
+        let ct = unhex("1e0f7d6f125a3a2f5e7f62e8c54a6017dd4a30376431470e");
+        let pw = Some("password");
+        assert_eq!(
+            decrypt(&tlv, &ct, pw, &mut Work::with_budget(4095)).err(),
+            Some(P12Error::Unsupported(TOO_MUCH_WORK))
+        );
+        let mut work = Work::with_budget(4096);
+        assert_eq!(decrypt(&tlv, &ct, pw, &mut work).unwrap().to_vec(), PLAIN);
+        assert_eq!(
+            decrypt(&tlv, &ct, pw, &mut work).err(),
+            Some(P12Error::Unsupported(TOO_MUCH_WORK))
+        );
+        // PBES2 at 2048 costs 2048.
+        let alg = unhex(AES128_SHA1);
+        let (tlv, _) = read_tlv(&alg).unwrap();
+        let ct = unhex(AES128_SHA1_CT);
+        assert_eq!(
+            decrypt(&tlv, &ct, pw, &mut Work::with_budget(2047)).err(),
+            Some(P12Error::Unsupported(TOO_MUCH_WORK))
+        );
+        assert!(decrypt(&tlv, &ct, pw, &mut Work::with_budget(2048)).is_ok());
     }
 
     /// Re-encode the fixed PBES2 shape after the iteration INTEGER grew by

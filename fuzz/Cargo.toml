@@ -24,8 +24,8 @@ serde_json = "1"
 keyroost-qr = { path = "../crates/keyroost-qr" }
 keyroost-ctap = { path = "../crates/keyroost-ctap" }
 keyroost-oath = { path = "../crates/keyroost-oath" }
-# `fuzzing` caps the file-chosen KDF iteration count so runs stay fast.
-keyroost-p12 = { path = "../crates/keyroost-p12", features = ["fuzzing"] }
+# cargo-fuzz's `--cfg fuzzing` caps the file-chosen KDF work so runs stay fast.
+keyroost-p12 = { path = "../crates/keyroost-p12" }
 keyroost-openpgp = { path = "../crates/keyroost-openpgp" }
 keyroost-pgpkey = { path = "../crates/keyroost-pgpkey" }
 keyroost-piv = { path = "../crates/keyroost-piv" }

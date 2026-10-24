@@ -506,6 +506,24 @@ mod rsa_tests {
     }
 
     #[test]
+    fn prime_equal_to_one_is_refused_not_a_panic() {
+        // p = 1 and q = n multiply to n; `rsa` before 0.9.10 panicked on it.
+        let der = fixture();
+        let int = |index| {
+            let (off, len) = integer_offset(&der, index);
+            der[off..off + len].to_vec()
+        };
+        let (n, e, d) = (int(1), int(2), int(3));
+        let (dp, dq, qinv) = (int(6), int(7), int(8));
+        for (p, q) in [(&[1u8][..], &n[..]), (&n[..], &[1u8][..])] {
+            assert_eq!(
+                check_rsa_consistent(&n, &e, &d, p, q, &dp, &dq, &qinv).err(),
+                Some(P12Error::Malformed("RSA key parts don't agree"))
+            );
+        }
+    }
+
+    #[test]
     fn multi_prime_rsa_is_unsupported() {
         let mut der = fixture();
         let (off, _) = integer_offset(&der, 0);

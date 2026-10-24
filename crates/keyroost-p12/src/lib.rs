@@ -8,8 +8,9 @@
 //! [`KeyParts`] (minimal big-endian integers, cleared on drop), the matching
 //! certificate if the file has one, and a label; certificates that belong to no
 //! key are returned as `authorities`. Choosing among several entries is left to
-//! the caller. The `fuzzing` feature lowers the KDF iteration cap and is only
-//! for the fuzz target.
+//! the caller. Key derivation is bounded per derivation and per file, so a
+//! hostile file can't stall the caller; under `--cfg fuzzing` (set by
+//! cargo-fuzz) both limits are lower.
 
 #![forbid(unsafe_code)]
 
@@ -21,6 +22,7 @@ mod pfx;
 mod pkcs8;
 
 pub use entries::{open, Contents, Entry};
+pub use pbe::TOO_MUCH_WORK;
 pub use pkcs8::KeyParts;
 
 use core::fmt;
@@ -33,14 +35,12 @@ pub enum P12Error {
     Malformed(&'static str),
     /// The password does not open the file (MAC or padding check failed).
     WrongPassword,
-    /// A valid file that uses something this reader does not handle.
+    /// A valid file that uses something this reader does not handle. A file
+    /// that asks for more key-derivation work than [`open`] allows in total
+    /// carries [`TOO_MUCH_WORK`].
     Unsupported(&'static str),
     /// The file holds no private key.
     NoKey,
-    /// The file holds several entries and none was chosen (carries the count).
-    SeveralEntries(usize),
-    /// The chosen entry number is not in the file (carries the number).
-    EntryOutOfRange(usize),
 }
 
 impl fmt::Display for P12Error {
@@ -50,10 +50,6 @@ impl fmt::Display for P12Error {
             P12Error::WrongPassword => write!(f, "wrong password for this PKCS#12 file"),
             P12Error::Unsupported(what) => write!(f, "unsupported PKCS#12 feature: {what}"),
             P12Error::NoKey => write!(f, "the PKCS#12 file contains no private key"),
-            P12Error::SeveralEntries(n) => {
-                write!(f, "the PKCS#12 file has {n} entries; choose one")
-            }
-            P12Error::EntryOutOfRange(n) => write!(f, "entry {n} is not in the PKCS#12 file"),
         }
     }
 }

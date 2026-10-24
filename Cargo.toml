@@ -37,6 +37,9 @@ repository = "https://github.com/framefilter/keyroost"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# cargo-fuzz builds with `--cfg fuzzing`; keyroost-p12 lowers its KDF limits
+# under it so the fuzz target is not stalled by hostile files.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 # This workspace spends its time parsing device- and file-supplied bytes;
 # a length-arithmetic bug should panic loudly in release builds, not wrap

@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::ber::{children, read_tlv, Tlv};
 use crate::kdf::{bmp_password, pkcs12_kdf, Hash};
+use crate::pbe::Work;
 use crate::{pbe, P12Error};
 
 /// What a bag holds.
@@ -142,7 +143,18 @@ fn explicit_content<'a>(wrapper: &'a Tlv<'a>) -> Result<Tlv<'a>, P12Error> {
 /// relies on the padding check of its encrypted parts, but only if every key
 /// comes from an encrypted container. Without a MAC nothing vouches for a
 /// plaintext key bag (it could have been swapped), so such a file is refused.
+///
+/// All key derivation (the MAC and every encrypted part, for each password
+/// candidate) shares one [`pbe::WORK_BUDGET`].
 pub(crate) fn read_bags(der: &[u8], password: Option<&str>) -> Result<Vec<RawBag>, P12Error> {
+    read_bags_within(der, password, &mut Work::new())
+}
+
+fn read_bags_within(
+    der: &[u8],
+    password: Option<&str>,
+    work: &mut Work,
+) -> Result<Vec<RawBag>, P12Error> {
     let (pfx, _) = read_tlv(der)?;
     expect(&pfx, TAG_SEQUENCE, "PFX is not a SEQUENCE")?;
     let parts = children(&pfx.value)?;
@@ -175,11 +187,11 @@ pub(crate) fn read_bags(der: &[u8], password: Option<&str>) -> Result<Vec<RawBag
     for (i, pw) in candidates.iter().copied().enumerate() {
         let last = i + 1 == candidates.len();
         if let Some(mac) = &mac {
-            if !mac.verify(auth_safe, pw) {
+            if !mac.verify(auth_safe, pw, work)? {
                 continue;
             }
         }
-        match walk_auth_safe(auth_safe, pw, mac.is_some()) {
+        match walk_auth_safe(auth_safe, pw, mac.is_some(), work) {
             Err(P12Error::WrongPassword) if !last => continue,
             other => return other,
         }
@@ -195,8 +207,15 @@ struct Mac {
 }
 
 impl Mac {
-    /// Whether the MAC over `data` matches under this password.
-    fn verify(&self, data: &[u8], password: Option<&str>) -> bool {
+    /// Whether the MAC over `data` matches under this password, charging the
+    /// key derivation to `work`.
+    fn verify(
+        &self,
+        data: &[u8],
+        password: Option<&str>,
+        work: &mut Work,
+    ) -> Result<bool, P12Error> {
+        work.spend(self.iterations)?;
         let pw = bmp_password(password);
         let key = pkcs12_kdf(
             self.hash,
@@ -213,10 +232,10 @@ impl Mac {
                     m.update(data);
                     m.finalize().into_bytes().to_vec()
                 }
-                Err(_) => return false,
+                Err(_) => return Ok(false),
             },
         };
-        constant_time_eq(&computed, &self.digest)
+        Ok(constant_time_eq(&computed, &self.digest))
     }
 }
 
@@ -269,6 +288,7 @@ fn walk_auth_safe(
     auth_safe: &[u8],
     password: Option<&str>,
     plain_keys_ok: bool,
+    work: &mut Work,
 ) -> Result<Vec<RawBag>, P12Error> {
     let (seq, _) = read_tlv(auth_safe)?;
     expect(&seq, TAG_SEQUENCE, "AuthenticatedSafe is not a SEQUENCE")?;
@@ -283,10 +303,10 @@ fn walk_auth_safe(
         let content = explicit_content(wrapper)?;
         if *oid.value == *DATA_OID {
             expect_octets(&content, "data content is not an OCTET STRING")?;
-            safe_contents(&content.value, password, plain_keys_ok, &mut bags)?;
+            safe_contents(&content.value, password, plain_keys_ok, work, &mut bags)?;
         } else if *oid.value == *ENCRYPTED_DATA_OID {
-            let plain = decrypt_encrypted_data(&content, password)?;
-            safe_contents(&plain, password, true, &mut bags)?;
+            let plain = decrypt_encrypted_data(&content, password, work)?;
+            safe_contents(&plain, password, true, work, &mut bags)?;
         } else {
             return Err(P12Error::Unsupported("AuthenticatedSafe content type"));
         }
@@ -298,6 +318,7 @@ fn walk_auth_safe(
 fn decrypt_encrypted_data(
     ed: &Tlv<'_>,
     password: Option<&str>,
+    work: &mut Work,
 ) -> Result<Zeroizing<Vec<u8>>, P12Error> {
     expect(ed, TAG_SEQUENCE, "EncryptedData is not a SEQUENCE")?;
     let kids = children(&ed.value)?;
@@ -315,7 +336,7 @@ fn decrypt_encrypted_data(
         return Err(P12Error::Unsupported("encrypted content type"));
     }
     let ciphertext = implicit_octets(cipher)?;
-    pbe::decrypt(alg, &ciphertext, password)
+    pbe::decrypt(alg, &ciphertext, password, work)
 }
 
 /// The bytes of an IMPLICIT `[0]` OCTET STRING, primitive or BER-chunked.
@@ -339,12 +360,13 @@ fn safe_contents(
     data: &[u8],
     password: Option<&str>,
     plain_keys_ok: bool,
+    work: &mut Work,
     bags: &mut Vec<RawBag>,
 ) -> Result<(), P12Error> {
     let (seq, _) = read_tlv(data)?;
     expect(&seq, TAG_SEQUENCE, "SafeContents is not a SEQUENCE")?;
     for bag in children(&seq.value)? {
-        if let Some(raw) = safe_bag(&bag, password, plain_keys_ok)? {
+        if let Some(raw) = safe_bag(&bag, password, plain_keys_ok, work)? {
             bags.push(raw);
         }
     }
@@ -357,6 +379,7 @@ fn safe_bag(
     bag: &Tlv<'_>,
     password: Option<&str>,
     plain_keys_ok: bool,
+    work: &mut Work,
 ) -> Result<Option<RawBag>, P12Error> {
     expect(bag, TAG_SEQUENCE, "SafeBag is not a SEQUENCE")?;
     let kids = children(&bag.value)?;
@@ -380,7 +403,10 @@ fn safe_bag(
             return Err(bad("EncryptedPrivateKeyInfo is not (algorithm, data)"));
         };
         expect_octets(cipher, "encrypted key is not an OCTET STRING")?;
-        (BagKind::Key, pbe::decrypt(alg, &cipher.value, password)?)
+        (
+            BagKind::Key,
+            pbe::decrypt(alg, &cipher.value, password, work)?,
+        )
     } else if *id.value == *CERT_BAG_OID {
         expect(&value, TAG_SEQUENCE, "cert bag is not a SEQUENCE")?;
         let parts = children(&value.value)?;
@@ -618,6 +644,112 @@ mod tests {
             read_bags(&pfx, PW).err(),
             Some(P12Error::Unsupported("PBMAC1"))
         );
+    }
+
+    /// `tag || length || content`, with a long-form length when needed.
+    fn tlv_long(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            v.push(len as u8);
+        } else {
+            let b = (len as u32).to_be_bytes();
+            let skip = b.iter().take_while(|&&x| x == 0).count();
+            v.push(0x80 | (4 - skip) as u8);
+            v.extend_from_slice(&b[skip..]);
+        }
+        v.extend_from_slice(content);
+        v
+    }
+
+    /// A MAC-less PFX whose one `data` SafeContents holds `n` shrouded key
+    /// bags, each PBES2 (PBKDF2-SHA1, 2048 iterations, AES-128) over a short
+    /// plaintext. The bags are not PKCS#8, which `read_bags` does not check.
+    fn many_shrouded_bags(n: usize) -> Vec<u8> {
+        const ALG: &str = "304906092a864886f70d01050d303c301b06092a864886f70d01050c300e0408010203040506070802020800301d06096086480165030401020410101112131415161718191a1b1c1d1e1f";
+        const CT: &str = "12ede7d7d6a368bd63f9f90480fc142fb7f0c6de095d3aa8b0aa6956c63535ab";
+        let unhex = |h: &str| -> Vec<u8> {
+            (0..h.len() / 2)
+                .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        };
+        let epki = tlv_long(0x30, &[unhex(ALG), tlv_long(0x04, &unhex(CT))].concat());
+        let bag = tlv_long(
+            0x30,
+            &[tlv_long(0x06, SHROUDED_KEY_BAG_OID), tlv_long(0xA0, &epki)].concat(),
+        );
+        let safe_contents = tlv_long(0x30, &bag.repeat(n));
+        let data_info = |content: &[u8]| {
+            tlv_long(
+                0x30,
+                &[
+                    tlv_long(0x06, DATA_OID),
+                    tlv_long(0xA0, &tlv_long(0x04, content)),
+                ]
+                .concat(),
+            )
+        };
+        let auth_safe = tlv_long(0x30, &data_info(&safe_contents));
+        tlv_long(0x30, &[tlv(0x02, &[3]), data_info(&auth_safe)].concat())
+    }
+
+    #[test]
+    fn work_adds_up_across_bags() {
+        const PW: Option<&str> = Some("password");
+        let p12 = many_shrouded_bags(10);
+        let mut work = Work::with_budget(10 * 2048);
+        assert_eq!(read_bags_within(&p12, PW, &mut work).unwrap().len(), 10);
+        assert_eq!(work.left(), 0);
+        // Three bags' worth of budget stops at the fourth, before its KDF.
+        assert_eq!(
+            read_bags_within(&p12, PW, &mut Work::with_budget(3 * 2048)).err(),
+            Some(P12Error::Unsupported(pbe::TOO_MUCH_WORK))
+        );
+    }
+
+    #[test]
+    fn over_budget_file_is_refused_before_its_kdf_runs() {
+        // The full budget, all but spent: the first derivation of a file of
+        // ten thousand bags is refused without running.
+        let p12 = many_shrouded_bags(10_000);
+        let mut work = Work::new();
+        work.spend(u32::try_from(pbe::WORK_BUDGET - 2047).unwrap())
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            read_bags_within(&p12, Some("password"), &mut work).err(),
+            Some(P12Error::Unsupported(pbe::TOO_MUCH_WORK))
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn both_empty_password_candidates_and_the_mac_are_charged() {
+        let p12 = fx!("empty-password.p12");
+        let spent = |pw| {
+            let mut work = Work::new();
+            let got = read_bags_within(p12, pw, &mut work).map(|b| b.len());
+            (got, pbe::WORK_BUDGET - work.left())
+        };
+        // One candidate, a failing MAC: the MAC alone is charged.
+        let (got, mac) = spent(Some("x"));
+        assert_eq!(got, Err(P12Error::WrongPassword));
+        assert!(mac > 0);
+        // This file's MAC is for the empty string, the second candidate: the
+        // first candidate's failed MAC, the second's, and its bags.
+        let (pfx, _) = read_tlv(p12).unwrap();
+        let parts = children(&pfx.value).unwrap();
+        let ci = children(&parts[1].value).unwrap();
+        let octets = explicit_content(&ci[1]).unwrap();
+        let mut walk = Work::new();
+        walk_auth_safe(&octets.value, Some(""), true, &mut walk).unwrap();
+        let bags = pbe::WORK_BUDGET - walk.left();
+        assert!(bags > 0);
+        for pw in [None, Some("")] {
+            let (got, total) = spent(pw);
+            assert!(got.is_ok());
+            assert_eq!(total, 2 * mac + bags, "{pw:?}");
+        }
     }
 
     #[test]

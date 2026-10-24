@@ -3179,7 +3179,8 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 ///   own row uses.
 ///
 /// * [`PivExtension::ImportKey`] — RSA-2048/3072/4096 `Verdict::KnownSupported`
-///   at firmware `[1, 8]` (piv-authenticator >= 0.3.6); every other algorithm
+///   at firmware `[1, 8]` (piv-authenticator >= 0.3.6) and
+///   `Verdict::KnownUnsupported` below it; every other algorithm
 ///   `Verdict::KnownUnsupportedSince` at `[]`. Source-verified in
 ///   piv-authenticator's `import_asymmetric_key`, not yet hardware-verified.
 ///   [`resolve`] additionally clamps import to the `SlotKeyAlgorithm` verdict.
@@ -3203,19 +3204,28 @@ const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
-    // `piv-authenticator`'s import command (since 0.3.6, firmware 1.8) takes
-    // RSA-2048/3072/4096 only, in slot 9A only — source-verified, not yet
-    // hardware-verified. Every other `ImportKey` algorithm is in the row above.
+    // `piv-authenticator`'s import command (`import_asymmetric_key`, since
+    // 0.3.6, first shipped in firmware 1.8) takes RSA-2048/3072/4096 only, in
+    // slot 9A only — source-verified, not yet hardware-verified. Firmware
+    // before 1.8 has no import command at all (source-verified), hence the
+    // `[]` `KnownUnsupported` below it. Every other `ImportKey` algorithm is
+    // in the row above.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::ImportKey(KeyAlg::Rsa2048),
             PivExtension::ImportKey(KeyAlg::Rsa3072),
             PivExtension::ImportKey(KeyAlg::Rsa4096),
         ],
-        verdicts: &[VersionVerdict {
-            version: &[1, 8],
-            verdict: Verdict::KnownSupported,
-        }],
+        verdicts: &[
+            VersionVerdict {
+                version: &[],
+                verdict: Verdict::KnownUnsupported,
+            },
+            VersionVerdict {
+                version: &[1, 8],
+                verdict: Verdict::KnownSupported,
+            },
+        ],
     },
     ExtensionVerdicts {
         extensions: &[
@@ -8156,6 +8166,32 @@ mod tests {
                 "{alg:?}"
             );
         }
+    }
+
+    #[test]
+    fn nitrokey_import_needs_firmware_1_8() {
+        // `import_asymmetric_key` first shipped in firmware 1.8.
+        for fw in [&[1u8, 7, 0][..], &[1, 7, 9], &[1, 0]] {
+            assert_eq!(
+                resolve(
+                    PivExtension::ImportKey(KeyAlg::Rsa2048),
+                    NITROKEY,
+                    None,
+                    Some(fw)
+                ),
+                FeatureGate::Unsupported,
+                "{fw:?}"
+            );
+        }
+        assert_eq!(
+            resolve(
+                PivExtension::ImportKey(KeyAlg::Rsa2048),
+                NITROKEY,
+                None,
+                Some(&[1, 8, 0])
+            ),
+            FeatureGate::Supported
+        );
     }
 
     #[test]

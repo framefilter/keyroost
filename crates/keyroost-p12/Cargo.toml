@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Host-side PKCS#12 (.p12/.pfx) reader that turns an entry into key parts for PIV import."
+# The fixtures are throwaway test keys; they stay in the repository.
+exclude = ["tests/fixtures/"]
 
 [lints]
 workspace = true
@@ -30,11 +32,8 @@ p384 = "0.13"
 ed25519-dalek = "2"
 x25519-dalek = "2"
 # Checks that an RSA key's parts agree before it can reach a card.
-rsa = "0.9"
+# `RsaPrivateKey::from_components` validates only since 0.9.7, and 0.9.10
+# fixed a panic on a prime equal to 1.
+rsa = "0.9.10"
 zeroize = "1"
 keyroost-oath = { path = "../keyroost-oath", version = "0.14.0" }
-
-[features]
-# Lowers the accepted KDF iteration count so the fuzz target is not stalled by
-# hostile files; never enabled in shipped builds.
-fuzzing = []
