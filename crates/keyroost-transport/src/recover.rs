@@ -136,7 +136,11 @@ impl<'a> FirstContact<'a> {
         self.opened = true;
         if self.tries > 0 {
             trace::line(self.debug, || {
-                format_line(Dir::Note, self.label, "card was reset; reconnected")
+                format_line(
+                    Dir::Note,
+                    self.label,
+                    "reopened after the card was reset or briefly gone",
+                )
             });
         }
     }

@@ -4,7 +4,7 @@
 //! answer is simply not matched by identity), and traces each exchange
 //! through [`crate::trace`] so it shows in `--debug` output and in the
 //! GUI's activity capture. HID reads say which kind of nothing it was
-//! ([`KeyAnswer`]), so a caller can remember a key's own "no" and ask again
+//! ([`KeyAnswer`](crate::identity::KeyAnswer)), so a caller can remember a key's own "no" and ask again
 //! after a failure.
 
 use std::path::Path;

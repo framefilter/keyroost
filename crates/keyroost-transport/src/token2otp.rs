@@ -484,7 +484,7 @@ impl HidOtpTransport {
 /// The §6.10 GET_INFO serial reply over USB-HID, raw (`D1 len …`), for
 /// identity matching (#51). Read-only, short timeout. A status word other
 /// than `9000` is the key declining; a transport failure is no answer,
-/// unless the key already declined command `0x41` (see [`after_probe`]).
+/// unless the key already declined command `0x41` (see `after_probe`).
 pub fn token2_serial_reply_hid(path: &Path, debug: bool) -> KeyAnswer<Vec<u8>> {
     let answer = |r: Result<(Vec<u8>, u16), OtpTransportError>| match r {
         Ok((data, 0x9000)) => KeyAnswer::Reply(data),
