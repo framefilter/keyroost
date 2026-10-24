@@ -10854,9 +10854,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         )
                         .into());
                     }
-                    let serial = serial
-                        .map(|v| format!("serial {v}"))
-                        .unwrap_or_else(|| "this device".into());
+                    let serial = piv_reset_target(serial);
                     // Some fingerprints need an authenticated management-key session
                     // before RESET is even accepted (`PivQuirk::
                     // ResetNeedsManagementAuth`) — the same precondition
@@ -11572,6 +11570,15 @@ fn key_import_error(
     } else {
         e.to_string().into()
     }
+}
+
+/// The card a PIV reset names: its serial as `piv info` shows it (decimal,
+/// or hex for a serial too long for that), else "this device".
+fn piv_reset_target(serial: Option<u128>) -> String {
+    serial.map_or_else(
+        || "this device".into(),
+        |v| format!("serial {}", keyroost_piv::format_serial_short(v)),
+    )
 }
 
 /// How an authority certificate is named
@@ -21714,6 +21721,18 @@ mod cli_tests {
             import_refusal_error(&r, &one),
             format!("{r} Nothing was written.")
         );
+    }
+
+    /// The reset line names the card as `piv info` does: a YubiKey's
+    /// serial in decimal, a 128-bit one (Nitrokey 3) in hex.
+    #[test]
+    fn piv_reset_names_the_serial_as_piv_info_does() {
+        assert_eq!(piv_reset_target(Some(37_806_840)), "serial 37806840");
+        assert_eq!(
+            piv_reset_target(Some(0x4268_2EF7_7F1E_E558_826B_8E28_CEDE_AC79)),
+            "serial 0x42682EF77F1EE558826B8E28CEDEAC79"
+        );
+        assert_eq!(piv_reset_target(None), "this device");
     }
 
     #[test]
