@@ -549,8 +549,9 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl piv retries set</code></td><td>Set how many wrong PIN and PUK entries are allowed. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl piv mgmt-key</code></td><td>Change the management key (mgmt-key: the key that authorizes changes to keys and certificates)</td></tr>
       <tr><td><code>keyroostctl piv mgmt-key change</code></td><td>Change the card-management (9B) key. Both keys are hex; from stdin, the current key comes on the first line and the new one on the second</td></tr>
-      <tr><td><code>keyroostctl piv key</code></td><td>Generate, delete or move the private keys in PIV slots</td></tr>
+      <tr><td><code>keyroostctl piv key</code></td><td>Generate, import, delete or move the private keys in PIV slots</td></tr>
       <tr><td><code>keyroostctl piv key generate</code></td><td>Generate a new key pair in a slot, replacing any key already there, and print its public key (PEM). Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl piv key import</code></td><td>Import a private key and its certificate from a .p12/.pfx file into a slot, replacing what the slot holds. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl piv key delete</code></td><td>Delete a slot&#x27;s private key; the slot&#x27;s certificate is left in place. Needs the management key. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl piv key move</code></td><td>Move a slot&#x27;s private key to another slot, without it leaving the card</td></tr>
       <tr><td><code>keyroostctl piv cert</code></td><td>Import, export, delete, request or generate the certificates in PIV slots</td></tr>

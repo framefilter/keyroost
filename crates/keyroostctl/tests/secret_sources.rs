@@ -236,6 +236,10 @@ fn fixture_dir() -> common::TempDir {
             "cert.der",
             include_bytes!("fixtures/rsa_piv.der"),
         ),
+        (
+            "fixture.p12",
+            include_bytes!("../../keyroost-p12/tests/fixtures/rsa2048-modern.p12"),
+        ),
     ] {
         std::fs::write(dir.join(name), body).unwrap();
     }
@@ -345,6 +349,65 @@ fn import_key_checks_the_key_file_before_selecting_a_key() {
             !err.contains('\u{2192}'),
             "{path:?}: a key was selected before the file was checked: {err}"
         );
+    }
+}
+
+/// `piv key import` opens the file before any key is looked at: a wrong
+/// file password, or a file with several keys and no `--entry`, stops
+/// before a key is selected and before the management key is read (the
+/// stdin line after the file password is never consumed).
+#[test]
+fn piv_key_import_checks_the_file_before_selecting_a_key() {
+    let dir = common::TempDir::new("piv-import");
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../keyroost-p12/tests/fixtures");
+    for (file, password, extra, want) in [
+        (
+            "rsa2048-modern.p12",
+            "not-the-password",
+            &[][..],
+            &["Wrong password for this file."][..],
+        ),
+        (
+            "two-entries.p12",
+            "keyroost-test",
+            &[],
+            &[
+                "The file holds 2 keys; pick one with --entry N. Nothing was written.",
+                "  1) ",
+                "  2) ",
+            ],
+        ),
+        (
+            "two-entries.p12",
+            "keyroost-test",
+            &["--entry", "3"],
+            &["--entry 3 isn't in the file, which holds 2 keys:"],
+        ),
+    ] {
+        let out = common::keyroostctl()
+            .args(["piv", "key", "import", "--slot", "9a", "--yes", "--in"])
+            .arg(fixtures.join(file))
+            .args(extra)
+            .args(["--file-password", "env:KR_TEST_P12", "--mgmt-key", "stdin"])
+            .args(["--pin", "env:KR_TEST_PIN"])
+            .env("KR_TEST_P12", password)
+            .env("KR_TEST_PIN", "123456")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{file} {extra:?}: {err}");
+        for w in want {
+            assert!(err.contains(w), "{file} {extra:?}: {w:?} in {err}");
+        }
+        assert!(
+            !err.contains('\u{2192}') && !err.contains("management key"),
+            "{file} {extra:?}: went past the file check: {err}"
+        );
+        assert!(out.stdout.is_empty(), "{file}: stdout {:?}", out.stdout);
     }
 }
 

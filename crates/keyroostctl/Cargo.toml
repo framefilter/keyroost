@@ -19,6 +19,8 @@ keyroost-proto = { path = "../keyroost-proto", version = "0.14.0" }
 keyroost-transport = { path = "../keyroost-transport", version = "0.14.0" }
 keyroost-piv = { path = "../keyroost-piv", version = "0.14.0" }
 keyroost-pivtest = { path = "../keyroost-pivtest", version = "0.14.0" }
+# Reads .p12/.pfx files for `piv key import`.
+keyroost-p12 = { path = "../keyroost-p12", version = "0.14.0" }
 keyroost-hid = { path = "../keyroost-hid", version = "0.14.0" }
 keyroost-ctap = { path = "../keyroost-ctap", version = "0.14.0" }
 keyroost-keyring = { path = "../keyroost-keyring", version = "0.14.0" }

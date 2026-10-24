@@ -370,10 +370,10 @@ pub struct PivSlotDetail {
 /// can't fail that same way, since the compiler checks the field name at
 /// every use.
 #[derive(Clone)]
-struct SessionIdentity {
-    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
-    version: Option<Vec<u8>>,
-    version_firmware: Option<Vec<u8>>,
+pub(crate) struct SessionIdentity {
+    pub(crate) fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    pub(crate) version: Option<Vec<u8>>,
+    pub(crate) version_firmware: Option<Vec<u8>>,
 }
 
 /// [`PivSession::applet_fingerprint`]'s resolved shape — see that method's
@@ -2658,7 +2658,7 @@ impl<'tx> PivSession<'tx> {
     /// [`Self::status`]/[`Self::status_detailed`]/[`Self::feature_gate`],
     /// which need its `name`/`serial` fields too) — this is just the
     /// narrower view over the same cached value.
-    fn identity(&mut self) -> SessionIdentity {
+    pub(crate) fn identity(&mut self) -> SessionIdentity {
         let AppletFingerprintResult {
             fingerprint,
             version,

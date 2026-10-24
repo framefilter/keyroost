@@ -812,7 +812,7 @@ enum PivCmd {
         #[command(subcommand)]
         cmd: PivMgmtKeyCmd,
     },
-    /// Generate, delete or move the private keys in PIV slots.
+    /// Generate, import, delete or move the private keys in PIV slots.
     Key {
         #[command(subcommand)]
         cmd: PivKeyCmd,
@@ -1109,6 +1109,73 @@ enum PivKeyCmd {
         /// chosen key type, PIN policy or touch policy.
         #[arg(long)]
         force: bool,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Import a private key and its certificate from a .p12/.pfx file into a
+    /// slot, replacing what the slot holds. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// The file password comes first: keyroost opens the file and checks it
+    /// against the slot before it asks for the management key, so a file
+    /// this key can't take is refused before anything is written.
+    /// Legacy-encrypted files open too. Then the certificate and the key are
+    /// written, and the slot is tested with the PIN as `piv test` does.
+    /// Authority certificates in the file are not written to the card;
+    /// `--chain-out` saves them. An imported key can't be attested as
+    /// generated on this key.
+    Import {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
+        #[arg(long, short = 's', value_enum)]
+        slot: CliPivSlot,
+        /// The PKCS#12 file to import (`.p12` or `.pfx`).
+        #[arg(long = "in", short = 'i', value_name = "FILE")]
+        input: std::path::PathBuf,
+        /// The file's password: env:NAME reads that environment variable,
+        /// stdin reads one line (first line; hidden when typed at a terminal;
+        /// an empty line for a file saved without a password). With neither,
+        /// a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        file_password: Option<SecretSource>,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --file-password stdin is
+        /// also given; hidden when typed at a terminal), default uses the
+        /// factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
+        /// The PIN, for the test after the import: env:NAME reads that
+        /// environment variable, stdin reads one line (the line after the file
+        /// password and management key when they come from stdin too: second
+        /// line after one of them, third after both; hidden when typed at a
+        /// terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// When the imported key may be used. `default` sends the standard
+        /// PIV command every card accepts; the other values are a Yubico
+        /// extension (firmware-dependent).
+        #[arg(long, value_enum, default_value = "default")]
+        pin_policy: CliPinPolicy,
+        /// Whether using the imported key requires a physical touch. Same
+        /// caveat: only `default` is standard PIV, the rest are a Yubico
+        /// extension (firmware-dependent).
+        #[arg(long, value_enum, default_value = "default")]
+        touch_policy: CliTouchPolicy,
+        #[command(flatten)]
+        compression: CertCompressArgs,
+        /// Which key to import when the file holds several, counting from 1.
+        /// Without it, such a file is listed and nothing is written.
+        #[arg(long, value_name = "N")]
+        entry: Option<usize>,
+        /// Save the file's authority (CA) certificates to FILE as PEM. They
+        /// are never written to the card.
+        #[arg(long, value_name = "FILE")]
+        chain_out: Option<std::path::PathBuf>,
+        #[arg(long, help = OVERWRITE_HELP, requires = "chain_out")]
+        overwrite: bool,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
@@ -10127,6 +10194,149 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
+        PivCmd::Key {
+            cmd:
+                PivKeyCmd::Import {
+                    reader,
+                    slot,
+                    input,
+                    file_password,
+                    mgmt_key,
+                    pin,
+                    pin_policy,
+                    touch_policy,
+                    compression,
+                    entry,
+                    chain_out,
+                    overwrite,
+                    yes,
+                },
+        } => {
+            let [chain_mode] = crate::prompt::check_overwrites([chain_out.as_deref()], *overwrite)?;
+            let piv_slot = slot.to_slot();
+            let (pin_policy, touch_policy) = (pin_policy.to_policy(), touch_policy.to_policy());
+            // Every secret has a source before anything is read, in stdin
+            // line order: file password, management key, PIN.
+            let mut sec = Secrets::real();
+            sec.check(
+                &P12_FILE_PASSWORD,
+                Source::from_flag(file_password.as_ref()),
+            )?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
+            sec.check(&PIV_PIN, Source::from_flag(pin.as_ref()))?;
+
+            // The file first: what it holds decides whether this key can
+            // take it, before any key is selected.
+            let bytes =
+                std::fs::read(input).map_err(|e| format!("read {}: {}", input.display(), e))?;
+            let password = sec.read(
+                &P12_FILE_PASSWORD,
+                Source::from_flag(file_password.as_ref()),
+            )?;
+            let contents = open_p12(&bytes, &password)?;
+            drop(password);
+            check_p12_entry(&contents, *entry)?;
+
+            let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
+            let name = crate::target::reader_of(&dev)?;
+            // Read-only: the plan against this applet, its warnings, and
+            // whether the slot holds anything to lose.
+            let (warnings, occupied) = keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(Vec<String>, bool), Box<dyn std::error::Error>> {
+                    let plan = keyroost_transport::piv_import::plan_import_on(
+                        s,
+                        &contents,
+                        *entry,
+                        piv_slot,
+                        pin_policy,
+                        touch_policy,
+                    )
+                    .map_err(|r| import_refusal_error(&r, &contents))?;
+                    let warnings =
+                        import_gate_warnings(s, plan.entry.key.alg(), pin_policy, touch_policy)?;
+                    let occupied = !*yes && !piv_slot_known_empty(s, piv_slot)?;
+                    Ok((warnings, occupied))
+                },
+            )?;
+            for w in &warnings {
+                output::warn(w);
+            }
+            let asked = occupied
+                && crate::prompt::confirm_statement_then_read(
+                    &dev,
+                    *yes,
+                    |key| {
+                        format!(
+                            "This replaces the key and certificate in PIV slot {} on {key}; \
+                             the old key is gone for good.",
+                            slot_name(*slot)
+                        )
+                    },
+                    &format!(
+                        "replace the key and certificate in PIV slot {}",
+                        slot_name(*slot)
+                    ),
+                )?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
+            let pin = sec.read(&PIV_PIN, Source::from_flag(pin.as_ref()))?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
+            let choice = compression.choice();
+            let (alg, outcome) = keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<_, Box<dyn std::error::Error>> {
+                    // Planned again on this session: the same answer unless
+                    // the key was swapped in between, and then nothing is
+                    // written.
+                    let plan = keyroost_transport::piv_import::plan_import_on(
+                        s,
+                        &contents,
+                        *entry,
+                        piv_slot,
+                        pin_policy,
+                        touch_policy,
+                    )
+                    .map_err(|r| import_refusal_error(&r, &contents))?;
+                    let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
+                    authenticate_piv(s, &mgmt)?;
+                    let alg = plan.entry.key.alg();
+                    eprintln!(
+                        "Importing {} into {} (touch the key if it blinks)\u{2026}",
+                        alg.label(),
+                        piv_slot.label()
+                    );
+                    Ok((
+                        alg,
+                        keyroost_transport::piv_import::run_import(
+                            s,
+                            &plan,
+                            choice,
+                            Some(pin.as_bytes()),
+                        ),
+                    ))
+                },
+            )?;
+            report_key_import(alg, piv_slot, &outcome);
+            // The authority certificates once the key is on the card, whatever
+            // the test said; a failure before that leaves nothing new.
+            let saved = if key_import_wrote_key(&outcome) {
+                save_or_list_authorities(&contents, chain_out.as_deref(), chain_mode)
+            } else {
+                Ok(())
+            };
+            match (outcome, saved) {
+                (Ok(_), saved) => saved?,
+                (Err(e), saved) => {
+                    if let Err(w) = saved {
+                        output::warn(&w);
+                    }
+                    return Err(key_import_error(e, choice));
+                }
+            }
+        }
+
         PivCmd::Cert {
             cmd:
                 PivCertCmd::Import {
@@ -11180,6 +11390,281 @@ fn piv_confirm_replace(
         }
     }
     Ok(ReplaceGate { name, dev, asked })
+}
+
+/// The password of a `.p12`/`.pfx` file (`piv key import`). Files saved with
+/// an empty password exist (OpenSSL's `-passout pass:`), so an empty answer
+/// is one.
+const P12_FILE_PASSWORD: Spec = Spec::current("file password", "file-password").allow_empty();
+
+/// Open a PKCS#12 file with its password, in the words `piv key import`
+/// shows.
+fn open_p12(bytes: &[u8], password: &str) -> Result<keyroost_p12::Contents, String> {
+    use keyroost_p12::P12Error;
+    keyroost_p12::open(bytes, Some(password)).map_err(|e| match e {
+        P12Error::WrongPassword => "Wrong password for this file.".to_string(),
+        P12Error::NoKey => "The file has no private key to import.".to_string(),
+        P12Error::Malformed(_) => format!("This isn't a .p12/.pfx file keyroost can read ({e})."),
+        e => format!("This file can't be imported: {e}."),
+    })
+}
+
+/// One line per entry of a PKCS#12 file, numbered from 1 as `--entry` takes
+/// them: the label, the key type, and whether a certificate came with it.
+/// Labels come from the file, so they are made safe to print.
+fn p12_entry_lines(contents: &keyroost_p12::Contents) -> Vec<String> {
+    contents
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let label = e
+                .label
+                .as_deref()
+                .filter(|l| !l.is_empty())
+                .map(sanitize_terminal)
+                .unwrap_or_else(|| "(no name)".to_string());
+            let cert = if e.certificate.is_some() {
+                ""
+            } else {
+                ", no certificate"
+            };
+            format!("  {}) {label} ({}{cert})", i + 1, e.key.alg().label())
+        })
+        .collect()
+}
+
+/// The `--entry` check, which needs no card: a file with several keys and
+/// no `--entry` is listed, and a number that isn't in the file is refused,
+/// before any key is selected. The same answer `plan_import` gives.
+fn check_p12_entry(contents: &keyroost_p12::Contents, entry: Option<usize>) -> Result<(), String> {
+    use keyroost_transport::piv_import::ImportRefusal;
+    let n = contents.entries.len();
+    let refusal = match entry {
+        Some(c) if c == 0 || c > n => ImportRefusal::EntryOutOfRange {
+            asked: c,
+            available: n,
+        },
+        None if n > 1 => ImportRefusal::ChooseEntry(Vec::new()),
+        _ => return Ok(()),
+    };
+    Err(import_refusal_error(&refusal, contents))
+}
+
+/// An import refusal in the CLI's words: the entries listed with `--entry`
+/// when there is a choice to make; otherwise the shared message.
+fn import_refusal_error(
+    r: &keyroost_transport::piv_import::ImportRefusal,
+    contents: &keyroost_p12::Contents,
+) -> String {
+    use keyroost_transport::piv_import::ImportRefusal;
+    match r {
+        ImportRefusal::ChooseEntry(_) => format!(
+            "The file holds {} keys; pick one with --entry N. Nothing was written.\n{}",
+            contents.entries.len(),
+            p12_entry_lines(contents).join("\n")
+        ),
+        ImportRefusal::EntryOutOfRange { asked, available } => format!(
+            "--entry {asked} isn't in the file, which holds {available} key{}:\n{}",
+            if *available == 1 { "" } else { "s" },
+            p12_entry_lines(contents).join("\n")
+        ),
+        r => format!("{r} Nothing was written."),
+    }
+}
+
+/// The warnings `piv key import` prints before it asks for the management
+/// key, as `piv key generate` does: an import, or a PIN or touch policy, that
+/// keyroost's list has no entry for on this key. A policy value this key is
+/// known to refuse stops the import (there is no `--force` here).
+fn import_gate_warnings(
+    s: &mut keyroost_transport::PivSession<'_>,
+    alg: keyroost_piv::KeyAlg,
+    pin_policy: keyroost_piv::PinPolicy,
+    touch_policy: keyroost_piv::TouchPolicy,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    use keyroost_piv::compat::{PivExtension, PivQuirk};
+    use keyroost_piv::{PinPolicy, TouchPolicy};
+    let mut gates = vec![PivExtension::ImportKey(alg)];
+    if pin_policy != PinPolicy::Default {
+        gates.push(PivExtension::SlotPinPolicy);
+    }
+    if touch_policy != TouchPolicy::Default {
+        gates.push(PivExtension::SlotTouchPolicy);
+    }
+    let mut warnings = Vec::new();
+    for gate in gates {
+        warnings.extend(check_piv_feature(s, gate, false)?);
+    }
+    let quirks = s.quirks();
+    for (quirk, selected, label) in [
+        (
+            PivQuirk::SlotPinPolicyOnceNotSupported,
+            pin_policy == PinPolicy::Once,
+            "PIN policy \"once\"",
+        ),
+        (
+            PivQuirk::SlotTouchPolicyCachedNotSupported,
+            touch_policy == TouchPolicy::Cached,
+            "Touch policy \"cached\"",
+        ),
+    ] {
+        if selected && quirks.contains(&quirk) {
+            return Err(format!(
+                "{label} is known to be unsupported on this device. Nothing was written."
+            )
+            .into());
+        }
+    }
+    Ok(warnings)
+}
+
+/// Whether the key reached the card: the import succeeded, or only its
+/// self-test failed.
+fn key_import_wrote_key(
+    outcome: &Result<
+        keyroost_transport::piv_import::ImportReport,
+        keyroost_transport::piv_import::ImportFailure,
+    >,
+) -> bool {
+    use keyroost_transport::piv_import::ImportFailure;
+    matches!(
+        outcome,
+        Ok(_) | Err(ImportFailure::SelfTestNotRun { .. } | ImportFailure::SelfTestFailed(_))
+    )
+}
+
+/// The result lines of `piv key import` on stdout: what was written, then
+/// the self-test report. A failure before the key was written prints
+/// nothing here; its error says what the slot holds.
+fn report_key_import(
+    alg: keyroost_piv::KeyAlg,
+    slot: keyroost_piv::Slot,
+    outcome: &Result<
+        keyroost_transport::piv_import::ImportReport,
+        keyroost_transport::piv_import::ImportFailure,
+    >,
+) {
+    use keyroost_transport::piv_import::ImportFailure;
+    let (report, tested) = match outcome {
+        Ok(r) | Err(ImportFailure::SelfTestFailed(r)) => (r, true),
+        Err(ImportFailure::SelfTestNotRun { report, .. }) => (report, false),
+        Err(_) => return,
+    };
+    match &report.cert {
+        Some(stored) => print_cert_stored(
+            &format!(
+                "Imported the {} key and its certificate into {}",
+                alg.label(),
+                slot.label()
+            ),
+            stored,
+        ),
+        None => println!(
+            "Imported the {} key into {}. The file has no certificate for it, so the slot \
+             now has none.",
+            alg.label(),
+            slot.label()
+        ),
+    }
+    if tested {
+        println!("{}", keyroost_pivtest::format_report(&report.self_test));
+    }
+}
+
+/// An import failure for the user. With `--no-compress`, a certificate the
+/// card refused as too large also gets the flags that would let it be
+/// stored compressed, as `piv cert import` says.
+fn key_import_error(
+    e: keyroost_transport::piv_import::ImportFailure,
+    choice: keyroost_transport::CertCompression,
+) -> Box<dyn std::error::Error> {
+    use keyroost_transport::piv_import::ImportFailure;
+    use keyroost_transport::{CertCompression, TransportError};
+    let hint = choice == CertCompression::Never
+        && matches!(
+            &e,
+            ImportFailure::CertificateNotStored {
+                error: TransportError::PivCertTooLarge {
+                    compressed_len: None,
+                    ..
+                },
+                ..
+            }
+        );
+    if hint {
+        format!("{e} Leave out --no-compress, or pass --compress.").into()
+    } else {
+        e.to_string().into()
+    }
+}
+
+/// The common name of a certificate's subject, else the whole subject, for
+/// naming an authority certificate. Made safe to print.
+fn certificate_name(der: &[u8]) -> String {
+    use keyroost_piv::x509_parse::{parse_subject_dn, DnAttr};
+    match parse_subject_dn(der) {
+        Ok(dn) => {
+            let cn = dn
+                .rdns
+                .iter()
+                .find(|(attr, v)| *attr == DnAttr::CommonName && !v.is_empty())
+                .map(|(_, v)| v.clone());
+            sanitize_terminal(&cn.unwrap_or_else(|| dn.to_string()))
+        }
+        Err(_) => "(unreadable subject)".to_string(),
+    }
+}
+
+/// The authority certificates of a file as PEM, one after another.
+fn authorities_pem(contents: &keyroost_p12::Contents) -> String {
+    contents
+        .authorities
+        .iter()
+        .map(|der| keyroost_piv::x509::pem_certificate(der))
+        .collect()
+}
+
+/// After an import: save the file's authority certificates to `--chain-out`,
+/// or name the ones left out. On stderr, as a status.
+fn save_or_list_authorities(
+    contents: &keyroost_p12::Contents,
+    chain_out: Option<&std::path::Path>,
+    mode: crate::prompt::OutMode,
+) -> Result<(), String> {
+    let n = contents.authorities.len();
+    let certs = if n == 1 {
+        "authority certificate"
+    } else {
+        "authority certificates"
+    };
+    match chain_out {
+        Some(path) if n == 0 => output::note(&format!(
+            "the file has no authority certificates, so {} was not written.",
+            sanitize_terminal(&path.display().to_string())
+        )),
+        Some(path) => {
+            mode.write(path, authorities_pem(contents).as_bytes())
+                .map_err(|e| crate::prompt::write_error(path, &e, Some("the key is imported")))?;
+            output::status(&format!(
+                "Saved {n} {certs} to {}.",
+                sanitize_terminal(&path.display().to_string())
+            ));
+        }
+        None if n == 0 => {}
+        None => {
+            let names: Vec<String> = contents
+                .authorities
+                .iter()
+                .map(|der| certificate_name(der))
+                .collect();
+            output::status(&format!(
+                "Skipped {n} {certs}: {} (not written to the card; --chain-out FILE saves them).",
+                names.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The algorithm of the key already in `slot`, if the card says (GET
@@ -15379,6 +15864,7 @@ mod cli_tests {
             ("piv key delete", IRREVERSIBLE),
             // These replace a key, seed or certificate already on the device.
             ("piv key generate", IRREVERSIBLE),
+            ("piv key import", IRREVERSIBLE),
             ("piv cert import", IRREVERSIBLE),
             ("piv cert generate", IRREVERSIBLE),
             ("molto seed set", IRREVERSIBLE),
@@ -21112,6 +21598,226 @@ mod cli_tests {
     }
 
     #[test]
+    fn piv_key_import_parses_flags() {
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "key",
+            "import",
+            "--slot",
+            "9c",
+            "-i",
+            "id.p12",
+            "--entry",
+            "2",
+            "--chain-out",
+            "ca.crt",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd:
+                    PivCmd::Key {
+                        cmd:
+                            PivKeyCmd::Import {
+                                slot,
+                                input,
+                                entry,
+                                chain_out,
+                                pin_policy,
+                                touch_policy,
+                                compression,
+                                overwrite,
+                                yes,
+                                file_password,
+                                mgmt_key,
+                                pin,
+                                ..
+                            },
+                    },
+            }) => {
+                assert_eq!(slot.to_slot().key_ref(), 0x9C);
+                assert_eq!(input, std::path::PathBuf::from("id.p12"));
+                assert_eq!(entry, Some(2));
+                assert_eq!(chain_out, Some(std::path::PathBuf::from("ca.crt")));
+                assert_eq!(pin_policy.to_policy(), keyroost_piv::PinPolicy::Default);
+                assert_eq!(touch_policy.to_policy(), keyroost_piv::TouchPolicy::Default);
+                assert_eq!(
+                    compression.choice(),
+                    keyroost_transport::CertCompression::Auto
+                );
+                assert!(!overwrite && !yes);
+                assert!(file_password.is_none() && mgmt_key.is_none() && pin.is_none());
+            }
+            _ => panic!("expected piv key import"),
+        }
+        // --entry counts from 1; --overwrite only means something with --chain-out.
+        for bad in [
+            &["--entry", "x"][..],
+            &["--overwrite"],
+            &["--compress", "--no-compress"],
+        ] {
+            let mut args = vec!["keyroostctl", "piv", "key", "import", "-s", "9a", "-i", "f"];
+            args.extend_from_slice(bad);
+            assert!(parse(&args).is_err(), "{bad:?} parsed");
+        }
+        // No --force: the pre-flight's refusals have no override here.
+        assert!(parse(&[
+            "keyroostctl",
+            "piv",
+            "key",
+            "import",
+            "-s",
+            "9a",
+            "-i",
+            "f",
+            "--force"
+        ])
+        .is_err());
+    }
+
+    const P12_TWO_ENTRIES: &[u8] =
+        include_bytes!("../../keyroost-p12/tests/fixtures/two-entries.p12");
+    const P12_CHAIN: &[u8] = include_bytes!("../../keyroost-p12/tests/fixtures/rsa2048-chain.p12");
+    const P12_EMPTY_PASSWORD: &[u8] =
+        include_bytes!("../../keyroost-p12/tests/fixtures/empty-password.p12");
+    const P12_PASSWORD: &str = "keyroost-test";
+
+    #[test]
+    fn piv_key_import_file_errors_are_plain() {
+        assert_eq!(
+            open_p12(P12_CHAIN, "nope").unwrap_err(),
+            "Wrong password for this file."
+        );
+        let e = open_p12(b"not a pkcs12 file", "x").unwrap_err();
+        assert!(
+            e.starts_with("This isn't a .p12/.pfx file keyroost can read ("),
+            "{e}"
+        );
+        // A file saved with an empty password opens with an empty answer.
+        assert_eq!(open_p12(P12_EMPTY_PASSWORD, "").unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn piv_key_import_lists_entries_until_one_is_picked() {
+        let contents = open_p12(P12_TWO_ENTRIES, P12_PASSWORD).unwrap();
+        let e = check_p12_entry(&contents, None).unwrap_err();
+        assert_eq!(
+            e,
+            "The file holds 2 keys; pick one with --entry N. Nothing was written.\n  \
+             1) first (RSA-2048)\n  2) second (ECC P-256)"
+        );
+        for pick in [1, 2] {
+            assert!(check_p12_entry(&contents, Some(pick)).is_ok());
+        }
+        for pick in [0, 3] {
+            let e = check_p12_entry(&contents, Some(pick)).unwrap_err();
+            assert!(
+                e.starts_with(&format!(
+                    "--entry {pick} isn't in the file, which holds 2 keys:\n  1) "
+                )),
+                "{e}"
+            );
+        }
+        // One key: nothing to pick.
+        let one = open_p12(P12_CHAIN, P12_PASSWORD).unwrap();
+        assert!(check_p12_entry(&one, None).is_ok());
+        // Every other refusal is the shared message.
+        let r = keyroost_transport::piv_import::ImportRefusal::RsaExponentNot65537;
+        assert_eq!(
+            import_refusal_error(&r, &one),
+            format!("{r} Nothing was written.")
+        );
+    }
+
+    #[test]
+    fn piv_key_import_chain_out_is_pem_per_authority() {
+        let contents = open_p12(P12_CHAIN, P12_PASSWORD).unwrap();
+        assert!(!contents.authorities.is_empty());
+        let pem = authorities_pem(&contents);
+        assert_eq!(
+            pem.matches("-----BEGIN CERTIFICATE-----").count(),
+            contents.authorities.len()
+        );
+        assert!(pem.ends_with("-----END CERTIFICATE-----\n"), "{pem}");
+        for der in &contents.authorities {
+            let name = certificate_name(der);
+            assert!(!name.is_empty() && name != "(unreadable subject)", "{name}");
+        }
+        assert_eq!(certificate_name(b"junk"), "(unreadable subject)");
+    }
+
+    #[test]
+    fn piv_key_import_takes_secrets_from_flags_not_argv() {
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "key",
+            "import",
+            "-s",
+            "9a",
+            "-i",
+            "f.p12",
+            "--file-password",
+            "stdin",
+            "--mgmt-key",
+            "default",
+            "--pin",
+            "env:KR_PIN",
+            "--yes",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd:
+                    PivCmd::Key {
+                        cmd:
+                            PivKeyCmd::Import {
+                                file_password,
+                                mgmt_key,
+                                pin,
+                                yes,
+                                ..
+                            },
+                    },
+            }) => {
+                assert_eq!(file_password, Some(SecretSource::Stdin));
+                assert_eq!(mgmt_key, Some(SecretSource::Default));
+                assert_eq!(pin, Some(SecretSource::Env("KR_PIN".into())));
+                assert!(yes);
+            }
+            _ => panic!("expected piv key import"),
+        }
+        for (flag, want) in [
+            ("--file-password", "--file-password takes env:NAME or stdin"),
+            ("--mgmt-key", "--mgmt-key takes env:NAME, stdin or default"),
+            ("--pin", "--pin takes env:NAME or stdin"),
+        ] {
+            let args = [
+                "keyroostctl",
+                "piv",
+                "key",
+                "import",
+                "-s",
+                "9a",
+                "-i",
+                "f.p12",
+                flag,
+                "S3CRETVALUE",
+            ];
+            let e = parse(&args)
+                .err()
+                .unwrap_or_else(|| panic!("{flag} parsed"));
+            let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let msg = redacted_parse_error(&e, &argv).unwrap_or_else(|| panic!("{flag}"));
+            assert!(msg.contains(want), "{flag}: {msg}");
+            assert!(!msg.contains("S3CRETVALUE"), "{flag}: {msg}");
+        }
+    }
+
+    #[test]
     fn piv_self_sign_inline_generate_key_mirrors_generate_key_defaults() {
         // Omitted: the convenience is off and its options carry the same
         // defaults `piv key generate` uses, so a later `--generate-key` run
@@ -23459,7 +24165,7 @@ mod cli_tests {
             Cmd::Piv {
                 cmd:
                     PivCmd::Key {
-                        cmd: PivKeyCmd::Generate { yes, .. },
+                        cmd: PivKeyCmd::Generate { yes, .. } | PivKeyCmd::Import { yes, .. },
                     }
                     | PivCmd::Cert {
                         cmd: PivCertCmd::Import { yes, .. },
@@ -23695,6 +24401,16 @@ mod cli_tests {
                 "--subject",
                 "CN=x",
                 "--generate-key",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "key",
+                "import",
+                "-s",
+                "9a",
+                "-i",
+                "f.p12",
             ],
             &["keyroostctl", "oath", "delete", "x"],
             &["keyroostctl", "oath", "import", "--in", "f.json"],

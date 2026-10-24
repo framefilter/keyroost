@@ -51,6 +51,9 @@ pub(crate) struct Spec {
     pub(crate) hint: Option<&'static str>,
     /// Replaces the prompt's label, shown as written (not capitalized).
     pub(crate) prompt: Option<&'static str>,
+    /// An empty value is a real answer (a file saved with an empty
+    /// password), not a missing secret.
+    pub(crate) empty_ok: bool,
 }
 
 impl Spec {
@@ -63,6 +66,7 @@ impl Spec {
             default_ok: false,
             hint: None,
             prompt: None,
+            empty_ok: false,
         }
     }
     pub(crate) const fn current(label: &'static str, flag: &'static str) -> Spec {
@@ -101,6 +105,12 @@ impl Spec {
     pub(crate) const fn prompt_as(self, text: &'static str) -> Spec {
         Spec {
             prompt: Some(text),
+            ..self
+        }
+    }
+    pub(crate) const fn allow_empty(self) -> Spec {
+        Spec {
+            empty_ok: true,
             ..self
         }
     }
@@ -574,7 +584,8 @@ fn strip_line_ending(line: &str) -> &str {
 }
 
 /// PINs and passwords are kept exactly; hex and base32 lose surrounding
-/// ASCII whitespace (finding 10). An empty result is never a secret.
+/// ASCII whitespace (finding 10). An empty result is never a secret, unless
+/// the spec allows one ([`Spec::allow_empty`]).
 fn finish(
     spec: &Spec,
     raw: Zeroizing<String>,
@@ -587,7 +598,7 @@ fn finish(
                 .to_owned(),
         ),
     };
-    if !value.is_empty() {
+    if !value.is_empty() || spec.empty_ok {
         return Ok(value);
     }
     Err(match origin {
@@ -921,6 +932,24 @@ mod tests {
             s.read(&PIN, Source::new(None, true)).unwrap_err(),
             "the PIN on stdin line 1 is empty"
         );
+    }
+
+    #[test]
+    fn an_empty_answer_is_kept_where_the_spec_allows_it() {
+        const PW: Spec = Spec::current("file password", "file-password").allow_empty();
+        let mut s = sec(FakeIo::piped(&["\n", "\n"]));
+        assert_eq!(s.read(&PW, Source::new(None, true)).unwrap().as_str(), "");
+        // The next secret on stdin still refuses an empty line.
+        assert_eq!(
+            s.read(&PIN, Source::new(None, true)).unwrap_err(),
+            "the PIN on stdin line 2 is empty"
+        );
+        let mut s = sec(FakeIo::terminal().typing(&[""]));
+        assert_eq!(s.read(&PW, Source::NONE).unwrap().as_str(), "");
+        assert!(s.prompted());
+        let io = FakeIo::piped(&[]).var("KR_EMPTY", "");
+        let s = sec(io);
+        assert!(s.check(&PW, Source::env("KR_EMPTY")).is_ok());
     }
 
     #[test]

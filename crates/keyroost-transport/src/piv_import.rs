@@ -190,6 +190,33 @@ pub fn plan_import<'a>(
     })
 }
 
+/// [`plan_import`] for the applet on `session`, using its fingerprint and
+/// reported versions. Read-only. The fingerprint probe re-SELECTs PIV, so call
+/// this before authenticating the management key.
+///
+/// # Errors
+/// [`ImportRefusal`], as [`plan_import`].
+pub fn plan_import_on<'a>(
+    session: &mut PivSession<'_>,
+    contents: &'a Contents,
+    choice: Option<usize>,
+    slot: Slot,
+    pin_policy: PinPolicy,
+    touch_policy: TouchPolicy,
+) -> Result<ImportPlan<'a>, ImportRefusal> {
+    let id = session.identity();
+    plan_import(
+        contents,
+        choice,
+        slot,
+        id.fingerprint,
+        id.version.as_deref(),
+        id.version_firmware.as_deref(),
+        pin_policy,
+        touch_policy,
+    )
+}
+
 /// The key values of `parts` in the form `layout` sends. Borrows from `parts`
 /// (which wipes itself on drop), so nothing secret is copied.
 #[must_use]
