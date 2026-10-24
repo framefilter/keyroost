@@ -15,7 +15,11 @@ use crate::kdf::{bmp_password, pkcs12_kdf, Hash};
 use crate::P12Error;
 
 /// Most KDF iterations accepted; a hostile file could otherwise stall us.
-const MAX_ITERATIONS: u32 = 10_000_000;
+pub(crate) const MAX_ITERATIONS: u32 = if cfg!(feature = "fuzzing") {
+    1_000
+} else {
+    10_000_000
+};
 
 // DER-encoded OID contents.
 const PBE_3DES: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x01, 0x03];

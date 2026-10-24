@@ -24,6 +24,8 @@ serde_json = "1"
 keyroost-qr = { path = "../crates/keyroost-qr" }
 keyroost-ctap = { path = "../crates/keyroost-ctap" }
 keyroost-oath = { path = "../crates/keyroost-oath" }
+# `fuzzing` caps the file-chosen KDF iteration count so runs stay fast.
+keyroost-p12 = { path = "../crates/keyroost-p12", features = ["fuzzing"] }
 keyroost-openpgp = { path = "../crates/keyroost-openpgp" }
 keyroost-pgpkey = { path = "../crates/keyroost-pgpkey" }
 keyroost-piv = { path = "../crates/keyroost-piv" }
@@ -153,6 +155,13 @@ bench = false
 [[bin]]
 name = "otp_apdu_retry"
 path = "fuzz_targets/otp_apdu_retry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p12_parse"
+path = "fuzz_targets/p12_parse.rs"
 test = false
 doc = false
 bench = false

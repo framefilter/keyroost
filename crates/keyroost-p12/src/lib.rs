@@ -2,15 +2,26 @@
 //!
 //! The file is untrusted input: every length is checked against the bytes that
 //! remain, nesting is bounded, and nothing here panics on malformed data.
+//!
+//! [`open`] reads a file (legacy RC2/3DES or PBES2/AES, with or without a MAC)
+//! into [`Contents`]: one [`Entry`] per private key, each with its
+//! [`KeyParts`] (minimal big-endian integers, cleared on drop), the matching
+//! certificate if the file has one, and a label; certificates that belong to no
+//! key are returned as `authorities`. Choosing among several entries is left to
+//! the caller. The `fuzzing` feature lowers the KDF iteration cap and is only
+//! for the fuzz target.
 
 #![forbid(unsafe_code)]
 
 mod ber;
+mod entries;
 mod kdf;
 mod pbe;
-// Not called until the public `open()` lands; the allow goes with it.
-#[allow(dead_code)]
 mod pfx;
+mod pkcs8;
+
+pub use entries::{open, Contents, Entry};
+pub use pkcs8::KeyParts;
 
 use core::fmt;
 

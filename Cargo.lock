@@ -2244,6 +2244,7 @@ dependencies = [
  "p384",
  "pbkdf2",
  "rc2",
+ "rsa",
  "sha2 0.10.9",
  "x25519-dalek",
  "zeroize",

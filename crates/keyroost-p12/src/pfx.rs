@@ -60,7 +60,7 @@ const SHA1_OID: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
 const SHA256_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 
 /// Same cap as the encryption schemes: a hostile file must not stall us.
-const MAX_ITERATIONS: u64 = 10_000_000;
+const MAX_ITERATIONS: u64 = pbe::MAX_ITERATIONS as u64;
 
 fn bad(what: &'static str) -> P12Error {
     P12Error::Malformed(what)
