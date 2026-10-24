@@ -6667,7 +6667,13 @@ impl App {
             .selected_device()
             .map(|d| d.vendor.clone())
             .unwrap_or_default();
-        self.spawn_job("Adding credential\u{2026}", move || {
+        // Some keys (Nitrokey 3) ask for a touch to save a touch account.
+        let label = if require_touch {
+            "Adding credential \u{2014} touch the key if it blinks\u{2026}"
+        } else {
+            "Adding credential\u{2026}"
+        };
+        self.spawn_job(label, move || {
             // Set when YubiKey 4 firmware 4.0–4.3.4 must not get this name
             // (the same check as `oath add` and the import plan).
             let mut refused: Option<String> = None;
@@ -6719,7 +6725,13 @@ impl App {
         let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
         let touch = self.oath_touch_names();
-        self.spawn_job("Deleting credential\u{2026}", move || {
+        // ... and to delete one.
+        let label = if touch.contains(&cred_name) {
+            "Deleting credential \u{2014} touch the key if it blinks\u{2026}"
+        } else {
+            "Deleting credential\u{2026}"
+        };
+        self.spawn_job(label, move || {
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
                 session.delete(&cred_name)?;

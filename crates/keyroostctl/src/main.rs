@@ -8162,6 +8162,10 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 require_touch: *touch,
                 imf: *counter,
             };
+            // Some keys (Nitrokey 3) ask for a touch to save a touch account.
+            if *touch {
+                eprintln!("Saving \u{2014} touch the key if it blinks\u{2026}");
+            }
             session.put(&params)?;
             println!(
                 "Added OATH {} credential {:?}.",

@@ -34,6 +34,8 @@ pub const AID: [u8; 7] = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01];
 pub const INS_SELECT: u8 = 0xA4;
 /// `SELECT` P1: select by DF name (AID).
 pub const P1_SELECT_BY_NAME: u8 = 0x04;
+/// ISO 7816 `GET RESPONSE` instruction (built by [`get_response`]).
+pub const INS_GET_RESPONSE: u8 = 0xC0;
 
 /// OATH applet instruction bytes (Yubico OATH spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +101,9 @@ pub enum Tag {
     Algorithm = 0x7B,
     /// Touch requirement byte.
     Touch = 0x7C,
+    /// Device serial number. Nitrokey's secrets app adds it to its `SELECT`
+    /// response; the Yubico applet does not send it.
+    SerialNumber = 0x8F,
 }
 
 impl Tag {
@@ -278,10 +283,18 @@ fn finish_apdu(ins: u8, p1: u8, p2: u8, data: &[u8]) -> Result<Vec<u8>, BuildErr
 // APDU builders
 // ---------------------------------------------------------------------------
 
-/// `SELECT` the OATH applet: `00 A4 04 00 07 A0 00 00 05 27 21 01`.
+/// Append `Le = 00` ("up to 256 bytes") to a case-3 command whose reply
+/// carries data. Without it a Nitrokey 3 answers `61xx` and holds the reply
+/// back for a GET RESPONSE; the YubiKey and Solo 2 answer the same either way.
+fn with_le(mut apdu: Vec<u8>) -> Vec<u8> {
+    apdu.push(0x00);
+    apdu
+}
+
+/// `SELECT` the OATH applet: `00 A4 04 00 07 A0 00 00 05 27 21 01 00`.
 #[must_use]
 pub fn select() -> Vec<u8> {
-    build_apdu(0x00, INS_SELECT, P1_SELECT_BY_NAME, 0x00, &AID)
+    with_le(build_apdu(0x00, INS_SELECT, P1_SELECT_BY_NAME, 0x00, &AID))
 }
 
 /// Parameters for provisioning a credential via [`put`].
@@ -415,7 +428,7 @@ pub fn calculate(name: &str, challenge: &[u8; 8]) -> Result<Vec<u8>, BuildError>
     let mut data = Vec::new();
     try_push_tlv(&mut data, Tag::Name, "name", name.as_bytes())?;
     push_tlv(&mut data, Tag::Challenge, challenge);
-    finish_apdu(Instruction::Calculate.code(), 0x00, P2_TRUNCATED, &data)
+    finish_apdu(Instruction::Calculate.code(), 0x00, P2_TRUNCATED, &data).map(with_le)
 }
 
 /// Build a `CALCULATE` APDU for a HOTP credential, which carries an **empty**
@@ -429,7 +442,7 @@ pub fn calculate_hotp(name: &str) -> Result<Vec<u8>, BuildError> {
     let mut data = Vec::new();
     try_push_tlv(&mut data, Tag::Name, "name", name.as_bytes())?;
     push_tlv(&mut data, Tag::Challenge, &[]);
-    finish_apdu(Instruction::Calculate.code(), 0x00, P2_TRUNCATED, &data)
+    finish_apdu(Instruction::Calculate.code(), 0x00, P2_TRUNCATED, &data).map(with_le)
 }
 
 /// Build a `CALCULATE_ALL` APDU (truncated). Data layout: `CHALLENGE(0x74) <8 bytes>`.
@@ -437,13 +450,13 @@ pub fn calculate_hotp(name: &str) -> Result<Vec<u8>, BuildError> {
 pub fn calculate_all(challenge: &[u8; 8]) -> Vec<u8> {
     let mut data = Vec::new();
     push_tlv(&mut data, Tag::Challenge, challenge);
-    build_apdu(
+    with_le(build_apdu(
         0x00,
         Instruction::CalculateAll.code(),
         0x00,
         P2_TRUNCATED,
         &data,
-    )
+    ))
 }
 
 /// Build a `SEND_REMAINING` APDU (case-2).
@@ -457,6 +470,17 @@ pub fn calculate_all(challenge: &[u8; 8]) -> Vec<u8> {
 #[must_use]
 pub fn send_remaining() -> Vec<u8> {
     build_apdu_get(0x00, Instruction::SendRemaining.code(), 0x00, 0x00, 0x00)
+}
+
+/// Build an ISO 7816-4 `GET RESPONSE` APDU (case-2): `00 C0 00 00 00`.
+///
+/// The Nitrokey 3 continues a `61xx` reply only this way: it refuses
+/// `SEND_REMAINING` with `6985` and drops the pending data. The YubiKey refuses
+/// `GET RESPONSE` the same way, so the applet's [`SelectInfo::more_data`]
+/// decides which one to send.
+#[must_use]
+pub fn get_response() -> Vec<u8> {
+    build_apdu_get(0x00, INS_GET_RESPONSE, 0x00, 0x00, 0x00)
 }
 
 // ---------------------------------------------------------------------------
@@ -481,7 +505,7 @@ pub const ACCESS_KEY_ITERATIONS: u32 = 1000;
 pub const ACCESS_KEY_LEN: usize = 16;
 
 /// What a SELECT response told us about the applet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectInfo {
     /// Applet version bytes from the VERSION (`0x79`) TLV, if present.
     pub version: Vec<u8>,
@@ -490,6 +514,19 @@ pub struct SelectInfo {
     /// CHALLENGE (`0x74`) from the SELECT response. `Some` iff a password is set;
     /// its presence is how we know the applet requires VALIDATE.
     pub challenge: Option<Vec<u8>>,
+    /// SERIAL NUMBER (`0x8F`), sent by Nitrokey's secrets app. `None` if absent.
+    pub serial: Option<Vec<u8>>,
+}
+
+/// Which command continues a reply the applet split with `61xx`. Sending the
+/// wrong one loses the rest of the reply on both kinds of applet, so it is
+/// chosen from the `SELECT` response rather than tried in turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoreData {
+    /// [`send_remaining`] (`A5`): the Yubico applet.
+    SendRemaining,
+    /// [`get_response`] (`C0`): Nitrokey's secrets app.
+    GetResponse,
 }
 
 impl SelectInfo {
@@ -497,6 +534,18 @@ impl SelectInfo {
     #[must_use]
     pub fn password_required(&self) -> bool {
         self.challenge.is_some()
+    }
+
+    /// The command that continues a `61xx` reply from this applet. Nitrokey's
+    /// secrets app, recognized by the SERIAL NUMBER it puts in its `SELECT`
+    /// response, takes ISO `GET RESPONSE`; every other applet `SEND_REMAINING`.
+    #[must_use]
+    pub fn more_data(&self) -> MoreData {
+        if self.serial.is_some() {
+            MoreData::GetResponse
+        } else {
+            MoreData::SendRemaining
+        }
     }
 }
 
@@ -511,6 +560,7 @@ pub fn parse_select(buf: &[u8]) -> Result<SelectInfo, ParseError> {
         challenge: find_tag(&tlvs, Tag::Challenge)
             .filter(|c| !c.is_empty())
             .map(<[u8]>::to_vec),
+        serial: find_tag(&tlvs, Tag::SerialNumber).map(<[u8]>::to_vec),
     })
 }
 
@@ -546,7 +596,13 @@ pub fn validate(access_key: &[u8], card_challenge: &[u8], host_challenge: &[u8])
     let mut data = Vec::new();
     push_tlv(&mut data, Tag::Response, &resp);
     push_tlv(&mut data, Tag::Challenge, host_challenge);
-    build_apdu(0x00, Instruction::Validate.code(), 0x00, 0x00, &data)
+    with_le(build_apdu(
+        0x00,
+        Instruction::Validate.code(),
+        0x00,
+        0x00,
+        &data,
+    ))
 }
 
 /// Check the card's `VALIDATE` reply: its RESPONSE TLV must equal
@@ -1057,7 +1113,7 @@ mod tests {
     fn select_bytes() {
         assert_eq!(
             select(),
-            vec![0x00, 0xA4, 0x04, 0x00, 0x07, 0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]
+            vec![0x00, 0xA4, 0x04, 0x00, 0x07, 0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01, 0x00]
         );
     }
 
@@ -1258,10 +1314,10 @@ mod tests {
         let apdu = calculate("ab", &challenge).unwrap();
         // header: 00 A2 00 01 (P2 truncated)
         // NAME(71) 02 "ab", CHALLENGE(74) 08 <8 bytes>
-        // Lc = 4 + 10 = 14 = 0x0E
+        // Lc = 4 + 10 = 14 = 0x0E, then Le = 00
         let expected = vec![
             0x00, 0xA2, 0x00, 0x01, 0x0E, 0x71, 0x02, 0x61, 0x62, 0x74, 0x08, 0x00, 0x00, 0x00,
-            0x00, 0x03, 0x4F, 0x09, 0x6D,
+            0x00, 0x03, 0x4F, 0x09, 0x6D, 0x00,
         ];
         assert_eq!(apdu, expected);
     }
@@ -1281,7 +1337,7 @@ mod tests {
         let apdu = calculate_hotp("ab").unwrap();
         assert_eq!(
             apdu,
-            vec![0x00, 0xA2, 0x00, 0x01, 0x06, 0x71, 0x02, 0x61, 0x62, 0x74, 0x00]
+            vec![0x00, 0xA2, 0x00, 0x01, 0x06, 0x71, 0x02, 0x61, 0x62, 0x74, 0x00, 0x00]
         );
     }
 
@@ -1385,8 +1441,15 @@ mod tests {
         let challenge = [0, 0, 0, 0, 0x03, 0x5A, 0x6B, 0x7C];
         assert_eq!(
             calculate_all(&challenge),
-            vec![0x00, 0xA4, 0x00, 0x01, 0x0A, 0x74, 0x08, 0, 0, 0, 0, 0x03, 0x5A, 0x6B, 0x7C]
+            vec![
+                0x00, 0xA4, 0x00, 0x01, 0x0A, 0x74, 0x08, 0, 0, 0, 0, 0x03, 0x5A, 0x6B, 0x7C, 0x00
+            ]
         );
+    }
+
+    #[test]
+    fn get_response_bytes() {
+        assert_eq!(get_response(), vec![0x00, 0xC0, 0x00, 0x00, 0x00]);
     }
 
     /// NAME(71) followed by its result TLV, as CALCULATE ALL lays them out.
@@ -1529,6 +1592,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_select_picks_the_more_data_command() {
+        // YubiKey and Solo 2 answers: no SERIAL NUMBER TLV, so SEND REMAINING.
+        let yubikey = [0x79, 0x03, 0x05, 0x07, 0x04, 0x71, 0x02, 0xAB, 0xCD];
+        let info = parse_select(&yubikey).unwrap();
+        assert_eq!(info.serial, None);
+        assert_eq!(info.more_data(), MoreData::SendRemaining);
+
+        // Nitrokey 3 answer (firmware 1.9.0, salt shortened): SERIAL NUMBER
+        // (0x8F) present, so ISO GET RESPONSE.
+        let nitrokey = [
+            0x79, 0x03, 0x04, 0x10, 0x00, 0x71, 0x02, 0xAB, 0xCD, 0x8F, 0x04, 0x42, 0x68, 0x2E,
+            0xF7,
+        ];
+        let info = parse_select(&nitrokey).unwrap();
+        assert_eq!(info.serial, Some(vec![0x42, 0x68, 0x2E, 0xF7]));
+        assert_eq!(info.more_data(), MoreData::GetResponse);
+    }
+
+    #[test]
     fn validate_apdu_framing_and_verify() {
         let key = [0x42u8; 16];
         let card_chal = [0xAA; 8];
@@ -1544,6 +1626,8 @@ mod tests {
         assert_eq!(&body[2..22], &respond(&key, &card_chal));
         assert_eq!(body[22], Tag::Challenge.code());
         assert_eq!(&body[24..32], &host_chal);
+        assert_eq!(apdu.len(), 5 + lc + 1, "ends with Le");
+        assert_eq!(apdu.last(), Some(&0x00));
 
         // A well-formed card reply (RESPONSE = HMAC(key, host_chal)) verifies;
         // a tampered one does not.

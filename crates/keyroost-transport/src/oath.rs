@@ -18,6 +18,9 @@ use keyroost_oath as oath;
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 use zeroize::Zeroizing;
 
+/// "Security status not satisfied": no VALIDATE yet, or (Nitrokey) no touch.
+const SW_SECURITY_NOT_SATISFIED: u16 = 0x6982;
+
 /// An open OATH applet session on one PC/SC reader.
 pub struct OathSession {
     card: Card,
@@ -42,11 +45,7 @@ impl OathSession {
         let mut session = Self {
             card,
             debug: false,
-            select_info: oath::SelectInfo {
-                version: Vec::new(),
-                device_id: Vec::new(),
-                challenge: None,
-            },
+            select_info: oath::SelectInfo::default(),
             access_key: None,
         };
         session.select()?;
@@ -189,11 +188,7 @@ impl OathSession {
                 let mut session = OathSession {
                     card,
                     debug: false,
-                    select_info: oath::SelectInfo {
-                        version: Vec::new(),
-                        device_id: Vec::new(),
-                        challenge: None,
-                    },
+                    select_info: oath::SelectInfo::default(),
                     access_key: None,
                 };
                 if session.select().is_ok() {
@@ -271,7 +266,7 @@ impl OathSession {
     /// Provision (add) a credential.
     pub fn put(&mut self, params: &oath::PutParams<'_>) -> Result<(), TransportError> {
         let sw = self.put_status(params)?;
-        ok_or_apdu("oath put", sw)
+        self.write_answer("oath put", "save", sw)
     }
 
     /// PUT and return the raw status word, for callers that read the key's
@@ -289,7 +284,22 @@ impl OathSession {
     /// Remove a credential by name.
     pub fn delete(&mut self, name: &str) -> Result<(), TransportError> {
         let sw = self.delete_status(name)?;
-        ok_or_apdu("oath delete", sw)
+        self.write_answer("oath delete", "delete", sw)
+    }
+
+    /// A PUT or DELETE answer. `6982` from an applet with no password is the
+    /// key waiting for a touch it didn't get ([`TransportError::OathNoTouch`]);
+    /// with a password it still means "unlock first".
+    fn write_answer(
+        &self,
+        label: &'static str,
+        action: &'static str,
+        sw: u16,
+    ) -> Result<(), TransportError> {
+        if sw == SW_SECURITY_NOT_SATISFIED && !self.password_required() {
+            return Err(TransportError::OathNoTouch { action });
+        }
+        ok_or_apdu(label, sw)
     }
 
     /// DELETE and return the raw status word.
@@ -300,19 +310,25 @@ impl OathSession {
     }
 
     /// Transmit one APDU and reassemble a response the card splits across `61xx`
-    /// continuations (`SEND_REMAINING`), returning `(payload, sw)`.
+    /// continuations (`SEND_REMAINING`, or `GET RESPONSE` where the SELECT
+    /// answer asks for it: [`oath::SelectInfo::more_data`]), returning
+    /// `(payload, sw)`.
     fn transmit_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
         let (cmd_sensitive, resp_sensitive) = trace_sensitivity(apdu);
-        const IO: crate::AppletIo = crate::AppletIo {
+        // Until SELECT has answered, SEND_REMAINING (the Yubico applet's).
+        let io = crate::AppletIo {
             label: "oath",
             more_data_sw: oath::SW_MORE_DATA,
-            get_response: oath::send_remaining,
+            get_response: match self.select_info.more_data() {
+                oath::MoreData::SendRemaining => oath::send_remaining,
+                oath::MoreData::GetResponse => oath::get_response,
+            },
             describe: None,
         };
         crate::transmit_applet(
             &self.card,
             self.debug,
-            &IO,
+            &io,
             apdu,
             cmd_sensitive,
             resp_sensitive,
