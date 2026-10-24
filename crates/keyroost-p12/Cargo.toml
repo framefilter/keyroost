@@ -28,8 +28,8 @@ hmac = "0.12"
 sha2 = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 # Parsing the PKCS#8 payload into key parts.
-p256 = "0.13"
-p384 = "0.13"
+p256 = "0.14"
+p384 = "0.14"
 ed25519-dalek = "2"
 x25519-dalek = "2"
 # Checks that an RSA key's parts agree before it can reach a card.

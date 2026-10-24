@@ -163,14 +163,14 @@ impl KeyParts {
 fn ec_point(alg: KeyAlg, scalar: &[u8]) -> Option<Vec<u8>> {
     match alg {
         KeyAlg::EccP256 => {
-            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            use p256::elliptic_curve::sec1::ToSec1Point;
             let sk = p256::SecretKey::from_slice(scalar).ok()?;
-            Some(sk.public_key().to_encoded_point(false).as_bytes().to_vec())
+            Some(sk.public_key().to_sec1_point(false).as_bytes().to_vec())
         }
         KeyAlg::EccP384 => {
-            use p384::elliptic_curve::sec1::ToEncodedPoint;
+            use p384::elliptic_curve::sec1::ToSec1Point;
             let sk = p384::SecretKey::from_slice(scalar).ok()?;
-            Some(sk.public_key().to_encoded_point(false).as_bytes().to_vec())
+            Some(sk.public_key().to_sec1_point(false).as_bytes().to_vec())
         }
         _ => None,
     }
