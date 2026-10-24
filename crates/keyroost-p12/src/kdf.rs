@@ -38,7 +38,9 @@ impl Hash {
 /// terminator. `None` (no password) is the empty string; `Some("")` is just
 /// the terminator, as the two are different keys in PKCS#12.
 pub(crate) fn bmp_password(pw: Option<&str>) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::new());
+    // Sized up front: a growing buffer would leave freed copies of the
+    // password in the heap. UTF-8 bytes >= UTF-16 units, so this suffices.
+    let mut out = Zeroizing::new(Vec::with_capacity(pw.map_or(0, |p| p.len() * 2 + 2)));
     if let Some(pw) = pw {
         for unit in pw.encode_utf16() {
             out.extend_from_slice(&unit.to_be_bytes());
@@ -50,11 +52,11 @@ pub(crate) fn bmp_password(pw: Option<&str>) -> Zeroizing<Vec<u8>> {
 
 /// Repeat `data` to the next multiple of `v` bytes (empty stays empty).
 fn fill(data: &[u8], v: usize) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::new());
     if data.is_empty() {
-        return out;
+        return Zeroizing::new(Vec::new());
     }
     let total = v * data.len().div_ceil(v);
+    let mut out = Zeroizing::new(Vec::with_capacity(total));
     out.extend(data.iter().cycle().take(total));
     out
 }
@@ -73,14 +75,17 @@ pub(crate) fn pkcs12_kdf(
     let v = hash.block_len();
 
     // I = S || P, each padded by repetition to a multiple of v bytes.
-    let mut i_buf = Zeroizing::new(Vec::new());
-    i_buf.extend_from_slice(&fill(salt, v));
-    i_buf.extend_from_slice(&fill(password, v));
+    let s_part = fill(salt, v);
+    let p_part = fill(password, v);
+    let mut i_buf = Zeroizing::new(Vec::with_capacity(s_part.len() + p_part.len()));
+    i_buf.extend_from_slice(&s_part);
+    i_buf.extend_from_slice(&p_part);
 
     let mut out = Zeroizing::new(Vec::with_capacity(out_len + u));
     while out.len() < out_len {
         // A = H^iterations(D || I)
-        let mut input = Zeroizing::new(vec![id; v]);
+        let mut input = Zeroizing::new(Vec::with_capacity(v + i_buf.len()));
+        input.resize(v, id);
         input.extend_from_slice(&i_buf);
         let mut a = hash.digest(&input);
         for _ in 1..iterations {
@@ -123,6 +128,10 @@ mod tests {
         assert_eq!(*bmp_password(Some("ab")), [0, 0x61, 0, 0x62, 0, 0]);
         assert_eq!(*bmp_password(Some("")), [0, 0]);
         assert!(bmp_password(None).is_empty());
+        // Sized once: a growing buffer would leave password copies in freed memory.
+        for pw in ["password", "\u{1F511}\u{1F511}", "h\u{e9}llo"] {
+            assert_eq!(bmp_password(Some(pw)).capacity(), pw.len() * 2 + 2, "{pw}");
+        }
         // Outside the BMP: a surrogate pair.
         assert_eq!(
             *bmp_password(Some("\u{1F511}")),
