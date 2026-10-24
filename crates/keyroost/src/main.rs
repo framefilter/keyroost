@@ -3389,9 +3389,11 @@ fn piv_import_key_block(
 /// Read and open a .p12/.pfx file, in the words the CLI uses for a file it
 /// can't open. An empty password is one (files saved with it exist).
 fn open_key_file(path: &std::path::Path, password: &str) -> Result<keyroost_p12::Contents, String> {
-    let bytes = zeroize::Zeroizing::new(
-        std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?,
-    );
+    use keyroost_transport::piv_import::{read_key_file, KeyFileError};
+    let bytes = read_key_file(path).map_err(|e| match e {
+        KeyFileError::Io(e) => format!("Cannot read {}: {e}", path.display()),
+        e => e.to_string(),
+    })?;
     keyroost_p12::open(&bytes, Some(password))
         .map_err(keyroost_transport::piv_import::file_error_message)
 }
@@ -10688,7 +10690,7 @@ impl App {
                 wipe(&mut app.piv.sign_pin);
                 match result {
                     Err(e) => {
-                        let message = format!("{e} Nothing was written.");
+                        let message = piv_import_not_written(e);
                         app.log(Severity::Err, message.clone());
                         app.piv.notice = None;
                         app.piv.error = Some(message);
@@ -12770,6 +12772,39 @@ fn piv_replace_warning(occupancy: PivOccupancy, slot: &str) -> Option<String> {
         )),
         PivOccupancy::Empty => None,
     }
+}
+
+/// What an import does to `slot`'s certificate, when it holds one: replaced
+/// by the file's (`entry_has_cert`) or deleted, for a key-only file. Said with
+/// "too" when the key warning above it already speaks of the key.
+fn piv_import_cert_note(
+    occupancy: PivOccupancy,
+    slot_has_cert: bool,
+    entry_has_cert: bool,
+    slot: &str,
+) -> Option<String> {
+    if !slot_has_cert {
+        return None;
+    }
+    Some(match (occupancy, entry_has_cert) {
+        (PivOccupancy::Key | PivOccupancy::MaybeKey, true) => {
+            "The slot's certificate is replaced too.".to_string()
+        }
+        (PivOccupancy::Key | PivOccupancy::MaybeKey, false) => {
+            "The slot's certificate is deleted too.".to_string()
+        }
+        (PivOccupancy::Empty, true) => {
+            format!("This replaces the certificate currently in {slot}.")
+        }
+        (PivOccupancy::Empty, false) => {
+            format!("This deletes the certificate currently in {slot}.")
+        }
+    })
+}
+
+/// An import that failed before reaching the card, as one message.
+fn piv_import_not_written(e: impl std::fmt::Display) -> String {
+    format!("{} Nothing was written.", sentence(e))
 }
 
 /// The red note for a Move destination the card reports holds a key:
@@ -19859,7 +19894,9 @@ impl App {
     /// The PIN and touch policy rows of the Generate key and Import key
     /// dialogs (`gen_pin_policy` / `gen_touch_policy`), gated by this key's
     /// support for each policy and the values its firmware refuses.
-    fn piv_modal_policy_fields(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    /// `importing` adds the import's own rule: a Token2 is never sent a touch
+    /// policy on import, whatever its version, so the row stays at `default`.
+    fn piv_modal_policy_fields(&mut self, ui: &mut egui::Ui, p: &Palette, importing: bool) {
         // PIN/touch policy (tags 0xAA/0xAB on GENERATE ASYMMETRIC KEYPAIR
         // and IMPORT ASYMMETRIC KEY) are Yubico extensions, not SP 800-73-4
         // — gated the same three-way way (`keyroost_piv::compat`) Move/Delete
@@ -19883,8 +19920,13 @@ impl App {
         );
         let pin_policy_gate =
             self.piv_gate(PivExtension::SlotPinPolicy, piv_fp, piv_ver, piv_fw_ver);
-        let touch_policy_gate =
-            self.piv_gate(PivExtension::SlotTouchPolicy, piv_fp, piv_ver, piv_fw_ver);
+        let touch_import_refused =
+            importing && keyroost_transport::piv_import::import_touch_policy_refused(piv_fp);
+        let touch_policy_gate = if touch_import_refused {
+            FeatureGate::Unsupported
+        } else {
+            self.piv_gate(PivExtension::SlotTouchPolicy, piv_fp, piv_ver, piv_fw_ver)
+        };
         // Narrower than the two gates above: a device can
         // support the extension in general yet reject one
         // specific value (e.g. YubiKey firmware 4.0-4.2
@@ -19909,11 +19951,15 @@ impl App {
             PivExtension::SlotTouchPolicy.requirement(),
             FeatureGate::UNVERIFIED_SUFFIX
         );
-        let touch_policy_blocked_hint = format!(
-            "{} {}",
-            PivExtension::SlotTouchPolicy.requirement(),
-            FeatureGate::INCOMPATIBLE_SUFFIX
-        );
+        let touch_policy_blocked_hint = if touch_import_refused {
+            keyroost_transport::piv_import::ImportRefusal::TouchPolicyNotSupported.to_string()
+        } else {
+            format!(
+                "{} {}",
+                PivExtension::SlotTouchPolicy.requirement(),
+                FeatureGate::INCOMPATIBLE_SUFFIX
+            )
+        };
         // `Unsupported` blocks the whole combo (matching
         // Move/Delete key's own treatment) rather than
         // just the one value the quirks above narrow —
@@ -20117,7 +20163,7 @@ impl App {
                     | ImportRefusal::PinPolicyOnceNotSupported
                     | ImportRefusal::TouchPolicyCachedNotSupported
             ) {
-                self.piv_modal_policy_fields(ui, p);
+                self.piv_modal_policy_fields(ui, p, true);
                 ui.add_space(6.0);
             }
             ui.colored_label(p.err, refusal.to_string());
@@ -20162,11 +20208,23 @@ impl App {
         {
             ui.colored_label(p.err, egui::RichText::new(warning).font(theme::f_sb(12.5)));
         }
-        if slot_has_cert {
-            card_note(ui, p, "The slot's certificate is replaced too.");
+        let entry_has_cert = self
+            .piv
+            .key_import
+            .contents
+            .as_ref()
+            .and_then(|c| c.entries.get(self.piv.key_import.entry))
+            .is_some_and(|e| e.certificate.is_some());
+        if let Some(note) = piv_import_cert_note(
+            occupancy,
+            slot_has_cert,
+            entry_has_cert,
+            &self.piv.selected_slot.to_slot().label(),
+        ) {
+            card_note(ui, p, &note);
         }
         ui.add_space(6.0);
-        self.piv_modal_policy_fields(ui, p);
+        self.piv_modal_policy_fields(ui, p, true);
         self.piv_modal_compression_field(ui, p, label_w);
 
         // Authority certificates are never written to the card; they can be
@@ -20548,7 +20606,7 @@ impl App {
                             card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
                             ui.add_space(8.0);
 
-                            self.piv_modal_policy_fields(ui, p);
+                            self.piv_modal_policy_fields(ui, p, false);
                         }
                         PivCredKind::ImportKey => {
                             import_ready = self.piv_import_key_fields(
@@ -29230,6 +29288,95 @@ mod tests {
             keyroost_piv::KeyAlg::EccP256,
         );
         assert_eq!(app.piv_key_import_preflight(), Some(Err(refusal)));
+    }
+
+    /// The slot's certificate note says what happens to it: replaced by the
+    /// file's, or deleted for a key-only file, and in full when no key
+    /// warning stands above it.
+    #[test]
+    fn import_key_cert_note_follows_the_entry_and_the_slot() {
+        use PivOccupancy::{Empty, Key, MaybeKey};
+        let note = |occ, slot_cert, entry_cert| {
+            piv_import_cert_note(occ, slot_cert, entry_cert, "Authentication (9A)")
+        };
+        for occ in [Key, MaybeKey, Empty] {
+            assert_eq!(note(occ, false, true), None);
+            assert_eq!(note(occ, false, false), None);
+        }
+        for occ in [Key, MaybeKey] {
+            assert_eq!(
+                note(occ, true, true).as_deref(),
+                Some("The slot's certificate is replaced too.")
+            );
+            assert_eq!(
+                note(occ, true, false).as_deref(),
+                Some("The slot's certificate is deleted too.")
+            );
+        }
+        assert_eq!(
+            note(Empty, true, true).as_deref(),
+            Some("This replaces the certificate currently in Authentication (9A).")
+        );
+        assert_eq!(
+            note(Empty, true, false).as_deref(),
+            Some("This deletes the certificate currently in Authentication (9A).")
+        );
+    }
+
+    /// A file over 1 MiB is refused before it is parsed, in the shared words.
+    #[test]
+    fn import_key_refuses_an_oversized_file() {
+        let dir = std::env::temp_dir().join(format!("keyroost-p12-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.p12");
+        std::fs::write(&path, vec![0u8; 1024 * 1024 + 1]).unwrap();
+        let got = open_key_file(&path, "x").err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some("This file is larger than a .p12/.pfx key file should be (over 1 MiB).")
+        );
+    }
+
+    #[test]
+    fn import_key_not_written_is_its_own_sentence() {
+        assert_eq!(
+            piv_import_not_written("reader went away"),
+            "Reader went away. Nothing was written."
+        );
+        assert_eq!(
+            piv_import_not_written("The card said no."),
+            "The card said no. Nothing was written."
+        );
+    }
+
+    /// A Token2 is never sent a touch policy on import, even at a version
+    /// past the newest on record (where the policy row reads unverified):
+    /// the import dialog puts the row back to `default`. Generate key keeps
+    /// the ordinary gate.
+    #[test]
+    fn import_key_touch_policy_stays_default_on_token2() {
+        use keyroost_piv::fingerprint::AppletFingerprint;
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx);
+        let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
+        for (importing, want) in [
+            (true, keyroost_piv::TouchPolicy::Default),
+            (false, keyroost_piv::TouchPolicy::Always),
+        ] {
+            let mut app = App::default();
+            app.piv.status = Some(piv_status_with(
+                AppletFingerprint::Token2,
+                Some(vec![6, 0, 0]),
+            ));
+            app.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Always;
+            let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.piv_modal_policy_fields(ui, &palette, importing);
+                });
+            });
+            assert_eq!(app.piv.gen_touch_policy, want, "importing: {importing}");
+        }
     }
 
     /// The result text: a key-only import says the slot now has no

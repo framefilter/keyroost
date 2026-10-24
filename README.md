@@ -68,8 +68,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   certificate), on-card key generation (RSA, ECC P-256/384/521, Ed25519,
   X25519), certificate import / export, self-signed certs or a CSR for a CA,
   importing a private key with its certificate from a `.p12` / `.pfx` file
-  (`piv key import`; legacy-encrypted files such as those issued by FNMT open
-  directly; on a Nitrokey 3, RSA keys into slot 9A, following Nitrokey's
+  (`piv key import`; legacy-encrypted files (RC2/3DES, the kind some
+  certificate authorities such as Spain's FNMT still issue) open directly; on a Nitrokey 3, RSA keys into slot 9A, following Nitrokey's
   published PIV source; not yet verified on Token2 keys), clearing a slot's
   certificate (`piv cert delete`) or key (`piv key delete`),
   moving a key between slots (`piv key move`), writing a
@@ -692,9 +692,10 @@ keyroostctl openpgp authenticate --in chal.bin --device my-yubikey  # client/SSH
 # --- PIV ---
 keyroostctl piv info --device my-yubikey
 keyroostctl piv key generate --slot 9a --algorithm eccp256   # asks for the management key
-# import a key and certificate issued as a .p12/.pfx file (for example a Spanish
-# FNMT certificate); asks for the file password, the management key and the PIN,
-# then tests the slot. A file with several keys lists them for --entry N.
+# import a key and certificate issued as a .p12/.pfx file (for example a personal
+# certificate from a certificate authority); asks for the file password, the
+# management key and the PIN, then tests the slot. A file with several keys
+# lists them for --entry N.
 keyroostctl piv key import --slot 9a --in my-certificate.p12 --device my-yubikey
 
 # bulk-provision several slots: management key + PIN from env once, loop the rest.
@@ -996,14 +997,14 @@ old script.
 | Crate | Purpose | External deps |
 |---|---|---|
 | `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
-| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session, import writers for OATH / Token2 OTP / Molto2 (in-tree `keyroost-import`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
+| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session, import writers for OATH / Token2 OTP / Molto2 (in-tree `keyroost-import`), PIV key import from `.p12` / `.pfx` (in-tree `keyroost-p12`) and the slot self-test (in-tree `keyroost-pivtest`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
 | `keyroost-hid` | USB HID enumeration of FIDO devices, and the "same physical USB device" evidence used to pair a key's FIDO and smart-card sides | none on Linux (`sysfs`); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
 | `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management, large-blob storage (including the name a key carries) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for client-PIN, `aes-gcm` + `miniz_oxide` for largeBlob entries, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM, applet fingerprinting and per-device feature gates | `zeroize` |
-| `keyroost-p12` | Host-side PKCS#12 (`.p12` / `.pfx`) reader for `piv key import`: legacy and modern encryption, MAC check, keys paired with their certificates | `rc2`, `des`, `cbc`, `aes`, `hmac`, `sha2`, `pbkdf2`, `p256`/`p384`, `ed25519-dalek`, `x25519-dalek`, `rsa`, `zeroize` |
-| `keyroost-pivtest` | Host-side round-trip self-test for a PIV slot key (decrypt / key-agree / sign), checked against the slot certificate's public key | `rsa`, `p256`, `p384`, `p521`, `ed25519-dalek`, `x25519-dalek`, `zeroize` |
+| `keyroost-p12` | Host-side PKCS#12 (`.p12` / `.pfx`) reader for `piv key import`: legacy and modern encryption, MAC check, keys paired with their certificates | `rc2`, `des`, `cbc`, `aes`, `hmac`, `sha2`, `pbkdf2`, `p256`/`p384`, `ed25519-dalek`, `x25519-dalek`, `rsa`, `zeroize`; in-tree `keyroost-proto`, `keyroost-piv`, `keyroost-oath` |
+| `keyroost-pivtest` | Host-side round-trip self-test for a PIV slot key (decrypt / key-agree / sign), checked against a public key: the slot certificate's, or one given (an imported key's) | `rsa`, `p256`, `p384`, `p521`, `ed25519-dalek`, `x25519-dalek`, `zeroize` |
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for ECDH seed encryption and the OTP-PIN session, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints) | `serde`, `serde_json`, `getrandom` (the per-computer salt); in-tree SHA-256 from `keyroost-proto` |
