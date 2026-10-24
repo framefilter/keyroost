@@ -29,6 +29,8 @@ p256 = "0.13"
 p384 = "0.13"
 ed25519-dalek = "2"
 x25519-dalek = "2"
+# Checks that an RSA key's parts agree before it can reach a card.
+rsa = "0.9"
 zeroize = "1"
 keyroost-oath = { path = "../keyroost-oath", version = "0.14.0" }
 
@@ -36,7 +38,3 @@ keyroost-oath = { path = "../keyroost-oath", version = "0.14.0" }
 # Lowers the accepted KDF iteration count so the fuzz target is not stalled by
 # hostile files; never enabled in shipped builds.
 fuzzing = []
-
-[dev-dependencies]
-# Independent reference decoder for the RSA CRT parts.
-rsa = "0.9"

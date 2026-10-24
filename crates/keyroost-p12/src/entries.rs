@@ -1,8 +1,9 @@
 //! Pairing keys with certificates into entries.
 
 use keyroost_piv::x509_parse::{parse_certificate_public_key, parse_subject_dn, DnAttr};
+use keyroost_piv::{KeyAlg, PublicKey};
 
-use crate::pfx::{read_bags, BagKind, RawBag};
+use crate::pfx::{read_bags, BagKind};
 use crate::pkcs8::{self, KeyParts};
 use crate::P12Error;
 
@@ -37,9 +38,77 @@ fn common_name(cert: &[u8]) -> Option<String> {
         .map(|(_, v)| v)
 }
 
+/// A parsed key bag, ready to pair.
+pub(crate) struct KeyIn {
+    pub parts: KeyParts,
+    pub local_key_id: Option<Vec<u8>>,
+    pub friendly_name: Option<String>,
+}
+
+/// A certificate bag with its public key (if it could be read).
+pub(crate) struct CertIn {
+    pub der: Vec<u8>,
+    pub public: Option<(KeyAlg, PublicKey)>,
+    pub local_key_id: Option<Vec<u8>>,
+    pub friendly_name: Option<String>,
+}
+
+/// Pair certificates with keys.
+///
+/// A certificate belongs to a key only if both the algorithm and the public
+/// key agree (Ed25519 and X25519 points are both 32 raw bytes, so the point
+/// alone is not enough). A matching `localKeyId` only breaks a tie between
+/// several certificates that match. Unclaimed certificates are returned as
+/// authorities in file order.
+pub(crate) fn pair(keys: Vec<KeyIn>, certs: Vec<CertIn>) -> Contents {
+    let mut claimed = vec![false; certs.len()];
+    let mut entries = Vec::new();
+    for key in keys {
+        let alg = key.parts.alg();
+        let public = key.parts.public_key();
+        let matches = |i: usize, c: &CertIn| {
+            claimed.get(i) == Some(&false)
+                && c.public
+                    .as_ref()
+                    .is_some_and(|(a, pk)| *a == alg && *pk == public)
+        };
+        let by_id = key.local_key_id.as_ref().and_then(|id| {
+            certs
+                .iter()
+                .enumerate()
+                .position(|(i, c)| matches(i, c) && c.local_key_id.as_ref() == Some(id))
+        });
+        let found = by_id.or_else(|| certs.iter().enumerate().position(|(i, c)| matches(i, c)));
+        let cert = found.and_then(|i| {
+            if let Some(slot) = claimed.get_mut(i) {
+                *slot = true;
+            }
+            certs.get(i)
+        });
+        let label = non_empty(&key.friendly_name)
+            .or_else(|| cert.and_then(|c| non_empty(&c.friendly_name)))
+            .or_else(|| cert.and_then(|c| common_name(&c.der)));
+        entries.push(Entry {
+            key: key.parts,
+            certificate: cert.map(|c| c.der.clone()),
+            label,
+        });
+    }
+    let authorities = certs
+        .into_iter()
+        .zip(claimed)
+        .filter(|(_, used)| !used)
+        .map(|(c, _)| c.der)
+        .collect();
+    Contents {
+        entries,
+        authorities,
+    }
+}
+
 /// Read a PKCS#12 file into entries and CA certificates.
 ///
-/// Certificates pair to keys by public key (a certificate's `localKeyId` only
+/// Certificates pair to keys by algorithm and public key (a `localKeyId` only
 /// breaks a tie between several that match), so a missing or wrong
 /// `localKeyId` cannot attach a certificate to a key that is not its own, and
 /// CA flags are never consulted. A key with no matching certificate becomes an
@@ -47,61 +116,93 @@ fn common_name(cert: &[u8]) -> Option<String> {
 ///
 /// # Errors
 /// [`P12Error`] if the file cannot be read, the password is wrong, a key is of
-/// an unsupported kind, or the file holds no private key.
+/// an unsupported kind or inconsistent, or the file holds no private key.
 pub fn open(file: &[u8], password: Option<&str>) -> Result<Contents, P12Error> {
-    let bags = read_bags(file, password)?;
     let mut keys = Vec::new();
-    let mut certs: Vec<(RawBag, Option<keyroost_piv::PublicKey>, bool)> = Vec::new();
-    for bag in bags {
+    let mut certs = Vec::new();
+    for bag in read_bags(file, password)? {
         match bag.kind {
-            BagKind::Key => keys.push((pkcs8::parse(&bag.value)?, bag)),
-            BagKind::Certificate => {
-                let public = parse_certificate_public_key(&bag.value)
-                    .ok()
-                    .map(|(_, p)| p);
-                certs.push((bag, public, false));
-            }
+            BagKind::Key => keys.push(KeyIn {
+                parts: pkcs8::parse(&bag.value)?,
+                local_key_id: bag.local_key_id,
+                friendly_name: bag.friendly_name,
+            }),
+            BagKind::Certificate => certs.push(CertIn {
+                public: parse_certificate_public_key(&bag.value).ok(),
+                der: bag.value.to_vec(),
+                local_key_id: bag.local_key_id,
+                friendly_name: bag.friendly_name,
+            }),
         }
     }
     if keys.is_empty() {
         return Err(P12Error::NoKey);
     }
+    Ok(pair(keys, certs))
+}
 
-    let mut entries = Vec::new();
-    for (key, key_bag) in keys {
-        let public = key.public_key();
-        let matches = |c: &(RawBag, Option<keyroost_piv::PublicKey>, bool)| {
-            !c.2 && c.1.as_ref() == Some(&public)
-        };
-        let by_id = key_bag.local_key_id.as_ref().and_then(|id| {
-            certs
-                .iter()
-                .position(|c| matches(c) && c.0.local_key_id.as_ref() == Some(id))
-        });
-        let found = by_id.or_else(|| certs.iter().position(matches));
-        let (certificate, cert_name) = match found.and_then(|i| certs.get_mut(i)) {
-            Some(c) => {
-                c.2 = true;
-                (Some(c.0.value.to_vec()), non_empty(&c.0.friendly_name))
-            }
-            None => (None, None),
-        };
-        let label = non_empty(&key_bag.friendly_name)
-            .or(cert_name)
-            .or_else(|| certificate.as_deref().and_then(common_name));
-        entries.push(Entry {
-            key,
-            certificate,
-            label,
-        });
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ed_key() -> KeyIn {
+        KeyIn {
+            parts: KeyParts::Ed25519 { seed: [7; 32] },
+            local_key_id: None,
+            friendly_name: None,
+        }
     }
-    let authorities = certs
-        .into_iter()
-        .filter(|c| !c.2)
-        .map(|c| c.0.value.to_vec())
-        .collect();
-    Ok(Contents {
-        entries,
-        authorities,
-    })
+
+    fn cert(alg: KeyAlg, point: Vec<u8>, tag: u8) -> CertIn {
+        CertIn {
+            der: vec![tag],
+            public: Some((alg, PublicKey::Ecc { point })),
+            local_key_id: None,
+            friendly_name: None,
+        }
+    }
+
+    fn ed_point() -> Vec<u8> {
+        match (KeyParts::Ed25519 { seed: [7; 32] }).public_key() {
+            PublicKey::Ecc { point } => point,
+            PublicKey::Rsa { .. } => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ed25519_key_does_not_pair_with_x25519_cert() {
+        // Same 32 bytes, different algorithm: not this key's certificate.
+        let c = pair(vec![ed_key()], vec![cert(KeyAlg::X25519, ed_point(), 1)]);
+        assert_eq!(c.entries.len(), 1);
+        assert!(c.entries[0].certificate.is_none());
+        assert_eq!(c.authorities, vec![vec![1]]);
+        // Control: the Ed25519 certificate with the same point does pair.
+        let c = pair(vec![ed_key()], vec![cert(KeyAlg::Ed25519, ed_point(), 2)]);
+        assert_eq!(c.entries[0].certificate, Some(vec![2]));
+        assert!(c.authorities.is_empty());
+    }
+
+    #[test]
+    fn non_matching_candidate_goes_to_authorities() {
+        let mut other = cert(KeyAlg::Ed25519, vec![9; 32], 3);
+        other.local_key_id = Some(vec![1]);
+        let mut key = ed_key();
+        key.local_key_id = Some(vec![1]);
+        let c = pair(vec![key], vec![other]);
+        assert!(c.entries[0].certificate.is_none());
+        assert_eq!(c.authorities, vec![vec![3]]);
+    }
+
+    #[test]
+    fn local_key_id_breaks_ties_between_matching_certs() {
+        let mut a = cert(KeyAlg::Ed25519, ed_point(), 1);
+        let mut b = cert(KeyAlg::Ed25519, ed_point(), 2);
+        a.local_key_id = Some(vec![1]);
+        b.local_key_id = Some(vec![2]);
+        let mut key = ed_key();
+        key.local_key_id = Some(vec![2]);
+        let c = pair(vec![key], vec![a, b]);
+        assert_eq!(c.entries[0].certificate, Some(vec![2]));
+        assert_eq!(c.authorities, vec![vec![1]]);
+    }
 }

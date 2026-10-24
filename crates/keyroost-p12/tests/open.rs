@@ -35,6 +35,7 @@ fn rsa_parts_match_openssl() {
             dp,
             dq,
             qinv,
+            ..
         } = &c.entries[0].key
         else {
             panic!("{name}: not RSA");
@@ -70,7 +71,7 @@ fn rsa_public_key_matches_certificate() {
 fn ec_scalar_and_public_point() {
     use p256::pkcs8::DecodePrivateKey as _;
     let c = open_fixture("p256-modern");
-    let KeyParts::Ec { alg, scalar } = &c.entries[0].key else {
+    let KeyParts::Ec { alg, scalar, .. } = &c.entries[0].key else {
         panic!("not EC");
     };
     assert_eq!(*alg, KeyAlg::EccP256);
@@ -80,7 +81,7 @@ fn ec_scalar_and_public_point() {
     assert_eq!(c.entries[0].key.public_key(), cert_public(cert).1);
 
     let c = open_fixture("p384-legacy");
-    let KeyParts::Ec { alg, scalar } = &c.entries[0].key else {
+    let KeyParts::Ec { alg, scalar, .. } = &c.entries[0].key else {
         panic!("not EC");
     };
     assert_eq!(*alg, KeyAlg::EccP384);
