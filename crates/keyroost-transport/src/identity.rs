@@ -166,6 +166,31 @@ pub fn ccid_applet_read(
     out
 }
 
+/// The firmware version a Trussed admin application reports over CCID
+/// (`"1.9.1"`), for a key whose CTAPHID INIT carries none: the Nitrokey 3
+/// answers INIT with version 0.0.0. `None` if the reader has no admin
+/// application or its answer isn't a dotted version.
+pub fn trussed_admin_firmware(reader: &str, debug: bool) -> Option<String> {
+    use keyroost_piv::fingerprint::{
+        parse_ascii_text, parse_dotted_version, NITROKEY_ADMIN_AID, NITROKEY_GET_VERSION_STRING,
+    };
+    let data = ccid_applet_read(
+        reader,
+        &keyroost_piv::select_by_aid(&NITROKEY_ADMIN_AID),
+        &NITROKEY_GET_VERSION_STRING,
+        true,
+        debug,
+    )?;
+    let parts = parse_dotted_version(parse_ascii_text(&data)?.trim())?;
+    Some(
+        parts
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

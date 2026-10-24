@@ -37,11 +37,21 @@ pub struct OathSession {
 
 impl OathSession {
     /// Connect to `reader_name` and SELECT the OATH applet.
+    ///
+    /// The session holds a PC/SC transaction for its whole life, so no other
+    /// program (a browser scanning for smart-card certificates, say) can put
+    /// a command between two of its own. One that SELECTs another applet
+    /// would send the session's next commands to that applet; a Nitrokey 3
+    /// then answered `6A81` to every CALCULATE until a re-SELECT.
     pub fn open(reader_name: &str) -> Result<Self, TransportError> {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let card = ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY)?;
+        let mut card = ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY)?;
+        // `pcsc::Transaction` borrows the card, so it can't live in the
+        // session next to it. Forgetting the guard leaves the transaction
+        // open; disconnecting (the card's drop) ends it, as PC/SC specifies.
+        std::mem::forget(card.transaction()?);
         let mut session = Self {
             card,
             debug: false,

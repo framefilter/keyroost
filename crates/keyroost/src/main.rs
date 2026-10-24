@@ -440,6 +440,9 @@ struct SecurityKeysState {
     /// CTAP info for the selected device, fetched lazily after selection.
     info: Option<AuthenticatorInfo>,
     init: Option<InitResponse>,
+    /// The firmware read from the key's admin application, when its INIT
+    /// reports none (version 0.0.0, as the Nitrokey 3 does).
+    admin_firmware: Option<String>,
     /// User-facing error from the last enumeration / open / GetInfo call.
     error: Option<String>,
     /// Live PIN entry field (cleared after submit).
@@ -1520,6 +1523,15 @@ fn openpgp_cred_mismatch(pgp: &OpenPgpState, kind: OpenPgpCredKind) -> Option<&'
 fn wipe(s: &mut String) {
     use zeroize::Zeroize;
     s.zeroize();
+}
+
+/// The firmware a key's CTAPHID INIT reports ("5.7.4"), or `None` when it
+/// reports 0.0.0: the Nitrokey 3 does, and its real version comes from the
+/// admin application instead.
+fn init_firmware(i: &InitResponse) -> Option<String> {
+    (i.device_major, i.device_minor, i.device_build)
+        .ne(&(0, 0, 0))
+        .then(|| format!("{}.{}.{}", i.device_major, i.device_minor, i.device_build))
 }
 
 /// Shared device-binding guard for background-job completions and modal
@@ -5086,10 +5098,12 @@ impl App {
     fn fetch_selected_info(&mut self) {
         self.security_keys.info = None;
         self.security_keys.init = None;
+        self.security_keys.admin_firmware = None;
         self.security_keys.error = None;
         let Some(target) = self.selected_fido_target() else {
             return;
         };
+        let reader = self.selected_device().and_then(|d| d.reader.clone());
         // Tag the job with the device it reads — if the user switches devices
         // while it's in flight, the result must not be painted into the new
         // device's pane (or its row in the sidebar).
@@ -5105,7 +5119,14 @@ impl App {
                     } else {
                         None
                     };
-                    Ok((init, info))
+                    // No firmware in the INIT: ask the admin application.
+                    let admin_firmware = match (&init, &reader) {
+                        (Some(i), Some(reader)) if init_firmware(i).is_none() => {
+                            keyroost_transport::identity::trussed_admin_firmware(reader, false)
+                        }
+                        _ => None,
+                    };
+                    Ok((init, info, admin_firmware))
                 }
                 Err(e) => Err(format!("could not open key: {e}")),
             };
@@ -5115,13 +5136,14 @@ impl App {
                     return; // selection changed mid-read; discard
                 }
                 match outcome {
-                    Ok((init, info)) => {
+                    Ok((init, info, admin_firmware)) => {
                         // The firmware (from the InitResponse, USB-HID only;
                         // PC/SC has none) and the AAGUID's model go on the
                         // hero via apply_key_details below.
                         if let Some(init) = init {
                             app.security_keys.init = Some(init);
                         }
+                        app.security_keys.admin_firmware = admin_firmware;
                         match info {
                             Some(Ok(info)) => {
                                 app.security_keys.info = Some(info);
@@ -5161,7 +5183,8 @@ impl App {
             .security_keys
             .init
             .as_ref()
-            .map(|i| format!("{}.{}.{}", i.device_major, i.device_minor, i.device_build));
+            .and_then(init_firmware)
+            .or_else(|| self.security_keys.admin_firmware.clone());
         let model = self
             .security_keys
             .info
@@ -9335,6 +9358,7 @@ impl App {
             .unwrap_or_default();
         self.security_keys.info = None;
         self.security_keys.init = None;
+        self.security_keys.admin_firmware = None;
         self.security_keys.session = None;
         self.security_keys.session_device = None;
         self.security_keys.error = None;
@@ -29369,6 +29393,29 @@ mod tests {
     /// selection, but every scan rebuilds the rows from scratch: they're put
     /// back on the rebuilt row, so a rescan (Refresh, a replug) doesn't turn
     /// "YubiKey 5 Series with NFC · fw 5.7.4" back into "YubiKey".
+    #[test]
+    fn key_details_take_admin_firmware_when_init_has_none() {
+        // A Nitrokey 3 answers INIT with 0.0.0; its admin app has the version.
+        let mut app = App {
+            selected_device: Some("serial:42682ef7".into()),
+            devices: vec![sel_key("serial:42682ef7", "42682ef7", None)],
+            ..Default::default()
+        };
+        app.security_keys.init = Some(keyroost_ctap::InitResponse {
+            channel_id: 3,
+            protocol_version: 2,
+            device_major: 0,
+            device_minor: 0,
+            device_build: 0,
+            capabilities: 0x05,
+        });
+        app.apply_key_details();
+        assert_eq!(app.devices[0].firmware, "", "0.0.0 is not shown");
+        app.security_keys.admin_firmware = Some("1.9.1".into());
+        app.apply_key_details();
+        assert_eq!(app.devices[0].firmware, "1.9.1");
+    }
+
     #[test]
     fn key_details_survive_a_rescan() {
         let mut app = App {

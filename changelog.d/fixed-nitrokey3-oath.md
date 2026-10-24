@@ -6,3 +6,11 @@
   added, read and deleted. Saving or deleting an account that requires a
   touch asks for a touch on a Nitrokey 3; the CLI and the app now say so,
   and a missed touch gets a message that says to try again and touch the key.
+- **Authenticator codes no longer drop out while a browser is open.** A
+  browser checking the key for smart-card certificates could slip its own
+  commands in between keyroost's, and the app then showed **Read code** on
+  ordinary accounts. keyroost now keeps the key to itself for the length of
+  each Authenticator read or change.
+- **The Nitrokey 3's firmware version shows in the app.** The key header
+  showed "fw 0.0.0", the placeholder the key's FIDO side reports; it now
+  shows the version from the key's admin application.
