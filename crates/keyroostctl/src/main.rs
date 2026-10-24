@@ -8239,6 +8239,8 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let name = crate::target::reader_of(&dev)?;
             let mut session = keyroost_transport::OathSession::open(&name)?;
             session.set_debug(debug);
+            // Some keys (Nitrokey 3) ask for a touch to reset.
+            eprintln!("Resetting \u{2014} touch the key if it blinks\u{2026}");
             session.factory_reset()?;
             println!("OATH applet reset: all credentials wiped, access password cleared.");
         }

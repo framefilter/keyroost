@@ -168,7 +168,7 @@ impl OathSession {
     /// destructive confirmation is the caller's job.
     pub fn factory_reset(&mut self) -> Result<(), TransportError> {
         let (_, sw) = self.transmit_full(&oath::reset())?;
-        ok_or_apdu("oath reset", sw)?;
+        self.write_answer("oath reset", "reset its Authenticator app", sw)?;
         // The wipe cleared any password; reflect that locally so a follow-up
         // command in this session doesn't try to validate against stale state.
         self.select_info.challenge = None;
@@ -276,7 +276,7 @@ impl OathSession {
     /// Provision (add) a credential.
     pub fn put(&mut self, params: &oath::PutParams<'_>) -> Result<(), TransportError> {
         let sw = self.put_status(params)?;
-        self.write_answer("oath put", "save", sw)
+        self.write_answer("oath put", "save the account", sw)
     }
 
     /// PUT and return the raw status word, for callers that read the key's
@@ -294,11 +294,11 @@ impl OathSession {
     /// Remove a credential by name.
     pub fn delete(&mut self, name: &str) -> Result<(), TransportError> {
         let sw = self.delete_status(name)?;
-        self.write_answer("oath delete", "delete", sw)
+        self.write_answer("oath delete", "delete the account", sw)
     }
 
-    /// A PUT or DELETE answer. `6982` from an applet with no password is the
-    /// key waiting for a touch it didn't get ([`TransportError::OathNoTouch`]);
+    /// A PUT, DELETE or RESET answer. `6982` from an applet with no password
+    /// is the key waiting for a touch it didn't get ([`TransportError::OathNoTouch`]);
     /// with a password it still means "unlock first".
     fn write_answer(
         &self,

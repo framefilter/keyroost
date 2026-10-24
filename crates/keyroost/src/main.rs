@@ -7014,7 +7014,9 @@ impl App {
             return;
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job("Resetting OATH applet\u{2026}", move || {
+        // Some keys (Nitrokey 3) ask for a touch to reset.
+        let label = "Resetting OATH applet \u{2014} touch the key if it blinks\u{2026}";
+        self.spawn_job(label, move || {
             let result = (|| -> Result<(), TransportError> {
                 let mut session = keyroost_transport::OathSession::open(&reader)?;
                 session.factory_reset()
