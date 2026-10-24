@@ -115,9 +115,14 @@ pub(crate) fn pair(keys: Vec<KeyIn>, certs: Vec<CertIn>) -> Contents {
 /// entry without one.
 ///
 /// # Errors
-/// [`P12Error`] if the file cannot be read, the password is wrong, a key is of
-/// an unsupported kind or inconsistent, or the file holds no private key.
+/// [`P12Error::TooLarge`] for a file over [`crate::MAX_FILE_BYTES`], checked
+/// before anything is parsed; otherwise [`P12Error`] if the file cannot be
+/// read, the password is wrong, a key is of an unsupported kind or
+/// inconsistent, or the file holds no private key.
 pub fn open(file: &[u8], password: Option<&str>) -> Result<Contents, P12Error> {
+    if file.len() > crate::MAX_FILE_BYTES {
+        return Err(P12Error::TooLarge);
+    }
     let mut keys = Vec::new();
     let mut certs = Vec::new();
     for bag in read_bags(file, password)? {
@@ -144,6 +149,26 @@ pub fn open(file: &[u8], password: Option<&str>) -> Result<Contents, P12Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_refuses_a_file_over_the_limit_before_parsing() {
+        // Zero bytes are no PKCS#12 file: at the limit that's what parsing
+        // says; one byte past it, parsing never starts.
+        let mut file = vec![0u8; crate::MAX_FILE_BYTES];
+        assert!(matches!(open(&file, None), Err(P12Error::Malformed(_))));
+        file.push(0);
+        assert_eq!(open(&file, None).unwrap_err(), P12Error::TooLarge);
+    }
+
+    #[test]
+    fn too_large_message_names_the_limit() {
+        assert_eq!(
+            crate::max_file_size(),
+            format!("{} MiB", crate::MAX_FILE_BYTES / (1024 * 1024))
+        );
+        assert_eq!(crate::max_file_size(), "1 MiB");
+        assert_eq!(P12Error::TooLarge.to_string(), "the file is over 1 MiB");
+    }
 
     fn ed_key() -> KeyIn {
         KeyIn {

@@ -6,8 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Host-side PKCS#12 (.p12/.pfx) reader that turns an entry into key parts for PIV import."
-# The fixtures are throwaway test keys; they stay in the repository.
-exclude = ["tests/fixtures/"]
+# The fixtures are throwaway test keys; they stay in the repository, and so
+# do the integration tests that read them.
+exclude = ["tests/"]
 
 [lints]
 workspace = true

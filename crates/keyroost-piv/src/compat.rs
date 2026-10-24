@@ -3792,6 +3792,24 @@ pub fn resolve(
             firmware_version,
         );
     }
+    resolve_axes(extension, fingerprint, applet_version, firmware_version)
+}
+
+/// One version axis as [`resolve`] reads it: which axis, `extension`'s rows on
+/// it (`None` when there are none), and the reported version.
+type AxisReading<'a> = (
+    VersionAxis,
+    Option<&'static [VersionVerdict]>,
+    Option<&'a [u8]>,
+);
+
+/// Both axes of `extension` on `fingerprint`, applet first.
+fn axes<'a>(
+    extension: PivExtension,
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&'a [u8]>,
+    firmware_version: Option<&'a [u8]>,
+) -> [AxisReading<'a>; 2] {
     // See "Both axes unset, one exception" above: only when *neither* axis
     // carries a reported version does the universal `[]` sentinel version
     // apply to both — an axis that's `None` while the other has data is left
@@ -3803,9 +3821,161 @@ pub fn resolve(
         (None, None) => (Some(&[][..]), Some(&[][..])),
         versions => versions,
     };
-    let applet_gate = resolve_in(applet_verdicts(fingerprint, extension), applet_version);
-    let firmware_gate = resolve_in(firmware_verdicts(fingerprint, extension), firmware_version);
-    merge_gates(axis_merge_mode(fingerprint), applet_gate, firmware_gate)
+    [
+        (
+            VersionAxis::Applet,
+            applet_verdicts(fingerprint, extension),
+            applet_version,
+        ),
+        (
+            VersionAxis::Firmware,
+            firmware_verdicts(fingerprint, extension),
+            firmware_version,
+        ),
+    ]
+}
+
+/// [`resolve`] after its special cases: `extension`'s own rows on both axes,
+/// merged per the fingerprint's [`AxisMergeMode`].
+fn resolve_axes(
+    extension: PivExtension,
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> FeatureGate {
+    let [(_, applet_rows, applet_version), (_, firmware_rows, firmware_version)] =
+        axes(extension, fingerprint, applet_version, firmware_version);
+    merge_gates(
+        axis_merge_mode(fingerprint),
+        resolve_in(applet_rows, applet_version),
+        resolve_in(firmware_rows, firmware_version),
+    )
+}
+
+/// Which reported version a [`VersionFloor`] is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionAxis {
+    /// The PIV applet's own version ([`resolve`]'s `applet_version`).
+    Applet,
+    /// The device's firmware version ([`resolve`]'s `firmware_version`).
+    Firmware,
+}
+
+/// "Needs version [`Self::version`] or later": the lowest version, on one
+/// axis, from which keyroost's list marks an extension known supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionFloor {
+    pub axis: VersionAxis,
+    pub version: &'static [u8],
+}
+
+/// Why [`resolve`] says [`FeatureGate::Unsupported`], when the only reason is
+/// that the reported version is too old: the lowest version, on the one axis
+/// that refuses, from which keyroost's list marks `extension` known
+/// supported. Follows [`resolve`]'s special cases, so an import that is
+/// refused because generating that key type is gets the later of the two
+/// floors. `None` when `extension` isn't refused, when nothing on record
+/// lifts the refusal (a feature this device is known never to have), or when
+/// both axes refuse.
+#[must_use]
+pub fn supported_from(
+    extension: PivExtension,
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> Option<VersionFloor> {
+    if resolve(extension, fingerprint, applet_version, firmware_version) != FeatureGate::Unsupported
+    {
+        return None;
+    }
+    floor_of(extension, fingerprint, applet_version, firmware_version)
+}
+
+/// [`supported_from`] for an `extension` [`resolve`] refuses.
+fn floor_of(
+    extension: PivExtension,
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> Option<VersionFloor> {
+    if let PivExtension::ImportKey(alg) = extension {
+        let generation = PivExtension::SlotKeyAlgorithm(alg);
+        let generation_floor = if resolve(generation, fingerprint, applet_version, firmware_version)
+            == FeatureGate::Unsupported
+        {
+            Some(floor_of(
+                generation,
+                fingerprint,
+                applet_version,
+                firmware_version,
+            )?)
+        } else {
+            None
+        };
+        if fingerprint == AppletFingerprint::YubiKey {
+            return generation_floor;
+        }
+        let own_floor = if resolve_axes(extension, fingerprint, applet_version, firmware_version)
+            == FeatureGate::Unsupported
+        {
+            Some(axis_floor(
+                extension,
+                fingerprint,
+                applet_version,
+                firmware_version,
+            )?)
+        } else {
+            None
+        };
+        return match (generation_floor, own_floor) {
+            (Some(a), Some(b)) if a.axis == b.axis => {
+                Some(if a.version >= b.version { a } else { b })
+            }
+            (Some(_), Some(_)) => None,
+            (a, b) => a.or(b),
+        };
+    }
+    if extension == PivExtension::GetSlotKeyStatus
+        && applet_verdicts(fingerprint, PivExtension::GetSlotKeyStatus).is_none()
+    {
+        return floor_of(
+            PivExtension::GetMetadata,
+            fingerprint,
+            applet_version,
+            firmware_version,
+        );
+    }
+    axis_floor(extension, fingerprint, applet_version, firmware_version)
+}
+
+/// The floor on the one axis whose own rows refuse `extension`: its first
+/// known-supported verdict above the reported version. `None` when both axes
+/// refuse, or the refusing one has no such verdict.
+fn axis_floor(
+    extension: PivExtension,
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> Option<VersionFloor> {
+    let mut floor = None;
+    for (axis, rows, version) in axes(extension, fingerprint, applet_version, firmware_version) {
+        if resolve_in(rows, version) != FeatureGate::Unsupported {
+            continue;
+        }
+        if floor.is_some() {
+            return None;
+        }
+        // An axis only refuses with rows and a version to read them at.
+        let (rows, version) = (rows?, version?);
+        let lifted = rows
+            .iter()
+            .find(|r| r.version > version && r.verdict == Verdict::KnownSupported)?;
+        floor = Some(VersionFloor {
+            axis,
+            version: lifted.version,
+        });
+    }
+    floor
 }
 
 /// Which private-key layout `fingerprint`'s import command expects: the
@@ -8403,6 +8573,63 @@ mod tests {
         assert!(
             s.contains("P-384") || s.contains(KeyAlg::EccP384.label()),
             "{s}"
+        );
+    }
+
+    /// A Nitrokey below firmware 1.8 has no import command; the refusal can
+    /// name the firmware that lifts it, read from the same rows.
+    #[test]
+    fn nitrokey_import_floor_is_firmware_1_8() {
+        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let floor = |alg, fw: Option<&[u8]>| {
+            supported_from(PivExtension::ImportKey(alg), fp, Some(&[6, 6, 6]), fw)
+        };
+        let fw = |version| {
+            Some(VersionFloor {
+                axis: VersionAxis::Firmware,
+                version,
+            })
+        };
+        for alg in [KeyAlg::Rsa2048, KeyAlg::Rsa4096] {
+            assert_eq!(floor(alg, Some(&[1, 7, 2])), fw(&[1, 8]), "{alg:?}");
+            assert_eq!(floor(alg, Some(&[1, 8])), None, "{alg:?} supported");
+        }
+        // RSA-3072 import is in from 1.8, but generating it only from 1.8.2,
+        // and import is never ahead of generation.
+        assert_eq!(floor(KeyAlg::Rsa3072, Some(&[1, 7])), fw(&[1, 8, 2]));
+        assert_eq!(floor(KeyAlg::Rsa3072, Some(&[1, 8, 1])), fw(&[1, 8, 2]));
+        assert_eq!(floor(KeyAlg::Rsa3072, Some(&[1, 8, 2])), None);
+        // Never importable: no floor to name.
+        assert_eq!(floor(KeyAlg::EccP256, Some(&[1, 7])), None);
+        assert_eq!(floor(KeyAlg::EccP256, Some(&[1, 9, 1])), None);
+        // No version read at all reads as `[]`, below every floor.
+        assert_eq!(
+            supported_from(PivExtension::ImportKey(KeyAlg::Rsa2048), fp, None, None),
+            fw(&[1, 8])
+        );
+    }
+
+    #[test]
+    fn supported_from_is_none_unless_refused_or_never_lifted() {
+        // Supported: no floor.
+        assert_eq!(
+            supported_from(
+                PivExtension::MoveKey,
+                AppletFingerprint::YubiKey,
+                Some(&[5, 7, 0]),
+                None
+            ),
+            None
+        );
+        // Refused for good (`KnownUnsupportedSince`): no floor either.
+        let nitrokey = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        assert_eq!(
+            resolve(PivExtension::ResetGlobal, nitrokey, None, Some(&[1, 8])),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            supported_from(PivExtension::ResetGlobal, nitrokey, None, Some(&[1, 8])),
+            None
         );
     }
 }

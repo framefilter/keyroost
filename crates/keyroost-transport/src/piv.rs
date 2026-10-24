@@ -180,8 +180,14 @@ pub struct PivStatus {
     /// neither source answers.
     pub serial: Option<u128>,
     /// Remaining PIN tries from a no-op VERIFY (`63 Cx`); `Some(0)` when blocked,
-    /// `None` when the card didn't report a count.
+    /// `None` when the card didn't report a count — see [`Self::pin_verified`]
+    /// for the one known reason it doesn't.
     pub pin_retries: Option<u8>,
+    /// The PIN is verified in this session: the no-op VERIFY answered `9000`,
+    /// which is how a card says so instead of reporting a count (then
+    /// [`Self::pin_retries`] is `None`). Seen on a status read in the same
+    /// session as a PIN-using operation (import, self-sign, self-test).
+    pub pin_verified: bool,
     /// Per-slot certificate presence, in canonical slot order.
     pub slots: Vec<PivSlotStatus>,
     /// The card's CHUID (FASC-N, GUID, expiration), when it has one. A
@@ -679,10 +685,15 @@ pub struct PivSessionState {
     chuid_cache: Option<Option<keyroost_piv::Chuid>>,
     /// Remaining PIV application-PIN tries, resolved via a no-op VERIFY —
     /// see [`PivSession::pin_retries`]. `None` until first resolved this
-    /// lineage; the inner `Option<u8>` mirrors that method's own return
-    /// value (`None` there means "already verified" or "not reportable",
-    /// not "unresolved" — this outer `Option` is what distinguishes the
-    /// two). Invalidated by [`PivSession::verify_pin`],
+    /// lineage; the inner `PinReading` is that method's own return value (a
+    /// count, "verified in this session", or neither) — this outer `Option`
+    /// is what tells any of those apart from "unresolved". A "verified"
+    /// reading holds only for the connection that saw it: a session's
+    /// connection ends with a card reset (the `pcsc` crate's `Card` drop),
+    /// which clears the verification, so
+    /// [`PivSession::with_cached_transaction`] drops such a reading on reuse
+    /// (`PivSessionState::forget_pin_verification`) and the next read asks
+    /// the card again. Invalidated by [`PivSession::verify_pin`],
     /// [`PivSession::change_pin`], [`PivSession::unblock_pin`], and
     /// [`PivSession::set_pin_retries`] — every operation that can move the
     /// counter, whether by consuming a try or resetting it — so a stale
@@ -690,7 +701,7 @@ pub struct PivSessionState {
     /// *not* touched by [`PivSession::verify_pin_hid_crescendo_aca`], which
     /// authenticates a wholly different PIN reference (HID Crescendo's ACA
     /// instance, not the standard PIV application PIN this cache tracks).
-    pin_retries_cache: Option<Option<u8>>,
+    pin_retries_cache: Option<PinReading>,
     /// The management-key algorithm [`PivSession::resolve_management_key_algorithm`]
     /// last settled on by probing (cards without GET METADATA). Only a hint:
     /// the next resolution re-checks it with one witness request (two for
@@ -1351,6 +1362,47 @@ fn piv_session_cache_reusable(pcsc_trustworthy: bool, pcsc_identity_matches: boo
     pcsc_trustworthy && pcsc_identity_matches
 }
 
+/// What a no-op VERIFY says about the PIV application PIN — see
+/// [`PivSession::pin_retries`]. `retries` and `verified` are never both set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PinReading {
+    retries: Option<u8>,
+    verified: bool,
+}
+
+/// `63 Cx` → `x` tries left, `6983` (blocked) → `0`, `9000` → verified in
+/// this session (a card that answers so reports no count), anything else →
+/// neither.
+fn pin_reading_from_sw(sw: u16) -> PinReading {
+    if let Some(n) = crate::sw_tries_remaining(sw) {
+        PinReading {
+            retries: Some(n),
+            verified: false,
+        }
+    } else if sw == 0x6983 {
+        PinReading {
+            retries: Some(0),
+            verified: false,
+        }
+    } else {
+        PinReading {
+            retries: None,
+            verified: sw == piv::SW_OK,
+        }
+    }
+}
+
+impl PivSessionState {
+    /// Drop a cached "PIN verified" reading before this state is reused on a
+    /// new connection: the verification belonged to the connection that saw
+    /// it (see `pin_retries_cache`). A cached count is kept.
+    fn forget_pin_verification(&mut self) {
+        if self.pin_retries_cache.is_some_and(|r| r.verified) {
+            self.pin_retries_cache = None;
+        }
+    }
+}
+
 impl<'tx> PivSession<'tx> {
     /// Connect to `reader_name`, SELECT the PIV application, and run `f` —
     /// the entire session — with every APDU it issues, from that initial
@@ -1611,6 +1663,7 @@ impl<'tx> PivSession<'tx> {
             cached.pcsc_identity.matches(&fresh_identity),
         ) {
             session.state = cached;
+            session.state.forget_pin_verification();
         } else {
             session.select()?;
             session.fingerprint();
@@ -2426,7 +2479,7 @@ impl<'tx> PivSession<'tx> {
             version_firmware,
             serial,
         } = self.applet_fingerprint();
-        let pin_retries = self.pin_retries();
+        let pin = self.pin_retries();
         // Best-effort: a transport hiccup reading the CHUID shouldn't fail
         // the whole status snapshot, any more than an unsupported GET
         // VERSION/SERIAL does above.
@@ -2439,7 +2492,8 @@ impl<'tx> PivSession<'tx> {
             version,
             version_firmware,
             serial,
-            pin_retries,
+            pin_retries: pin.retries,
+            pin_verified: pin.verified,
             slots,
             chuid,
             applet_fingerprint,
@@ -2515,7 +2569,7 @@ impl<'tx> PivSession<'tx> {
             version_firmware,
             serial,
         } = self.applet_fingerprint();
-        let pin_retries = self.pin_retries();
+        let pin = self.pin_retries();
         let chuid = self.read_chuid().unwrap_or_default();
 
         let mut slots = Vec::with_capacity(4);
@@ -2562,7 +2616,8 @@ impl<'tx> PivSession<'tx> {
                 version,
                 version_firmware,
                 serial,
-                pin_retries,
+                pin_retries: pin.retries,
+                pin_verified: pin.verified,
                 slots,
                 chuid,
                 applet_fingerprint,
@@ -2608,32 +2663,29 @@ impl<'tx> PivSession<'tx> {
 
     /// Remaining PIN tries via a no-op VERIFY (consumes no try itself — the
     /// query the card answers is distinct from an actual PIN presentation).
-    /// `63 Cx` → `Some(x)`, `6983` (blocked) → `Some(0)`, `9000` (already
-    /// verified) / anything else → `None`.
+    /// `63 Cx` → `x` tries left, `6983` (blocked) → `0`, `9000` → verified in
+    /// this session, no count, anything else → neither (see
+    /// `pin_reading_from_sw`).
     ///
     /// Cached in `PivSessionState::pin_retries_cache` for the rest of this
-    /// lineage once a real status word comes back — a transport-level
-    /// failure (the early `?` below) is never cached, same as every other
-    /// cache here. [`Self::verify_pin`]/[`Self::change_pin`]/
+    /// lineage once a real status word comes back — except that a
+    /// "verified" reading is dropped when the state is reused on a new
+    /// connection (see that field's doc) — and a transport-level failure
+    /// (the early return below) is never cached, same as every other cache
+    /// here. [`Self::verify_pin`]/[`Self::change_pin`]/
     /// [`Self::unblock_pin`]/[`Self::set_pin_retries`] each invalidate this
     /// on the way out, since each is the one thing that can actually move
-    /// the counter this method itself never touches.
-    fn pin_retries(&mut self) -> Option<u8> {
+    /// the counter (or the verification) this method itself never touches.
+    fn pin_retries(&mut self) -> PinReading {
         if let Some(cached) = self.state.pin_retries_cache {
             return cached;
         }
         let Ok((_, sw)) = self.transmit_full(&piv::verify_pin_status()) else {
-            return None;
+            return PinReading::default();
         };
-        let retries = if let Some(n) = crate::sw_tries_remaining(sw) {
-            Some(n)
-        } else if sw == 0x6983 {
-            Some(0)
-        } else {
-            None
-        };
-        self.state.pin_retries_cache = Some(retries);
-        retries
+        let reading = pin_reading_from_sw(sw);
+        self.state.pin_retries_cache = Some(reading);
+        reading
     }
 
     /// This session's [`keyroost_piv::fingerprint::AppletFingerprint`] plus
@@ -6860,6 +6912,38 @@ fn block_crypt(
 mod tests {
     use super::*;
     use crate::gzip::MAX_CERT_DECOMPRESSED;
+
+    #[test]
+    fn pin_reading_tells_count_blocked_and_verified_apart() {
+        let tries = |retries, verified| PinReading { retries, verified };
+        assert_eq!(pin_reading_from_sw(0x63C3), tries(Some(3), false));
+        assert_eq!(pin_reading_from_sw(0x63C0), tries(Some(0), false));
+        assert_eq!(pin_reading_from_sw(0x6983), tries(Some(0), false));
+        // A card that already verified the PIN in this session reports no
+        // count: that's "verified", not "unknown".
+        assert_eq!(pin_reading_from_sw(0x9000), tries(None, true));
+        assert_eq!(pin_reading_from_sw(0x6D00), tries(None, false));
+    }
+
+    #[test]
+    fn reused_state_forgets_pin_verification_but_keeps_a_count() {
+        let mut state = PivSessionState {
+            pin_retries_cache: Some(pin_reading_from_sw(0x9000)),
+            ..Default::default()
+        };
+        state.forget_pin_verification();
+        assert_eq!(state.pin_retries_cache, None, "verified must be re-asked");
+
+        let count = Some(pin_reading_from_sw(0x63C2));
+        state.pin_retries_cache = count;
+        state.forget_pin_verification();
+        assert_eq!(state.pin_retries_cache, count);
+
+        let unknown = Some(pin_reading_from_sw(0x6D00));
+        state.pin_retries_cache = unknown;
+        state.forget_pin_verification();
+        assert_eq!(state.pin_retries_cache, unknown);
+    }
 
     #[test]
     fn decode_serial_if_bcd_applies_only_when_the_quirk_resolves() {

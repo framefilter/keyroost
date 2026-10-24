@@ -41,6 +41,22 @@ pub enum P12Error {
     Unsupported(&'static str),
     /// The file holds no private key.
     NoKey,
+    /// The file is over [`MAX_FILE_BYTES`]; [`open`] refuses it unread.
+    TooLarge,
+}
+
+/// The largest file [`open`] reads. A real .p12/.pfx holds a key and a few
+/// certificates: kilobytes, not megabytes.
+pub const MAX_FILE_BYTES: usize = 1024 * 1024;
+
+const MIB: usize = 1024 * 1024;
+// `max_file_size` names the limit in whole MiB.
+const _: () = assert!(MAX_FILE_BYTES % MIB == 0);
+
+/// [`MAX_FILE_BYTES`] for a message: "1 MiB".
+#[must_use]
+pub fn max_file_size() -> String {
+    format!("{} MiB", MAX_FILE_BYTES / MIB)
 }
 
 impl fmt::Display for P12Error {
@@ -50,6 +66,7 @@ impl fmt::Display for P12Error {
             P12Error::WrongPassword => write!(f, "wrong password for this PKCS#12 file"),
             P12Error::Unsupported(what) => write!(f, "unsupported PKCS#12 feature: {what}"),
             P12Error::NoKey => write!(f, "the PKCS#12 file contains no private key"),
+            P12Error::TooLarge => write!(f, "the file is over {}", max_file_size()),
         }
     }
 }

@@ -3428,22 +3428,21 @@ fn piv_cert_error_hint(e: &TransportError, choice: PivCertCompressionSel) -> Opt
 /// Why a key with this applet fingerprint and version can't import into
 /// `slot` at all (#174), before any file is picked: its import command
 /// doesn't take the slot (the Nitrokey takes 9A only), or keyroost's list
-/// marks every key type unsupported for import. `None` when it may; what
-/// the file holds is checked once it is open (`plan_import`).
+/// marks every key type unsupported for import (`import_blocked`, the same
+/// words the CLI prints, naming the firmware that lifts it when the list has
+/// one). `None` when it may; what the file holds is checked once it is open
+/// (`plan_import`).
 fn piv_import_key_block(
     fp: keyroost_piv::fingerprint::AppletFingerprint,
     ver: Option<&[u8]>,
     fw: Option<&[u8]>,
     slot: keyroost_piv::Slot,
 ) -> Option<String> {
-    use keyroost_piv::compat::{self, FeatureGate, PivExtension};
-    let none_importable = keyroost_piv::KeyAlg::ALL.into_iter().all(|alg| {
-        compat::resolve(PivExtension::ImportKey(alg), fp, ver, fw) == FeatureGate::Unsupported
-    });
-    if none_importable {
-        return Some("This device can't import keys.".to_string());
+    use keyroost_transport::piv_import::import_blocked;
+    if let Some(refusal) = import_blocked(fp, ver, fw) {
+        return Some(refusal.to_string());
     }
-    (!compat::import_slot_allowed(fp, slot))
+    (!keyroost_piv::compat::import_slot_allowed(fp, slot))
         .then(|| keyroost_transport::piv_import::ImportRefusal::SlotNotSupported(slot).to_string())
 }
 
@@ -13012,6 +13011,16 @@ fn piv_import_cert_note(
 /// An import that failed before reaching the card, as one message.
 fn piv_import_not_written(e: impl std::fmt::Display) -> String {
     format!("{} Nothing was written.", sentence(e))
+}
+
+/// The PIN part of the PIV header: the tries left, or "PIN verified" when the
+/// card reports the PIN is verified in this session instead of a count.
+fn piv_header_pin(st: &keyroost_transport::PivStatus) -> String {
+    match st.pin_retries {
+        Some(n) => format!("PIN retries {n}"),
+        None if st.pin_verified => "PIN verified".to_string(),
+        None => "PIN retries \u{2014}".to_string(),
+    }
 }
 
 /// The red note for a Move destination the card reports holds a key:
@@ -23141,9 +23150,7 @@ impl App {
                     let serial = st
                         .serial
                         .map_or("\u{2014}".to_string(), keyroost_piv::format_serial_short);
-                    let retries = st
-                        .pin_retries
-                        .map_or("\u{2014}".to_string(), |n| n.to_string());
+                    let pin_field = piv_header_pin(st);
                     // The token's own reported name when it has one (e.g. a
                     // Nitrokey's admin application); otherwise the generic name
                     // for its fingerprinted applet family — same fallback as
@@ -23155,7 +23162,7 @@ impl App {
                     };
                     ui.label(
                         egui::RichText::new(format!(
-                            "{applet_name} \u{00B7} {applet_field} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
+                            "{applet_name} \u{00B7} {applet_field} \u{00B7} Serial {serial} \u{00B7} {pin_field}"
                         ))
                         .font(theme::f_reg(12.5))
                         .color(p.txt2),
@@ -29783,6 +29790,19 @@ mod tests {
             piv_import_not_written("The card said no."),
             "The card said no. Nothing was written."
         );
+    }
+
+    /// After a PIN-using operation the card reports "verified" instead of a
+    /// count; the header says so rather than showing a dash.
+    #[test]
+    fn piv_header_says_pin_verified_instead_of_a_dash() {
+        let mut st = keyroost_transport::PivStatus::default();
+        assert_eq!(piv_header_pin(&st), "PIN retries \u{2014}");
+        st.pin_retries = Some(3);
+        assert_eq!(piv_header_pin(&st), "PIN retries 3");
+        st.pin_retries = None;
+        st.pin_verified = true;
+        assert_eq!(piv_header_pin(&st), "PIN verified");
     }
 
     /// A Token2 is never sent a touch policy on import, even at a version

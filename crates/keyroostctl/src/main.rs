@@ -9777,6 +9777,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     match status.pin_retries {
                         Some(0) => println!("PIN retries: 0 (blocked)"),
                         Some(n) => println!("PIN retries: {}", n),
+                        // `piv info` never verifies the PIN and opens its
+                        // own session, so this shows only if the card kept
+                        // a verification from elsewhere; still say so.
+                        None if status.pin_verified => println!("PIN retries: (PIN verified)"),
                         None => println!("PIN retries: (unavailable)"),
                     }
                     match &status.chuid {

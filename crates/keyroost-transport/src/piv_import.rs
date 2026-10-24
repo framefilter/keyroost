@@ -51,6 +51,16 @@ pub enum ImportRefusal {
         asked: usize,
         available: usize,
     },
+    /// The device takes no key of any type ([`import_blocked`]).
+    ImportNotSupported,
+    /// The device's version is too old to import (keys of type `alg`, or any
+    /// key when `None`); `floor` is the version keyroost's list says it
+    /// works from ([`compat::supported_from`]).
+    NeedsNewerVersion {
+        alg: Option<KeyAlg>,
+        fingerprint: AppletFingerprint,
+        floor: compat::VersionFloor,
+    },
     KeyTypeNotSupported(KeyAlg),
     SlotNotSupported(Slot),
     /// The device only takes RSA keys with public exponent 65537.
@@ -86,6 +96,27 @@ impl fmt::Display for ImportRefusal {
             }
             Self::EntryOutOfRange { asked, available } => {
                 write!(f, "Key {asked} isn't in the file, which has {available}.")
+            }
+            Self::ImportNotSupported => f.write_str("This device can't import keys."),
+            Self::NeedsNewerVersion {
+                alg,
+                fingerprint,
+                floor,
+            } => {
+                f.write_str("Importing ")?;
+                if let Some(alg) = alg {
+                    write!(f, "{} ", alg.label())?;
+                }
+                let what = match floor.axis {
+                    compat::VersionAxis::Firmware => "firmware",
+                    compat::VersionAxis::Applet => "PIV applet",
+                };
+                write!(
+                    f,
+                    "keys needs {} {what} {} or later.",
+                    fingerprint.applet_name(),
+                    keyroost_piv::format_version_bytes(floor.version)
+                )
             }
             Self::KeyTypeNotSupported(alg) => {
                 write!(f, "This device can't import {} keys.", alg.label())
@@ -139,14 +170,10 @@ pub fn certificate_name(der: &[u8]) -> String {
     }
 }
 
-/// The largest .p12/.pfx file [`read_key_file`] reads. A real one holds a
-/// key and a few certificates: kilobytes, not megabytes.
-pub const MAX_KEY_FILE_BYTES: usize = 1024 * 1024;
-
 /// Why [`read_key_file`] returned no bytes.
 #[derive(Debug)]
 pub enum KeyFileError {
-    /// The file is over [`MAX_KEY_FILE_BYTES`].
+    /// The file is over [`keyroost_p12::MAX_FILE_BYTES`].
     TooLarge,
     /// The file couldn't be read.
     Io(std::io::Error),
@@ -155,9 +182,7 @@ pub enum KeyFileError {
 impl fmt::Display for KeyFileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooLarge => {
-                f.write_str("This file is larger than a .p12/.pfx key file should be (over 1 MiB).")
-            }
+            Self::TooLarge => f.write_str(&too_large_message()),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -165,8 +190,17 @@ impl fmt::Display for KeyFileError {
 
 impl std::error::Error for KeyFileError {}
 
+/// A file over [`keyroost_p12::MAX_FILE_BYTES`], in the words the CLI and the
+/// app use whether [`read_key_file`] or [`keyroost_p12::open`] refused it.
+fn too_large_message() -> String {
+    format!(
+        "This file is larger than a .p12/.pfx key file should be (over {}).",
+        keyroost_p12::max_file_size()
+    )
+}
+
 /// Read a .p12/.pfx file for [`keyroost_p12::open`], the same in the CLI and
-/// the app: at most [`MAX_KEY_FILE_BYTES`], into a buffer that is wiped when
+/// the app: at most [`keyroost_p12::MAX_FILE_BYTES`] (the most `open` takes), into a buffer that is wiped when
 /// dropped (the file holds an encrypted private key).
 ///
 /// # Errors
@@ -174,7 +208,7 @@ impl std::error::Error for KeyFileError {}
 /// [`KeyFileError::Io`].
 pub fn read_key_file(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, KeyFileError> {
     let file = std::fs::File::open(path).map_err(KeyFileError::Io)?;
-    read_key_file_from(file, MAX_KEY_FILE_BYTES)
+    read_key_file_from(file, keyroost_p12::MAX_FILE_BYTES)
 }
 
 /// [`read_key_file`] on any reader, with the limit given.
@@ -204,6 +238,7 @@ pub fn file_error_message(e: keyroost_p12::P12Error) -> String {
     match e {
         P12Error::WrongPassword => "Wrong password for this file.".to_string(),
         P12Error::NoKey => "The file has no private key to import.".to_string(),
+        P12Error::TooLarge => too_large_message(),
         P12Error::Malformed(what) => {
             format!("This isn't a .p12/.pfx file keyroost can read ({what}).")
         }
@@ -288,10 +323,60 @@ pub fn choose_entry(contents: &Contents, choice: Option<usize>) -> Result<&Entry
     }
 }
 
+/// Why this applet can't import a key of any type, before a file is picked:
+/// [`ImportRefusal::NeedsNewerVersion`] when keyroost's list names a version
+/// that would lift the refusal (the lowest one, for whichever key type it
+/// comes first), else [`ImportRefusal::ImportNotSupported`]. `None` when some
+/// key type may import. [`plan_import`] runs this first, so the CLI and the
+/// app say the same thing.
+#[must_use]
+pub fn import_blocked(
+    fp: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> Option<ImportRefusal> {
+    let gate = |alg| {
+        compat::resolve(
+            PivExtension::ImportKey(alg),
+            fp,
+            applet_version,
+            firmware_version,
+        )
+    };
+    if !KeyAlg::ALL
+        .into_iter()
+        .all(|alg| gate(alg) == FeatureGate::Unsupported)
+    {
+        return None;
+    }
+    let floors: Vec<compat::VersionFloor> = KeyAlg::ALL
+        .into_iter()
+        .filter_map(|alg| {
+            compat::supported_from(
+                PivExtension::ImportKey(alg),
+                fp,
+                applet_version,
+                firmware_version,
+            )
+        })
+        .collect();
+    // Floors on different axes don't compare; say only that it can't.
+    let one_axis = floors.windows(2).all(|w| w[0].axis == w[1].axis);
+    let lowest = floors.iter().min_by_key(|f| f.version).filter(|_| one_axis);
+    Some(lowest.map_or(ImportRefusal::ImportNotSupported, |&floor| {
+        ImportRefusal::NeedsNewerVersion {
+            alg: None,
+            fingerprint: fp,
+            floor,
+        }
+    }))
+}
+
 /// Check a parsed PKCS#12 file against the target applet and slot.
 ///
 /// `choice` is 1-based (as typed, or a dropdown index plus one). Checks run in
-/// this order so the most useful message wins: entry choice, key type, slot,
+/// this order so the most useful message wins: a device that imports nothing
+/// ([`import_blocked`]), entry choice, key type, slot,
 /// RSA exponent, then policies (the extension, then a value the firmware is
 /// known to refuse). A non-default PIN or touch policy is refused
 /// where the applet is known not to take it; where support is merely unverified
@@ -308,12 +393,29 @@ pub fn plan_import<'a>(
     pin_policy: PinPolicy,
     touch_policy: TouchPolicy,
 ) -> Result<ImportPlan<'a>, ImportRefusal> {
+    if let Some(refusal) = import_blocked(fp, applet_version, firmware_version) {
+        return Err(refusal);
+    }
     let entry = choose_entry(contents, choice)?;
 
     let alg = entry.key.alg();
     let gate = |ext| compat::resolve(ext, fp, applet_version, firmware_version);
     if gate(PivExtension::ImportKey(alg)) == FeatureGate::Unsupported {
-        return Err(ImportRefusal::KeyTypeNotSupported(alg));
+        let floor = compat::supported_from(
+            PivExtension::ImportKey(alg),
+            fp,
+            applet_version,
+            firmware_version,
+        );
+        return Err(
+            floor.map_or(ImportRefusal::KeyTypeNotSupported(alg), |floor| {
+                ImportRefusal::NeedsNewerVersion {
+                    alg: Some(alg),
+                    fingerprint: fp,
+                    floor,
+                }
+            }),
+        );
     }
     if !compat::import_slot_allowed(fp, slot) {
         return Err(ImportRefusal::SlotNotSupported(slot));
@@ -947,6 +1049,89 @@ mod tests {
         assert_eq!(entry_labels(&c)[1], "entry 2 (ECC P-256; no certificate)");
     }
 
+    /// Below firmware 1.8 a Nitrokey has no import command: the refusal names
+    /// the firmware that has one, before any entry choice, and is the same
+    /// text the app shows before a file is picked.
+    #[test]
+    fn nitrokey_below_1_8_is_told_the_firmware_it_needs() {
+        let old_fw: Option<&[u8]> = Some(&[1, 7, 2]);
+        let blocked = import_blocked(NK, None, old_fw).expect("refused");
+        assert_eq!(
+            blocked,
+            ImportRefusal::NeedsNewerVersion {
+                alg: None,
+                fingerprint: NK,
+                floor: compat::VersionFloor {
+                    axis: compat::VersionAxis::Firmware,
+                    version: &[1, 8],
+                },
+            }
+        );
+        assert_eq!(
+            blocked.to_string(),
+            "Importing keys needs NitroKey firmware 1.8 or later."
+        );
+        for (file, slot) in [
+            ("rsa2048-modern", Slot::Authentication),
+            ("two-entries", Slot::Authentication),
+            ("p256-modern", Slot::Signature),
+        ] {
+            let c = load(file);
+            let got = plan_import(
+                &c,
+                None,
+                slot,
+                NK,
+                None,
+                old_fw,
+                PinPolicy::Default,
+                TouchPolicy::Default,
+            )
+            .unwrap_err();
+            assert_eq!(got, blocked, "{file}");
+        }
+        assert_eq!(import_blocked(NK, None, Some(&[1, 8])), None);
+        assert_eq!(import_blocked(NK, None, NK_FW), None);
+    }
+
+    #[test]
+    fn needs_newer_version_names_the_key_type_and_axis() {
+        let r = ImportRefusal::NeedsNewerVersion {
+            alg: Some(KeyAlg::Rsa3072),
+            fingerprint: NK,
+            floor: compat::VersionFloor {
+                axis: compat::VersionAxis::Firmware,
+                version: &[1, 8, 2],
+            },
+        };
+        assert_eq!(
+            r.to_string(),
+            format!(
+                "Importing {} keys needs NitroKey firmware 1.8.2 or later.",
+                KeyAlg::Rsa3072.label()
+            )
+        );
+        let r = ImportRefusal::NeedsNewerVersion {
+            alg: None,
+            fingerprint: AppletFingerprint::YubiKey,
+            floor: compat::VersionFloor {
+                axis: compat::VersionAxis::Applet,
+                version: &[5, 7],
+            },
+        };
+        assert_eq!(
+            r.to_string(),
+            format!(
+                "Importing keys needs {} PIV applet 5.7 or later.",
+                AppletFingerprint::YubiKey.applet_name()
+            )
+        );
+        assert_eq!(
+            ImportRefusal::ImportNotSupported.to_string(),
+            "This device can't import keys."
+        );
+    }
+
     #[test]
     fn choose_entry_is_the_plans_choice() {
         let c = load("two-entries");
@@ -1446,8 +1631,14 @@ mod run_tests {
             e.to_string(),
             "This file is larger than a .p12/.pfx key file should be (over 1 MiB)."
         );
+        // `open`'s own refusal, for a caller that skipped `read_key_file`,
+        // reads the same.
+        assert_eq!(
+            file_error_message(keyroost_p12::P12Error::TooLarge),
+            e.to_string()
+        );
         // An endless reader stops one byte past the limit.
-        let e = read_key_file_from(std::io::repeat(1), MAX_KEY_FILE_BYTES).unwrap_err();
+        let e = read_key_file_from(std::io::repeat(1), keyroost_p12::MAX_FILE_BYTES).unwrap_err();
         assert!(matches!(e, KeyFileError::TooLarge));
     }
 
