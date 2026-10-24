@@ -453,7 +453,7 @@ fn safe_bag(
 
 /// UTF-16BE bytes to a string; `None` when they are not valid UTF-16.
 fn bmp_to_string(bytes: &[u8]) -> Option<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let units: Vec<u16> = bytes

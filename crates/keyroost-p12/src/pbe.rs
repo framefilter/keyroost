@@ -320,7 +320,7 @@ fn finish<D>(dec: D, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, P12Error>
 where
     D: BlockDecryptMut,
 {
-    if ciphertext.is_empty() || ciphertext.len() % D::BlockSize::USIZE != 0 {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(D::BlockSize::USIZE) {
         return Err(bad("ciphertext is not a whole number of blocks"));
     }
     let mut buf = Zeroizing::new(ciphertext.to_vec());
