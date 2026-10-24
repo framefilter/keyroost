@@ -16,6 +16,15 @@ pub(crate) struct Tlv<'a> {
     pub value: Cow<'a, [u8]>,
 }
 
+impl Drop for Tlv<'_> {
+    /// A flattened (owned) value can hold decrypted material; clear it.
+    fn drop(&mut self) {
+        if let Cow::Owned(v) = &mut self.value {
+            zeroize::Zeroize::zeroize(v);
+        }
+    }
+}
+
 /// Read one element from the front of `input`; returns it and the rest.
 ///
 /// Nesting is bounded to 32 levels of indefinite-length and constructed

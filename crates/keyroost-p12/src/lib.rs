@@ -5,14 +5,12 @@
 
 #![forbid(unsafe_code)]
 
-// Consumed by the PFX walk in later tasks.
-#[allow(dead_code)]
 mod ber;
-// Used by the PFX walk.
-#[allow(dead_code)]
 mod kdf;
-#[allow(dead_code)]
 mod pbe;
+// Not called until the public `open()` lands; the allow goes with it.
+#[allow(dead_code)]
+mod pfx;
 
 use core::fmt;
 
