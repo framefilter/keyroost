@@ -46,6 +46,7 @@ pub use openpgp::{ImportKey, KeyImport, OpenPgpSession, OpenPgpStatus};
 mod gzip;
 
 mod piv;
+pub mod piv_import;
 pub use piv::{
     random_chuid_guid, random_management_key, CertCompression, CertImport, CertUnreadable,
     CurrentMgmtAuth, FactoryResetOutcome, FactoryResetPlan, PinProtectMaintenance, PivResetPreview,

@@ -15,6 +15,7 @@ keyroost-proto = { path = "../keyroost-proto", version = "0.14.0" }
 keyroost-oath = { path = "../keyroost-oath", version = "0.14.0" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.14.0" }
 keyroost-piv = { path = "../keyroost-piv", version = "0.14.0" }
+keyroost-p12 = { path = "../keyroost-p12", version = "0.14.0" }
 keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.14.0" }
 keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.14.0" }
 keyroost-hid = { path = "../keyroost-hid", version = "0.14.0" }
