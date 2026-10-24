@@ -104,7 +104,7 @@ pub fn encrypt_seed_payload(
         .ok_or(EncryptError::BadDevicePubkey)?;
 
     // Fresh ephemeral host keypair (spec §7: per-command).
-    let host_secret = SecretKey::generate();
+    let host_secret = SecretKey::from(p256::NonZeroScalar::generate());
     let host_pub = host_secret.public_key();
 
     // shared X coordinate -> SHA-256 -> 32-byte AES-256 key.
@@ -165,7 +165,7 @@ mod tests {
     fn blob_shape_and_block_alignment() {
         // Stand in for the device with a known keypair so we can validate shape
         // and that the ciphertext is a whole number of AES blocks.
-        let device_secret = SecretKey::generate();
+        let device_secret = SecretKey::from(p256::NonZeroScalar::generate());
         let device_xy = {
             let pt = device_secret.public_key().to_sec1_point(false);
             pt.as_bytes()[1..].to_vec()
@@ -185,7 +185,7 @@ mod tests {
         use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
         type Dec = cbc::Decryptor<aes::Aes256>;
 
-        let device_secret = SecretKey::generate();
+        let device_secret = SecretKey::from(p256::NonZeroScalar::generate());
         let device_pub = device_secret.public_key();
         let device_xy = {
             let pt = device_pub.to_sec1_point(false);
@@ -289,7 +289,7 @@ pub struct HostAgreement {
 impl HostAgreement {
     /// Generate a fresh ephemeral P-256 keypair for one session.
     pub fn new() -> Self {
-        let secret = SecretKey::generate();
+        let secret = SecretKey::from(p256::NonZeroScalar::generate());
         let point = secret.public_key().to_sec1_point(false);
         let mut public_xy = [0u8; 64];
         public_xy.copy_from_slice(&point.as_bytes()[1..]);

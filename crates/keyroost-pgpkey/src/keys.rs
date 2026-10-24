@@ -312,10 +312,10 @@ fn ec_random(curve: Curve) -> Result<Zeroizing<Vec<u8>>> {
     Ok(match curve {
         // The curve crates are on a newer rand_core than `OsRng` here, so
         // they draw from the OS RNG themselves (their `getrandom` feature).
-        Curve::NistP256 => take(p256::SecretKey::generate().to_bytes()),
-        Curve::NistP384 => take(p384::SecretKey::generate().to_bytes()),
-        Curve::Secp256k1 => take(k256::SecretKey::generate().to_bytes()),
-        Curve::NistP521 => take(p521::SecretKey::generate().to_bytes()),
+        Curve::NistP256 => take(p256::SecretKey::from(p256::NonZeroScalar::generate()).to_bytes()),
+        Curve::NistP384 => take(p384::SecretKey::from(p384::NonZeroScalar::generate()).to_bytes()),
+        Curve::Secp256k1 => take(k256::SecretKey::from(k256::NonZeroScalar::generate()).to_bytes()),
+        Curve::NistP521 => take(p521::SecretKey::from(p521::NonZeroScalar::generate()).to_bytes()),
         _ => return Err(Error::Unsupported("curve")),
     })
 }
