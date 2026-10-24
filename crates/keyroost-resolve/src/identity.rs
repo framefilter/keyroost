@@ -357,16 +357,49 @@ pub fn read_identities(
     read_identities_with(&mut HidIdCache::new(), plan, hids, probes, registry, debug)
 }
 
-/// Each HID identity answer, by plug-in: the interface's path, USB position
-/// and IDs, and the identity reader's index in the registry. A replug gets
-/// a new path (or position) and is asked again. `None` is "the key answered
+/// One HID interface's plug-in, as far as the backend tells it apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlugIn {
+    path: PathBuf,
+    usb_device: Option<UsbDeviceKey>,
+    serial_number: Option<String>,
+    vendor_id: u16,
+    product_id: u16,
+}
+
+impl PlugIn {
+    fn of(h: &HidDevice) -> Self {
+        Self {
+            path: h.path.clone(),
+            usb_device: h.usb_device.clone(),
+            serial_number: h.serial_number.clone(),
+            vendor_id: h.vendor_id,
+            product_id: h.product_id,
+        }
+    }
+}
+
+/// Whether `h`'s [`PlugIn`] names one plug-in of one key, so a remembered
+/// identity can't belong to another key: a Linux bus address or a macOS
+/// registry path (`DevSrvsID:…`), both new on every attach. A Windows
+/// device node and HID path follow the USB port when the key has no
+/// iSerial, so two identical keys swapping ports would swap identities.
+fn unique_per_plug_in(h: &HidDevice) -> bool {
+    match &h.usb_device {
+        Some(UsbDeviceKey::BusAddr(..)) => true,
+        Some(_) => false,
+        None => h.path.to_string_lossy().starts_with("DevSrvsID:"),
+    }
+}
+
+/// Each HID identity answer, by plug-in and the identity reader's index in
+/// the registry. A replug is asked again. `None` is "the key answered
 /// without an identity" (e.g. a YubiKey NEO refusing READ CONFIG with
-/// `ERR_INVALID_CMD`). Only the key's own answers are kept, never a failure
-/// to reach it, so a key that was briefly busy is asked again next scan.
-type HidIdCache = Vec<(
-    (PathBuf, Option<UsbDeviceKey>, u16, u16, usize),
-    Option<CanonicalId>,
-)>;
+/// `ERR_INVALID_CMD`), kept for any plug-in: the worst a mix-up can do is
+/// leave a key unmatched. An identity is kept only where
+/// [`unique_per_plug_in`]. Only the key's own answers are kept, never a
+/// failure to reach it, so a key that was briefly busy is asked again.
+type HidIdCache = Vec<((PlugIn, usize), Option<CanonicalId>)>;
 static HID_ID_CACHE: std::sync::Mutex<HidIdCache> = std::sync::Mutex::new(Vec::new());
 
 /// [`read_identities`], asking each HID interface at most once per plug-in
@@ -378,10 +411,10 @@ pub(crate) fn read_identities_once(
     registry: &[&dyn IdentityReader],
     debug: bool,
 ) -> Identities {
-    match HID_ID_CACHE.lock() {
-        Ok(mut cache) => read_identities_with(&mut cache, plan, hids, probes, registry, debug),
-        Err(_) => read_identities(plan, hids, probes, registry, debug),
-    }
+    let mut cache = HID_ID_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    read_identities_with(&mut cache, plan, hids, probes, registry, debug)
 }
 
 fn read_identities_with(
@@ -441,27 +474,22 @@ fn read_identities_with(
 
 /// The planned HID identities: from `cache` where this plug-in was already
 /// answered, from `ask(registry index, interface)` otherwise. A cache hit
-/// sends nothing. Entries for interfaces no longer present are dropped.
+/// sends nothing. Entries for plug-ins no longer present are dropped.
 fn hid_identities_from(
     cache: &mut HidIdCache,
     plan: &IdentityPlan,
     hids: &[HidDevice],
     mut ask: impl FnMut(usize, &HidDevice) -> KeyAnswer<CanonicalId>,
 ) -> HashMap<PathBuf, CanonicalId> {
-    // Forget interfaces that are gone, so the cache can't grow without end.
-    cache.retain(|(k, _)| hids.iter().any(|h| h.path == k.0));
+    // Forget plug-ins that are gone, so the cache can't grow without end.
+    let present: Vec<PlugIn> = hids.iter().map(PlugIn::of).collect();
+    cache.retain(|((p, _), _)| present.contains(p));
     let mut out = HashMap::new();
     for (v, path) in &plan.hid {
         let Some(h) = hids.iter().find(|h| &h.path == path) else {
             continue;
         };
-        let key = (
-            h.path.clone(),
-            h.usb_device.clone(),
-            h.vendor_id,
-            h.product_id,
-            *v,
-        );
+        let key = (PlugIn::of(h), *v);
         let id = match cache.iter().find(|(k, _)| *k == key) {
             Some((_, id)) => id.clone(),
             None => {
@@ -470,7 +498,9 @@ fn hid_identities_from(
                     KeyAnswer::Declined => None,
                     KeyAnswer::NoAnswer => continue,
                 };
-                cache.push((key, id.clone()));
+                if id.is_none() || unique_per_plug_in(h) {
+                    cache.push((key, id.clone()));
+                }
                 id
             }
         };
@@ -831,12 +861,19 @@ mod tests {
         }
     }
 
+    const MAC_PATH: &str = "DevSrvsID:4294970001";
+
     /// Each HID interface is asked once per plug-in and identity reader:
-    /// the next scan of the same plug-in uses the earlier answer.
+    /// the next scan of the same plug-in uses the earlier answer. Holds
+    /// where a plug-in can't be mistaken for another key's: a macOS
+    /// registry path, or a Linux bus address.
     #[test]
     fn hid_identity_is_asked_once_per_plug_in() {
-        let hids = [hid(0x1050, 0x0116, "/dev/a", None, None, None)];
-        let plan = hid_plan(&[(0, "/dev/a"), (1, "/dev/a")]);
+        let hids = [
+            hid(0x1050, 0x0116, MAC_PATH, None, None, None),
+            hid(0x1050, 0x0407, "/dev/hidraw3", None, Some(1), Some(7)),
+        ];
+        let plan = hid_plan(&[(0, MAC_PATH), (1, MAC_PATH), (0, "/dev/hidraw3")]);
         let mut cache = HidIdCache::new();
         let mut asked = Vec::new();
         let ids = hid_identities_from(&mut cache, &plan, &hids, |v, h| {
@@ -848,12 +885,70 @@ mod tests {
         });
         assert_eq!(
             asked,
-            vec![(0, "/dev/a".into()), (1, "/dev/a".into())],
+            vec![
+                (0, MAC_PATH.into()),
+                (1, MAC_PATH.into()),
+                (0, "/dev/hidraw3".into())
+            ],
             "each reader asks"
         );
         let again = hid_identities_from(&mut cache, &plan, &hids, |_, _| panic!("asked twice"));
         assert_eq!(again, ids);
-        assert_eq!(again[&PathBuf::from("/dev/a")].value, "5");
+        assert_eq!(again[&PathBuf::from(MAC_PATH)].value, "5");
+        assert_eq!(again[&PathBuf::from("/dev/hidraw3")].value, "5");
+    }
+
+    /// On Windows a key without an iSerial has a port-based device node and
+    /// path, so two identical keys swapping ports would swap identities: an
+    /// identity is asked for again on every scan. "No identity" is still
+    /// kept, since a mix-up there only leaves a key unmatched. A path with no
+    /// USB position that isn't a macOS registry path is treated the same.
+    #[test]
+    fn a_port_based_plug_in_asks_for_its_identity_again() {
+        let mut win = hid(
+            0x1050,
+            0x0407,
+            r"\\?\HID#VID_1050&PID_0407&MI_01#7&1A2B3C4D&0&0000#{4d1e55b2}",
+            None,
+            None,
+            None,
+        );
+        win.usb_device = Some(UsbDeviceKey::win_node(r"USB\VID_1050&PID_0407\5&ABC&0&3"));
+        let no_position = hid(0x1050, 0x0407, "/dev/hidraw9", None, None, None);
+        for h in [win, no_position] {
+            let hids = [h.clone()];
+            let plan = hid_plan(&[(0, h.path.to_str().unwrap()), (1, h.path.to_str().unwrap())]);
+            let mut cache = HidIdCache::new();
+            let mut asked = Vec::new();
+            for _ in 0..2 {
+                hid_identities_from(&mut cache, &plan, &hids, |v, _| {
+                    asked.push(v);
+                    match v {
+                        0 => KeyAnswer::Reply(yubico_from_serial_str("5").unwrap()),
+                        _ => KeyAnswer::Declined,
+                    }
+                });
+            }
+            assert_eq!(asked, vec![0, 1, 0], "{}", h.path.display());
+        }
+    }
+
+    /// The key's own serial is part of its plug-in: a different key showing
+    /// up under the same path and position is asked.
+    #[test]
+    fn a_different_serial_on_the_same_path_is_asked() {
+        let one = [hid(0x1050, 0x0407, MAC_PATH, Some("A1"), None, None)];
+        let other = [hid(0x1050, 0x0407, MAC_PATH, Some("B2"), None, None)];
+        let plan = hid_plan(&[(0, MAC_PATH)]);
+        let mut cache = HidIdCache::new();
+        hid_identities_from(&mut cache, &plan, &one, |_, _| KeyAnswer::Declined);
+        let mut asked = 0;
+        hid_identities_from(&mut cache, &plan, &other, |_, _| {
+            asked += 1;
+            KeyAnswer::Declined
+        });
+        assert_eq!(asked, 1);
+        assert_eq!(cache.len(), 1, "the first key's entry is gone");
     }
 
     /// A key that answered without an identity (a YubiKey NEO answers READ
@@ -887,7 +982,20 @@ mod tests {
         });
         assert_eq!(asked, vec![PathBuf::from("/dev/b")]);
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache[0].0 .0, PathBuf::from("/dev/b"));
+        assert_eq!(cache[0].0 .0.path, PathBuf::from("/dev/b"));
+        // Same path, new bus address (Linux reusing a hidraw number): the
+        // old plug-in is dropped, not just kept because its path is present.
+        let readdressed = [hid(0x1050, 0x0116, "/dev/b", None, Some(1), Some(9))];
+        hid_identities_from(
+            &mut cache,
+            &IdentityPlan::default(),
+            &readdressed,
+            |_, _| panic!("asked"),
+        );
+        assert!(cache.is_empty());
+        hid_identities_from(&mut cache, &hid_plan(&[(0, "/dev/b")]), &after, |_, _| {
+            KeyAnswer::Declined
+        });
         // Unplugged with nothing in its place: nothing is kept.
         hid_identities_from(&mut cache, &IdentityPlan::default(), &[], |_, _| {
             panic!("asked")

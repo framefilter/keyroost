@@ -27,6 +27,7 @@ use keyroost_token2otp::entry::{serialize_enum_all, ParseError};
 use keyroost_token2otp::hidframe::{self, ResponseAssembler, Step};
 use keyroost_token2otp::{cmd, EncryptError, Entry, OtpError, OtpType, WriteEntry};
 
+use crate::identity::KeyAnswer;
 use keyroost_proto::trace::{format_line, Dir};
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::fs::{File, OpenOptions};
@@ -482,23 +483,37 @@ impl HidOtpTransport {
 
 /// The §6.10 GET_INFO serial reply over USB-HID, raw (`D1 len …`), for
 /// identity matching (#51). Read-only, short timeout. A status word other
-/// than `9000` is the key declining; any transport failure is no answer.
-pub fn token2_serial_reply_hid(path: &Path, debug: bool) -> crate::identity::KeyAnswer<Vec<u8>> {
-    use crate::identity::KeyAnswer;
+/// than `9000` is the key declining; a transport failure is no answer,
+/// unless the key already declined command `0x41` (see [`after_probe`]).
+pub fn token2_serial_reply_hid(path: &Path, debug: bool) -> KeyAnswer<Vec<u8>> {
     let answer = |r: Result<(Vec<u8>, u16), OtpTransportError>| match r {
         Ok((data, 0x9000)) => KeyAnswer::Reply(data),
         Ok(_) => KeyAnswer::Declined,
         Err(_) => KeyAnswer::NoAnswer,
     };
-    if let Some(mut t) = CtapOtpTransport::open_probed(path, debug) {
-        return answer(t.transmit(&t2::read_serial_request(), false));
-    }
-    let Ok(mut t) = HidOtpTransport::open_path(path) else {
-        return KeyAnswer::NoAnswer;
+    let probe_declined = match CtapOtpTransport::probe(path, debug) {
+        Ok(mut t) => return answer(t.transmit(&t2::read_serial_request(), false)),
+        Err(declined) => declined,
     };
-    t.set_debug(debug);
-    t.timeout = Duration::from_millis(1500);
-    answer(t.transmit(&t2::read_serial_request(), false))
+    let fallback = match HidOtpTransport::open_path(path) {
+        Ok(mut t) => {
+            t.set_debug(debug);
+            t.timeout = Duration::from_millis(1500);
+            answer(t.transmit(&t2::read_serial_request(), false))
+        }
+        Err(_) => KeyAnswer::NoAnswer,
+    };
+    after_probe(probe_declined, fallback)
+}
+
+/// The report-frame fallback's answer, after a `0x41` probe the key itself
+/// declined when `probe_declined`: that "no" over CTAPHID is still the
+/// key's answer when the fallback gets none.
+fn after_probe(probe_declined: bool, fallback: KeyAnswer<Vec<u8>>) -> KeyAnswer<Vec<u8>> {
+    match fallback {
+        KeyAnswer::NoAnswer if probe_declined => KeyAnswer::Declined,
+        a => a,
+    }
 }
 
 impl OtpTransport for HidOtpTransport {
@@ -638,6 +653,13 @@ impl CtapOtpTransport {
     /// doesn't (a key without the command answers a CTAPHID error), so the
     /// caller falls back to [`HidOtpTransport`].
     pub(crate) fn open_probed(path: &Path, debug: bool) -> Option<Self> {
+        Self::probe(path, debug).ok()
+    }
+
+    /// [`Self::open_probed`], saying why not: `Err(true)` when the key itself
+    /// declined the probe (a CTAPHID error it returned, or a refusing status
+    /// word), `Err(false)` when it couldn't be reached.
+    fn probe(path: &Path, debug: bool) -> Result<Self, bool> {
         let note = |what: String| {
             crate::trace::line(debug, || {
                 format_line(Dir::Note, &otp_label("CTAPHID"), &what)
@@ -647,7 +669,7 @@ impl CtapOtpTransport {
             Ok(d) => d,
             Err(e) => {
                 note(format!("open failed: {e}"));
-                return None;
+                return Err(false);
             }
         };
         let prompt = std::sync::Arc::new(CtapPrompt::default());
@@ -679,20 +701,28 @@ impl CtapOtpTransport {
         }));
         let mut t = Self { dev, prompt };
         t.dev.set_timeout(CTAP_PROBE_TIMEOUT);
-        match t.transmit(&t2::get_ecdh_pubkey(), false) {
-            Ok((_, 0x9000)) => {
-                t.dev.set_timeout(Duration::from_secs(20));
-                Some(t)
-            }
-            Ok((_, sw)) => {
-                note(format!("probe answered sw={sw:#06x}; trying report frames"));
-                None
-            }
+        let probe = t2::get_ecdh_pubkey();
+        let declined = match t.send(&probe, false) {
+            Ok(resp) => match t.finish(&probe, resp) {
+                Ok((_, 0x9000)) => {
+                    t.dev.set_timeout(Duration::from_secs(20));
+                    return Ok(t);
+                }
+                Ok((_, sw)) => {
+                    note(format!("probe answered sw={sw:#06x}; trying report frames"));
+                    true
+                }
+                Err(e) => {
+                    note(format!("probe failed: {e}; trying report frames"));
+                    true
+                }
+            },
             Err(e) => {
                 note(format!("probe failed: {e}; trying report frames"));
-                None
+                crate::identity::ctaphid_error_answer::<()>(&e) == KeyAnswer::Declined
             }
-        }
+        };
+        Err(declined)
     }
 }
 
@@ -706,12 +736,14 @@ fn split_ctap_reply(mut resp: Vec<u8>) -> Result<(Vec<u8>, u16), OtpTransportErr
     Ok((resp, sw))
 }
 
-impl OtpTransport for CtapOtpTransport {
-    fn transmit(
+impl CtapOtpTransport {
+    /// Send `apdu` as command `0x41`; a CTAPHID error comes back as the key
+    /// returned it.
+    fn send(
         &mut self,
         apdu: &[u8],
         detect_button_wait: bool,
-    ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+    ) -> Result<Vec<u8>, keyroost_ctap::hid::HidTransportError> {
         let debug = self.prompt.debug.load(Ordering::Relaxed);
         trace_bytes(
             debug,
@@ -728,7 +760,12 @@ impl OtpTransport for CtapOtpTransport {
             .store(detect_button_wait, Ordering::Relaxed);
         let resp = self.dev.transact(OTP_CTAPHID_CMD, apdu);
         self.prompt.armed.store(false, Ordering::Relaxed);
-        let resp = resp.map_err(|e| OtpTransportError::TransportUnavailable(e.to_string()))?;
+        resp
+    }
+
+    /// Split a [`Self::send`] reply into data and status word, and trace it.
+    fn finish(&self, apdu: &[u8], resp: Vec<u8>) -> Result<(Vec<u8>, u16), OtpTransportError> {
+        let debug = self.prompt.debug.load(Ordering::Relaxed);
         let (data, sw) = split_ctap_reply(resp)?;
         trace_bytes(
             debug,
@@ -739,6 +776,19 @@ impl OtpTransport for CtapOtpTransport {
             response_is_sensitive(apdu),
         );
         Ok((data, sw))
+    }
+}
+
+impl OtpTransport for CtapOtpTransport {
+    fn transmit(
+        &mut self,
+        apdu: &[u8],
+        detect_button_wait: bool,
+    ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+        let resp = self
+            .send(apdu, detect_button_wait)
+            .map_err(|e| OtpTransportError::TransportUnavailable(e.to_string()))?;
+        self.finish(apdu, resp)
     }
 
     fn set_button_prompt(&mut self, cb: ButtonPrompt) {
@@ -2236,6 +2286,21 @@ mod ctap_reply_tests {
             split_ctap_reply(vec![0x90]),
             Err(OtpTransportError::EmptyResponse)
         ));
+    }
+
+    /// A key that declined command `0x41` over CTAPHID has answered, even
+    /// when the report-frame fallback then gets nothing.
+    #[test]
+    fn a_declined_probe_is_the_answer_when_the_fallback_gets_none() {
+        use super::{after_probe, KeyAnswer};
+        assert_eq!(after_probe(true, KeyAnswer::NoAnswer), KeyAnswer::Declined);
+        assert_eq!(after_probe(false, KeyAnswer::NoAnswer), KeyAnswer::NoAnswer);
+        // What the fallback did get wins.
+        assert_eq!(
+            after_probe(true, KeyAnswer::Reply(vec![1])),
+            KeyAnswer::Reply(vec![1])
+        );
+        assert_eq!(after_probe(false, KeyAnswer::Declined), KeyAnswer::Declined);
     }
 }
 

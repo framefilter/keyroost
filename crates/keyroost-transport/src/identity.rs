@@ -45,14 +45,6 @@ pub enum KeyAnswer<T> {
 }
 
 impl<T> KeyAnswer<T> {
-    /// The reply, if the key gave one.
-    pub fn reply(self) -> Option<T> {
-        match self {
-            Self::Reply(t) => Some(t),
-            Self::Declined | Self::NoAnswer => None,
-        }
-    }
-
     /// Read a reply with `f`; a reply `f` can't use is the key answering
     /// without what was asked.
     pub fn and_then<U>(self, f: impl FnOnce(T) -> Option<U>) -> KeyAnswer<U> {
@@ -66,15 +58,21 @@ impl<T> KeyAnswer<T> {
 
 /// A failed CTAPHID exchange as a [`KeyAnswer`]: an error code the key
 /// returned is its answer, except the ones that only say "not now" (busy,
-/// locked to another channel, message timeout).
-fn ctaphid_error_answer<T>(e: &keyroost_ctap::hid::HidTransportError) -> KeyAnswer<T> {
+/// locked to another channel, message timeout) or point at another
+/// application's traffic interleaving with ours (invalid channel or
+/// sequence).
+pub(crate) fn ctaphid_error_answer<T>(e: &keyroost_ctap::hid::HidTransportError) -> KeyAnswer<T> {
     use keyroost_ctap::hid::{
-        HidTransportError, CTAPHID_ERR_CHANNEL_BUSY, CTAPHID_ERR_LOCK_REQUIRED,
-        CTAPHID_ERR_MSG_TIMEOUT,
+        HidTransportError, CTAPHID_ERR_CHANNEL_BUSY, CTAPHID_ERR_INVALID_CHANNEL,
+        CTAPHID_ERR_INVALID_SEQ, CTAPHID_ERR_LOCK_REQUIRED, CTAPHID_ERR_MSG_TIMEOUT,
     };
     match e {
         HidTransportError::DeviceError(
-            CTAPHID_ERR_CHANNEL_BUSY | CTAPHID_ERR_LOCK_REQUIRED | CTAPHID_ERR_MSG_TIMEOUT,
+            CTAPHID_ERR_CHANNEL_BUSY
+            | CTAPHID_ERR_LOCK_REQUIRED
+            | CTAPHID_ERR_MSG_TIMEOUT
+            | CTAPHID_ERR_INVALID_CHANNEL
+            | CTAPHID_ERR_INVALID_SEQ,
         ) => KeyAnswer::NoAnswer,
         HidTransportError::DeviceError(_) => KeyAnswer::Declined,
         _ => KeyAnswer::NoAnswer,
@@ -298,6 +296,8 @@ mod tests {
             CTAPHID_ERR_CHANNEL_BUSY,
             CTAPHID_ERR_LOCK_REQUIRED,
             CTAPHID_ERR_MSG_TIMEOUT,
+            CTAPHID_ERR_INVALID_CHANNEL,
+            CTAPHID_ERR_INVALID_SEQ,
         ] {
             assert_eq!(answer(E::DeviceError(busy)), KeyAnswer::NoAnswer);
         }
