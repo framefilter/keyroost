@@ -8,6 +8,11 @@
 // Consumed by the PFX walk in later tasks.
 #[allow(dead_code)]
 mod ber;
+// Used by the PFX walk.
+#[allow(dead_code)]
+mod kdf;
+#[allow(dead_code)]
+mod pbe;
 
 use core::fmt;
 

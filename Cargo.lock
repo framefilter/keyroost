@@ -2237,6 +2237,7 @@ dependencies = [
  "des",
  "ed25519-dalek",
  "hmac 0.12.1",
+ "keyroost-oath",
  "keyroost-piv",
  "keyroost-proto",
  "p256",
