@@ -33,6 +33,7 @@ use std::fs::{File, OpenOptions};
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::sync::mpsc;
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
@@ -482,6 +483,10 @@ impl HidOtpTransport {
 /// The §6.10 GET_INFO serial reply over USB-HID, raw (`D1 len …`), for
 /// identity matching (#51). Read-only, short timeout, `None` on any failure.
 pub fn token2_serial_reply_hid(path: &Path, debug: bool) -> Option<Vec<u8>> {
+    if let Some(mut t) = CtapOtpTransport::open_probed(path, debug) {
+        let (data, sw) = t.transmit(&t2::read_serial_request(), false).ok()?;
+        return (sw == 0x9000).then_some(data);
+    }
     let mut t = HidOtpTransport::open_path(path).ok()?;
     t.set_debug(debug);
     t.timeout = Duration::from_millis(1500);
@@ -582,6 +587,170 @@ impl OtpTransport for HidOtpTransport {
     fn set_debug(&mut self, on: bool) {
         self.debug = on;
     }
+}
+
+// ---------------------------------------------------------------------------
+// CTAPHID transport (vendor command 0x41)
+// ---------------------------------------------------------------------------
+
+/// The CTAPHID vendor command that carries one OTP applet APDU and its answer
+/// on the key's FIDO interface (`0x41`, sent with the init-frame bit). Token2
+/// documented it in issue #155: open the FIDO interface, CTAPHID INIT, then
+/// send the applet's APDUs raw, without a SELECT (the applet is pre-selected).
+/// The reply is the applet's `data || SW`, the same bytes the report-framed
+/// path reassembles.
+const OTP_CTAPHID_CMD: u8 = 0xC1;
+
+/// How long [`CtapOtpTransport::open_probed`] waits for the probe's answer.
+const CTAP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// USB-HID transport for the Token2 OTP applet over CTAPHID vendor command
+/// `0x41` ([`OTP_CTAPHID_CMD`]). Preferred over [`HidOtpTransport`]: on PIN+
+/// firmware 2.1.x the FIDO interface answers the report-framed request with a
+/// CTAPHID error frame, which that path misread as status word `0x0105`
+/// (#155), while `0x41` reaches the applet.
+pub struct CtapOtpTransport {
+    dev: keyroost_ctap::CtapHidDevice,
+    /// Shared with the device's keepalive hook, which runs inside `transact`.
+    prompt: std::sync::Arc<CtapPrompt>,
+}
+
+/// What the keepalive hook needs: whether the command in flight may wait for
+/// the button, the prompt to show once when the key says it is waiting, and
+/// whether to trace keepalives.
+#[derive(Default)]
+struct CtapPrompt {
+    armed: std::sync::atomic::AtomicBool,
+    debug: std::sync::atomic::AtomicBool,
+    button_prompt: std::sync::Mutex<Option<ButtonPrompt>>,
+}
+
+impl CtapOtpTransport {
+    /// Open `path` (a FIDO-usage HID interface) and confirm the applet answers
+    /// command `0x41` with the read-only `GET_ECDH_PUBKEY`. `None` when it
+    /// doesn't (a key without the command answers a CTAPHID error), so the
+    /// caller falls back to [`HidOtpTransport`].
+    pub fn open_probed(path: &Path, debug: bool) -> Option<Self> {
+        let note = |what: String| {
+            crate::trace::line(debug, || {
+                format_line(Dir::Note, &otp_label("CTAPHID"), &what)
+            })
+        };
+        let (mut dev, _init) = match keyroost_ctap::CtapHidDevice::open(path) {
+            Ok(d) => d,
+            Err(e) => {
+                note(format!("open failed: {e}"));
+                return None;
+            }
+        };
+        let prompt = std::sync::Arc::new(CtapPrompt::default());
+        prompt.debug.store(debug, Ordering::Relaxed);
+        let hook = prompt.clone();
+        dev.set_keepalive_hook(Box::new(move |status| {
+            let debug = hook.debug.load(Ordering::Relaxed);
+            crate::trace::line(debug, || {
+                format_line(
+                    Dir::Note,
+                    &otp_label("CTAPHID"),
+                    &format!("keepalive {status}"),
+                )
+            });
+            // Once per command, and only when the key says it is waiting.
+            if status == keyroost_ctap::hid::KEEPALIVE_STATUS_UPNEEDED
+                && hook.armed.swap(false, Ordering::Relaxed)
+            {
+                if let Some(cb) = hook
+                    .button_prompt
+                    .lock()
+                    .ok()
+                    .as_mut()
+                    .and_then(|p| p.as_mut())
+                {
+                    cb();
+                }
+            }
+        }));
+        let mut t = Self { dev, prompt };
+        t.dev.set_timeout(CTAP_PROBE_TIMEOUT);
+        match t.transmit(&t2::get_ecdh_pubkey(), false) {
+            Ok((_, 0x9000)) => {
+                t.dev.set_timeout(Duration::from_secs(20));
+                Some(t)
+            }
+            Ok((_, sw)) => {
+                note(format!("probe answered sw={sw:#06x}; trying report frames"));
+                None
+            }
+            Err(e) => {
+                note(format!("probe failed: {e}; trying report frames"));
+                None
+            }
+        }
+    }
+}
+
+/// Split a `0x41` reply into the applet's data and status word.
+fn split_ctap_reply(mut resp: Vec<u8>) -> Result<(Vec<u8>, u16), OtpTransportError> {
+    if resp.len() < 2 {
+        return Err(OtpTransportError::EmptyResponse);
+    }
+    let sw = u16::from_be_bytes([resp[resp.len() - 2], resp[resp.len() - 1]]);
+    resp.truncate(resp.len() - 2);
+    Ok((resp, sw))
+}
+
+impl OtpTransport for CtapOtpTransport {
+    fn transmit(
+        &mut self,
+        apdu: &[u8],
+        detect_button_wait: bool,
+    ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+        let debug = self.prompt.debug.load(Ordering::Relaxed);
+        trace_bytes(
+            debug,
+            Dir::Sent,
+            "CTAPHID",
+            "",
+            apdu,
+            request_is_sensitive(apdu),
+        );
+        // The keepalive hook shows the prompt if the key reports it is
+        // waiting for its button while this command is in flight.
+        self.prompt
+            .armed
+            .store(detect_button_wait, Ordering::Relaxed);
+        let resp = self.dev.transact(OTP_CTAPHID_CMD, apdu);
+        self.prompt.armed.store(false, Ordering::Relaxed);
+        let resp = resp.map_err(|e| OtpTransportError::TransportUnavailable(e.to_string()))?;
+        let (data, sw) = split_ctap_reply(resp)?;
+        trace_bytes(
+            debug,
+            Dir::Received,
+            "CTAPHID",
+            &format!("sw={sw:#06x}"),
+            &data,
+            response_is_sensitive(apdu),
+        );
+        Ok((data, sw))
+    }
+
+    fn set_button_prompt(&mut self, cb: ButtonPrompt) {
+        if let Ok(mut p) = self.prompt.button_prompt.lock() {
+            *p = Some(cb);
+        }
+    }
+    fn set_debug(&mut self, on: bool) {
+        self.prompt.debug.store(on, Ordering::Relaxed);
+    }
+}
+
+/// The first Token2 key's FIDO-usage HID interface, for [`CtapOtpTransport`].
+fn first_token2_fido_path() -> Option<std::path::PathBuf> {
+    keyroost_hid::enumerate()
+        .ok()?
+        .into_iter()
+        .find(|d| d.vendor_id == t2::USB_VID && d.usage_page == t2::FIDO_USAGE_PAGE)
+        .map(|d| d.path)
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +1154,8 @@ const NO_PIN_FEATURE_ANSWERS: [u16; 5] = [
 
 impl Token2OtpSession {
     /// Open the OTP applet, trying USB-HID first and falling back to PC/SC.
+    /// Over USB-HID, CTAPHID command `0x41` ([`CtapOtpTransport`]) is tried
+    /// before the report-framed [`HidOtpTransport`].
     ///
     /// HID enumerating successfully is not the same as the OTP applet being
     /// reachable over HID: a key can expose its FIDO HID interface while having
@@ -1001,6 +1172,11 @@ impl Token2OtpSession {
 
     /// As [`detect`](Self::detect), with tracing of the CCID probe.
     pub fn detect_debug(debug: bool) -> Result<Self, OtpTransportError> {
+        if let Some(t) =
+            first_token2_fido_path().and_then(|p| CtapOtpTransport::open_probed(&p, debug))
+        {
+            return Ok(Self::wrap(Box::new(t), false));
+        }
         match HidOtpTransport::open_first() {
             Ok(mut t) => {
                 t.set_debug(debug);
@@ -1058,6 +1234,11 @@ impl Token2OtpSession {
     /// Force the USB-HID transport (no PC/SC fallback). Errors if HID isn't
     /// usable.
     pub fn detect_hid_only(debug: bool) -> Result<Self, OtpTransportError> {
+        if let Some(t) =
+            first_token2_fido_path().and_then(|p| CtapOtpTransport::open_probed(&p, debug))
+        {
+            return Ok(Self::wrap(Box::new(t), false));
+        }
         let mut t = HidOtpTransport::open_first()?;
         t.set_debug(debug);
         let t = probe_hid_owned(t).map_err(|(e, _)| e)?;
@@ -1089,6 +1270,9 @@ impl Token2OtpSession {
     /// Open the OTP applet on one explicitly resolved USB-HID device path (no
     /// first-match scan). Probes the applet the same way [`Self::detect_hid_only`] does.
     pub fn open_hid_path(path: &Path, debug: bool) -> Result<Self, OtpTransportError> {
+        if let Some(t) = CtapOtpTransport::open_probed(path, debug) {
+            return Ok(Self::wrap(Box::new(t), false));
+        }
         let mut t = HidOtpTransport::open_path(path)?;
         t.set_debug(debug);
         let t = probe_hid_owned(t).map_err(|(e, _)| e)?;
@@ -1116,6 +1300,19 @@ impl Token2OtpSession {
             pin_present: None,
             fp_present: None,
         })
+    }
+
+    /// A fresh session on `transport`: no PIN session, nothing read yet.
+    fn wrap(transport: Box<dyn OtpTransport>, is_pcsc: bool) -> Self {
+        Self {
+            transport,
+            is_pcsc,
+            pin_session: None,
+            pin_verified: false,
+            typed_pin_verified: false,
+            pin_present: None,
+            fp_present: None,
+        }
     }
 
     /// Wrap an explicit HID transport (e.g. when the caller resolved a path).
@@ -1999,6 +2196,30 @@ mod otp_applet_serial_tests {
             assert_eq!(read_otp_applet_serial(|a| s.tx(a)), None);
             assert!(s.0.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod ctap_reply_tests {
+    use super::{split_ctap_reply, OtpTransportError};
+
+    #[test]
+    fn a_ctap_reply_splits_into_data_and_status_word() {
+        // GET_ECDH_PUBKEY on a PIN+ (fw 2.1.2): 64 key bytes, then 90 00.
+        let mut reply = vec![0xAB; 64];
+        reply.extend_from_slice(&[0x90, 0x00]);
+        let (data, sw) = split_ctap_reply(reply).unwrap();
+        assert_eq!((data.len(), sw), (64, 0x9000));
+        // A bare status word: READ_ALL on an empty store.
+        assert_eq!(
+            split_ctap_reply(vec![0x6A, 0x83]).unwrap(),
+            (vec![], 0x6A83)
+        );
+        // Shorter than a status word.
+        assert!(matches!(
+            split_ctap_reply(vec![0x90]),
+            Err(OtpTransportError::EmptyResponse)
+        ));
     }
 }
 

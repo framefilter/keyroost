@@ -274,7 +274,17 @@ pub struct CtapHidDevice {
     /// long user-presence wait (e.g. fingerprint capture) can be aborted from
     /// another thread without unplugging the key.
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Called with each KEEPALIVE's status byte (see
+    /// [`Self::set_keepalive_hook`]).
+    keepalive_hook: Option<KeepaliveHook>,
 }
+
+/// A callback for each KEEPALIVE's status byte: `1` processing, `2` waiting
+/// for user presence ([`KEEPALIVE_STATUS_UPNEEDED`]).
+pub type KeepaliveHook = Box<dyn FnMut(u8) + Send>;
+
+/// KEEPALIVE status: the authenticator is waiting for user presence (a touch).
+pub const KEEPALIVE_STATUS_UPNEEDED: u8 = 0x02;
 
 impl CtapHidDevice {
     /// Open a HID device by path and allocate a CTAPHID channel.
@@ -285,6 +295,7 @@ impl CtapHidDevice {
             channel_id: CTAPHID_BROADCAST_CID,
             timeout: DEFAULT_READ_TIMEOUT,
             cancel: None,
+            keepalive_hook: None,
         };
         let init = dev.do_init()?;
         dev.channel_id = init.channel_id;
@@ -307,6 +318,13 @@ impl CtapHidDevice {
     /// instead of blocking until the user acts or the device times out.
     pub fn set_cancel_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.cancel = Some(flag);
+    }
+
+    /// Install a callback for each KEEPALIVE's status byte, so a caller can
+    /// say "touch your key" when the device reports it is waiting for one
+    /// ([`KEEPALIVE_STATUS_UPNEEDED`]) rather than before every command.
+    pub fn set_keepalive_hook(&mut self, hook: KeepaliveHook) {
+        self.keepalive_hook = Some(hook);
     }
 
     /// Linux backend: open the `/dev/hidraw*` node read/write, `O_NONBLOCK`
@@ -625,6 +643,9 @@ impl CtapHidDevice {
                 if self.cancel_requested() {
                     return Err(HidTransportError::Cancelled);
                 }
+                if let Some(hook) = self.keepalive_hook.as_mut() {
+                    hook(buf[7]);
+                }
                 // Push the deadline out so the timeout bounds device *silence*,
                 // not how long the user takes to respond.
                 deadline = Instant::now() + self.timeout;
@@ -745,9 +766,17 @@ fn ctap_line(dir: Dir, cmd: u8, len: usize, payload: &str) -> String {
 /// - authenticatorConfig (`0x0D`): every subcommand carries a
 ///   pinUvAuthParam.
 ///
+/// Vendor commands (`0x40`–`0x7F`, sent as `0xC0`–`0xFF`) are redacted
+/// whole: this crate can't tell what they carry, and Token2's OTP tunnel
+/// (`0x41`) carries account names, live codes and encrypted seeds. Their
+/// callers trace them under their own rules.
+///
 /// Add every future personal-data- or PIN-bearing CTAP2 command here, not at
 /// the trace call sites.
 fn exchange_is_sensitive(cmd: u8, payload: &[u8]) -> bool {
+    if cmd >= 0xC0 {
+        return true;
+    }
     if cmd != CTAPHID_CBOR {
         return false;
     }
@@ -847,6 +876,7 @@ mod tests {
             channel_id: 1,
             timeout: Duration::from_millis(300),
             cancel: None,
+            keepalive_hook: None,
         };
         let start = Instant::now();
         let res = dev.recv(1, CTAPHID_CBOR);
@@ -1087,6 +1117,28 @@ mod tests {
         }
     }
 
+    /// Every KEEPALIVE's status byte reaches the hook, in order, and the
+    /// response still comes back.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    #[test]
+    fn keepalive_statuses_reach_the_hook() {
+        let (mut dev, mut peer) = paired_device(Duration::from_millis(300));
+        let keepalive = |status: u8| {
+            let mut f = [0u8; CTAPHID_REPORT_SIZE];
+            f[3] = 0x01;
+            f[4] = CTAPHID_KEEPALIVE;
+            f[6] = 0x01;
+            f[7] = status;
+            f
+        };
+        queue_frames(&mut peer, &[keepalive(1), keepalive(2), ok_frame()]);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        dev.set_keepalive_hook(Box::new(move |status| log.lock().unwrap().push(status)));
+        assert_eq!(dev.transact(CTAPHID_CBOR, &[0x04]).unwrap(), vec![0x00]);
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+    }
+
     /// A `CtapHidDevice` on one end of a socketpair (channel 1) and the raw
     /// peer end the test drives as a make-believe authenticator.
     #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
@@ -1099,6 +1151,7 @@ mod tests {
             channel_id: 1,
             timeout,
             cancel: None,
+            keepalive_hook: None,
         };
         (dev, b)
     }
@@ -1221,6 +1274,19 @@ mod tests {
         // Non-CBOR frames (INIT, PING) are never redacted.
         assert!(!exchange_is_sensitive(CTAPHID_INIT, &[0x0A]));
         assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[]));
+    }
+
+    #[test]
+    fn trace_redacts_vendor_commands() {
+        // Token2's OTP tunnel (0x41) carries account names, live codes and
+        // encrypted seeds; no vendor command's payload is classified here.
+        for cmd in [0xC0, 0xC1, 0xC2, 0xE2, 0xFF] {
+            assert!(
+                exchange_is_sensitive(cmd, &[0x80, 0xC5, 0x05, 0x00]),
+                "vendor cmd 0x{cmd:02x} must be redacted"
+            );
+        }
+        assert!(!exchange_is_sensitive(CTAPHID_PING, &[0x80]));
     }
 
     #[test]
