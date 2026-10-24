@@ -8,7 +8,7 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Next: PIV key import from a .p12 file (#174).
+Next: the soon item below (smart-card driver hint), after #174 lands.
 
 ---
 
@@ -16,7 +16,9 @@ Next: PIV key import from a .p12 file (#174).
 
 Being worked on right now — check with whoever holds it before starting.
 
-(Nothing at the moment.)
+- **PIV: import a key and certificate from a .p12 file
+  ([#174](https://github.com/framefilter/keyroost/issues/174)).** Branch
+  `feat/174-pkcs12-import`.
 
 ---
 
@@ -33,22 +35,12 @@ Being worked on right now — check with whoever holds it before starting.
 
 **Next:**
 
-- **PIV: import an existing key and certificate from a .p12 file
-  ([#174](https://github.com/framefilter/keyroost/issues/174), from discussion
-  #172).** Put an RSA or EC private key plus its certificate from a PKCS#12
-  (`.p12`) file into a PIV slot, using the import-key command the card already
-  supports. Read legacy-encrypted `.p12` files directly (40-bit RC2 / 3DES,
-  SHA-1 MAC), such as Spain's FNMT certificates, which OpenSSL 3 refuses by
-  default. GUI and CLI. Show the dependency options to the maintainer before
-  choosing one (no new dependencies without discussion). (M)
-
-- **Token2 PIN+ OTP list unreachable over HID ([#155](https://github.com/framefilter/keyroost/issues/155)).**
-  On firmware 2.1.0 (`349e:0022`) the OTP applet doesn't answer keyroost's
-  interrupt-OUT frames; the reporter reached it with feature reports, and
-  Token2 recommends CTAPHID vendor command `0x41` on the FIDO interface
-  (works on Windows too). A commenter sees it on a contact card over PC/SC
-  as well. Waiting on diagnostics from the reporters; also: the GUI's OTP
-  tab shows an empty list instead of the error. (S–M)
+- **Soon: say when a key's smart-card interface has no reader.** Spot a key
+  whose USB descriptor has a smart-card (CCID, class 0x0B) interface while the
+  smart-card service lists no reader for it, and say so in `doctor` and the
+  app (one line: the system's smart-card driver doesn't list this key yet;
+  PIV/OpenPGP need a newer driver). Evidence from the machine; never a list of
+  driver versions. (S)
 
 **Later:**
 

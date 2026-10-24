@@ -2229,6 +2229,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyroost-p12"
+version = "0.14.0"
+dependencies = [
+ "aes",
+ "cbc",
+ "des",
+ "ed25519-dalek",
+ "hmac 0.12.1",
+ "keyroost-piv",
+ "keyroost-proto",
+ "p256",
+ "p384",
+ "pbkdf2",
+ "rc2",
+ "sha2 0.10.9",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "keyroost-pgpkey"
 version = "0.14.0"
 dependencies = [
@@ -3563,6 +3583,15 @@ name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
+
+[[package]]
+name = "rc2"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62c64daa8e9438b84aaae55010a93f396f8e60e3911590fcba770d04643fc1dd"
+dependencies = [
+ "cipher",
+]
 
 [[package]]
 name = "read-fonts"
