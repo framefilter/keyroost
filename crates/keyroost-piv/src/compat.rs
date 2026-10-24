@@ -3177,6 +3177,12 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 ///   `Verdict::KnownUnsupportedSince` at the universal `[]` version — the
 ///   same closed-enumeration reasoning `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s
 ///   own row uses.
+///
+/// * [`PivExtension::ImportKey`] — RSA-2048/3072/4096 `Verdict::KnownSupported`
+///   at firmware `[1, 8]` (piv-authenticator >= 0.3.6); every other algorithm
+///   `Verdict::KnownUnsupportedSince` at `[]`. Source-verified in
+///   piv-authenticator's `import_asymmetric_key`, not yet hardware-verified.
+///   [`resolve`] additionally clamps import to the `SlotKeyAlgorithm` verdict.
 const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
         extensions: &[
@@ -3750,8 +3756,9 @@ pub fn resolve(
 }
 
 /// Which private-key layout `fingerprint`'s import command expects: the
-/// Trussed Nitrokey takes RSA as `p`, `q`, `e`; every other applet gets
-/// Yubico's layout.
+/// Trussed Nitrokey takes RSA as `p`, `q`, `e` (source-verified in
+/// piv-authenticator's `import_asymmetric_key`, not yet hardware-verified);
+/// every other applet gets Yubico's layout.
 #[must_use]
 pub fn import_layout(fingerprint: AppletFingerprint) -> crate::ImportLayout {
     match fingerprint {
@@ -3761,8 +3768,9 @@ pub fn import_layout(fingerprint: AppletFingerprint) -> crate::ImportLayout {
 }
 
 /// Whether `fingerprint`'s import command accepts `slot`: the Trussed
-/// Nitrokey imports into the authentication slot (9A) only; every other
-/// applet is not restricted here.
+/// Nitrokey imports into the authentication slot (9A) only (source-verified in
+/// piv-authenticator's `import_asymmetric_key`, not yet hardware-verified);
+/// every other applet is not restricted here.
 #[must_use]
 pub fn import_slot_allowed(fingerprint: AppletFingerprint, slot: crate::Slot) -> bool {
     match fingerprint {

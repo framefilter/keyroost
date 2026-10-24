@@ -1151,7 +1151,8 @@ pub enum ImportLayout {
     /// scalar (tags `06`..`08`).
     Yubico,
     /// Trussed `piv-authenticator` (Nitrokey): RSA as `p`, `q` and the public
-    /// exponent `e` (tags `01`..`03`); it derives the rest itself.
+    /// exponent `e` (tags `01`..`03`); it derives the rest itself. Source-verified
+    /// (piv-authenticator's `import_asymmetric_key`), not yet hardware-verified.
     NitrokeyRsa,
 }
 
@@ -1197,7 +1198,8 @@ pub struct ImportKey<'a> {
 /// a key the layout cannot carry), reported instead of panicking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportBodyError {
-    /// A key value is longer than the fixed width its tag takes.
+    /// A key value is longer than the fixed width its tag takes (or, for
+    /// Ed25519/X25519, not exactly 32 bytes).
     PartTooLong,
     /// The algorithm and the kind of key parts do not belong together, or the
     /// algorithm has no import encoding.
@@ -1216,6 +1218,21 @@ impl core::fmt::Display for ImportBodyError {
 }
 
 impl std::error::Error for ImportBodyError {}
+
+/// Append `tag || len || value` for a raw byte string that must be exactly
+/// `width` bytes (Ed25519 seed, X25519 scalar: padding would change the key).
+fn push_exact_tlv(
+    out: &mut Vec<u8>,
+    tag: u8,
+    value: &[u8],
+    width: usize,
+) -> Result<(), ImportBodyError> {
+    if value.len() != width {
+        return Err(ImportBodyError::PartTooLong);
+    }
+    push_tlv(out, &[tag], value);
+    Ok(())
+}
 
 /// Append `tag || len || value` with `value` left-padded with zeros to `width`.
 fn push_padded_tlv(
@@ -1240,7 +1257,8 @@ fn push_padded_tlv(
 ///
 /// RSA values (`p`, `q`, and the CRT parts) are left-padded to `bits / 16`
 /// bytes in both layouts; the Nitrokey layout sends `e` as given. EC scalars are padded to the curve
-/// size (32 for P-256, 48 for P-384), Ed25519/X25519 values to 32. A value
+/// size (32 for P-256, 48 for P-384); Ed25519/X25519 values must be exactly
+/// 32 bytes (raw byte strings; padding would change the key). A value
 /// longer than its field, or parts that do not fit the algorithm, return an
 /// [`ImportBodyError`]. The body holds key material, so it zeroizes on drop.
 ///
@@ -1270,6 +1288,9 @@ pub fn import_key_body(
             let width = bits / 16;
             push_padded_tlv(&mut out, 1, p, width)?;
             push_padded_tlv(&mut out, 2, q, width)?;
+            if e.len() > width {
+                return Err(ImportBodyError::PartTooLong);
+            }
             push_tlv(&mut out, &[3], e);
         }
         (ImportParts::Ec { scalar }, KeyAlg::EccP256, _) => {
@@ -1279,10 +1300,10 @@ pub fn import_key_body(
             push_padded_tlv(&mut out, 6, scalar, 48)?;
         }
         (ImportParts::Ed25519 { seed }, KeyAlg::Ed25519, _) => {
-            push_padded_tlv(&mut out, 7, seed, 32)?;
+            push_exact_tlv(&mut out, 7, seed, 32)?;
         }
         (ImportParts::X25519 { scalar }, KeyAlg::X25519, _) => {
-            push_padded_tlv(&mut out, 8, scalar, 32)?;
+            push_exact_tlv(&mut out, 8, scalar, 32)?;
         }
         _ => return Err(ImportBodyError::PartsMismatch),
     }
@@ -4053,14 +4074,51 @@ mod tests {
             alg: KeyAlg::X25519,
             alg_id: KeyAlg::X25519.id(),
             parts: ImportParts::X25519 {
-                scalar: &[0x07; 31],
+                scalar: &[0x07; 32],
             },
         };
         let body = import_key_body(&key, PinPolicy::Default, TouchPolicy::Never).unwrap();
-        let mut want = vec![0x08, 0x20, 0x00];
-        want.extend([0x07; 31]);
+        let mut want = vec![0x08, 0x20];
+        want.extend([0x07; 32]);
         want.extend([0xAB, 0x01, 0x01]);
         assert_eq!(*body, want);
+    }
+
+    #[test]
+    fn raw_25519_values_must_be_exactly_32_bytes() {
+        for len in [31usize, 33] {
+            let x = vec![7u8; len];
+            let key = ImportKey {
+                alg: KeyAlg::X25519,
+                alg_id: KeyAlg::X25519.id(),
+                parts: ImportParts::X25519 { scalar: &x },
+            };
+            assert!(import_key_body(&key, PinPolicy::Default, TouchPolicy::Default).is_err());
+            let key = ImportKey {
+                alg: KeyAlg::Ed25519,
+                alg_id: KeyAlg::Ed25519.id(),
+                parts: ImportParts::Ed25519 { seed: &x },
+            };
+            assert!(import_key_body(&key, PinPolicy::Default, TouchPolicy::Default).is_err());
+        }
+    }
+
+    #[test]
+    fn nitrokey_exponent_is_bounded() {
+        let e = vec![1u8; 300];
+        let key = ImportKey {
+            alg: KeyAlg::Rsa2048,
+            alg_id: KeyAlg::Rsa2048.id(),
+            parts: ImportParts::RsaPrimes {
+                p: &[1],
+                q: &[2],
+                e: &e,
+            },
+        };
+        assert_eq!(
+            import_key_body(&key, PinPolicy::Default, TouchPolicy::Default).unwrap_err(),
+            ImportBodyError::PartTooLong
+        );
     }
 
     #[test]
