@@ -3414,12 +3414,13 @@ fn piv_key_import_wrote_key(
 }
 
 /// After the key is on the card: save the file's authority certificates to
-/// `chain_out` as PEM, or name the ones left out. `None` when the file has
-/// none. Names come from the file, so they are made safe to show.
+/// `chain_out` as PEM, or name the ones left out; `Err` when they couldn't
+/// be saved. `None` when the file has none. Names come from the file, so
+/// they are made safe to show.
 fn piv_key_import_authorities(
     contents: &keyroost_p12::Contents,
     chain_out: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<Result<String, String>> {
     let n = contents.authorities.len();
     let certs = if n == 1 {
         "authority certificate"
@@ -3431,11 +3432,11 @@ fn piv_key_import_authorities(
         (_, Some(path)) => {
             let pem = keyroost_transport::piv_import::authorities_pem(contents);
             match std::fs::write(path, pem.as_bytes()) {
-                Ok(()) => format!("Saved {n} {certs} to {}.", path.display()),
-                Err(e) => format!(
+                Ok(()) => Ok(format!("Saved {n} {certs} to {}.", path.display())),
+                Err(e) => Err(format!(
                     "The key is imported, but the {certs} couldn't be saved to {}: {e}.",
                     path.display()
-                ),
+                )),
             }
         }
         (_, None) => {
@@ -3444,25 +3445,26 @@ fn piv_key_import_authorities(
                 .iter()
                 .map(|der| sanitize_title(&keyroost_transport::piv_import::certificate_name(der)))
                 .collect();
-            format!(
+            Ok(format!(
                 "Skipped {n} {certs}: {} (not written to the card).",
                 names.join(", ")
-            )
+            ))
         }
     })
 }
 
 /// The import dialog's result text (#174): `Ok(detail)` when the key is on
-/// the card and its self-test passed (what was stored, the authority
-/// certificates, then the self-test, one line each), else `Err(message)`:
-/// the shared failure text, which says what the slot holds, then the same
-/// lines where the key was written.
+/// the card, its self-test passed and the authority certificates were
+/// handled (what was stored, the authority certificates, then the
+/// self-test, one line each), else `Err(message)`: the shared failure text,
+/// which says what the slot holds, or the authority certificates' save
+/// failure, then the same lines where the key was written.
 fn piv_key_import_text(
     outcome: &Result<
         keyroost_transport::piv_import::ImportReport,
         keyroost_transport::piv_import::ImportFailure,
     >,
-    authorities: Option<&str>,
+    authorities: Option<&Result<String, String>>,
     alg: keyroost_piv::KeyAlg,
     slot: keyroost_piv::Slot,
     compression: PivCertCompressionSel,
@@ -3491,12 +3493,31 @@ fn piv_key_import_text(
             )),
         }
     }
-    lines.extend(authorities.map(str::to_owned));
+    // A save that failed after a good import fails the import, as in the
+    // CLI; its message leads, like any other failure's.
+    let save_failed = match authorities {
+        Some(Ok(line)) => {
+            lines.push(line.clone());
+            None
+        }
+        Some(Err(e)) if outcome.is_err() => {
+            lines.push(e.clone());
+            None
+        }
+        Some(Err(e)) => Some(e),
+        None => None,
+    };
     if let Ok(report) | Err(ImportFailure::SelfTestFailed(report)) = outcome {
         lines.push(keyroost_pivtest::format_report(&report.self_test));
     }
     match outcome {
-        Ok(_) => Ok(lines.join("\n")),
+        Ok(_) => match save_failed {
+            Some(e) => Err(std::iter::once(e.clone())
+                .chain(lines)
+                .collect::<Vec<_>>()
+                .join("\n")),
+            None => Ok(lines.join("\n")),
+        },
         Err(e) => {
             let mut message = e.to_string();
             // As `piv_cert_error_hint`: under Never, a certificate that
@@ -10707,7 +10728,7 @@ impl App {
                         }
                         let text = piv_key_import_text(
                             &outcome,
-                            authorities.as_deref(),
+                            authorities.as_ref(),
                             alg,
                             slot,
                             compression,
@@ -20221,7 +20242,20 @@ impl App {
             entry_has_cert,
             &self.piv.selected_slot.to_slot().label(),
         ) {
-            card_note(ui, p, &note);
+            if matches!(occupancy, PivOccupancy::Empty) {
+                // No key warning above it: this note is the one that says
+                // what the import changes, and Import is relabeled to match.
+                ui.horizontal_wrapped(|ui| {
+                    theme::warn_marker(ui, p);
+                    ui.label(
+                        egui::RichText::new(note)
+                            .font(theme::f_sb(12.5))
+                            .color(p.warn),
+                    );
+                });
+            } else {
+                card_note(ui, p, &note);
+            }
         }
         ui.add_space(6.0);
         self.piv_modal_policy_fields(ui, p, true);
@@ -21153,14 +21187,18 @@ impl App {
                             );
                         } else {
                             // Relabel Generate as a conscious "Overwrite key"
-                            // when the target slot is occupied; the op itself is
-                            // unchanged.
+                            // when the target slot is occupied, and Import as
+                            // "Import and replace" when it holds only a
+                            // certificate (the CLI asks for both); the op
+                            // itself is unchanged.
                             let submit = if matches!(
                                 kind,
                                 PivCredKind::GenerateKey | PivCredKind::ImportKey
                             ) && selected_occupied
                             {
                                 "Overwrite key"
+                            } else if kind == PivCredKind::ImportKey && selected_has_cert {
+                                "Import and replace"
                             } else {
                                 kind.submit_label()
                             };
@@ -29394,7 +29432,9 @@ mod tests {
         };
         let text = piv_key_import_text(
             &Ok(report()),
-            Some("Skipped 1 authority certificate: CA (not written to the card)."),
+            Some(&Ok(
+                "Skipped 1 authority certificate: CA (not written to the card).".into(),
+            )),
             keyroost_piv::KeyAlg::EccP256,
             slot,
             PivCertCompressionSel::Auto,
@@ -29420,12 +29460,34 @@ mod tests {
         .unwrap_err();
         assert!(e.starts_with("The new key is on the card"), "{e}");
 
+        // A good import whose authority certificates couldn't be saved is
+        // an error that says the key is in, as the CLI's is.
+        let e = piv_key_import_text(
+            &Ok(report()),
+            Some(&Err(
+                "The key is imported, but the authority certificate couldn't be saved.".into(),
+            )),
+            keyroost_piv::KeyAlg::EccP256,
+            slot,
+            PivCertCompressionSel::Auto,
+        )
+        .unwrap_err();
+        let lines: Vec<&str> = e.lines().collect();
+        assert!(lines[0].starts_with("The key is imported, but"), "{e}");
+        assert!(lines[1].contains("no certificate for it"), "{e}");
+        assert_eq!(
+            lines[2],
+            keyroost_pivtest::format_report(&report().self_test)
+        );
+
         let path = format!(
             "{}/../keyroost-p12/tests/fixtures/rsa2048-chain.p12",
             env!("CARGO_MANIFEST_DIR")
         );
         let contents = open_key_file(std::path::Path::new(&path), "keyroost-test").unwrap();
-        let skipped = piv_key_import_authorities(&contents, None).unwrap();
+        let skipped = piv_key_import_authorities(&contents, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             skipped,
             "Skipped 2 authority certificates: inter, ca (not written to the card)."
@@ -29433,7 +29495,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("keyroost-chain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("authorities.crt");
-        let saved = piv_key_import_authorities(&contents, Some(&out)).unwrap();
+        let saved = piv_key_import_authorities(&contents, Some(&out))
+            .unwrap()
+            .unwrap();
         assert!(
             saved.starts_with("Saved 2 authority certificates to "),
             "{saved}"
@@ -29442,6 +29506,13 @@ mod tests {
         assert_eq!(
             written,
             keyroost_transport::piv_import::authorities_pem(&contents)
+        );
+        let unsaved = piv_key_import_authorities(&contents, Some(&dir.join("gone/x.crt")))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            unsaved.starts_with("The key is imported, but the authority certificates"),
+            "{unsaved}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
