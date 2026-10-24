@@ -68,7 +68,7 @@ jobs:
       # already-published probe below skips crates that made it), so a red
       # run costs one re-dispatch, while a silent skip would quietly ship a
       # release with no crates.
-      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
 
       # Tiered by dependency; `cargo publish` itself waits for each crate to
