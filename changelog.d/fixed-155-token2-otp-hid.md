@@ -5,3 +5,8 @@
   them through the CTAPHID vendor command Token2 documented, and keeps the
   earlier framing for keys that don't answer it. A code that needs a touch
   says "touch your key" when the key asks for one. ([#155])
+- **`otp info` and `otp reset` work over USB on the same keys.** Both failed
+  with "unexpected status word 0x6FFB": the key rejects the short form
+  keyroost sent them in over USB. They now go out in the form Token2's
+  protocol document and reference client use; over a smart-card reader
+  nothing changes. ([#155])

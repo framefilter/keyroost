@@ -1918,7 +1918,12 @@ impl Token2OtpSession {
     /// Erase every entry (spec §6.5): a bodyless `WRITE_SEED`. Requires a
     /// confirming button press over HID.
     pub fn erase_all(&mut self) -> Result<(), OtpTransportError> {
-        let (_, sw) = self.transport.transmit(&t2::erase_all(), true)?;
+        let apdu = if self.is_pcsc {
+            t2::erase_all()
+        } else {
+            t2::erase_all_usb()
+        };
+        let (_, sw) = self.transport.transmit(&apdu, true)?;
         OtpError::check(sw)?;
         Ok(())
     }
@@ -2018,7 +2023,11 @@ impl Token2OtpSession {
         // We return whatever we get; `DeviceInfo::parse` records the length so
         // callers can tell which fields are actually backed by real bytes rather
         // than zero-padding (see `DeviceInfo::has_config_byte`).
-        let apdu = t2::read_config(64);
+        let apdu = if self.is_pcsc {
+            t2::read_config(64)
+        } else {
+            t2::read_config_usb(64)
+        };
         let (data, sw) = self.transport.transmit(&apdu, false)?;
         OtpError::check(sw)?;
         Ok(data)

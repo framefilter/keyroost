@@ -509,6 +509,25 @@ pub fn erase_all() -> Vec<u8> {
     build_apdu(cmd::WRITE_SEED, &[])
 }
 
+/// [`erase_all`] for USB-HID: extended Lc `00 00 00` and no data, as spec §3
+/// frames every command but SELECT and Token2's reference client sends it.
+/// A PIN+ (fw 2.1.2) answers the bodyless form with `6FFB` over USB and
+/// accepts this one (it then waits for the confirming button press).
+pub fn erase_all_usb() -> Vec<u8> {
+    let mut apdu = cmd::WRITE_SEED.to_vec();
+    apdu.extend_from_slice(&[0x00, 0x00, 0x00]);
+    apdu
+}
+
+/// [`read_config`] for USB-HID: the byte count as a one-byte body behind an
+/// extended Lc (spec §3, §6.9). A PIN+ (fw 2.1.2) answers the short `Le` form
+/// with `6FFB` over USB and this one with `9000`.
+pub fn read_config_usb(num_bytes: u8) -> Vec<u8> {
+    let mut apdu = cmd::READ_CONFIG.to_vec();
+    apdu.extend_from_slice(&[0x00, 0x00, 0x01, num_bytes.clamp(1, 64)]);
+    apdu
+}
+
 /// Build the FIDO-applet `GET_INFO` serial-number request (spec §6.10): the
 /// fixed 18-byte payload `D1 10` followed by 16 zero bytes.
 pub fn read_serial_request() -> Vec<u8> {
@@ -823,6 +842,23 @@ mod tests {
     fn erase_all_is_bodyless_write_seed() {
         // erase-all is a WRITE_SEED with no data at all (spec §6.5, §11).
         assert_eq!(erase_all(), vec![0x80, 0xC5, 0x05, 0x02]);
+    }
+
+    #[test]
+    fn usb_forms_use_extended_lc() {
+        // Over USB-HID a PIN+ (fw 2.1.2) answers the two short forms above
+        // with 6FFB and accepts these, the framing of spec §3 and of Token2's
+        // reference client: extended Lc, no Le.
+        assert_eq!(
+            erase_all_usb(),
+            vec![0x80, 0xC5, 0x05, 0x02, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            read_config_usb(64),
+            vec![0x80, 0xC5, 0x02, 0x00, 0x00, 0x00, 0x01, 0x40]
+        );
+        assert_eq!(*read_config_usb(0).last().unwrap(), 0x01); // clamped to >=1
+        assert_eq!(*read_config_usb(200).last().unwrap(), 0x40); // clamped to <=64
     }
 
     #[test]
