@@ -17,11 +17,19 @@ pub(crate) struct Tlv<'a> {
 }
 
 /// Read one element from the front of `input`; returns it and the rest.
+///
+/// Nesting is bounded to 32 levels of indefinite-length and constructed
+/// OCTET STRING content inside this one element. Definite-length structure
+/// is not descended into here: a caller that walks it with [`children`] owns
+/// that bound (the PFX walk has a fixed shape: PFX, AuthenticatedSafe,
+/// SafeContents, bag).
 pub(crate) fn read_tlv(input: &[u8]) -> Result<(Tlv<'_>, &[u8]), P12Error> {
     read_at(input, 0)
 }
 
 /// Split `value` (the content of a constructed element) into its elements.
+/// Each element is bounded as in [`read_tlv`]; the caller bounds how deeply
+/// it calls this again.
 pub(crate) fn children(value: &[u8]) -> Result<Vec<Tlv<'_>>, P12Error> {
     let mut out = Vec::new();
     let mut rest = value;
@@ -67,33 +75,39 @@ fn header(input: &[u8]) -> Result<(u8, Option<usize>, usize), P12Error> {
     Ok((tag, Some(len), 2 + n))
 }
 
-fn read_at(input: &[u8], depth: usize) -> Result<(Tlv<'_>, &[u8]), P12Error> {
-    if depth > MAX_DEPTH {
+/// Where one element sits in its input.
+struct Extent {
+    tag: u8,
+    /// Header length in bytes.
+    hlen: usize,
+    /// Content length in bytes (excluding any end-of-contents marker).
+    clen: usize,
+    /// Bytes the whole element occupies, header and marker included.
+    total: usize,
+}
+
+/// Measure one element without building anything. Indefinite elements are
+/// walked once, so each byte is visited once per enclosing indefinite level;
+/// `depth` counts those levels (the outermost element is depth 0).
+fn extent(input: &[u8], depth: usize) -> Result<Extent, P12Error> {
+    if depth >= MAX_DEPTH {
         return Err(bad("nesting too deep"));
     }
     let (tag, len, hlen) = header(input)?;
-    let constructed = tag & 0x20 != 0;
     let body = input.get(hlen..).ok_or_else(|| bad("truncated element"))?;
     match len {
-        Some(len) => {
-            let value = body.get(..len).ok_or_else(|| bad("length exceeds input"))?;
-            let rest = body.get(len..).ok_or_else(|| bad("length exceeds input"))?;
-            let value = if tag == 0x24 {
-                Cow::Owned(flatten_octets(value, depth)?)
-            } else {
-                Cow::Borrowed(value)
-            };
-            Ok((
-                Tlv {
-                    tag,
-                    constructed,
-                    value,
-                },
-                rest,
-            ))
+        Some(clen) => {
+            if clen > body.len() {
+                return Err(bad("length exceeds input"));
+            }
+            Ok(Extent {
+                tag,
+                hlen,
+                clen,
+                total: hlen + clen,
+            })
         }
         None => {
-            // Walk children until the end-of-contents marker (00 00).
             let mut pos = 0usize;
             loop {
                 let here = body
@@ -105,43 +119,61 @@ fn read_at(input: &[u8], depth: usize) -> Result<(Tlv<'_>, &[u8]), P12Error> {
                 if here.first() == Some(&0) && here.get(1) == Some(&0) {
                     break;
                 }
-                let (_, next) = read_at(here, depth + 1)?;
-                pos += here.len() - next.len();
+                pos += extent(here, depth + 1)?.total;
             }
-            let content = body.get(..pos).ok_or_else(|| bad("truncated element"))?;
-            let rest = body
-                .get(pos + 2..)
-                .ok_or_else(|| bad("truncated element"))?;
-            let value = if tag == 0x24 {
-                Cow::Owned(flatten_octets(content, depth)?)
-            } else {
-                Cow::Borrowed(content)
-            };
-            Ok((
-                Tlv {
-                    tag,
-                    constructed,
-                    value,
-                },
-                rest,
-            ))
+            Ok(Extent {
+                tag,
+                hlen,
+                clen: pos,
+                total: hlen + pos + 2,
+            })
         }
     }
 }
 
-/// Join the segments of a constructed OCTET STRING into one value.
-fn flatten_octets(content: &[u8], depth: usize) -> Result<Vec<u8>, P12Error> {
-    let mut out = Vec::new();
+fn read_at(input: &[u8], depth: usize) -> Result<(Tlv<'_>, &[u8]), P12Error> {
+    let e = extent(input, depth)?;
+    let content = input
+        .get(e.hlen..e.hlen + e.clen)
+        .ok_or_else(|| bad("truncated element"))?;
+    let rest = input
+        .get(e.total..)
+        .ok_or_else(|| bad("truncated element"))?;
+    let value = if e.tag == 0x24 {
+        let mut out = Vec::new();
+        flatten_octets(content, depth, &mut out)?;
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(content)
+    };
+    Ok((
+        Tlv {
+            tag: e.tag,
+            constructed: e.tag & 0x20 != 0,
+            value,
+        },
+        rest,
+    ))
+}
+
+/// Join the segments of a constructed OCTET STRING into `out`.
+fn flatten_octets(content: &[u8], depth: usize, out: &mut Vec<u8>) -> Result<(), P12Error> {
     let mut rest = content;
     while !rest.is_empty() {
-        let (seg, next) = read_at(rest, depth + 1)?;
-        match seg.tag {
-            0x04 | 0x24 => out.extend_from_slice(&seg.value),
+        let e = extent(rest, depth + 1)?;
+        let seg = rest
+            .get(e.hlen..e.hlen + e.clen)
+            .ok_or_else(|| bad("truncated element"))?;
+        match e.tag {
+            0x04 => out.extend_from_slice(seg),
+            0x24 => flatten_octets(seg, depth + 1, out)?,
             _ => return Err(bad("unexpected element inside an octet string")),
         }
-        rest = next;
+        rest = rest
+            .get(e.total..)
+            .ok_or_else(|| bad("truncated element"))?;
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -226,5 +258,45 @@ mod tests {
         assert!(read_tlv(&[0x04, 0x84, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]).is_err());
         assert!(read_tlv(&[0x04, 0x88, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).is_err());
         assert!(read_tlv(&[0x04, 0x89, 1, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    fn nested_octets(n: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        for _ in 0..n {
+            data.extend_from_slice(&[0x24, 0x80]);
+        }
+        data.extend_from_slice(&[0x04, 0x01, 0x42]);
+        for _ in 0..n {
+            data.extend_from_slice(&[0x00, 0x00]);
+        }
+        data
+    }
+
+    #[test]
+    fn nested_indefinite_octet_strings_are_fast_and_bounded() {
+        // 31 wrappers around a primitive: the primitive sits at depth 31 (ok).
+        let ok = nested_octets(31);
+        let (t, rest) = read_tlv(&ok).unwrap();
+        assert_eq!(&*t.value, &[0x42]);
+        assert!(rest.is_empty());
+        // 32 wrappers push the primitive to depth 32 (error).
+        assert!(read_tlv(&nested_octets(32)).is_err());
+        let mut only = Vec::new();
+        for _ in 0..32 {
+            only.extend_from_slice(&[0x24, 0x80]);
+        }
+        for _ in 0..32 {
+            only.extend_from_slice(&[0x00, 0x00]);
+        }
+        // 32 nested elements (depths 0..31) are the limit; 33 are too many.
+        assert!(read_tlv(&only).is_ok());
+        let mut over = Vec::new();
+        for _ in 0..33 {
+            over.extend_from_slice(&[0x24, 0x80]);
+        }
+        for _ in 0..33 {
+            over.extend_from_slice(&[0x00, 0x00]);
+        }
+        assert!(read_tlv(&over).is_err());
     }
 }
