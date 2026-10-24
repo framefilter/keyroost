@@ -10494,15 +10494,23 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         return Err(format!("no self-test applies to a {} key", alg.label()).into());
                     }
 
-                    eprintln!(
-                        "\u{2192} Testing {} ({}) on the card (touch if it blinks)\u{2026}",
-                        piv_slot.label(),
-                        alg.label()
-                    );
-                    // Verifies the PIN (if given) before the first op, and again
-                    // before each later one for PIN-per-use slots (9c).
-                    let results =
-                        s.self_test(piv_slot, alg, &pubkey, pin.as_ref().map(|p| p.as_bytes()))?;
+                    // Verifies the PIN (if given) once up front, so a wrong PIN
+                    // fails before any op, then before each later op for
+                    // PIN-per-use slots (9c). The progress line prints after
+                    // that first verify.
+                    let results = s.self_test_with_progress(
+                        piv_slot,
+                        alg,
+                        &pubkey,
+                        pin.as_ref().map(|p| p.as_bytes()),
+                        || {
+                            eprintln!(
+                                "\u{2192} Testing {} ({}) on the card (touch if it blinks)\u{2026}",
+                                piv_slot.label(),
+                                alg.label()
+                            );
+                        },
+                    )?;
 
                     let all_ok = !results.iter().any(|(_, r)| r.is_failure());
                     if json_output() {

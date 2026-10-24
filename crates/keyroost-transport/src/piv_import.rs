@@ -26,6 +26,10 @@ pub struct ImportPlan<'a> {
     pub entry: &'a Entry,
     pub slot: Slot,
     pub layout: ImportLayout,
+    /// The PIN and touch policies [`plan_import`] checked against the applet;
+    /// [`run_import`] sends exactly these.
+    pub pin_policy: PinPolicy,
+    pub touch_policy: TouchPolicy,
     /// CA certificates in the file that are not written to the card.
     pub skipped_authorities: usize,
 }
@@ -180,6 +184,8 @@ pub fn plan_import<'a>(
         entry,
         slot,
         layout,
+        pin_policy,
+        touch_policy,
         skipped_authorities: contents.authorities.len(),
     })
 }
@@ -221,16 +227,20 @@ pub struct ImportReport {
 pub enum ImportFailure {
     /// A last check before the first write failed; nothing was written.
     Refused(ImportRefusal),
-    /// The certificate step failed (storing the entry's certificate, or for a
-    /// key-only entry deleting the slot's old one), so the key was not
-    /// written. `slot_key_unchanged` is always true: the key is written only
-    /// after this step succeeds. `certificate_cleared` is `None` when the
-    /// card refused the step outright (the slot's old certificate is still
-    /// there); otherwise the store may have left the new certificate next to
-    /// the old key, so it was deleted: `Some(true)` when that worked.
+    /// The certificate step failed, so the key was not written. The step is
+    /// storing the entry's certificate (`storing_certificate`), or for a
+    /// key-only entry deleting the slot's old one. `slot_key_unchanged` is
+    /// always true: the key is written only after this step succeeds.
+    ///
+    /// `certificate_cleared` is `None` when the card refused the step outright
+    /// (the slot's old certificate is still there). Otherwise the exchange may
+    /// not have finished: a store may have left the new certificate next to
+    /// the old key, so it was deleted (`Some(true)` when that worked); for a
+    /// key-only entry it is `Some(false)`, the old certificate perhaps gone.
     CertificateNotStored {
         slot: Slot,
         error: TransportError,
+        storing_certificate: bool,
         slot_key_unchanged: bool,
         certificate_cleared: Option<bool>,
     },
@@ -296,32 +306,44 @@ impl fmt::Display for ImportFailure {
             Self::CertificateNotStored {
                 slot,
                 error,
+                storing_certificate,
                 certificate_cleared,
                 ..
             } => {
                 let s = slot_hex(*slot);
-                match certificate_cleared {
-                    None => {
+                match (storing_certificate, certificate_cleared) {
+                    (_, None) => {
                         if matches!(
                             error,
                             TransportError::PivCertTooLarge { .. }
                                 | TransportError::PivCardFull { .. }
                         ) {
                             f.write_str("The certificate didn't fit on the key.")?;
+                        } else if *storing_certificate {
+                            write!(f, "The certificate couldn't be stored: {error}.")?;
                         } else {
-                            write!(f, "The slot's certificate couldn't be updated: {error}.")?;
+                            write!(
+                                f,
+                                "The slot's old certificate couldn't be deleted: {error}."
+                            )?;
                         }
                         write!(
                             f,
                             " Nothing was changed; slot {s} keeps its old key and certificate."
                         )
                     }
-                    Some(true) => write!(
+                    (false, Some(_)) => write!(
+                        f,
+                        "Deleting the slot's old certificate didn't finish: {error}. The new \
+                         key wasn't written; slot {s} keeps its old key, and may or may not \
+                         still have its old certificate."
+                    ),
+                    (true, Some(true)) => write!(
                         f,
                         "The certificate couldn't be stored: {error}. \
                          Slot {s} keeps its old key and now has no certificate."
                     ),
-                    Some(false) => write!(
+                    (true, Some(false)) => write!(
                         f,
                         "The certificate couldn't be stored: {error}. Slot {s} keeps its \
                          old key, but its certificate may not match it; delete it with {}.",
@@ -410,6 +432,8 @@ pub(crate) trait ImportCard {
     fn clear_certificate(&mut self, slot: Slot) -> Result<(), TransportError>;
     /// Send an IMPORT ASYMMETRIC KEY body.
     fn write_key(&mut self, slot: Slot, alg_id: u8, body: &[u8]) -> Result<(), TransportError>;
+    /// Note the key just written, for firmware that can't report it.
+    fn remember_key(&mut self, slot: Slot, alg: KeyAlg, public: PublicKey);
     fn self_test(
         &mut self,
         slot: Slot,
@@ -441,6 +465,10 @@ impl ImportCard for PivSession<'_> {
         PivSession::write_import_key(self, slot, alg_id, body)
     }
 
+    fn remember_key(&mut self, slot: Slot, alg: KeyAlg, public: PublicKey) {
+        self.remember_pubkey(slot, alg, public);
+    }
+
     fn self_test(
         &mut self,
         slot: Slot,
@@ -453,8 +481,9 @@ impl ImportCard for PivSession<'_> {
 }
 
 /// Write `plan` to the card: the entry's certificate, then its key, then the
-/// self-test against the entry's public key. The management key must already
-/// be authenticated; `pin`, when given, is used for the self-test only.
+/// self-test against the entry's public key, with the PIN and touch policies
+/// the plan was checked for. The management key must already be
+/// authenticated; `pin`, when given, is used for the self-test only.
 ///
 /// The order keeps the slot consistent at every step:
 /// 1. Checks with no card writes: the certificate belongs to the key, and the
@@ -473,11 +502,9 @@ pub fn run_import(
     session: &mut PivSession<'_>,
     plan: &ImportPlan<'_>,
     compression: CertCompression,
-    pin_policy: PinPolicy,
-    touch_policy: TouchPolicy,
     pin: Option<&[u8]>,
 ) -> Result<ImportReport, ImportFailure> {
-    run_import_with(session, plan, compression, pin_policy, touch_policy, pin)
+    run_import_with(session, plan, compression, pin)
 }
 
 /// Whether `entry`'s certificate (if any) carries the key's own public key.
@@ -493,8 +520,6 @@ fn run_import_with(
     card: &mut impl ImportCard,
     plan: &ImportPlan<'_>,
     compression: CertCompression,
-    pin_policy: PinPolicy,
-    touch_policy: TouchPolicy,
     pin: Option<&[u8]>,
 ) -> Result<ImportReport, ImportFailure> {
     let slot = plan.slot;
@@ -513,7 +538,7 @@ fn run_import_with(
         alg_id: card.algorithm_id(alg),
         parts: import_parts(&entry.key, plan.layout),
     };
-    let body = keyroost_piv::import_key_body(&key, pin_policy, touch_policy)
+    let body = keyroost_piv::import_key_body(&key, plan.pin_policy, plan.touch_policy)
         .map_err(|e| ImportFailure::Refused(ImportRefusal::KeyNotEncodable(e)))?;
 
     // 2. The certificate (or, for a key-only entry, no certificate).
@@ -528,18 +553,22 @@ fn run_import_with(
                 return Err(ImportFailure::CertificateNotStored {
                     slot,
                     error,
+                    storing_certificate: true,
                     slot_key_unchanged: true,
                     certificate_cleared,
                 });
             }
         },
         None => {
+            // A refused delete changed nothing; an unfinished one may have
+            // deleted the old certificate. Either way the old key stays.
             card.clear_certificate(slot)
                 .map_err(|error| ImportFailure::CertificateNotStored {
                     slot,
+                    certificate_cleared: (!card_refused(&error)).then_some(false),
                     error,
+                    storing_certificate: false,
                     slot_key_unchanged: true,
-                    certificate_cleared: None,
                 })?;
             None
         }
@@ -554,6 +583,9 @@ fn run_import_with(
             certificate_cleared,
         });
     }
+    // Like `generate_key`'s seeding: firmware without GET METADATA can't
+    // report the new key itself.
+    card.remember_key(slot, alg, public.clone());
 
     // 4. The self-test, against the key just written.
     let mut report = ImportReport {
@@ -832,11 +864,14 @@ mod run_tests {
     //! compression decision (`store_certificate`), so a card refusing every
     //! length shows both the uncompressed and the compressed attempt.
     use super::*;
-    use crate::piv::{cert_write_result, store_certificate};
+    use crate::piv::{
+        cert_write_result, send_certificate, send_import_key, store_certificate, LongLink,
+    };
     use crate::{CertCompression, CertImport, TransportError};
     use keyroost_piv::fingerprint::TrussedVariant;
     use keyroost_piv::{CertInfo, PublicKey};
     use keyroost_pivtest::{Outcome, SelfTest};
+    use std::collections::VecDeque;
 
     const PW: &str = "keyroost-test";
     const PIN: &[u8] = b"123456";
@@ -860,6 +895,10 @@ mod run_tests {
             alg_id: u8,
             body: Vec<u8>,
         },
+        RememberKey {
+            alg: KeyAlg,
+            public: PublicKey,
+        },
         SelfTest {
             alg: KeyAlg,
             pubkey: PublicKey,
@@ -877,6 +916,25 @@ mod run_tests {
         key_sw: u16,
         alg_id: u8,
         self_test: Result<Vec<(SelfTest, Outcome)>, ()>,
+        /// When set, certificate stores and key writes go through the real
+        /// APDU-level send path, each APDU answered from here in order
+        /// (`9000` once it runs out).
+        apdus: Option<VecDeque<Answer>>,
+    }
+
+    /// One scripted answer to an APDU.
+    type Answer = Result<(Vec<u8>, u16), TransportError>;
+
+    const LINK: LongLink = LongLink {
+        traced: false,
+        chain_upfront: None,
+    };
+
+    impl FakeCard {
+        fn send(&mut self) -> impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError> + '_ {
+            let script = self.apdus.as_mut().unwrap();
+            move |_apdu| script.pop_front().unwrap_or(Ok((Vec::new(), 0x9000)))
+        }
     }
 
     impl Default for FakeCard {
@@ -893,6 +951,7 @@ mod run_tests {
                     (SelfTest::KeyAgree, Outcome::Skipped(KeyAlg::Rsa2048)),
                     (SelfTest::Sign, Outcome::Passed),
                 ]),
+                apdus: None,
             }
         }
     }
@@ -916,6 +975,10 @@ mod run_tests {
             der: &[u8],
             compression: CertCompression,
         ) -> Result<CertImport, TransportError> {
+            if self.apdus.is_some() {
+                self.calls.push(Call::PutCert { compressed: false });
+                return send_certificate(LINK, slot, der, compression, &mut self.send());
+            }
             let sw = self.cert_sw;
             let calls = &mut self.calls;
             let done = store_certificate(slot, der, compression, |info, _payload| {
@@ -939,21 +1002,23 @@ mod run_tests {
             }
         }
 
-        fn write_key(
-            &mut self,
-            _slot: Slot,
-            alg_id: u8,
-            body: &[u8],
-        ) -> Result<(), TransportError> {
+        fn write_key(&mut self, slot: Slot, alg_id: u8, body: &[u8]) -> Result<(), TransportError> {
             self.calls.push(Call::WriteKey {
                 alg_id,
                 body: body.to_vec(),
             });
+            if self.apdus.is_some() {
+                return send_import_key(LINK, slot, alg_id, body, &mut self.send());
+            }
             if self.key_sw == 0x9000 {
                 Ok(())
             } else {
                 Err(apdu_err("piv import key", self.key_sw))
             }
+        }
+
+        fn remember_key(&mut self, _slot: Slot, alg: KeyAlg, public: PublicKey) {
+            self.calls.push(Call::RememberKey { alg, public });
         }
 
         fn self_test(
@@ -991,14 +1056,7 @@ mod run_tests {
     }
 
     fn run(card: &mut FakeCard, plan: &ImportPlan<'_>) -> Result<ImportReport, ImportFailure> {
-        run_import_with(
-            card,
-            plan,
-            CertCompression::Auto,
-            PinPolicy::Default,
-            TouchPolicy::Default,
-            Some(PIN),
-        )
+        run_import_with(card, plan, CertCompression::Auto, Some(PIN))
     }
 
     fn kinds(calls: &[Call]) -> Vec<&'static str> {
@@ -1008,6 +1066,7 @@ mod run_tests {
                 Call::PutCert { .. } => "put-cert",
                 Call::ClearCert => "clear-cert",
                 Call::WriteKey { .. } => "write-key",
+                Call::RememberKey { .. } => "remember-key",
                 Call::SelfTest { .. } => "self-test",
             })
             .collect()
@@ -1021,7 +1080,7 @@ mod run_tests {
         let report = run(&mut card, &plan).unwrap();
         assert_eq!(
             kinds(&card.calls),
-            ["put-cert", "write-key", "self-test"],
+            ["put-cert", "write-key", "remember-key", "self-test"],
             "{:?}",
             card.calls
         );
@@ -1029,6 +1088,13 @@ mod run_tests {
         // The self-test runs against the entry's own public key, with the PIN.
         assert_eq!(
             card.calls[2],
+            Call::RememberKey {
+                alg: KeyAlg::Rsa2048,
+                public: c.entries[0].key.public_key(),
+            }
+        );
+        assert_eq!(
+            card.calls[3],
             Call::SelfTest {
                 alg: KeyAlg::Rsa2048,
                 pubkey: c.entries[0].key.public_key(),
@@ -1133,15 +1199,7 @@ mod run_tests {
             readback_mismatch: true,
             ..FakeCard::default()
         };
-        let err = run_import_with(
-            &mut card,
-            &plan,
-            CertCompression::Always,
-            PinPolicy::Default,
-            TouchPolicy::Default,
-            None,
-        )
-        .unwrap_err();
+        let err = run_import_with(&mut card, &plan, CertCompression::Always, None).unwrap_err();
         assert_eq!(kinds(&card.calls), ["put-cert", "clear-cert"]);
         assert!(matches!(
             err,
@@ -1161,15 +1219,7 @@ mod run_tests {
             clear_ok: false,
             ..FakeCard::default()
         };
-        let err = run_import_with(
-            &mut card,
-            &plan,
-            CertCompression::Always,
-            PinPolicy::Default,
-            TouchPolicy::Default,
-            None,
-        )
-        .unwrap_err();
+        let err = run_import_with(&mut card, &plan, CertCompression::Always, None).unwrap_err();
         assert!(matches!(
             err,
             ImportFailure::CertificateNotStored {
@@ -1241,7 +1291,10 @@ mod run_tests {
         assert!(plan.entry.certificate.is_none());
         let mut card = FakeCard::default();
         let report = run(&mut card, &plan).unwrap();
-        assert_eq!(kinds(&card.calls), ["clear-cert", "write-key", "self-test"]);
+        assert_eq!(
+            kinds(&card.calls),
+            ["clear-cert", "write-key", "remember-key", "self-test"]
+        );
         assert!(report.cert.is_none());
 
         // Can't clear the old certificate: stop before the key.
@@ -1313,7 +1366,10 @@ mod run_tests {
         };
         let err = run(&mut card, &plan).unwrap_err();
         // No rollback: the written key and certificate stay.
-        assert_eq!(kinds(&card.calls), ["put-cert", "write-key", "self-test"]);
+        assert_eq!(
+            kinds(&card.calls),
+            ["put-cert", "write-key", "remember-key", "self-test"]
+        );
         let ImportFailure::SelfTestFailed(report) = &err else {
             panic!("{err:?}")
         };
@@ -1369,6 +1425,8 @@ mod run_tests {
             entry: &entry,
             slot: Slot::Authentication,
             layout: ImportLayout::Yubico,
+            pin_policy: PinPolicy::Default,
+            touch_policy: TouchPolicy::Default,
             skipped_authorities: 0,
         };
         let mut card = FakeCard::default();
@@ -1417,6 +1475,137 @@ mod run_tests {
             }
         }
         assert!(checked >= 10, "{checked}");
+    }
+
+    fn reader_failure() -> Result<(Vec<u8>, u16), TransportError> {
+        Err(TransportError::Pcsc(pcsc::Error::CommError))
+    }
+
+    fn sw(sw: u16) -> Result<(Vec<u8>, u16), TransportError> {
+        Ok((Vec::new(), sw))
+    }
+
+    #[test]
+    fn certificate_refused_after_a_reader_failure_is_cleared_and_hedged() {
+        // The extended PUT DATA fails at the reader (it may have landed), the
+        // chained retry is refused at its first link: the slot may hold the
+        // new certificate next to the old key, so it is deleted.
+        let c = load("rsa2048-modern");
+        let plan = yk_plan(&c);
+        let mut card = FakeCard {
+            apdus: Some(VecDeque::from([reader_failure(), sw(0x6A80)])),
+            ..FakeCard::default()
+        };
+        let err = run_import_with(&mut card, &plan, CertCompression::Never, None).unwrap_err();
+        assert_eq!(kinds(&card.calls), ["put-cert", "clear-cert"]);
+        match &err {
+            ImportFailure::CertificateNotStored {
+                error: TransportError::PivWriteUnconfirmed(_),
+                certificate_cleared: Some(true),
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(!msg.contains("Nothing was changed"), "{msg}");
+        assert!(
+            msg.ends_with("Slot 9A keeps its old key and now has no certificate."),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn key_refused_after_a_reader_failure_is_hedged() {
+        let c = load("rsa2048-modern");
+        let plan = yk_plan(&c);
+        // Certificate: one extended PUT DATA, accepted. Key: the extended APDU
+        // fails at the reader, then the first chained link is refused.
+        let mut card = FakeCard {
+            apdus: Some(VecDeque::from([sw(0x9000), reader_failure(), sw(0x6A80)])),
+            ..FakeCard::default()
+        };
+        let err = run_import_with(&mut card, &plan, CertCompression::Never, None).unwrap_err();
+        assert_eq!(kinds(&card.calls), ["put-cert", "write-key", "clear-cert"]);
+        match &err {
+            ImportFailure::KeyNotWritten {
+                error: TransportError::PivWriteUnconfirmed(_),
+                certificate_cleared: true,
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.starts_with("The key write didn't finish: "), "{msg}");
+        assert!(msg.contains("may hold its old key or the new one"), "{msg}");
+    }
+
+    #[test]
+    fn key_only_delete_failures_say_what_the_slot_holds() {
+        let c = load("key-only");
+        let plan = yk_plan(&c);
+        // A refused delete: nothing changed.
+        let mut card = FakeCard {
+            clear_ok: false,
+            ..FakeCard::default()
+        };
+        let err = run(&mut card, &plan).unwrap_err();
+        assert!(matches!(
+            err,
+            ImportFailure::CertificateNotStored {
+                storing_certificate: false,
+                certificate_cleared: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            err.to_string(),
+            "The slot's old certificate couldn't be deleted: device rejected piv clear \
+             certificate: SW=6A80 (incorrect parameters in the command data field). Nothing \
+             was changed; slot 9A keeps its old key and certificate."
+        );
+
+        // An unfinished delete (reader failure): hedged.
+        let err = ImportFailure::CertificateNotStored {
+            slot: Slot::Authentication,
+            error: TransportError::Pcsc(pcsc::Error::CommError),
+            storing_certificate: false,
+            slot_key_unchanged: true,
+            certificate_cleared: Some(false),
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains("Nothing was changed"), "{msg}");
+        assert!(
+            msg.contains("may or may not still have its old certificate"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn plan_carries_the_checked_policies_to_the_key_body() {
+        let c = load("p256-modern");
+        let plan = plan_import(
+            &c,
+            None,
+            Slot::Signature,
+            AppletFingerprint::YubiKey,
+            Some(&[5, 7, 1]),
+            None,
+            PinPolicy::Always,
+            TouchPolicy::Cached,
+        )
+        .unwrap();
+        let mut card = FakeCard {
+            self_test: Ok(vec![(SelfTest::Sign, Outcome::Passed)]),
+            ..FakeCard::default()
+        };
+        run(&mut card, &plan).unwrap();
+        let Call::WriteKey { body, .. } = &card.calls[1] else {
+            panic!("{:?}", card.calls)
+        };
+        assert!(
+            body.ends_with(&[0xAA, 0x01, 0x03, 0xAB, 0x01, 0x03]),
+            "{body:02X?}"
+        );
     }
 
     #[test]

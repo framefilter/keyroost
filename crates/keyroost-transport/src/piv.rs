@@ -4262,8 +4262,11 @@ impl<'tx> PivSession<'tx> {
     /// Requires prior management-key auth.
     ///
     /// Sent as one APDU (extended length when the key needs it), or chained
-    /// on a T=0 link and whenever the card won't take the extended APDU, as
-    /// for a certificate. The key bytes never appear in a `--debug` trace.
+    /// on a T=0 link, after a reader failure of the extended APDU, or when the
+    /// card refuses it as too long (see `key_import_retry_sw`); any other
+    /// refusal is returned as is. A failure after a reader failure is
+    /// [`TransportError::PivWriteUnconfirmed`]: the key may be on the card.
+    /// The key bytes never appear in a `--debug` trace.
     /// Unlike [`Self::generate_key`] this leaves the slot's certificate alone
     /// (the PKCS#12 import writes the matching one first); it evicts the
     /// slot's cached policy and public key the same way, then reads the
@@ -4288,19 +4291,17 @@ impl<'tx> PivSession<'tx> {
         alg_id: u8,
         body: &[u8],
     ) -> Result<(), TransportError> {
-        let sent = self.transmit_long(
-            "piv import key",
-            &piv::import_key(slot, alg_id, body),
-            || piv::import_key_chained(slot, alg_id, body, CHAIN_CHUNK),
-        );
+        let link = self.long_link();
+        let sent = send_import_key(link, slot, alg_id, body, &mut |apdu| {
+            self.transmit_full(apdu)
+        });
         // Whatever was cached for the slot describes the old key. Evict even
         // when the exchange failed: a lost answer may hide an accepted key.
         // Both caches go before `slot_policy` reads back, for the reason
         // `generate_key` gives.
         self.state.policy_cache.evict(slot.key_ref());
         self.state.pubkey_cache.evict(slot.key_ref());
-        let (_, sw) = sent?;
-        ok_or_write("piv import key", sw)?;
+        sent?;
         let _ = self.slot_policy(slot);
         Ok(())
     }
@@ -4324,9 +4325,24 @@ impl<'tx> PivSession<'tx> {
         pubkey: &PublicKey,
         pin: Option<&[u8]>,
     ) -> Result<Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>, TransportError> {
+        self.self_test_with_progress(slot, alg, pubkey, pin, || {})
+    }
+
+    /// [`Self::self_test`], calling `on_start` once the PIN (if any) is
+    /// verified and just before the first operation — where a caller prints
+    /// its "testing…" line.
+    pub fn self_test_with_progress(
+        &mut self,
+        slot: Slot,
+        alg: KeyAlg,
+        pubkey: &PublicKey,
+        pin: Option<&[u8]>,
+        on_start: impl FnOnce(),
+    ) -> Result<Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>, TransportError> {
         if let Some(pin) = pin {
             self.verify_pin(pin)?;
         }
+        on_start();
         let mut ran = 0usize;
         Ok(keyroost_pivtest::run(alg, pubkey, |op, input| {
             if let (Some(pin), true) = (pin, ran > 0) {
@@ -4406,9 +4422,9 @@ impl<'tx> PivSession<'tx> {
         der: &[u8],
         compression: CertCompression,
     ) -> Result<CertImport, TransportError> {
-        let done = store_certificate(slot, der, compression, |info, payload| {
-            let sw = self.put_cert_object(slot, &piv::encode_certificate(payload, info))?;
-            cert_write_result(slot, der.len(), sw)
+        let link = self.long_link();
+        let done = send_certificate(link, slot, der, compression, &mut |apdu| {
+            self.transmit_full(apdu)
         })?;
         if done.auto_compressed {
             trace::line(self.traced, || {
@@ -4440,79 +4456,12 @@ impl<'tx> PivSession<'tx> {
         Ok(done)
     }
 
-    /// PUT DATA of a slot's certificate object `value`, returning the final
-    /// status word.
-    ///
-    /// Tries a single extended-length PUT DATA first; a cert big enough to
-    /// need one (any real X.509 cert typically is) that gets rejected falls
-    /// back to ISO 7816-4 command chaining — see [`Self::sign`] for why. The
-    /// fallback also runs when the extended APDU fails at the PC/SC layer
-    /// before any status word comes back (seen with certificates of a few
-    /// KB). A mid-chain `6700` / `6A84` comes back as that status word.
-    fn put_cert_object(&mut self, slot: Slot, value: &[u8]) -> Result<u16, TransportError> {
-        let tag = slot.cert_object_tag();
-        chained_cert_sw(self.transmit_long(
-            "piv import certificate",
-            &piv::put_data(&tag, value),
-            || piv::put_data_chained(&tag, value, CHAIN_CHUNK),
-        ))
-    }
-
-    /// Send a command whose data may not fit one short APDU: `single` (one
-    /// extended-length APDU when the data needs it), or the `chained` ISO
-    /// 7816-4 sequence. Chains up front on a T=0 link or when forced; chains
-    /// as a fallback when an extended `single` fails at the PC/SC layer or the
-    /// card answers it with anything but `9000`. A short-form `single` is
-    /// never retried. Returns the final exchange; [`Self::transmit_chain`]
-    /// turns a refused intermediate link into [`TransportError::Apdu`].
-    fn transmit_long<C: AsRef<[u8]>>(
-        &mut self,
-        label: &'static str,
-        single: &[u8],
-        chained: impl FnOnce() -> Vec<C>,
-    ) -> Result<(Vec<u8>, u16), TransportError> {
-        if self.chain_upfront() {
-            trace::line(self.traced, || {
-                format_line(
-                    Dir::Note,
-                    label,
-                    &format!("command chaining up front ({})", self.chain_reason()),
-                )
-            });
-            return self.transmit_chain(label, &chained());
+    /// How [`send_long`] may send on this link.
+    fn long_link(&self) -> LongLink {
+        LongLink {
+            traced: self.traced,
+            chain_upfront: self.chain_upfront().then(|| self.chain_reason()),
         }
-        let extended = uses_extended_length(single);
-        let direct = self.transmit_full(single);
-        if retry_chained_after(&direct, extended) {
-            if let Err(e) = &direct {
-                trace::line(self.traced, || {
-                    format_line(
-                        Dir::Note,
-                        label,
-                        &format!(
-                            "extended length failed at the PC/SC \
-                         layer ({e}); retrying with command chaining"
-                        ),
-                    )
-                });
-            }
-            return self.transmit_chain(label, &chained());
-        }
-        let (data, sw) = direct?;
-        if sw == piv::SW_OK || !extended {
-            return Ok((data, sw));
-        }
-        trace::line(self.traced, || {
-            format_line(
-                Dir::Note,
-                label,
-                &format!(
-                    "extended length rejected (SW={sw:04X}); \
-                 retrying with command chaining"
-                ),
-            )
-        });
-        self.transmit_chain(label, &chained())
     }
 
     /// [`Self::import_certificate`]'s pre-flight key check — see that
@@ -5918,24 +5867,208 @@ impl<'tx> PivSession<'tx> {
         label: &'static str,
         chunks: &[C],
     ) -> Result<(Vec<u8>, u16), TransportError> {
-        let last = chunks.len().saturating_sub(1);
-        for (i, chunk) in chunks.iter().enumerate() {
-            let (data, sw) = self.transmit_full(chunk.as_ref())?;
-            if i == last {
-                return Ok((data, sw));
-            }
-            // An intermediate chain link the card didn't accept (anything but
-            // 9000) aborts the chain.
-            if sw != piv::SW_OK {
-                return Err(TransportError::Apdu {
-                    label,
-                    sw1: (sw >> 8) as u8,
-                    sw2: sw as u8,
-                });
-            }
-        }
-        Ok((Vec::new(), piv::SW_OK)) // unreachable: chunk builders never return an empty list
+        transmit_chain_with(label, chunks, &mut |apdu| self.transmit_full(apdu))
     }
+}
+
+/// [`PivSession::transmit_chain`] over any single-APDU `send`, so the
+/// long-command logic built on it is tested without a card.
+fn transmit_chain_with<C: AsRef<[u8]>>(
+    label: &'static str,
+    chunks: &[C],
+    send: &mut impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+) -> Result<(Vec<u8>, u16), TransportError> {
+    let last = chunks.len().saturating_sub(1);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let (data, sw) = send(chunk.as_ref())?;
+        if i == last {
+            return Ok((data, sw));
+        }
+        // An intermediate chain link the card didn't accept (anything but
+        // 9000) aborts the chain.
+        if sw != piv::SW_OK {
+            return Err(TransportError::Apdu {
+                label,
+                sw1: (sw >> 8) as u8,
+                sw2: sw as u8,
+            });
+        }
+    }
+    Ok((Vec::new(), piv::SW_OK)) // unreachable: chunk builders never return an empty list
+}
+
+/// How a command too long for one short APDU may go out on a link: chained
+/// from the start (with the reason, for the trace), or one APDU first.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LongLink {
+    pub(crate) traced: bool,
+    pub(crate) chain_upfront: Option<&'static str>,
+}
+
+/// What [`send_long`] got back. `after_reader_failure`: the one-APDU attempt
+/// failed at the PC/SC layer and the command went again chained, so `result`
+/// is the retry's and the first attempt may have been applied anyway.
+pub(crate) struct LongSent {
+    pub(crate) result: Result<(Vec<u8>, u16), TransportError>,
+    pub(crate) after_reader_failure: bool,
+}
+
+/// Send a command whose data may not fit one short APDU: `single` (one
+/// extended-length APDU when the data needs it), or the `chained` ISO 7816-4
+/// sequence. Chains up front when `link` says so (T=0, or forced); chains as
+/// a fallback when an extended `single` fails at the PC/SC layer, or when the
+/// card answers it with a status word `retry_on` accepts. A short-form
+/// `single` is never retried. A refused intermediate link comes back as
+/// [`TransportError::Apdu`] ([`transmit_chain_with`]).
+pub(crate) fn send_long<C: AsRef<[u8]>>(
+    link: LongLink,
+    label: &'static str,
+    single: &[u8],
+    chained: impl FnOnce() -> Vec<C>,
+    retry_on: impl Fn(u16) -> bool,
+    send: &mut impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+) -> LongSent {
+    let note = |text: &str| trace::line(link.traced, || format_line(Dir::Note, label, text));
+    if let Some(reason) = link.chain_upfront {
+        note(&format!("command chaining up front ({reason})"));
+        return LongSent {
+            result: transmit_chain_with(label, &chained(), send),
+            after_reader_failure: false,
+        };
+    }
+    let extended = uses_extended_length(single);
+    let direct = send(single);
+    if retry_chained_after(&direct, extended) {
+        if let Err(e) = &direct {
+            note(&format!(
+                "extended length failed at the PC/SC layer ({e}); retrying with command chaining"
+            ));
+        }
+        return LongSent {
+            result: transmit_chain_with(label, &chained(), send),
+            after_reader_failure: true,
+        };
+    }
+    let result = match direct {
+        Ok((_, sw)) if extended && sw != piv::SW_OK && retry_on(sw) => {
+            note(&format!(
+                "extended length rejected (SW={sw:04X}); retrying with command chaining"
+            ));
+            transmit_chain_with(label, &chained(), send)
+        }
+        other => other,
+    };
+    LongSent {
+        result,
+        after_reader_failure: false,
+    }
+}
+
+/// `e`, marked [`TransportError::PivWriteUnconfirmed`] when an earlier
+/// attempt at the same write failed at the reader and may have been applied.
+fn unconfirmed_if(after_reader_failure: bool, e: TransportError) -> TransportError {
+    match e {
+        TransportError::PivWriteUnconfirmed(_) => e,
+        e if after_reader_failure => TransportError::PivWriteUnconfirmed(Box::new(e)),
+        e => e,
+    }
+}
+
+/// PUT DATA of a slot's certificate object `value`, returning the final
+/// status word.
+///
+/// Tries a single extended-length PUT DATA first; a cert big enough to need
+/// one (any real X.509 cert typically is) that gets rejected falls back to
+/// ISO 7816-4 command chaining — see [`PivSession::sign`] for why. The
+/// fallback also runs when the extended APDU fails at the PC/SC layer before
+/// any status word comes back (seen with certificates of a few KB); that sets
+/// `after_reader_failure`. A mid-chain `6700` / `6A84` comes back as that
+/// status word.
+fn put_cert_object_with(
+    link: LongLink,
+    slot: Slot,
+    value: &[u8],
+    send: &mut impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+    after_reader_failure: &mut bool,
+) -> Result<u16, TransportError> {
+    let tag = slot.cert_object_tag();
+    let sent = send_long(
+        link,
+        "piv import certificate",
+        &piv::put_data(&tag, value),
+        || piv::put_data_chained(&tag, value, CHAIN_CHUNK),
+        |_| true,
+        send,
+    );
+    *after_reader_failure |= sent.after_reader_failure;
+    chained_cert_sw(sent.result)
+}
+
+/// Store `der` in `slot`'s certificate object as `compression` says
+/// ([`store_certificate`]), each APDU through `send`. A failure after a write
+/// that failed at the reader (and was retried chained) is
+/// [`TransportError::PivWriteUnconfirmed`]: that first write may have landed.
+pub(crate) fn send_certificate(
+    link: LongLink,
+    slot: Slot,
+    der: &[u8],
+    compression: CertCompression,
+    send: &mut impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+) -> Result<CertImport, TransportError> {
+    let mut after_reader_failure = false;
+    let stored = store_certificate(slot, der, compression, |info, payload| {
+        let sw = put_cert_object_with(
+            link,
+            slot,
+            &piv::encode_certificate(payload, info),
+            send,
+            &mut after_reader_failure,
+        )?;
+        cert_write_result(slot, der.len(), sw)
+    });
+    stored.map_err(|e| unconfirmed_if(after_reader_failure, e))
+}
+
+/// `6883` "last command of the chain expected": how some applets answer an
+/// extended-length command they would take chained.
+const SW_LAST_COMMAND_EXPECTED: u16 = 0x6883;
+
+/// Whether an IMPORT ASYMMETRIC KEY sent as one extended APDU and answered
+/// `sw` is worth sending again chained: only the answers cards give an
+/// extended length they don't take — `6700` (wrong length), `6883` (chain
+/// expected), and `6A80`, which a Token2 PIV token's contact interface gives
+/// a well-formed extended-length command it accepts chained (see
+/// [`PivSession::sign`]). Anything else (`6982` no management key, …) is the
+/// card's real answer; the private key isn't sent twice for it.
+fn key_import_retry_sw(sw: u16) -> bool {
+    matches!(sw, piv::SW_WRONG_LENGTH | SW_LAST_COMMAND_EXPECTED | 0x6A80)
+}
+
+/// Send an IMPORT ASYMMETRIC KEY `body` for `slot`, each APDU through `send`.
+/// A failure after an attempt that failed at the reader (and was retried
+/// chained) is [`TransportError::PivWriteUnconfirmed`]: the key may be on the
+/// card.
+pub(crate) fn send_import_key(
+    link: LongLink,
+    slot: Slot,
+    alg_id: u8,
+    body: &[u8],
+    send: &mut impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+) -> Result<(), TransportError> {
+    let LongSent {
+        result,
+        after_reader_failure,
+    } = send_long(
+        link,
+        "piv import key",
+        &piv::import_key(slot, alg_id, body),
+        || piv::import_key_chained(slot, alg_id, body, CHAIN_CHUNK),
+        key_import_retry_sw,
+        send,
+    );
+    result
+        .and_then(|(_, sw)| ok_or_write("piv import key", sw))
+        .map_err(|e| unconfirmed_if(after_reader_failure, e))
 }
 
 /// The IMPORT ASYMMETRIC KEY body for `key`, refused when its parts are not
@@ -7232,6 +7365,143 @@ mod tests {
         for apdu in &chained {
             assert!(piv_cmd_sensitive(apdu));
         }
+    }
+
+    /// A single-APDU `send` answering from `script` in order (`9000` once it
+    /// runs out), recording each APDU's CLA and data length.
+    fn scripted(
+        script: Vec<Result<(Vec<u8>, u16), TransportError>>,
+        sent: &mut Vec<(u8, usize)>,
+    ) -> impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError> + '_ {
+        let mut script = std::collections::VecDeque::from(script);
+        move |apdu| {
+            sent.push((apdu[0], command_data(apdu).map_or(0, <[u8]>::len)));
+            script.pop_front().unwrap_or(Ok((Vec::new(), piv::SW_OK)))
+        }
+    }
+
+    const DIRECT: LongLink = LongLink {
+        traced: false,
+        chain_upfront: None,
+    };
+
+    fn reader_failure() -> Result<(Vec<u8>, u16), TransportError> {
+        Err(TransportError::Pcsc(pcsc::Error::CommError))
+    }
+
+    fn sw(sw: u16) -> Result<(Vec<u8>, u16), TransportError> {
+        Ok((Vec::new(), sw))
+    }
+
+    fn fixture_cert() -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/../keyroost-p12/tests/fixtures/rsa2048-modern.crt.der",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn key_import_is_resent_chained_only_for_length_refusals() {
+        let body = [0x5A; 600];
+        for (answer, chained) in [
+            (0x6700, true),
+            (0x6883, true),
+            (0x6A80, true),
+            (0x6982, false),
+            (0x6A84, false),
+        ] {
+            let mut sent = Vec::new();
+            let r = send_import_key(
+                DIRECT,
+                Slot::Authentication,
+                0x07,
+                &body,
+                &mut scripted(vec![sw(answer), sw(answer)], &mut sent),
+            );
+            assert_eq!(sent.len() > 1, chained, "SW {answer:04X}: {sent:?}");
+            assert!(r.is_err());
+            if answer == 0x6982 {
+                // The card's own answer, mapped as for every PIV write.
+                assert!(matches!(r, Err(TransportError::PivSecurityNotSatisfied)));
+            }
+        }
+    }
+
+    #[test]
+    fn key_import_refused_after_a_reader_failure_is_unconfirmed() {
+        let mut sent = Vec::new();
+        let r = send_import_key(
+            DIRECT,
+            Slot::Authentication,
+            0x07,
+            &[0x5A; 600],
+            &mut scripted(vec![reader_failure(), sw(0x6A80)], &mut sent),
+        );
+        assert!(
+            matches!(&r, Err(TransportError::PivWriteUnconfirmed(inner))
+                if matches!(**inner, TransportError::Apdu { sw1: 0x6A, sw2: 0x80, .. })),
+            "{r:?}"
+        );
+        // Without the reader failure the same refusal is a plain refusal.
+        let mut sent = Vec::new();
+        let r = send_import_key(
+            DIRECT,
+            Slot::Authentication,
+            0x07,
+            &[0x5A; 600],
+            &mut scripted(vec![sw(0x6A80), sw(0x6A80)], &mut sent),
+        );
+        assert!(matches!(r, Err(TransportError::Apdu { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn certificate_refused_after_a_reader_failure_is_unconfirmed() {
+        let der = fixture_cert();
+        let mut sent = Vec::new();
+        let r = send_certificate(
+            DIRECT,
+            Slot::Authentication,
+            &der,
+            CertCompression::Never,
+            &mut scripted(vec![reader_failure(), sw(0x6700)], &mut sent),
+        );
+        assert!(
+            matches!(&r, Err(TransportError::PivWriteUnconfirmed(inner))
+                if matches!(**inner, TransportError::PivCertTooLarge { .. })),
+            "{r:?}"
+        );
+        // A plain refusal stays what it was.
+        let mut sent = Vec::new();
+        let r = send_certificate(
+            DIRECT,
+            Slot::Authentication,
+            &der,
+            CertCompression::Never,
+            // Refused extended, then refused at the first chained link.
+            &mut scripted(vec![sw(0x6A84), sw(0x6A84)], &mut sent),
+        );
+        assert!(
+            matches!(r, Err(TransportError::PivCardFull { .. })),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn auto_still_compresses_after_a_reader_failure_then_length_refusal() {
+        // Extended PUT DATA fails at the reader, the chained retry is refused
+        // as too long: Auto stores it compressed, as before.
+        let der = fixture_cert();
+        let mut sent = Vec::new();
+        let done = send_certificate(
+            DIRECT,
+            Slot::Authentication,
+            &der,
+            CertCompression::Auto,
+            &mut scripted(vec![reader_failure(), sw(0x6700)], &mut sent),
+        )
+        .unwrap();
+        assert!(done.compressed && done.auto_compressed);
     }
 
     #[test]
