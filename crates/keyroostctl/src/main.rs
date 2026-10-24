@@ -6978,8 +6978,7 @@ fn oath_password_from(
         return Ok((name, Some(pw)));
     }
     let required = {
-        let mut probe = keyroost_transport::OathSession::open(&name)?;
-        probe.set_debug(debug);
+        let probe = keyroost_transport::OathSession::open_traced(&name, debug)?;
         probe.password_required()
     }; // the probe session is closed here, before any prompt
     if !required {
@@ -6999,8 +6998,7 @@ fn open_oath_unlocked(
     password: Option<&str>,
     debug: bool,
 ) -> Result<keyroost_transport::OathSession, Box<dyn std::error::Error>> {
-    let mut session = keyroost_transport::OathSession::open(name)?;
-    session.set_debug(debug);
+    let mut session = keyroost_transport::OathSession::open_traced(name, debug)?;
     match password {
         Some(pw) => session.unlock(pw)?,
         None if session.password_required() => {
@@ -8085,8 +8083,7 @@ fn reset_one_card_applet(
     let run = || -> Result<(), Box<dyn std::error::Error>> {
         match step {
             ResetStep::Oath => {
-                let mut s = keyroost_transport::OathSession::open(&reader()?)?;
-                s.set_debug(debug);
+                let mut s = keyroost_transport::OathSession::open_traced(&reader()?, debug)?;
                 s.factory_reset()?;
             }
             ResetStep::OpenPgp => {
@@ -8307,8 +8304,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // password-protected applet whose password is lost — that's its
             // entire purpose — so no unlock is attempted.
             let name = crate::target::reader_of(&dev)?;
-            let mut session = keyroost_transport::OathSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = keyroost_transport::OathSession::open_traced(&name, debug)?;
             // Some keys (Nitrokey 3) ask for a touch to reset.
             eprintln!("Resetting \u{2014} touch the key if it blinks\u{2026}");
             session.factory_reset()?;
@@ -11070,9 +11066,9 @@ fn open_openpgp_at(
     name: &str,
     debug: bool,
 ) -> Result<keyroost_transport::OpenPgpSession, Box<dyn std::error::Error>> {
-    let mut session = keyroost_transport::OpenPgpSession::open(name)?;
-    session.set_debug(debug);
-    Ok(session)
+    Ok(keyroost_transport::OpenPgpSession::open_traced(
+        name, debug,
+    )?)
 }
 
 /// Authenticate the management key on an already-open [`keyroost_transport::PivSession`] against

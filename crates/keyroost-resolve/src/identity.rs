@@ -154,6 +154,10 @@ pub trait IdentityReader: Sync {
 pub const SOLO2_VID: u16 = 0x1209;
 pub const SOLO2_PID: u16 = 0xBEEE;
 
+/// The YubiKey NEO's USB product IDs, one per enabled-interface mix
+/// (OTP / U2F / CCID).
+const YUBIKEY_NEO_PIDS: std::ops::RangeInclusive<u16> = 0x0110..=0x0116;
+
 /// Yubico: management READ CONFIG over CTAPHID; CCID serial from the probe.
 pub struct YubicoIdentity;
 impl IdentityReader for YubicoIdentity {
@@ -161,7 +165,10 @@ impl IdentityReader for YubicoIdentity {
         "Yubico"
     }
     fn claims_hid(&self, h: &HidDevice) -> bool {
-        h.vendor_id == crate::VID_YUBICO
+        // Not a NEO: one answered READ CONFIG with ERR_INVALID_CMD on every
+        // try, so asking only adds FIDO-side traffic. Its pairing falls back
+        // to the vendor match.
+        h.vendor_id == crate::VID_YUBICO && !YUBIKEY_NEO_PIDS.contains(&h.product_id)
     }
     fn claims_reader(&self, p: &ReaderProbe) -> bool {
         !p.is_molto2
@@ -740,6 +747,26 @@ mod tests {
             vec![(0, "/dev/hidraw17".into()), (0, "/dev/hidraw18".into())]
         );
         assert_eq!(plan.ccid, vec![(0, YK0.to_string()), (0, YK1.to_string())]);
+    }
+
+    #[test]
+    fn a_yubikey_neo_is_not_asked_for_its_identity_over_hid() {
+        const NEO: &str = "Yubico Yubikey NEO OTP+U2F+CCID";
+        let probes = [reader(NEO, Some("11111111"), None, None)];
+        for pid in 0x0110..=0x0116 {
+            let hids = [hid(0x1050, pid, "DevSrvsID:1", None, None, None)];
+            assert_eq!(
+                plan_identity_reads(&hids, &probes, IDENTITY_READERS),
+                IdentityPlan::default(),
+                "pid {pid:#06x}"
+            );
+        }
+        // A YubiKey 5 still is.
+        for pid in [0x0402, 0x0406, 0x0407] {
+            let hids = [hid(0x1050, pid, "DevSrvsID:1", None, None, None)];
+            let plan = plan_identity_reads(&hids, &probes, IDENTITY_READERS);
+            assert_eq!(plan.hid, vec![(0, "DevSrvsID:1".into())], "pid {pid:#06x}");
+        }
     }
 
     #[test]

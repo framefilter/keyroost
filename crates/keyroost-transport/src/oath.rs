@@ -13,6 +13,7 @@
 //! and [`clear_password`](OathSession::clear_password) — though Trussed devices
 //! (Solo 2 / Nitrokey 3) omit that handshake.
 
+use crate::recover::{self, FirstContact};
 use crate::TransportError;
 use keyroost_oath as oath;
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
@@ -44,22 +45,53 @@ impl OathSession {
     /// would send the session's next commands to that applet; a Nitrokey 3
     /// then answered `6A81` to every CALCULATE until a re-SELECT.
     pub fn open(reader_name: &str) -> Result<Self, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        Self::open_traced(reader_name, false)
+    }
+
+    /// [`Self::open`] with per-APDU stderr tracing on from the start, so the
+    /// SELECT it sends is traced too.
+    ///
+    /// A card found just reset or briefly gone while connecting, beginning
+    /// the transaction or answering the SELECT is waited for and opened once
+    /// more (see `crate::recover`).
+    pub fn open_traced(reader_name: &str, debug: bool) -> Result<Self, TransportError> {
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let mut card = ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY)?;
-        // `pcsc::Transaction` borrows the card, so it can't live in the
-        // session next to it. Forgetting the guard leaves the transaction
-        // open; disconnecting (the card's drop) ends it, as PC/SC specifies.
-        std::mem::forget(card.transaction()?);
-        let mut session = Self {
-            card,
-            debug: false,
-            select_info: oath::SelectInfo::default(),
-            access_key: None,
-        };
-        session.select()?;
-        Ok(session)
+        let mut contact = FirstContact::new(reader_name, debug, "oath");
+        loop {
+            let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+            let mut card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
+                Ok(card) => card,
+                Err(e) => {
+                    contact.retry_or_fail(e.into())?;
+                    continue;
+                }
+            };
+            // `pcsc::Transaction` borrows the card, so it can't live in the
+            // session next to it. Forgetting the guard leaves the transaction
+            // open; disconnecting (the card's drop) ends it, as PC/SC specifies.
+            if let Err(e) = card.transaction().map(std::mem::forget) {
+                recover::release(card);
+                contact.retry_or_fail(e.into())?;
+                continue;
+            }
+            let mut session = Self {
+                card,
+                debug,
+                select_info: oath::SelectInfo::default(),
+                access_key: None,
+            };
+            match session.select() {
+                Ok(()) => {
+                    contact.opened();
+                    return Ok(session);
+                }
+                Err(e) => {
+                    recover::release(session.card);
+                    contact.retry_or_fail(e)?;
+                }
+            }
+        }
     }
 
     /// The applet version from SELECT (YubiKey: firmware), when it is 3 bytes.

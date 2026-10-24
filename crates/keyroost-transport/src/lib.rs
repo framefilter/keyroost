@@ -45,6 +45,8 @@ pub use openpgp::{ImportKey, KeyImport, OpenPgpSession, OpenPgpStatus};
 
 mod gzip;
 
+mod recover;
+
 mod piv;
 pub mod piv_import;
 pub use piv::{

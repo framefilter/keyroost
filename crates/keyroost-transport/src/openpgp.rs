@@ -10,6 +10,7 @@
 //! PIN verification/changes, key generation and import, PSO signing/decryption,
 //! and factory reset.
 
+use crate::recover::{self, FirstContact};
 use crate::{trace, TransportError};
 use keyroost_openpgp as pgp;
 use keyroost_proto::trace::{format_line, Dir};
@@ -126,13 +127,39 @@ impl OpenPgpSession {
     /// Connect to `reader_name` and SELECT the OpenPGP applet. Returns
     /// [`TransportError::NoOpenPgpApplet`] when the card has no OpenPGP applet.
     pub fn open(reader_name: &str) -> Result<Self, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        Self::open_traced(reader_name, false)
+    }
+
+    /// [`Self::open`] with per-APDU stderr tracing on from the start, so the
+    /// SELECT it sends is traced too.
+    ///
+    /// A card found just reset or briefly gone while connecting or answering
+    /// the SELECT is waited for and opened once more (see `crate::recover`).
+    pub fn open_traced(reader_name: &str, debug: bool) -> Result<Self, TransportError> {
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let card = ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY)?;
-        let mut session = Self { card, debug: false };
-        session.select()?;
-        Ok(session)
+        let mut contact = FirstContact::new(reader_name, debug, "openpgp");
+        loop {
+            let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+            let card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
+                Ok(card) => card,
+                Err(e) => {
+                    contact.retry_or_fail(e.into())?;
+                    continue;
+                }
+            };
+            let mut session = Self { card, debug };
+            match session.select() {
+                Ok(()) => {
+                    contact.opened();
+                    return Ok(session);
+                }
+                Err(e) => {
+                    recover::release(session.card);
+                    contact.retry_or_fail(e)?;
+                }
+            }
+        }
     }
 
     /// Enable per-APDU stderr tracing.

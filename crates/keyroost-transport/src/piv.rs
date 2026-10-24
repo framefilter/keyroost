@@ -10,6 +10,7 @@
 //! generation, certificate import/export, and applet reset.
 
 use crate::gzip::{gunzip_capped, gzip_member};
+use crate::recover::{self, FirstContact};
 use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
@@ -1454,22 +1455,46 @@ impl<'tx> PivSession<'tx> {
     /// another process (or another thread's own Molto2/OATH/PIV session)
     /// could otherwise interleave a command between two of this session's
     /// own APDUs.
+    ///
+    /// A card found just reset or briefly gone while connecting, beginning
+    /// the transaction or answering the SELECT is waited for and opened once
+    /// more (see `crate::recover`); `f` itself never runs twice.
     pub fn with_transaction_traced<R, E: From<TransportError>>(
         reader_name: &str,
         traced: bool,
         f: impl FnOnce(&mut PivSession<'_>) -> Result<R, E>,
     ) -> Result<R, E> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let mut card = ctx
-            .connect(&cstr, ShareMode::Shared, Protocols::ANY)
-            .map_err(TransportError::from)?;
-        let txn = card.transaction().map_err(TransportError::from)?;
-        let mut session = Self::from_transaction(txn, reader_name, traced);
-        session.select()?;
-        session.fingerprint();
-        f(&mut session)
+        let mut contact = FirstContact::new(reader_name, traced, "piv");
+        loop {
+            let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+            let mut card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
+                Ok(card) => card,
+                Err(e) => {
+                    contact.retry_or_fail(e.into())?;
+                    continue;
+                }
+            };
+            // The session borrows `card`, so it lives inside this match and
+            // only the error leaves it, freeing `card` to be released.
+            let failed: TransportError = match card.transaction() {
+                Ok(txn) => {
+                    let mut session = Self::from_transaction(txn, reader_name, traced);
+                    match session.select() {
+                        Ok(()) => {
+                            contact.opened();
+                            session.fingerprint();
+                            return f(&mut session);
+                        }
+                        Err(e) => e,
+                    }
+                }
+                Err(e) => e.into(),
+            };
+            recover::release(card);
+            contact.retry_or_fail(failed)?;
+        }
     }
 
     /// Build a fresh, unselected [`PivSession`] around `txn` — an
@@ -1612,69 +1637,93 @@ impl<'tx> PivSession<'tx> {
     /// against either way — even on this same, unchanged card, letting
     /// `cached` go stale here would just mean the next call re-validates
     /// from an older baseline than it needs to.
+    ///
+    /// A card found just reset while opening is waited for and opened once
+    /// more, as in [`Self::with_transaction_traced`].
     pub fn with_cached_transaction_traced<R, E: From<TransportError>>(
         reader_name: &str,
         cached: PivSessionState,
         traced: bool,
         f: impl FnOnce(&mut PivSession<'_>) -> Result<R, E>,
     ) -> Result<R, E> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
+        let mut contact = FirstContact::new(reader_name, traced, "piv");
+        loop {
+            let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
 
-        // Card-free. The input baseline here doesn't matter for what's
-        // actually compared (the event counter, read unconditionally below)
-        // — `State::UNAWARE` just asks for "current state, no diffing",
-        // which a zero timeout returns immediately either way.
-        let mut states = [ReaderState::new(cstr.clone(), State::UNAWARE)];
-        let (fresh_state, fresh_event_count) =
-            match ctx.get_status_change(std::time::Duration::ZERO, &mut states) {
-                Ok(()) | Err(PcscError::Timeout) => {
-                    (Some(states[0].event_state()), Some(states[0].event_count()))
+            // Card-free. The input baseline here doesn't matter for what's
+            // actually compared (the event counter, read unconditionally below)
+            // — `State::UNAWARE` just asks for "current state, no diffing",
+            // which a zero timeout returns immediately either way.
+            let mut states = [ReaderState::new(cstr.clone(), State::UNAWARE)];
+            let (fresh_state, fresh_event_count) =
+                match ctx.get_status_change(std::time::Duration::ZERO, &mut states) {
+                    Ok(()) | Err(PcscError::Timeout) => {
+                        (Some(states[0].event_state()), Some(states[0].event_count()))
+                    }
+                    // Can't ask PC/SC at all (service hiccup, reader mid-teardown) —
+                    // the connect just below surfaces the real error if the reader
+                    // is genuinely gone; here, just don't trust the cache.
+                    Err(_) => (None, None),
+                };
+            let pcsc_trustworthy = pcsc_reading_usable(fresh_state);
+
+            // The ATR needs a live connection either way, so make one regardless
+            // of what the card-free check found, and begin the transaction on it
+            // immediately — before either branch below sends anything, SELECT
+            // included, so the transaction genuinely covers the whole session
+            // regardless of which branch runs.
+            let mut card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
+                Ok(card) => card,
+                Err(e) => {
+                    contact.retry_or_fail(e.into())?;
+                    continue;
                 }
-                // Can't ask PC/SC at all (service hiccup, reader mid-teardown) —
-                // the connect just below surfaces the real error if the reader
-                // is genuinely gone; here, just don't trust the cache.
-                Err(_) => (None, None),
             };
-        let pcsc_trustworthy = pcsc_reading_usable(fresh_state);
+            // The session borrows `card`, so it lives inside this match and
+            // only the error leaves it, freeing `card` to be released.
+            let failed: TransportError = match card.transaction() {
+                Ok(txn) => {
+                    let mut session = Self::from_transaction(txn, reader_name, traced);
+                    let fresh_identity = PcscIdentity {
+                        reader_name: reader_name.to_owned(),
+                        event_count: fresh_event_count,
+                        atr: session.atr(),
+                    };
 
-        // The ATR needs a live connection either way, so make one regardless
-        // of what the card-free check found, and begin the transaction on it
-        // immediately — before either branch below sends anything, SELECT
-        // included, so the transaction genuinely covers the whole session
-        // regardless of which branch runs.
-        let mut card = ctx
-            .connect(&cstr, ShareMode::Shared, Protocols::ANY)
-            .map_err(TransportError::from)?;
-        let txn = card.transaction().map_err(TransportError::from)?;
-        let mut session = Self::from_transaction(txn, reader_name, traced);
-        let fresh_identity = PcscIdentity {
-            reader_name: reader_name.to_owned(),
-            event_count: fresh_event_count,
-            atr: session.atr(),
-        };
-
-        // The caller's choice, not a card fact: set before anything is read,
-        // and kept even when the cached card facts are thrown away below.
-        session.state.send_unsupported_reads = cached.send_unsupported_reads;
-        if piv_session_cache_reusable(
-            pcsc_trustworthy,
-            cached.pcsc_identity.matches(&fresh_identity),
-        ) {
-            session.state = cached;
-            session.state.forget_pin_verification();
-        } else {
-            session.select()?;
-            session.fingerprint();
+                    // The caller's choice, not a card fact: set before anything is read,
+                    // and kept even when the cached card facts are thrown away below.
+                    session.state.send_unsupported_reads = cached.send_unsupported_reads;
+                    // Whichever branch runs, this connect's own readings are the
+                    // freshest anchor available for the *next* `with_cached_transaction`
+                    // call on this reader — stored regardless of whether this call
+                    // reused `cached` or resolved fresh.
+                    if piv_session_cache_reusable(
+                        pcsc_trustworthy,
+                        cached.pcsc_identity.matches(&fresh_identity),
+                    ) {
+                        contact.opened();
+                        session.state = cached;
+                        session.state.forget_pin_verification();
+                        session.state.pcsc_identity = fresh_identity;
+                        return f(&mut session);
+                    }
+                    match session.select() {
+                        Ok(()) => {
+                            contact.opened();
+                            session.fingerprint();
+                            session.state.pcsc_identity = fresh_identity;
+                            return f(&mut session);
+                        }
+                        Err(e) => e,
+                    }
+                }
+                Err(e) => e.into(),
+            };
+            recover::release(card);
+            contact.retry_or_fail(failed)?;
         }
-        // Whichever branch ran, this connect's own readings are the
-        // freshest anchor available for the *next* `with_cached_transaction`
-        // call on this reader — store them regardless of whether this call
-        // reused `cached` or resolved fresh.
-        session.state.pcsc_identity = fresh_identity;
-
-        f(&mut session)
     }
 
     /// Rebuild every piece of in-session state this session caches or
