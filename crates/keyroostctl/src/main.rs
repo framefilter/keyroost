@@ -11296,6 +11296,7 @@ fn piv_metadata_quirky(
 /// The `piv info` words for one slot. A slot without a certificate reads
 /// "empty" only when the card said it holds no key (`key` from
 /// `PivSession::slot_key_presence`); when keyroost can't tell, it says so.
+/// A certificate in a slot the card says holds no key gets ", no key".
 fn piv_slot_state(
     cert_unreadable: Option<keyroost_transport::CertUnreadable>,
     cert_present: bool,
@@ -11304,10 +11305,15 @@ fn piv_slot_state(
     key: keyroost_transport::SlotKeyPresence,
 ) -> String {
     use keyroost_transport::SlotKeyPresence;
+    let no_key = if key == SlotKeyPresence::NoKey {
+        ", no key"
+    } else {
+        ""
+    };
     match (cert_unreadable, cert_present) {
-        (Some(reason), _) => format!("cert present but unreadable ({reason})"),
+        (Some(reason), _) => format!("cert present but unreadable ({reason}){no_key}"),
         (None, true) => format!(
-            "cert present ({cert_len} bytes{})",
+            "cert present ({cert_len} bytes{}){no_key}",
             if cert_compressed {
                 ", stored compressed"
             } else {
@@ -23534,13 +23540,22 @@ mod cli_tests {
             piv_slot_state(None, true, 812, true, K::Unknown),
             "cert present (812 bytes, stored compressed)"
         );
+        // A certificate in a slot the card says holds no key says so.
         assert_eq!(
             piv_slot_state(None, true, 812, false, K::NoKey),
+            "cert present (812 bytes), no key"
+        );
+        assert_eq!(
+            piv_slot_state(None, true, 812, false, K::Present),
             "cert present (812 bytes)"
         );
         assert!(
             piv_slot_state(Some(CertUnreadable::Damaged), true, 0, false, K::Unknown)
                 .starts_with("cert present but unreadable")
+        );
+        assert!(
+            piv_slot_state(Some(CertUnreadable::Damaged), true, 0, false, K::NoKey)
+                .ends_with("), no key")
         );
     }
 

@@ -3004,8 +3004,10 @@ struct PivState {
     /// [`keyroost_transport::PivSession::status_detailed`] call each refresh
     /// makes: the key algorithm (GET METADATA where authoritative, else a key
     /// generated this app run, else the slot certificate's
-    /// SubjectPublicKeyInfo; `None` means no key in the slot, on any PIV
-    /// card), and the certificate's Subject DN (`None` if the slot has no
+    /// SubjectPublicKeyInfo; `None` means none is known — and a `Some` from
+    /// the certificate doesn't mean a key is there: the status read's
+    /// per-slot `key` answer says that, see [`piv_slot_occupied`]), and the
+    /// certificate's Subject DN (`None` if the slot has no
     /// certificate or its DN failed to parse — degraded silently). Split out
     /// of [`keyroost_transport::PivSlotDetail`] into the shape the pane draws.
     slot_keys: Vec<(
@@ -3160,6 +3162,47 @@ struct PivState {
     /// so expanding the section only probes the card once. `None` until read;
     /// invalidated after a move so the section re-reads on its next expand.
     retired_occupancy: Option<Vec<(keyroost_piv::Slot, keyroost_transport::SlotKeyPresence)>>,
+    /// What the same lazy read found in each retired slot's certificate
+    /// object. A slot missing from the list (its read failed) is unknown.
+    /// Read, cached and dropped together with `retired_occupancy`
+    /// ([`PivState::forget_retired`]).
+    retired_certs: Option<Vec<(keyroost_piv::Slot, PivCertSeen)>>,
+}
+
+/// What a certificate read found in one slot: the fields of
+/// [`keyroost_transport::PivSlotStatus`] the pane's state line uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PivCertSeen {
+    present: bool,
+    unreadable: Option<keyroost_transport::CertUnreadable>,
+    compressed: bool,
+}
+
+impl PivCertSeen {
+    fn of(st: &keyroost_transport::PivSlotStatus) -> Self {
+        Self {
+            present: st.cert_present,
+            unreadable: st.cert_unreadable,
+            compressed: st.cert_compressed,
+        }
+    }
+}
+
+/// `slot`'s entry in the retired certificate cache, if it was read.
+fn piv_retired_cert(
+    retired_certs: Option<&[(keyroost_piv::Slot, PivCertSeen)]>,
+    slot: keyroost_piv::Slot,
+) -> Option<PivCertSeen> {
+    retired_certs.and_then(|v| v.iter().find(|(s, _)| *s == slot).map(|(_, c)| *c))
+}
+
+impl PivState {
+    /// Drop the lazily-read retired-slot caches (key and certificate) so
+    /// the section re-reads them on its next open.
+    fn forget_retired(&mut self) {
+        self.retired_occupancy = None;
+        self.retired_certs = None;
+    }
 }
 
 // The pane is replaced wholesale on device switch (`self.piv =
@@ -3235,6 +3278,7 @@ impl Default for PivState {
             move_dest: None,
             key_import: PivKeyImport::default(),
             retired_occupancy: None,
+            retired_certs: None,
         }
     }
 }
@@ -3539,7 +3583,8 @@ fn piv_key_import_text(
 /// whether that is stored compressed or unreadable) or just a key, with the
 /// key algorithm parenthesized after the state word it describes. A slot with
 /// neither reads "empty" only when the card said it holds no key (`key`, the
-/// transport's `SlotKeyPresence`); when keyroost can't tell, it says so. The
+/// transport's `SlotKeyPresence`); when keyroost can't tell, it says so. A
+/// certificate in a slot the card says holds no key gets ", no key". The
 /// words match `keyroostctl piv info`'s.
 fn piv_slot_state_text(
     cert_unreadable: Option<keyroost_transport::CertUnreadable>,
@@ -3553,10 +3598,19 @@ fn piv_slot_state_text(
     // no-certificate case that's "key present (…), no certificate", not
     // "…, no certificate (…)": the algorithm belongs to the key, and
     // there's no certificate for it to trail.
+    // A certificate can sit in a slot with no key: say so when the card did
+    // (the algorithm shown is then the certificate's).
+    let no_key = if key == keyroost_transport::SlotKeyPresence::NoKey {
+        ", no key"
+    } else {
+        ""
+    };
     match (cert_unreadable, cert_present, alg) {
         // A certificate is there but won't decode: say so, rather than
         // "empty", which would invite overwriting it unawares.
-        (Some(reason), _, _) => format!("certificate present but unreadable ({reason})"),
+        (Some(reason), _, _) => {
+            format!("certificate present but unreadable ({reason}){no_key}")
+        }
         (None, true, alg) => {
             let parts: Vec<&str> = alg
                 .map(keyroost_piv::KeyAlg::label)
@@ -3564,9 +3618,9 @@ fn piv_slot_state_text(
                 .chain(cert_compressed.then_some("compressed"))
                 .collect();
             if parts.is_empty() {
-                "certificate present".to_string()
+                format!("certificate present{no_key}")
             } else {
-                format!("certificate present ({})", parts.join(", "))
+                format!("certificate present ({}){no_key}", parts.join(", "))
             }
         }
         (None, false, Some(a)) => format!("key present ({}), no certificate", a.label()),
@@ -3581,8 +3635,16 @@ fn piv_slot_state_text(
 }
 
 /// A retired slot's state words, from the lazily-read `retired_occupancy`
-/// cache (`None`: not read yet). Same rule as [`piv_slot_state_text`].
-fn piv_retired_slot_state_text(key: Option<keyroost_transport::SlotKeyPresence>) -> String {
+/// and `retired_certs` caches (`None`: not read yet). Once its certificate
+/// has been read, the same words as [`piv_slot_state_text`] (no algorithm:
+/// the retired read doesn't name one).
+fn piv_retired_slot_state_text(
+    key: Option<keyroost_transport::SlotKeyPresence>,
+    cert: Option<PivCertSeen>,
+) -> String {
+    if let (Some(key), Some(c)) = (key, cert) {
+        return piv_slot_state_text(c.unreadable, c.present, c.compressed, None, key);
+    }
     match key {
         Some(keyroost_transport::SlotKeyPresence::Present) => "key present".to_string(),
         Some(keyroost_transport::SlotKeyPresence::NoKey) | None => "empty".to_string(),
@@ -3590,13 +3652,23 @@ fn piv_retired_slot_state_text(key: Option<keyroost_transport::SlotKeyPresence>)
     }
 }
 
-/// The retired-slot rail's hover text for one row.
-fn piv_retired_slot_hover(label: &str, key: keyroost_transport::SlotKeyPresence) -> String {
-    match key {
-        keyroost_transport::SlotKeyPresence::Present => format!("{label} \u{00B7} holds a key"),
-        keyroost_transport::SlotKeyPresence::NoKey => format!("{label} \u{00B7} empty"),
-        _ => format!("{label} \u{00B7} no certificate (a key may be present)"),
-    }
+/// The retired-slot rail's hover text for one row (`has_cert`: the
+/// certificate read found one).
+fn piv_retired_slot_hover(
+    label: &str,
+    key: keyroost_transport::SlotKeyPresence,
+    has_cert: bool,
+) -> String {
+    use keyroost_transport::SlotKeyPresence as K;
+    let what = match (key, has_cert) {
+        (K::Present, false) => "holds a key",
+        (K::Present, true) => "holds a key and a certificate",
+        (K::NoKey, false) => "empty",
+        (K::NoKey, true) => "holds a certificate, no key",
+        (_, false) => "no certificate (a key may be present)",
+        (_, true) => "holds a certificate",
+    };
+    format!("{label} \u{00B7} {what}")
 }
 
 /// A PIV certificate-compression picker combo.
@@ -10112,7 +10184,7 @@ impl App {
                 // retired-slot occupancy; drop the cache so the retired tab
                 // re-reads fresh on its next open instead of showing stale
                 // occupancy (see piv_move_key for the same invalidation).
-                app.piv.retired_occupancy = None;
+                app.piv.forget_retired();
                 // A retired-slot selection is stale once its occupancy cache is
                 // dropped; snapping back to a
                 // standard slot prevents acting on it with unknown occupancy —
@@ -10457,7 +10529,7 @@ impl App {
                         // stays put — the user is almost certainly about to
                         // look at (or self-sign/CSR) exactly the slot they
                         // just generated into.
-                        app.piv.retired_occupancy = None;
+                        app.piv.forget_retired();
                     }
                     Err(e) => {
                         app.log(Severity::Err, e.to_string());
@@ -10761,7 +10833,7 @@ impl App {
                         ) && current
                         {
                             app.load_piv_status(LogKind::Background);
-                            app.piv.retired_occupancy = None;
+                            app.piv.forget_retired();
                         }
                         Self::apply_piv_cred_result(app);
                         if let (Ok(detail), Some(m)) = (text, app.piv.cred_modal.as_mut()) {
@@ -10985,7 +11057,7 @@ impl App {
                 );
                 // Retired occupancy changed (source and/or destination); drop
                 // the cache so the retired tab re-reads on its next open.
-                app.piv.retired_occupancy = None;
+                app.piv.forget_retired();
                 // A retired-slot selection is stale once its occupancy cache is
                 // dropped; snapping back to a
                 // standard slot prevents acting on it with unknown occupancy —
@@ -11000,10 +11072,12 @@ impl App {
         });
     }
 
-    /// Lazily read which of the 20 retired slots hold a key (GET METADATA each),
-    /// caching the result in `PivState::retired_occupancy`. Triggered once when
-    /// the "Retired slots" section is expanded (or the move modal opens) rather
-    /// than on every status refresh, keeping the common path to 4 slot reads.
+    /// Lazily read which of the 20 retired slots hold a key (GET METADATA each)
+    /// and a certificate (GET DATA each), caching the results in
+    /// `PivState::retired_occupancy` and `PivState::retired_certs`. Triggered
+    /// once when the "Retired slots" section is expanded (or the move modal
+    /// opens) rather than on every status refresh, keeping the common path to
+    /// 4 slot reads; the up-to-40 reads happen only here, in the background.
     /// Returns whether the read was actually queued (mirrors `spawn_job`'s
     /// contract): `false` means no job is in flight, so callers must not act
     /// as though a load is pending.
@@ -11018,11 +11092,20 @@ impl App {
                 &reader,
                 cached_state,
                 |s| {
-                    let occupancy: Vec<_> = keyroost_piv::Slot::retired_all()
-                        .into_iter()
-                        .map(|slot| (slot, s.slot_key_presence(slot)))
-                        .collect();
-                    Ok::<_, TransportError>((occupancy, s.state()))
+                    let mut occupancy = Vec::with_capacity(20);
+                    let mut certs = Vec::with_capacity(20);
+                    for slot in keyroost_piv::Slot::retired_all() {
+                        match s.slot_status(slot) {
+                            Ok(st) => {
+                                occupancy.push((slot, st.key));
+                                certs.push((slot, PivCertSeen::of(&st)));
+                            }
+                            // The certificate read failed: its state stays
+                            // unknown, and the key answer is read on its own.
+                            Err(_) => occupancy.push((slot, s.slot_key_presence(slot))),
+                        }
+                    }
+                    Ok::<_, TransportError>((occupancy, certs, s.state()))
                 },
             );
             Box::new(move |app: &mut App| {
@@ -11030,7 +11113,7 @@ impl App {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok((v, state)) => {
+                    Ok((v, certs, state)) => {
                         app.store_piv_session_state(for_device.clone(), state);
                         // Background: this fires the first time the retired
                         // slots section is expanded, or the move-key modal is
@@ -11041,6 +11124,7 @@ impl App {
                             format!("retired slot occupancy read ({} slots)", v.len()),
                         );
                         app.piv.retired_occupancy = Some(v);
+                        app.piv.retired_certs = Some(certs);
                     }
                     Err(e) => {
                         app.log_bg(Severity::Warn, format!("retired slot occupancy: {e}"));
@@ -11053,28 +11137,39 @@ impl App {
 
     /// Whether the currently selected PIV slot already holds a private key.
     /// Thin wrapper over [`piv_slot_occupied`] reading the loaded caches; drives
-    /// the Generate-key overwrite warning and the Import-cert replace note.
+    /// the Generate/Import key "Overwrite key" relabel.
     fn piv_selected_occupied(&self) -> bool {
+        self.piv_occupied(self.piv.selected_slot.to_slot())
+    }
+
+    /// [`piv_slot_occupied`] for `slot`, reading the loaded caches.
+    fn piv_occupied(&self, slot: keyroost_piv::Slot) -> bool {
         piv_slot_occupied(
-            self.piv.selected_slot,
+            slot,
             &self.piv.slot_keys,
+            &self.piv_standard_key_presence(),
             self.piv.retired_occupancy.as_deref(),
         )
     }
 
-    /// [`piv_slot_occupancy`] for `slot`, reading the loaded caches and the
-    /// last status read's per-slot key presence.
-    fn piv_occupancy(&self, slot: keyroost_piv::Slot) -> PivOccupancy {
-        let standard: Vec<_> = self
-            .piv
+    /// The last status read's per-slot key answer for the standard slots
+    /// (empty before the first read).
+    fn piv_standard_key_presence(
+        &self,
+    ) -> Vec<(keyroost_piv::Slot, keyroost_transport::SlotKeyPresence)> {
+        self.piv
             .status
             .as_ref()
             .map(|s| s.slots.iter().map(|sl| (sl.slot, sl.key)).collect())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// [`piv_slot_occupancy`] for `slot`, reading the retired cache and the
+    /// last status read's per-slot key presence.
+    fn piv_occupancy(&self, slot: keyroost_piv::Slot) -> PivOccupancy {
         piv_slot_occupancy(
             slot,
-            &self.piv.slot_keys,
-            &standard,
+            &self.piv_standard_key_presence(),
             self.piv.retired_occupancy.as_deref(),
         )
     }
@@ -11094,9 +11189,15 @@ impl App {
 
     /// The selected slot's key algorithm (from the last `status_detailed`
     /// read) and whether it holds a certificate — the two facts the Test row
-    /// gates its button on.
+    /// gates its button on. A retired slot's certificate comes from the lazy
+    /// retired read (false until read); its algorithm isn't read.
     fn piv_selected_test_target(&self) -> (Option<keyroost_piv::KeyAlg>, bool) {
         let sel = self.piv.selected_slot.to_slot();
+        if matches!(sel, keyroost_piv::Slot::Retired(_)) {
+            let has_cert =
+                piv_retired_cert(self.piv.retired_certs.as_deref(), sel).is_some_and(|c| c.present);
+            return (None, has_cert);
+        }
         let entry = self.piv.slot_keys.iter().find(|(s, _, _)| *s == sel);
         let alg = entry.and_then(|(_, a, _)| *a);
         let has_cert = entry.is_some_and(|(_, _, dn)| dn.is_some())
@@ -12702,32 +12803,38 @@ fn run_piv_self_test(
 
 /// Slots a key may be moved to: every standard + retired slot that is empty
 /// and is not the source. `occupied(slot)` reports current key presence.
-/// Whether `sel` currently holds a private key, read from the loaded occupancy
-/// caches. Standard slots read `slot_keys` (a carried algorithm means a key is
-/// present); a retired slot reads the lazily-populated `retired_occupancy`
-/// cache (`None` cache, or a slot the cache doesn't list, is treated as empty).
-/// Pure so the overwrite guard can be unit-tested without hardware or `self`.
+/// Whether `slot` currently holds a private key, read from the loaded
+/// occupancy caches. A standard slot reads the card's key answer in
+/// `standard` (the status read's per-slot
+/// [`keyroost_transport::SlotKeyPresence`]): "present" is a key, "no key" is
+/// none (a certificate alone doesn't count), and when the card can't tell, a
+/// key algorithm `slot_keys` carries from any source counts, so a card
+/// without GET METADATA loses nothing. A retired slot reads the
+/// lazily-populated `retired_occupancy` cache (`None` cache, or a slot the
+/// cache doesn't list, is treated as empty). Pure so the overwrite guard can
+/// be unit-tested without hardware or `self`.
 fn piv_slot_occupied(
-    sel: PivSlotSel,
+    slot: keyroost_piv::Slot,
     slot_keys: &[(
         keyroost_piv::Slot,
         Option<keyroost_piv::KeyAlg>,
         Option<String>,
     )],
+    standard: &[(keyroost_piv::Slot, keyroost_transport::SlotKeyPresence)],
     retired_occupancy: Option<&[(keyroost_piv::Slot, keyroost_transport::SlotKeyPresence)]>,
 ) -> bool {
-    match sel {
-        PivSlotSel::Retired(n) => retired_occupancy
-            .and_then(|v| v.iter().find(|(s, _)| *s == keyroost_piv::Slot::Retired(n)))
-            .is_some_and(|(_, key)| *key == keyroost_transport::SlotKeyPresence::Present),
-        _ => {
-            let sel_slot = sel.to_slot();
-            slot_keys
-                .iter()
-                .find(|(s, _, _)| *s == sel_slot)
-                .map(|(_, a, _)| a.is_some())
-                .unwrap_or(false)
-        }
+    use keyroost_transport::SlotKeyPresence as K;
+    if matches!(slot, keyroost_piv::Slot::Retired(_)) {
+        return retired_occupancy
+            .and_then(|v| v.iter().find(|(s, _)| *s == slot))
+            .is_some_and(|(_, key)| *key == K::Present);
+    }
+    match standard.iter().find(|(s, _)| *s == slot).map(|(_, k)| *k) {
+        Some(K::Present) => true,
+        Some(K::NoKey) => false,
+        _ => slot_keys
+            .iter()
+            .any(|(s, alg, _)| *s == slot && alg.is_some()),
     }
 }
 
@@ -12745,19 +12852,16 @@ enum PivOccupancy {
     Empty,
 }
 
-/// [`PivOccupancy`] for `slot`. Standard slots: a carried algorithm in
-/// `slot_keys` is a key, otherwise `standard` (the status read's per-slot
-/// [`keyroost_transport::SlotKeyPresence`]) decides. Retired slots read the
-/// lazily-populated `retired_occupancy` cache. Only a confirmed "no key" is
-/// [`PivOccupancy::Empty`]; an unlisted slot or a missing cache is
+/// [`PivOccupancy`] for `slot`, from the card's key answer: `standard` (the
+/// status read's per-slot [`keyroost_transport::SlotKeyPresence`]) for a
+/// standard slot, the lazily-populated `retired_occupancy` cache for a
+/// retired one. Not the certificate: a slot holding only a certificate the
+/// card says has no key is [`PivOccupancy::Empty`]. Only a confirmed "no
+/// key" is empty; "can't tell" (even with an algorithm known from the
+/// certificate), an unlisted slot or a missing cache is
 /// [`PivOccupancy::MaybeKey`]. Pure so it can be unit-tested.
 fn piv_slot_occupancy(
     slot: keyroost_piv::Slot,
-    slot_keys: &[(
-        keyroost_piv::Slot,
-        Option<keyroost_piv::KeyAlg>,
-        Option<String>,
-    )],
     standard: &[(keyroost_piv::Slot, keyroost_transport::SlotKeyPresence)],
     retired_occupancy: Option<&[(keyroost_piv::Slot, keyroost_transport::SlotKeyPresence)]>,
 ) -> PivOccupancy {
@@ -12765,12 +12869,6 @@ fn piv_slot_occupancy(
     let presence = if matches!(slot, keyroost_piv::Slot::Retired(_)) {
         retired_occupancy.and_then(|v| v.iter().find(|(s, _)| *s == slot).map(|(_, k)| *k))
     } else {
-        if slot_keys
-            .iter()
-            .any(|(s, alg, _)| *s == slot && alg.is_some())
-        {
-            return PivOccupancy::Key;
-        }
         standard.iter().find(|(s, _)| *s == slot).map(|(_, k)| *k)
     };
     match presence {
@@ -20407,9 +20505,9 @@ impl App {
         // Inline new==confirm guard, mirroring the op-level backstop. Shown as
         // the modal's error line; blocks Submit when set.
         let mismatch = piv_cred_mismatch(&self.piv, kind);
-        // Whether the target slot already holds a key — drives the Generate-key
-        // overwrite warning + relabel and the Import-cert replace note.
-        // Precomputed before the closure borrows `self` mutably.
+        // Whether the target slot already holds a key — drives the Generate /
+        // Import key "Overwrite key" relabel. Precomputed before the closure
+        // borrows `self` mutably.
         let selected_occupied = self.piv_selected_occupied();
         // The Generate warning fails closed (a slot keyroost can't vouch for
         // as empty may hold a key); the "Overwrite key" relabel stays for a
@@ -20423,29 +20521,14 @@ impl App {
 
         // Move-key flow: precompute the source slot and the eligible destination
         // slots (empty, non-source) before the modal borrows `self` mutably. A
-        // standard slot is occupied when its `slot_keys` entry carries a key
-        // algorithm; a retired slot's occupancy comes from the lazily-read cache
-        // (unknown → treated as empty; the transport re-checks and refuses an
-        // occupied destination, so a stale cache can't cause a bad move).
+        // slot is occupied per [`piv_slot_occupied`]: the card's key answer (a
+        // certificate alone doesn't count); a retired slot's comes from the
+        // lazily-read cache (unknown → treated as empty; the transport
+        // re-checks and refuses an occupied destination, so a stale cache
+        // can't cause a bad move).
         let move_src = self.piv.selected_slot.to_slot();
         let move_dests: Vec<keyroost_piv::Slot> = if kind == PivCredKind::MoveKey {
-            let piv = &self.piv;
-            let occupied = |s: keyroost_piv::Slot| -> bool {
-                if matches!(s, keyroost_piv::Slot::Retired(_)) {
-                    piv.retired_occupancy
-                        .as_ref()
-                        .and_then(|v| v.iter().find(|(rs, _)| *rs == s))
-                        .is_some_and(|(_, key)| {
-                            *key == keyroost_transport::SlotKeyPresence::Present
-                        })
-                } else {
-                    piv.slot_keys
-                        .iter()
-                        .find(|(sl, _, _)| *sl == s)
-                        .map(|(_, alg, _)| alg.is_some())
-                        .unwrap_or(false)
-                }
-            };
+            let occupied = |s: keyroost_piv::Slot| -> bool { self.piv_occupied(s) };
             move_key_eligible_destinations(move_src, &occupied)
         } else {
             Vec::new()
@@ -20658,8 +20741,8 @@ impl App {
                             self.piv_modal_compression_field(ui, p, 96.0);
                             // Importing only replaces the public certificate
                             // object (no key loss) — a lighter note, not a red
-                            // warning.
-                            if selected_occupied {
+                            // warning, and only when there is one to replace.
+                            if selected_has_cert {
                                 let slot = self.piv.selected_slot.to_slot().label();
                                 card_note(
                                     ui,
@@ -23233,16 +23316,21 @@ impl App {
             // Retired slots aren't tracked by `status.slots` / `slot_keys`
             // (those only cover the four standard slots), so an occupied
             // retired slot would otherwise fall through to "empty" below.
-            // Consult the lazily-populated retired-occupancy cache instead —
-            // the same one `selected_has_key` reads — so the label stays
-            // honest before a user hits Generate/Import on an archived key.
+            // Consult the lazily-populated retired caches instead — the same
+            // ones `selected_has_key` / `selected_has_cert` read — so the label
+            // stays honest before a user hits Generate/Import on an archived
+            // key.
+            let slot = keyroost_piv::Slot::Retired(n);
             let key = self
                 .piv
                 .retired_occupancy
                 .as_ref()
-                .and_then(|v| v.iter().find(|(s, _)| *s == keyroost_piv::Slot::Retired(n)))
+                .and_then(|v| v.iter().find(|(s, _)| *s == slot))
                 .map(|(_, key)| *key);
-            piv_retired_slot_state_text(key)
+            piv_retired_slot_state_text(
+                key,
+                piv_retired_cert(self.piv.retired_certs.as_deref(), slot),
+            )
         } else {
             let sel_slot = selected.to_slot();
             let sel_status = self
@@ -23260,9 +23348,11 @@ impl App {
             let mut s =
                 piv_slot_state_text(cert_unreadable, cert_present, cert_compressed, alg, key);
             // PIN/touch policy, only alongside an actual key — an empty slot
-            // has no policy to report, and showing "not available" there
-            // would read as a hardware problem rather than just "no key yet".
-            if cert_present || alg.is_some() {
+            // (or one holding only a certificate) has no policy to report,
+            // and showing "not available" there would read as a hardware
+            // problem rather than just "no key yet".
+            if (cert_present || alg.is_some()) && key != keyroost_transport::SlotKeyPresence::NoKey
+            {
                 let policy = self
                     .piv
                     .slot_policies
@@ -23292,22 +23382,20 @@ impl App {
             s
         };
         // Whether the active slot holds a private key — gates the Move button
-        // (and Move source). Standard slots read from `slot_keys`; a retired slot
-        // reads from the lazily-populated occupancy cache.
-        let selected_has_key = piv_slot_occupied(
-            selected,
-            &self.piv.slot_keys,
-            self.piv.retired_occupancy.as_deref(),
-        );
+        // (and Move source). See [`piv_slot_occupied`]: the card's key answer
+        // for a standard slot, the lazily-populated cache for a retired one.
+        let selected_has_key = self.piv_occupied(selected.to_slot());
         // Whether the active slot holds an X.509 certificate — gates Export.
-        // Standard slots read `status.slots`; retired slots carry no cert
-        // signal in the loaded state, and neither does the pane before its
-        // first status read, so both resolve optimistically (the button stays
-        // live and the low-level "slot holds no certificate" error still
-        // guards). Only a standard slot the card has read and found certless
-        // dims the button.
+        // Standard slots read `status.slots`, retired slots the lazy retired
+        // read. Before those reads there is no cert signal, so both resolve
+        // optimistically (the button stays live and the low-level "slot holds
+        // no certificate" error still guards). Only a slot the card has read
+        // and found certless dims the button.
         let selected_has_cert = match selected {
-            PivSlotSel::Retired(_) => true,
+            PivSlotSel::Retired(_) => {
+                piv_retired_cert(self.piv.retired_certs.as_deref(), selected.to_slot())
+                    .is_none_or(|c| c.present)
+            }
             _ => {
                 !self.piv.loaded
                     || self.piv.status.as_ref().is_some_and(|s| {
@@ -23564,6 +23652,7 @@ impl App {
         if matches!(selected, PivSlotSel::Retired(_)) {
             match self.piv.retired_occupancy.clone() {
                 Some(occ) => {
+                    let certs = self.piv.retired_certs.clone();
                     // Show as many rows as the pane can spare before the action
                     // cards below, then scroll. Twenty rows fit outright on a
                     // reasonably tall window.
@@ -23579,6 +23668,8 @@ impl App {
                                     continue;
                                 };
                                 let has_key = key == keyroost_transport::SlotKeyPresence::Present;
+                                let has_cert = piv_retired_cert(certs.as_deref(), slot)
+                                    .is_some_and(|c| c.present);
                                 let sel_variant = PivSlotSel::Retired(n);
                                 let active = selected == sel_variant;
                                 let (rect, resp) = ui.allocate_exact_size(
@@ -23606,7 +23697,7 @@ impl App {
                                     theme::f_mono(12.5),
                                     if active {
                                         p.accent
-                                    } else if has_key {
+                                    } else if has_key || has_cert {
                                         p.txt
                                     } else {
                                         p.txt3
@@ -23622,7 +23713,11 @@ impl App {
                                     );
                                 }
                                 let resp =
-                                    resp.on_hover_text(piv_retired_slot_hover(&slot.label(), key));
+                                    resp.on_hover_text(piv_retired_slot_hover(
+                                        &slot.label(),
+                                        key,
+                                        has_cert,
+                                    ));
                                 if resp
                                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                                     .clicked()
@@ -28420,26 +28515,104 @@ mod tests {
     #[test]
     fn piv_retired_slot_state_words() {
         use keyroost_transport::SlotKeyPresence as K;
-        assert_eq!(piv_retired_slot_state_text(Some(K::Present)), "key present");
-        assert_eq!(piv_retired_slot_state_text(Some(K::NoKey)), "empty");
+        // Certificate not read (its read failed): key words only, as before.
         assert_eq!(
-            piv_retired_slot_state_text(Some(K::Unknown)),
+            piv_retired_slot_state_text(Some(K::Present), None),
+            "key present"
+        );
+        assert_eq!(piv_retired_slot_state_text(Some(K::NoKey), None), "empty");
+        assert_eq!(
+            piv_retired_slot_state_text(Some(K::Unknown), None),
             "no certificate (a key may be present)"
         );
         // Not read yet: as before, the same wording a slot with no key uses.
-        assert_eq!(piv_retired_slot_state_text(None), "empty");
+        assert_eq!(piv_retired_slot_state_text(None, None), "empty");
+        // Certificate read: the standard slots' words.
+        let none = PivCertSeen {
+            present: false,
+            unreadable: None,
+            compressed: false,
+        };
+        let cert = PivCertSeen {
+            present: true,
+            ..none
+        };
         assert_eq!(
-            piv_retired_slot_hover("Retired key 3", K::Present),
+            piv_retired_slot_state_text(Some(K::NoKey), Some(cert)),
+            "certificate present, no key"
+        );
+        assert_eq!(
+            piv_retired_slot_state_text(Some(K::Present), Some(cert)),
+            "certificate present"
+        );
+        assert_eq!(
+            piv_retired_slot_state_text(Some(K::Present), Some(none)),
+            "key present, no certificate"
+        );
+        assert_eq!(
+            piv_retired_slot_state_text(Some(K::NoKey), Some(none)),
+            "empty"
+        );
+        assert_eq!(
+            piv_retired_slot_hover("Retired key 3", K::Present, false),
             "Retired key 3 \u{00B7} holds a key"
         );
         assert_eq!(
-            piv_retired_slot_hover("Retired key 3", K::NoKey),
+            piv_retired_slot_hover("Retired key 3", K::NoKey, false),
             "Retired key 3 \u{00B7} empty"
         );
         assert_eq!(
-            piv_retired_slot_hover("Retired key 3", K::Unknown),
+            piv_retired_slot_hover("Retired key 3", K::Unknown, false),
             "Retired key 3 \u{00B7} no certificate (a key may be present)"
         );
+        assert_eq!(
+            piv_retired_slot_hover("Retired key 3", K::NoKey, true),
+            "Retired key 3 \u{00B7} holds a certificate, no key"
+        );
+        assert_eq!(
+            piv_retired_slot_hover("Retired key 3", K::Present, true),
+            "Retired key 3 \u{00B7} holds a key and a certificate"
+        );
+    }
+
+    /// A retired slot's certificate, once the lazy retired read has run,
+    /// feeds the Test row and the import dialog's certificate note; before
+    /// that read it counts as absent there (and Export stays live).
+    #[test]
+    fn piv_retired_certificate_feeds_the_test_target() {
+        let mut app = App::default();
+        let slot = keyroost_piv::Slot::Retired(5);
+        app.piv.selected_slot = PivSlotSel::Retired(5);
+        assert_eq!(app.piv_selected_test_target(), (None, false));
+        app.piv.retired_occupancy = Some(vec![(slot, keyroost_transport::SlotKeyPresence::NoKey)]);
+        app.piv.retired_certs = Some(vec![(
+            slot,
+            PivCertSeen {
+                present: true,
+                unreadable: None,
+                compressed: false,
+            },
+        )]);
+        assert_eq!(app.piv_selected_test_target(), (None, true));
+        // A certificate-only retired slot is not occupied, and its import
+        // note speaks of replacing the certificate.
+        assert!(!app.piv_selected_occupied());
+        assert_eq!(app.piv_occupancy(slot), PivOccupancy::Empty);
+        assert_eq!(
+            piv_import_cert_note(PivOccupancy::Empty, true, true, &slot.label()),
+            Some(format!(
+                "This replaces the certificate currently in {}.",
+                slot.label()
+            ))
+        );
+        // Another retired slot the read didn't cover: no certificate known.
+        app.piv.selected_slot = PivSlotSel::Retired(6);
+        assert_eq!(app.piv_selected_test_target(), (None, false));
+        // Dropping the retired caches forgets the certificate too.
+        app.piv.selected_slot = PivSlotSel::Retired(5);
+        app.piv.forget_retired();
+        assert!(app.piv.retired_certs.is_none());
+        assert_eq!(app.piv_selected_test_target(), (None, false));
     }
 
     /// The selected slot's state line marks a compressed certificate.
@@ -28470,6 +28643,20 @@ mod tests {
         assert_eq!(
             piv_slot_state_text(None, false, false, None, K::NoKey),
             "empty"
+        );
+        // A certificate in a slot the card says holds no key: the algorithm
+        // is the certificate's, and the line says there is no key.
+        assert_eq!(
+            piv_slot_state_text(None, true, false, p256, K::NoKey),
+            "certificate present (ECC P-256), no key"
+        );
+        assert_eq!(
+            piv_slot_state_text(None, true, true, None, K::NoKey),
+            "certificate present (compressed), no key"
+        );
+        assert_eq!(
+            piv_slot_state_text(None, true, false, p256, K::Present),
+            "certificate present (ECC P-256)"
         );
         assert_eq!(
             piv_slot_state_text(None, false, false, None, K::Unknown),
@@ -28535,6 +28722,7 @@ mod tests {
             keyroost_piv::Slot::Retired(3),
             keyroost_transport::SlotKeyPresence::Present,
         )]);
+        app.piv.retired_certs = Some(Vec::new());
         let status = keyroost_transport::PivStatus::default();
         App::apply_piv_write(&mut app, Ok(status), "did a thing".into());
         assert_eq!(
@@ -28543,6 +28731,7 @@ mod tests {
             "a retired-slot selection must not survive its occupancy cache clearing"
         );
         assert!(app.piv.retired_occupancy.is_none());
+        assert!(app.piv.retired_certs.is_none());
     }
 
     /// A standard-slot selection is left untouched by the same invalidation —
@@ -28611,73 +28800,87 @@ mod tests {
     }
 
     /// The overwrite-guard occupancy predicate reads the right cache for each
-    /// selection kind: standard slots from `slot_keys`, retired slots from the
-    /// lazily-populated `retired_occupancy` cache.
+    /// selection kind: standard slots from the card's key answer (falling
+    /// back to `slot_keys` only when the card can't tell), retired slots from
+    /// the lazily-populated `retired_occupancy` cache.
     #[test]
     fn piv_slot_occupied_reads_the_right_cache() {
         use keyroost_piv::{KeyAlg, Slot};
-        use keyroost_transport::SlotKeyPresence;
+        use keyroost_transport::SlotKeyPresence as K;
 
-        // Standard-slot occupancy comes from `slot_keys`: a carried algorithm
-        // means the slot holds a private key; `None` means empty.
+        // Each standard slot holds a certificate, so `slot_keys` carries the
+        // certificate's algorithm for all of them.
+        let p256 = Some(KeyAlg::EccP256);
         let slot_keys = vec![
-            (Slot::Authentication, Some(KeyAlg::EccP256), None),
-            (Slot::Signature, None, None),
+            (Slot::Authentication, p256, Some("CN=a".to_string())),
+            (Slot::Signature, p256, Some("CN=s".to_string())),
+            (Slot::KeyManagement, p256, Some("CN=k".to_string())),
+            (Slot::CardAuthentication, None, None),
         ];
-        assert!(piv_slot_occupied(PivSlotSel::Auth, &slot_keys, None));
-        // alg is None -> empty
-        assert!(!piv_slot_occupied(PivSlotSel::Sign, &slot_keys, None));
-        // slot absent from the cache -> treated as empty
-        assert!(!piv_slot_occupied(PivSlotSel::CardAuth, &slot_keys, None));
+        let standard = vec![
+            (Slot::Authentication, K::Present),
+            (Slot::Signature, K::NoKey),
+            (Slot::KeyManagement, K::Unknown),
+            (Slot::CardAuthentication, K::Unknown),
+        ];
+        let occupied = |s: Slot| piv_slot_occupied(s, &slot_keys, &standard, None);
+        // The card says there is a key.
+        assert!(occupied(Slot::Authentication));
+        // Certificate only, and the card says no key: not occupied (no
+        // "Overwrite key", no Move/Delete key).
+        assert!(!occupied(Slot::Signature));
+        // The card can't tell: a known algorithm (here the certificate's)
+        // still counts, as before.
+        assert!(occupied(Slot::KeyManagement));
+        // Can't tell and no algorithm: not occupied.
+        assert!(!occupied(Slot::CardAuthentication));
+        // Before any status read: `slot_keys` alone decides.
+        assert!(piv_slot_occupied(
+            Slot::Authentication,
+            &slot_keys,
+            &[],
+            None
+        ));
+        assert!(!piv_slot_occupied(
+            Slot::CardAuthentication,
+            &slot_keys,
+            &[],
+            None
+        ));
 
         // Retired-slot occupancy comes from the `retired_occupancy` cache.
         let retired = vec![
-            (Slot::retired(1).unwrap(), SlotKeyPresence::Present),
-            (Slot::retired(2).unwrap(), SlotKeyPresence::NoKey),
-            (Slot::retired(4).unwrap(), SlotKeyPresence::Unknown),
+            (Slot::retired(1).unwrap(), K::Present),
+            (Slot::retired(2).unwrap(), K::NoKey),
+            (Slot::retired(4).unwrap(), K::Unknown),
         ];
-        assert!(piv_slot_occupied(
-            PivSlotSel::Retired(1),
-            &slot_keys,
-            Some(&retired)
-        ));
+        let r = |n: u8| piv_slot_occupied(Slot::retired(n).unwrap(), &[], &[], Some(&retired));
+        assert!(r(1));
         // listed but empty
-        assert!(!piv_slot_occupied(
-            PivSlotSel::Retired(2),
-            &slot_keys,
-            Some(&retired)
-        ));
+        assert!(!r(2));
         // can't tell: not counted as occupied (the card refuses an occupied
         // move destination itself)
-        assert!(!piv_slot_occupied(
-            PivSlotSel::Retired(4),
-            &slot_keys,
-            Some(&retired)
-        ));
+        assert!(!r(4));
         // not listed in the cache -> false
-        assert!(!piv_slot_occupied(
-            PivSlotSel::Retired(3),
-            &slot_keys,
-            Some(&retired)
-        ));
+        assert!(!r(3));
         // cache absent entirely -> false (unknown treated as empty)
-        assert!(!piv_slot_occupied(PivSlotSel::Retired(1), &slot_keys, None));
+        assert!(!piv_slot_occupied(
+            Slot::retired(1).unwrap(),
+            &slot_keys,
+            &standard,
+            None
+        ));
     }
 
     /// The Generate / Move "replace?" warning fails closed: a slot keyroost
     /// can't vouch for as empty counts as possibly holding a key, the same
-    /// rule the CLI applies before it writes.
+    /// rule the CLI applies before it writes. It follows the card's key
+    /// answer, not the certificate.
     #[test]
     fn piv_slot_occupancy_treats_unknown_as_possibly_occupied() {
-        use keyroost_piv::{KeyAlg, Slot};
+        use keyroost_piv::Slot;
         use keyroost_transport::SlotKeyPresence as K;
 
-        let slot_keys = vec![
-            (Slot::Authentication, Some(KeyAlg::EccP256), None),
-            (Slot::Signature, None, None),
-            (Slot::KeyManagement, None, None),
-            (Slot::CardAuthentication, None, None),
-        ];
         let standard = vec![
             (Slot::Authentication, K::Unknown),
             (Slot::Signature, K::NoKey),
@@ -28689,18 +28892,19 @@ mod tests {
             (Slot::retired(2).unwrap(), K::NoKey),
             (Slot::retired(4).unwrap(), K::Unknown),
         ];
-        let occ =
-            |s: Slot, r: Option<&[(Slot, K)]>| piv_slot_occupancy(s, &slot_keys, &standard, r);
+        let occ = |s: Slot, r: Option<&[(Slot, K)]>| piv_slot_occupancy(s, &standard, r);
 
-        // A carried algorithm is a key, whatever the status says.
-        assert_eq!(occ(Slot::Authentication, None), PivOccupancy::Key);
+        // The card says there is a key.
         assert_eq!(occ(Slot::CardAuthentication, None), PivOccupancy::Key);
-        // Only a confirmed "no key" is empty.
+        // Only a confirmed "no key" is empty — also for a slot holding a
+        // certificate (the status doesn't look at it).
         assert_eq!(occ(Slot::Signature, None), PivOccupancy::Empty);
-        // Can't tell -> may hold a key.
+        // Can't tell -> may hold a key, whatever algorithm the certificate
+        // names.
+        assert_eq!(occ(Slot::Authentication, None), PivOccupancy::MaybeKey);
         assert_eq!(occ(Slot::KeyManagement, None), PivOccupancy::MaybeKey);
         assert_eq!(
-            piv_slot_occupancy(Slot::KeyManagement, &slot_keys, &[], None),
+            piv_slot_occupancy(Slot::KeyManagement, &[], None),
             PivOccupancy::MaybeKey
         );
 

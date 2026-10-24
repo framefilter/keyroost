@@ -230,10 +230,9 @@ pub struct PivSlotStatus {
     /// True when the certificate is stored gzip-compressed (CertInfo `0x01`)
     /// and inflated cleanly. `cert_len` is still the inflated DER length.
     pub cert_compressed: bool,
-    /// Whether the slot holds a key, for a slot without a certificate (see
-    /// [`SlotKeyPresence`]). Not read for a slot with a certificate, readable
-    /// or not: [`SlotKeyPresence::Unknown`] there, and the certificate is
-    /// what a caller shows.
+    /// Whether the slot holds a key (see [`SlotKeyPresence`]), read for every
+    /// slot, with a certificate or without: a certificate can sit in a slot
+    /// that holds no key.
     pub key: SlotKeyPresence,
 }
 
@@ -2413,7 +2412,7 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// Read a read-only status snapshot: version, serial, PIN retries, CHUID,
-    /// and which slots hold a certificate. No PIN, no touch.
+    /// and which slots hold a certificate and a key. No PIN, no touch.
     pub fn status(&mut self) -> Result<PivStatus, TransportError> {
         // Fingerprint resolution (which also resolves `version` and
         // `serial` — see `Self::applet_fingerprint`'s doc) runs first and is
@@ -2434,13 +2433,7 @@ impl<'tx> PivSession<'tx> {
         let chuid = self.read_chuid().unwrap_or_default();
         let mut slots = Vec::with_capacity(4);
         for slot in piv::Slot::all() {
-            let mut st = self.slot_status(slot)?;
-            // Only a slot without a certificate needs the key answer, so only
-            // it costs a GET METADATA (once per session: it's cached).
-            if !st.cert_present {
-                st.key = self.slot_key_presence(slot);
-            }
-            slots.push(st);
+            slots.push(self.slot_status(slot)?);
         }
         Ok(PivStatus {
             version,
@@ -2553,13 +2546,10 @@ impl<'tx> PivSession<'tx> {
                 .map(|dn| dn.to_string());
             let policy = self.slot_policy(slot);
 
-            let mut st = slot_status_of(slot, &cert);
-            // Same answer as `status` gives; the algorithm reads above have
+            // Same answer as `status` gives; the algorithm read above has
             // already cached everything it needs, so no APDU here.
-            if !st.cert_present {
-                st.key = self.slot_key_presence(slot);
-            }
-            slots.push(st);
+            let key = self.slot_key_presence(slot);
+            slots.push(slot_status_of(slot, &cert, key));
             detail.push(PivSlotDetail {
                 slot,
                 algorithm,
@@ -5775,10 +5765,14 @@ impl<'tx> PivSession<'tx> {
         }
     }
 
-    /// Whether `slot` holds a certificate (GET DATA), and its size if so.
-    fn slot_status(&mut self, slot: piv::Slot) -> Result<PivSlotStatus, TransportError> {
+    /// Whether `slot` holds a certificate (GET DATA; its size if so) and a
+    /// key ([`Self::slot_key_presence`]). Works for retired slots too. Both
+    /// reads are cached, so a slot costs at most one GET DATA and one GET
+    /// METADATA per session lineage.
+    pub fn slot_status(&mut self, slot: piv::Slot) -> Result<PivSlotStatus, TransportError> {
         let cert = self.cert_object(slot)?;
-        Ok(slot_status_of(slot, &cert))
+        let key = self.slot_key_presence(slot);
+        Ok(slot_status_of(slot, &cert, key))
     }
 
     /// Transmit one APDU and reassemble a response the card splits across
@@ -6618,11 +6612,13 @@ fn cert_object_decode(body: &[u8]) -> Result<Option<StoredCert>, CertUnreadable>
     }))
 }
 
-/// A slot's [`PivSlotStatus`] from its decoded certificate object:
-/// [`slot_occupancy`] plus the compressed flag of a readable certificate.
+/// A slot's [`PivSlotStatus`] from its decoded certificate object and the
+/// card's key answer: [`slot_occupancy`] plus the compressed flag of a
+/// readable certificate, and `key` whether a certificate is there or not.
 fn slot_status_of(
     slot: piv::Slot,
     cert: &Result<Option<StoredCert>, CertUnreadable>,
+    key: SlotKeyPresence,
 ) -> PivSlotStatus {
     let der = cert
         .as_ref()
@@ -6637,6 +6633,7 @@ fn slot_status_of(
                 ..
             }))
         );
+    status.key = key;
     status
 }
 
@@ -6661,7 +6658,7 @@ fn slot_occupancy(slot: piv::Slot, cert: Result<Option<&[u8]>, CertUnreadable>) 
                 cert_len: len,
                 cert_unreadable: None,
                 cert_compressed: false,
-                // The status reads fill this in; it needs the card.
+                // `slot_status_of` fills this in; it needs the card.
                 key: SlotKeyPresence::Unknown,
             }
         }
@@ -8401,22 +8398,48 @@ mod tests {
         let slot = Slot::Signature;
         let der = sample_der();
         let obj = compressed_cert_object(&crate::gzip::gzip_member(&der));
-        let st = slot_status_of(slot, &cert_object_decode(&obj));
+        let st = slot_status_of(slot, &cert_object_decode(&obj), SlotKeyPresence::Unknown);
         assert!(st.cert_present);
         assert!(st.cert_compressed);
         assert_eq!(st.cert_len, der.len()); // the DER, not the gzip member
 
         let plain = [0x53, 0x07, 0x70, 0x02, 0xAB, 0xCD, 0x71, 0x01, 0x00];
-        let st = slot_status_of(slot, &cert_object_decode(&plain));
+        let st = slot_status_of(slot, &cert_object_decode(&plain), SlotKeyPresence::Unknown);
         assert!(st.cert_present);
         assert!(!st.cert_compressed);
 
         // Flagged compressed but damaged: present, unreadable, not "compressed".
         let bad = compressed_cert_object(b"not gzip at all, just bytes");
-        let st = slot_status_of(slot, &cert_object_decode(&bad));
+        let st = slot_status_of(slot, &cert_object_decode(&bad), SlotKeyPresence::Unknown);
         assert!(st.cert_present);
         assert!(!st.cert_compressed);
         assert_eq!(st.cert_unreadable, Some(CertUnreadable::Damaged));
+    }
+
+    #[test]
+    fn slot_status_carries_the_key_answer_for_a_slot_with_a_certificate() {
+        // A certificate can sit in a slot that holds no key (or one that
+        // does): the status says which, rather than leaving it unknown.
+        let slot = Slot::CardAuthentication;
+        let plain = [0x53, 0x07, 0x70, 0x02, 0xAB, 0xCD, 0x71, 0x01, 0x00];
+        for key in [
+            SlotKeyPresence::Present,
+            SlotKeyPresence::NoKey,
+            SlotKeyPresence::Unknown,
+        ] {
+            let st = slot_status_of(slot, &cert_object_decode(&plain), key);
+            assert!(st.cert_present);
+            assert_eq!(st.key, key);
+        }
+        // An unreadable certificate keeps the key answer too.
+        let bad = compressed_cert_object(b"not gzip at all, just bytes");
+        let st = slot_status_of(slot, &cert_object_decode(&bad), SlotKeyPresence::NoKey);
+        assert!(st.cert_unreadable.is_some());
+        assert_eq!(st.key, SlotKeyPresence::NoKey);
+        // And a slot without a certificate, as before.
+        let st = slot_status_of(slot, &Ok(None), SlotKeyPresence::Present);
+        assert!(!st.cert_present);
+        assert_eq!(st.key, SlotKeyPresence::Present);
     }
 
     #[test]
