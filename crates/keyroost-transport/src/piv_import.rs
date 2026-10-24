@@ -9,7 +9,7 @@ use core::fmt;
 
 use keyroost_p12::{Contents, Entry, KeyParts};
 use keyroost_piv::compat::{self, FeatureGate, PivExtension, PivQuirk};
-use keyroost_piv::fingerprint::AppletFingerprint;
+use keyroost_piv::fingerprint::{AppletFingerprint, TrussedVariant};
 use keyroost_piv::{
     ImportBodyError, ImportKey, ImportLayout, ImportParts, KeyAlg, PinPolicy, PublicKey, Slot,
     TouchPolicy,
@@ -37,6 +37,7 @@ pub struct ImportPlan<'a> {
 }
 
 /// Why an import can't go ahead. Every variant is reached before any write.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportRefusal {
     /// The file holds no private key.
@@ -114,7 +115,7 @@ impl fmt::Display for ImportRefusal {
                 write!(
                     f,
                     "keys needs {} {what} {} or later.",
-                    fingerprint.applet_name(),
+                    product_name(*fingerprint),
                     keyroost_piv::format_version_bytes(floor.version)
                 )
             }
@@ -152,6 +153,16 @@ impl fmt::Display for ImportRefusal {
 }
 
 impl std::error::Error for ImportRefusal {}
+
+/// The device as a refusal names it: the product where the fingerprint's
+/// label is the applet's (the Trussed applet keyroost knows ships on the
+/// Nitrokey 3), else that label.
+fn product_name(fp: AppletFingerprint) -> &'static str {
+    match fp {
+        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => "Nitrokey 3",
+        other => other.applet_name(),
+    }
+}
 
 /// The common name of a certificate's subject, else the whole subject, else
 /// `(unreadable subject)`: how an entry's or an authority certificate's
@@ -380,8 +391,7 @@ pub fn import_blocked(
 /// RSA exponent, then policies (the extension, then a value the firmware is
 /// known to refuse). A non-default PIN or touch policy is refused
 /// where the applet is known not to take it; where support is merely unverified
-/// it is allowed, as `piv key generate` does. A Token2 is never sent a touch
-/// policy on import, whatever its version: [`import_touch_policy_refused`].
+/// it is allowed, as `piv key generate` does.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_import<'a>(
     contents: &'a Contents,
@@ -434,8 +444,7 @@ pub fn plan_import<'a>(
         return Err(ImportRefusal::PinPolicyNotSupported);
     }
     if touch_policy != TouchPolicy::Default
-        && (import_touch_policy_refused(fp)
-            || gate(PivExtension::SlotTouchPolicy) == FeatureGate::Unsupported)
+        && gate(PivExtension::SlotTouchPolicy) == FeatureGate::Unsupported
     {
         return Err(ImportRefusal::TouchPolicyNotSupported);
     }
@@ -459,15 +468,6 @@ pub fn plan_import<'a>(
         touch_policy,
         skipped_authorities: contents.authorities.len(),
     })
-}
-
-/// Whether `fp`'s import is refused any touch policy but the default, at
-/// every version. A Token2's touch-policy row is known unsupported only up to
-/// the newest firmware on record, so a newer one would otherwise resolve as
-/// unverified and let the policy through; import never sends it one.
-#[must_use]
-pub fn import_touch_policy_refused(fp: AppletFingerprint) -> bool {
-    fp == AppletFingerprint::Token2
 }
 
 /// [`plan_import`] for the applet on `session`, using its fingerprint and
@@ -951,7 +951,6 @@ fn run_import_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keyroost_piv::fingerprint::TrussedVariant;
 
     const PW: &str = "keyroost-test";
 
@@ -1069,7 +1068,7 @@ mod tests {
         );
         assert_eq!(
             blocked.to_string(),
-            "Importing keys needs NitroKey firmware 1.8 or later."
+            "Importing keys needs Nitrokey 3 firmware 1.8 or later."
         );
         for (file, slot) in [
             ("rsa2048-modern", Slot::Authentication),
@@ -1107,7 +1106,7 @@ mod tests {
         assert_eq!(
             r.to_string(),
             format!(
-                "Importing {} keys needs NitroKey firmware 1.8.2 or later.",
+                "Importing {} keys needs Nitrokey 3 firmware 1.8.2 or later.",
                 KeyAlg::Rsa3072.label()
             )
         );
@@ -1243,89 +1242,87 @@ mod tests {
         assert_eq!(plan.layout, ImportLayout::Yubico);
     }
 
+    /// A Token2's touch policy goes through its compat row like any other
+    /// device: refused up to the newest applet version on record (5.112.0),
+    /// unverified (allowed, with the usual warning) past it — the same
+    /// answer `piv key generate` gets.
     #[test]
-    fn token2_touch_policy_refused() {
+    fn token2_touch_policy_follows_its_compat_row() {
         let c = load("rsa2048-modern");
-        assert_eq!(
+        let plan = |version: Option<&[u8]>, touch| {
             plan_import(
                 &c,
                 None,
                 Slot::Authentication,
                 AppletFingerprint::Token2,
-                None,
-                None,
-                PinPolicy::Default,
-                TouchPolicy::Always
-            )
-            .unwrap_err(),
-            ImportRefusal::TouchPolicyNotSupported
-        );
-    }
-
-    #[test]
-    fn token2_touch_policy_refused_on_newer_versions_too() {
-        // Past the newest Token2 version on record the touch-policy row
-        // reads unverified; import still never sends one.
-        let c = load("rsa2048-modern");
-        let plan = |version: &[u8], touch| {
-            plan_import(
-                &c,
-                None,
-                Slot::Authentication,
-                AppletFingerprint::Token2,
-                Some(version),
+                version,
                 None,
                 PinPolicy::Default,
                 touch,
             )
         };
+        let gate = |version| {
+            compat::resolve(
+                PivExtension::SlotTouchPolicy,
+                AppletFingerprint::Token2,
+                version,
+                None,
+            )
+        };
+        for version in [None, Some(&[5u8, 112, 0][..]), Some(&[5, 100, 0])] {
+            assert_eq!(gate(version), FeatureGate::Unsupported, "{version:?}");
+            assert_eq!(
+                plan(version, TouchPolicy::Always).unwrap_err(),
+                ImportRefusal::TouchPolicyNotSupported,
+                "{version:?}"
+            );
+            assert!(plan(version, TouchPolicy::Default).is_ok(), "{version:?}");
+        }
         for version in [&[5u8, 113, 0][..], &[6, 0, 0]] {
+            assert_eq!(gate(Some(version)), FeatureGate::Unverified, "{version:?}");
             for touch in [TouchPolicy::Always, TouchPolicy::Cached, TouchPolicy::Never] {
                 assert_eq!(
-                    plan(version, touch).unwrap_err(),
-                    ImportRefusal::TouchPolicyNotSupported,
+                    plan(Some(version), touch).unwrap().touch_policy,
+                    touch,
                     "{version:?} {touch:?}"
                 );
             }
-            assert!(plan(version, TouchPolicy::Default).is_ok(), "{version:?}");
         }
     }
 
+    /// A Nitrokey never applies a PIN or touch policy (its compat rows, known
+    /// unsupported through firmware 1.9.1): import refuses a non-default one.
     #[test]
-    fn nitrokey_pin_policy_refused() {
+    fn nitrokey_policies_refused_through_1_9_1() {
         let c = load("rsa2048-modern");
-        assert_eq!(
+        let plan = |fw: &[u8], pin, touch| {
             plan_import(
                 &c,
                 None,
                 Slot::Authentication,
                 NK,
                 None,
-                Some(&[1, 8, 3]),
-                PinPolicy::Always,
-                TouchPolicy::Default
+                Some(fw),
+                pin,
+                touch,
             )
-            .unwrap_err(),
-            ImportRefusal::PinPolicyNotSupported
-        );
-    }
-
-    #[test]
-    fn nitrokey_newer_firmware_pin_policy_is_unverified_not_refused() {
-        // Newer than the firmware the refusal was observed on: like
-        // `piv key generate`, warn-level (unverified), so allowed here.
-        let c = load("rsa2048-modern");
-        assert!(plan_import(
-            &c,
-            None,
-            Slot::Authentication,
-            NK,
-            None,
-            NK_FW,
-            PinPolicy::Always,
-            TouchPolicy::Always
-        )
-        .is_ok());
+        };
+        for fw in [&[1u8, 8, 3][..], &[1, 9, 1]] {
+            assert_eq!(
+                plan(fw, PinPolicy::Always, TouchPolicy::Default).unwrap_err(),
+                ImportRefusal::PinPolicyNotSupported,
+                "{fw:?}"
+            );
+            assert_eq!(
+                plan(fw, PinPolicy::Default, TouchPolicy::Always).unwrap_err(),
+                ImportRefusal::TouchPolicyNotSupported,
+                "{fw:?}"
+            );
+            assert!(plan(fw, PinPolicy::Default, TouchPolicy::Default).is_ok());
+        }
+        // Newer than the newest source read: unverified, so allowed, as
+        // `piv key generate` does.
+        assert!(plan(&[1, 9, 2], PinPolicy::Always, TouchPolicy::Always).is_ok());
     }
 
     #[test]
@@ -1398,7 +1395,6 @@ mod run_tests {
         cert_write_result, send_certificate, send_import_key, store_certificate, LongLink,
     };
     use crate::{CertCompression, CertImport, TransportError};
-    use keyroost_piv::fingerprint::TrussedVariant;
     use keyroost_piv::{CertInfo, PublicKey};
     use keyroost_pivtest::{Outcome, SelfTest};
     use std::collections::VecDeque;

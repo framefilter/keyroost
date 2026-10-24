@@ -3180,23 +3180,45 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 ///   live unit at firmware 1.8.3 accepting all four, PIN VERIFY unlocking
 ///   management included.
 /// * [`PivExtension::SetPinPukRetries`], [`PivExtension::MoveKey`],
-///   [`PivExtension::DeleteKey`], [`PivExtension::Attest`],
-///   [`PivExtension::SlotPinPolicy`], [`PivExtension::SlotTouchPolicy`] —
+///   [`PivExtension::DeleteKey`], [`PivExtension::Attest`] —
 ///   `Verdict::KnownUnsupported` pinned to exactly the version keyroost has
 ///   evidence for, firmware 1.8.3 (`[1, 8, 3]`): a live unit there rejects
-///   all six, corroborated for the two policy rows by the Trussed
-///   `piv-authenticator` source itself
-///   (<https://github.com/trussed-dev/piv-authenticator>), which implements
-///   no `0xAA`/`0xAB` handling on GENERATE ASYMMETRIC KEYPAIR. Per
-///   `Verdict::KnownUnsupported`'s backward-extension rule this is assumed
-///   to also hold at every earlier, untested version — including 1.8 itself —
-///   without a separate `[1, 8]` entry on these rows; the single `[1, 8, 3]`
-///   verdict already covers both. A firmware newer than 1.8.3 with no verdict
-///   of its own softens to [`FeatureGate::Unverified`] rather than staying
-///   `Unsupported`, since a later firmware may have added any of these six —
-///   unlike [`PivExtension::ResetGlobal`]'s `Verdict::KnownUnsupportedSince`
-///   row above, which has a standing reason (this vendor's own architecture)
-///   to expect it never comes back.
+///   all four. Per `Verdict::KnownUnsupported`'s backward-extension rule this
+///   is assumed to also hold at every earlier, untested version — including
+///   1.8 itself — without a separate `[1, 8]` entry on these rows; the single
+///   `[1, 8, 3]` verdict already covers both. A firmware newer than 1.8.3
+///   with no verdict of its own softens to [`FeatureGate::Unverified`] rather
+///   than staying `Unsupported`, since a later firmware may have added any of
+///   these — unlike [`PivExtension::ResetGlobal`]'s
+///   `Verdict::KnownUnsupportedSince` row above, which has a standing reason
+///   (this vendor's own architecture) to expect it never comes back.
+/// * [`PivExtension::SlotPinPolicy`], [`PivExtension::SlotTouchPolicy`] —
+///   `Verdict::KnownUnsupported` at firmware 1.9.1 (`[1, 9, 1]`), the newest
+///   release whose source was read; the backward rule covers every older
+///   firmware. From the Trussed `piv-authenticator` source
+///   (<https://github.com/trussed-dev/piv-authenticator>), mapped to firmware
+///   through the `nitrokey-3-firmware` `Cargo.lock`
+///   (<https://github.com/Nitrokey/nitrokey-3-firmware>: 1.7.0-1.7.2 ship
+///   0.3.4, 1.8.0 0.3.8, 1.8.1 0.3.9, 1.8.2/1.8.3 0.5.3, 1.9.0/1.9.1 0.7.0):
+///   * 0.3.8 through 0.7.0 (firmware 1.8.0-1.9.1) accept tags `0xAA`/`0xAB`
+///     and ignore them. GENERATE reads its template with
+///     `tlv::get_do(&[0xAC, 0x80])`, which skips tags it doesn't ask for
+///     (v0.7.0 `src/lib.rs` line 866, v0.5.3 line 878); IMPORT (`INS FE`)
+///     looks up only `0x01`/`0x02`/`0x03` (v0.7.0 `src/lib.rs` lines
+///     1076-1078). The stored key record (`KeyWithAlg`) has no policy field,
+///     so a per-key policy can't be kept. The PIN rule is fixed per slot
+///     (`container.rs` lines 163-171): 9C asks for the PIN before each use,
+///     9E and 9B never, every other slot once per session; no code path asks
+///     for a touch.
+///   * 0.3.4 (firmware 1.7.x) parses the template strictly
+///     (`derp::nested`), so GENERATE with a policy tag fails with
+///     IncorrectDataParameter (`6A80` by the usual mapping).
+///
+///   A live unit at firmware 1.8.3 was earlier recorded as rejecting the
+///   policy tags. The source above says 1.8.x/1.9.x accept and ignore them,
+///   so that observation may have come from something else and needs a
+///   recheck on hardware. The verdict is "not supported" either way: the
+///   device never applies a requested policy.
 /// * [`PivExtension::SlotKeyAlgorithm`] — RSA-2048, RSA-4096, and ECC P-256
 ///   are supported on every firmware keyroost has evidence for, pre-1.8.2 and
 ///   1.8.2-and-later alike: one `Verdict::KnownSupported` row at the
@@ -3294,13 +3316,22 @@ const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::MoveKey,
             PivExtension::DeleteKey,
             PivExtension::Attest,
-            PivExtension::SlotPinPolicy,
-            PivExtension::SlotTouchPolicy,
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
         ],
         verdicts: &[VersionVerdict {
             version: &[1, 8, 3],
+            verdict: Verdict::KnownUnsupported,
+        }],
+    },
+    // PIN and touch policies: ignored (1.8.0-1.9.1) or refused (1.7.x) per
+    // the piv-authenticator source, never applied — see this const's doc.
+    // Pinned to the newest firmware read; older ones follow by the backward
+    // rule, a newer one softens to `Unverified`.
+    ExtensionVerdicts {
+        extensions: &[PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy],
+        verdicts: &[VersionVerdict {
+            version: &[1, 9, 1],
             verdict: Verdict::KnownUnsupported,
         }],
     },
@@ -6500,26 +6531,27 @@ mod tests {
     }
 
     #[test]
-    fn trussed_nitrokey_slot_pin_and_touch_policy_unsupported_at_1_8_3_firmware() {
+    fn trussed_nitrokey_slot_pin_and_touch_policy_unsupported_through_1_9_1_firmware() {
+        // Source-read up to 1.9.1: policy tags ignored (1.8.0-1.9.1) or
+        // refused (1.7.x), never applied — see
+        // `TRUSSED_NITROKEY_FIRMWARE_VERDICTS`'s doc.
+        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
         for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
+            // Backward from 1.9.1 to every older firmware, and with no
+            // firmware version read at all.
+            for fw in [&[1, 9, 1][..], &[1, 9, 0], &[1, 8, 3], &[1, 8], &[1, 7, 2]] {
+                assert_eq!(
+                    resolve(ext, fp, Some(&[6, 6, 6]), Some(fw)),
+                    FeatureGate::Unsupported,
+                    "{ext:?} at firmware {fw:?}"
+                );
+            }
+            assert_eq!(resolve(ext, fp, None, None), FeatureGate::Unsupported);
+            // Newer than the newest source read: may have changed.
             assert_eq!(
-                resolve(
-                    ext,
-                    AppletFingerprint::Trussed(TrussedVariant::NitroKey),
-                    None,
-                    Some(&[1, 8, 3]),
-                ),
-                FeatureGate::Unsupported
-            );
-            // Backward-extends to earlier, untested firmware too.
-            assert_eq!(
-                resolve(
-                    ext,
-                    AppletFingerprint::Trussed(TrussedVariant::NitroKey),
-                    None,
-                    Some(&[1, 8]),
-                ),
-                FeatureGate::Unsupported
+                resolve(ext, fp, None, Some(&[1, 9, 2])),
+                FeatureGate::Unverified,
+                "{ext:?} above 1.9.1"
             );
         }
     }
