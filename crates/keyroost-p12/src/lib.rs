@@ -45,18 +45,17 @@ pub enum P12Error {
     TooLarge,
 }
 
+/// [`MAX_FILE_BYTES`] in MiB, the one place the limit is set.
+const MAX_FILE_MIB: usize = 1;
+
 /// The largest file [`open`] reads. A real .p12/.pfx holds a key and a few
 /// certificates: kilobytes, not megabytes.
-pub const MAX_FILE_BYTES: usize = 1024 * 1024;
-
-const MIB: usize = 1024 * 1024;
-// `max_file_size` names the limit in whole MiB.
-const _: () = assert!(MAX_FILE_BYTES % MIB == 0);
+pub const MAX_FILE_BYTES: usize = MAX_FILE_MIB * 1024 * 1024;
 
 /// [`MAX_FILE_BYTES`] for a message: "1 MiB".
 #[must_use]
 pub fn max_file_size() -> String {
-    format!("{} MiB", MAX_FILE_BYTES / MIB)
+    format!("{MAX_FILE_MIB} MiB")
 }
 
 impl fmt::Display for P12Error {

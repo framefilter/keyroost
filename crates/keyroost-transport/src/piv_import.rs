@@ -211,8 +211,9 @@ fn too_large_message() -> String {
 }
 
 /// Read a .p12/.pfx file for [`keyroost_p12::open`], the same in the CLI and
-/// the app: at most [`keyroost_p12::MAX_FILE_BYTES`] (the most `open` takes), into a buffer that is wiped when
-/// dropped (the file holds an encrypted private key).
+/// the app: at most [`keyroost_p12::MAX_FILE_BYTES`] (the most `open` takes),
+/// into a buffer that is wiped when dropped (the file holds an encrypted
+/// private key).
 ///
 /// # Errors
 /// [`KeyFileError::TooLarge`] past the limit (nothing more is read), else

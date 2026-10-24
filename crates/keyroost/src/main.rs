@@ -2338,6 +2338,21 @@ fn piv_reset_global_alternative_available(
 /// device already known to handle non-default policies, and the per-row
 /// warning marker / disabled-combo hover above already cover the
 /// unverified/unsupported cases on their own.
+/// The Import dialog's note when "Enable Anyway" is on for this key yet a
+/// policy row stays greyed out: the override relaxes Generate, not import.
+/// `None` otherwise.
+fn piv_import_override_note(
+    enable_anyway_ignored: bool,
+    pin_policy_gate: keyroost_piv::compat::FeatureGate,
+    touch_policy_gate: keyroost_piv::compat::FeatureGate,
+) -> Option<&'static str> {
+    use keyroost_piv::compat::FeatureGate;
+    (enable_anyway_ignored
+        && (pin_policy_gate == FeatureGate::Unsupported
+            || touch_policy_gate == FeatureGate::Unsupported))
+        .then_some("Enable Anyway doesn't apply to importing.")
+}
+
 fn piv_policy_caveat_hint_needed(
     pin_policy_gate: keyroost_piv::compat::FeatureGate,
     touch_policy_gate: keyroost_piv::compat::FeatureGate,
@@ -13013,12 +13028,14 @@ fn piv_import_not_written(e: impl std::fmt::Display) -> String {
     format!("{} Nothing was written.", sentence(e))
 }
 
-/// The PIN part of the PIV header: the tries left, or "PIN verified" when the
-/// card reports the PIN is verified in this session instead of a count.
+/// The PIN part of the PIV header: the tries left, or "PIN accepted" when the
+/// card reported the PIN verified in the session that read this status
+/// instead of a count. "Accepted", not "verified": the snapshot outlives that
+/// session, which resets the card when it ends.
 fn piv_header_pin(st: &keyroost_transport::PivStatus) -> String {
     match st.pin_retries {
         Some(n) => format!("PIN retries {n}"),
-        None if st.pin_verified => "PIN verified".to_string(),
+        None if st.pin_verified => "PIN accepted".to_string(),
         None => "PIN retries \u{2014}".to_string(),
     }
 }
@@ -20110,8 +20127,10 @@ impl App {
     /// The PIN and touch policy rows of the Generate key and Import key
     /// dialogs (`gen_pin_policy` / `gen_touch_policy`), gated by this key's
     /// support for each policy and the values its firmware refuses — the
-    /// same rows, and the same "Enable Anyway" override, for both.
-    fn piv_modal_policy_fields(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    /// same rows for both. `allow_override` lets "Enable Anyway" relax them
+    /// (Generate); Import passes `false`, since `plan_import` refuses what the
+    /// rows mark unsupported whatever the override, and says so.
+    fn piv_modal_policy_fields(&mut self, ui: &mut egui::Ui, p: &Palette, allow_override: bool) {
         // PIN/touch policy (tags 0xAA/0xAB on GENERATE ASYMMETRIC KEYPAIR
         // and IMPORT ASYMMETRIC KEY) are Yubico extensions, not SP 800-73-4
         // — gated the same three-way way (`keyroost_piv::compat`) Move/Delete
@@ -20133,10 +20152,20 @@ impl App {
                 )
             },
         );
-        let pin_policy_gate =
-            self.piv_gate(PivExtension::SlotPinPolicy, piv_fp, piv_ver, piv_fw_ver);
-        let touch_policy_gate =
-            self.piv_gate(PivExtension::SlotTouchPolicy, piv_fp, piv_ver, piv_fw_ver);
+        let gate = |ext| {
+            if allow_override {
+                self.piv_gate(ext, piv_fp, piv_ver, piv_fw_ver)
+            } else {
+                keyroost_piv::compat::resolve(ext, piv_fp, piv_ver, piv_fw_ver)
+            }
+        };
+        let pin_policy_gate = gate(PivExtension::SlotPinPolicy);
+        let touch_policy_gate = gate(PivExtension::SlotTouchPolicy);
+        let override_note = piv_import_override_note(
+            !allow_override && self.piv_compat_ignored_selected(),
+            pin_policy_gate,
+            touch_policy_gate,
+        );
         // Narrower than the two gates above: a device can
         // support the extension in general yet reject one
         // specific value (e.g. YubiKey firmware 4.0-4.2
@@ -20246,6 +20275,9 @@ impl App {
                 "Policy other than `default` requires YubiKey or compatible \
                  token.",
             );
+        }
+        if let Some(note) = override_note {
+            card_note(ui, p, note);
         }
     }
 
@@ -20369,7 +20401,7 @@ impl App {
                     | ImportRefusal::PinPolicyOnceNotSupported
                     | ImportRefusal::TouchPolicyCachedNotSupported
             ) {
-                self.piv_modal_policy_fields(ui, p);
+                self.piv_modal_policy_fields(ui, p, false);
                 ui.add_space(6.0);
             }
             ui.colored_label(p.err, refusal.to_string());
@@ -20443,7 +20475,7 @@ impl App {
             }
         }
         ui.add_space(6.0);
-        self.piv_modal_policy_fields(ui, p);
+        self.piv_modal_policy_fields(ui, p, false);
         self.piv_modal_compression_field(ui, p, label_w);
 
         // Authority certificates are never written to the card; they can be
@@ -20818,7 +20850,7 @@ impl App {
                             card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
                             ui.add_space(8.0);
 
-                            self.piv_modal_policy_fields(ui, p);
+                            self.piv_modal_policy_fields(ui, p, true);
                         }
                         PivCredKind::ImportKey => {
                             import_ready = self.piv_import_key_fields(
@@ -29785,61 +29817,77 @@ mod tests {
     /// After a PIN-using operation the card reports "verified" instead of a
     /// count; the header says so rather than showing a dash.
     #[test]
-    fn piv_header_says_pin_verified_instead_of_a_dash() {
+    fn piv_header_says_pin_accepted_instead_of_a_dash() {
         let mut st = keyroost_transport::PivStatus::default();
         assert_eq!(piv_header_pin(&st), "PIN retries \u{2014}");
         st.pin_retries = Some(3);
         assert_eq!(piv_header_pin(&st), "PIN retries 3");
         st.pin_retries = None;
         st.pin_verified = true;
-        assert_eq!(piv_header_pin(&st), "PIN verified");
+        assert_eq!(piv_header_pin(&st), "PIN accepted");
     }
 
-    /// The Generate and Import dialogs' policy rows follow the compat rows
-    /// and "Enable Anyway", with no per-device rule of their own: a policy
-    /// the list marks unsupported falls back to `default` (the combo is
-    /// greyed out), an unverified one stays (with the warning), and Enable
-    /// Anyway turns "unsupported" into "unverified".
+    /// The Generate and Import dialogs' policy rows follow the compat rows,
+    /// with no per-device rule of their own: a policy the list marks
+    /// unsupported falls back to `default` (the combo is greyed out), an
+    /// unverified one stays (with the warning). Enable Anyway turns
+    /// "unsupported" into "unverified" in Generate only: import refuses it
+    /// anyway (`plan_import`), so the Import dialog doesn't offer it.
     #[test]
     fn piv_policy_rows_follow_the_compat_rows() {
         use keyroost_piv::fingerprint::{AppletFingerprint, TrussedVariant};
         use keyroost_piv::{PinPolicy, TouchPolicy};
+        const GENERATE: bool = true;
+        const IMPORT: bool = false;
         let ctx = egui::Context::default();
         crate::ui::theme::install_fonts(&ctx);
         let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
-        let nitrokey = |fw: Vec<u8>| {
+        let nitrokey = || {
             let mut st = piv_status_with(
                 AppletFingerprint::Trussed(TrussedVariant::NitroKey),
                 Some(vec![6, 6, 6]),
             );
-            st.version_firmware = Some(fw);
+            st.version_firmware = Some(vec![1, 9, 1]);
             st
         };
-        let cases = [
+        let token2 = |v: Vec<u8>| piv_status_with(AppletFingerprint::Token2, Some(v));
+        let mut cases = Vec::new();
+        for dialog in [GENERATE, IMPORT] {
             // Token2: refused up to 5.112.0, unverified past it.
-            (
-                piv_status_with(AppletFingerprint::Token2, Some(vec![5, 112, 0])),
+            cases.push((
+                token2(vec![5, 112, 0]),
                 false,
+                dialog,
                 (PinPolicy::Always, TouchPolicy::Default),
-            ),
-            (
-                piv_status_with(AppletFingerprint::Token2, Some(vec![6, 0, 0])),
+            ));
+            cases.push((
+                token2(vec![6, 0, 0]),
                 false,
+                dialog,
                 (PinPolicy::Always, TouchPolicy::Always),
-            ),
+            ));
             // Nitrokey: neither policy, through firmware 1.9.1.
-            (
-                nitrokey(vec![1, 9, 1]),
+            cases.push((
+                nitrokey(),
                 false,
+                dialog,
                 (PinPolicy::Default, TouchPolicy::Default),
-            ),
-            (
-                nitrokey(vec![1, 9, 1]),
-                true,
-                (PinPolicy::Always, TouchPolicy::Always),
-            ),
-        ];
-        for (status, enable_anyway, want) in cases {
+            ));
+        }
+        // Enable Anyway: Generate offers both; Import still refuses them.
+        cases.push((
+            nitrokey(),
+            true,
+            GENERATE,
+            (PinPolicy::Always, TouchPolicy::Always),
+        ));
+        cases.push((
+            nitrokey(),
+            true,
+            IMPORT,
+            (PinPolicy::Default, TouchPolicy::Default),
+        ));
+        for (status, enable_anyway, allow_override, want) in cases {
             let mut app = App {
                 selected_device: Some("serial:A".into()),
                 ..Default::default()
@@ -29852,19 +29900,37 @@ mod tests {
             app.piv.gen_touch_policy = TouchPolicy::Always;
             let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    app.piv_modal_policy_fields(ui, &palette);
+                    app.piv_modal_policy_fields(ui, &palette, allow_override);
                 });
             });
             let st = app.piv.status.as_ref().unwrap();
             assert_eq!(
                 (app.piv.gen_pin_policy, app.piv.gen_touch_policy),
                 want,
-                "{:?} {:?} {:?} enable anyway: {enable_anyway}",
+                "{:?} {:?} {:?} enable anyway: {enable_anyway}, generate: {allow_override}",
                 st.applet_fingerprint,
                 st.version,
                 st.version_firmware
             );
         }
+    }
+
+    /// The Import dialog says why Enable Anyway leaves a policy row greyed
+    /// out — and only then.
+    #[test]
+    fn import_dialog_says_enable_anyway_does_not_apply() {
+        use keyroost_piv::compat::FeatureGate::{Supported, Unsupported, Unverified};
+        let note = Some("Enable Anyway doesn't apply to importing.");
+        assert_eq!(piv_import_override_note(true, Unsupported, Supported), note);
+        assert_eq!(
+            piv_import_override_note(true, Unverified, Unsupported),
+            note
+        );
+        assert_eq!(piv_import_override_note(true, Unverified, Unverified), None);
+        assert_eq!(
+            piv_import_override_note(false, Unsupported, Unsupported),
+            None
+        );
     }
 
     /// The result text: a key-only import says the slot now has no
