@@ -129,6 +129,8 @@ pub enum Instruction {
     /// METADATA's policy support), this certificate's key-policy extension is
     /// also the only source for the slot's PIN/touch policy.
     Attest = 0xF9,
+    /// Yubico extension: IMPORT ASYMMETRIC KEY — load a private key into a slot.
+    ImportKey = 0xFE,
 }
 
 impl Instruction {
@@ -161,6 +163,7 @@ impl Instruction {
             0xFA => Self::SetPinRetries,
             0xFB => Self::Reset,
             0xF9 => Self::Attest,
+            0xFE => Self::ImportKey,
             _ => return None,
         })
     }
@@ -187,6 +190,7 @@ impl Instruction {
             Self::SetPinRetries => "SET PIN RETRIES (yubico extension)",
             Self::Reset => "RESET (yubico extension)",
             Self::Attest => "ATTEST (yubico extension)",
+            Self::ImportKey => "IMPORT ASYMMETRIC KEY (yubico extension)",
         }
     }
 }
@@ -1137,6 +1141,199 @@ pub fn generate_key(
         &data,
         Some(0),
     )
+}
+
+/// Which private-key layout an applet's import command expects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportLayout {
+    /// Yubico's IMPORT ASYMMETRIC KEY: RSA as the CRT parts `p`, `q`, `dp`,
+    /// `dq`, `qinv` (tags `01`..`05`), EC and edwards/montgomery keys as a
+    /// scalar (tags `06`..`08`).
+    Yubico,
+    /// Trussed `piv-authenticator` (Nitrokey): RSA as `p`, `q` and the public
+    /// exponent `e` (tags `01`..`03`); it derives the rest itself.
+    NitrokeyRsa,
+}
+
+/// The private-key values of one import, borrowed from the caller (typically
+/// a parsed PKCS#12 entry). Big-endian, no leading-zero requirement: the
+/// builders pad where the layout needs a fixed width.
+#[derive(Clone, Copy, Debug)]
+pub enum ImportParts<'a> {
+    /// RSA CRT parts for the Yubico layout.
+    RsaCrt {
+        p: &'a [u8],
+        q: &'a [u8],
+        dp: &'a [u8],
+        dq: &'a [u8],
+        qinv: &'a [u8],
+    },
+    /// RSA primes and public exponent for the Nitrokey layout.
+    RsaPrimes {
+        p: &'a [u8],
+        q: &'a [u8],
+        e: &'a [u8],
+    },
+    /// ECDSA/ECDH private scalar (P-256 or P-384).
+    Ec { scalar: &'a [u8] },
+    /// Ed25519 private seed.
+    Ed25519 { seed: &'a [u8] },
+    /// X25519 private scalar.
+    X25519 { scalar: &'a [u8] },
+}
+
+/// A private key ready to be sent by [`import_key_body`]: its algorithm, the
+/// wire algorithm byte the target applet uses for it, and the key values.
+#[derive(Clone, Copy, Debug)]
+pub struct ImportKey<'a> {
+    pub alg: KeyAlg,
+    /// Tag-less algorithm byte for P1 of the import command — resolve it for
+    /// the applet in hand (see [`compat::slot_key_algorithm_apdu_id`]).
+    pub alg_id: u8,
+    pub parts: ImportParts<'a>,
+}
+
+/// Why [`import_key_body`] refused to build a body. These are caller bugs (or
+/// a key the layout cannot carry), reported instead of panicking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportBodyError {
+    /// A key value is longer than the fixed width its tag takes.
+    PartTooLong,
+    /// The algorithm and the kind of key parts do not belong together, or the
+    /// algorithm has no import encoding.
+    PartsMismatch,
+}
+
+impl core::fmt::Display for ImportBodyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ImportBodyError::PartTooLong => write!(f, "a key value is longer than its field"),
+            ImportBodyError::PartsMismatch => {
+                write!(f, "the key values do not match the key algorithm")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImportBodyError {}
+
+/// Append `tag || len || value` with `value` left-padded with zeros to `width`.
+fn push_padded_tlv(
+    out: &mut Vec<u8>,
+    tag: u8,
+    value: &[u8],
+    width: usize,
+) -> Result<(), ImportBodyError> {
+    if value.len() > width {
+        return Err(ImportBodyError::PartTooLong);
+    }
+    let mut padded = Zeroizing::new(vec![0u8; width]);
+    padded[width - value.len()..].copy_from_slice(value);
+    push_tlv(out, &[tag], &padded);
+    Ok(())
+}
+
+/// The IMPORT ASYMMETRIC KEY data field for `key`: the key values as TLVs
+/// (see [`ImportLayout`] for the two layouts, chosen by the kind of
+/// [`ImportParts`]), then the PIN policy (`AA 01 <p>`) and touch policy
+/// (`AB 01 <t>`) tags, each omitted when `Default`.
+///
+/// RSA values (`p`, `q`, and the CRT parts) are left-padded to `bits / 16`
+/// bytes in both layouts; the Nitrokey layout sends `e` as given. EC scalars are padded to the curve
+/// size (32 for P-256, 48 for P-384), Ed25519/X25519 values to 32. A value
+/// longer than its field, or parts that do not fit the algorithm, return an
+/// [`ImportBodyError`]. The body holds key material, so it zeroizes on drop.
+///
+/// # Errors
+/// [`ImportBodyError`] as described above.
+pub fn import_key_body(
+    key: &ImportKey<'_>,
+    pin_policy: PinPolicy,
+    touch_policy: TouchPolicy,
+) -> Result<Zeroizing<Vec<u8>>, ImportBodyError> {
+    let rsa_bits = match key.alg {
+        KeyAlg::Rsa1024 => Some(1024),
+        KeyAlg::Rsa2048 => Some(2048),
+        KeyAlg::Rsa3072 => Some(3072),
+        KeyAlg::Rsa4096 => Some(4096),
+        _ => None,
+    };
+    let mut out = Zeroizing::new(Vec::with_capacity(2400));
+    match (key.parts, key.alg, rsa_bits) {
+        (ImportParts::RsaCrt { p, q, dp, dq, qinv }, _, Some(bits)) => {
+            let width = bits / 16;
+            for (tag, v) in [(1, p), (2, q), (3, dp), (4, dq), (5, qinv)] {
+                push_padded_tlv(&mut out, tag, v, width)?;
+            }
+        }
+        (ImportParts::RsaPrimes { p, q, e }, _, Some(bits)) => {
+            let width = bits / 16;
+            push_padded_tlv(&mut out, 1, p, width)?;
+            push_padded_tlv(&mut out, 2, q, width)?;
+            push_tlv(&mut out, &[3], e);
+        }
+        (ImportParts::Ec { scalar }, KeyAlg::EccP256, _) => {
+            push_padded_tlv(&mut out, 6, scalar, 32)?;
+        }
+        (ImportParts::Ec { scalar }, KeyAlg::EccP384, _) => {
+            push_padded_tlv(&mut out, 6, scalar, 48)?;
+        }
+        (ImportParts::Ed25519 { seed }, KeyAlg::Ed25519, _) => {
+            push_padded_tlv(&mut out, 7, seed, 32)?;
+        }
+        (ImportParts::X25519 { scalar }, KeyAlg::X25519, _) => {
+            push_padded_tlv(&mut out, 8, scalar, 32)?;
+        }
+        _ => return Err(ImportBodyError::PartsMismatch),
+    }
+    if pin_policy != PinPolicy::Default {
+        push_tlv(&mut out, &[0xAA], &[pin_policy.id()]);
+    }
+    if touch_policy != TouchPolicy::Default {
+        push_tlv(&mut out, &[0xAB], &[touch_policy.id()]);
+    }
+    Ok(out)
+}
+
+/// IMPORT ASYMMETRIC KEY into `slot` as one APDU: `00 FE <alg_id> <key_ref>`
+/// with `body` (from [`import_key_body`]) as the data field and no `Le`.
+/// Requires prior management-key authentication. The APDU carries key
+/// material, so it zeroizes on drop.
+#[must_use]
+pub fn import_key(slot: Slot, alg_id: u8, body: &[u8]) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(build_apdu_ext(
+        0x00,
+        Instruction::ImportKey.code(),
+        alg_id,
+        slot.key_ref(),
+        body,
+        None,
+    ))
+}
+
+/// Command-chaining form of [`import_key`], like [`put_data_chained`]: the
+/// same body split into chained `0xFE` APDUs of at most `max_chunk` data
+/// bytes (clamped to 1..=255). No chunk requests an `Le`. Each APDU carries
+/// key material and zeroizes on drop.
+#[must_use]
+pub fn import_key_chained(
+    slot: Slot,
+    alg_id: u8,
+    body: &[u8],
+    max_chunk: usize,
+) -> Vec<Zeroizing<Vec<u8>>> {
+    chain_apdu(
+        0x00,
+        Instruction::ImportKey.code(),
+        alg_id,
+        slot.key_ref(),
+        body,
+        max_chunk.clamp(1, 255),
+        None,
+    )
+    .into_iter()
+    .map(Zeroizing::new)
+    .collect()
 }
 
 /// The PUT DATA body shared by [`put_data`] (single extended-length APDU) and
@@ -2256,6 +2453,7 @@ mod tests {
             Instruction::SetPinRetries,
             Instruction::Reset,
             Instruction::Attest,
+            Instruction::ImportKey,
         ] {
             assert_eq!(Instruction::from_code(ins.code()), Some(ins));
             assert!(!ins.name().is_empty());
@@ -3757,5 +3955,216 @@ mod tests {
             find_tlv_recursive(NESTED_TLV, 0x80),
             find_tlv_recursive_with_limit(NESTED_TLV, 0x80, MAX_TLV_DEPTH)
         );
+    }
+    // --- import key (Yubico and Nitrokey layouts) ---
+
+    fn rsa2048_crt_key<'a>() -> ImportKey<'a> {
+        ImportKey {
+            alg: KeyAlg::Rsa2048,
+            alg_id: KeyAlg::Rsa2048.id(),
+            parts: ImportParts::RsaCrt {
+                p: &[0x01, 0x02],
+                q: &[0x03],
+                dp: &[0x04, 0x05, 0x06],
+                dq: &[0x07],
+                qinv: &[0x08],
+            },
+        }
+    }
+
+    fn padded_tlv(tag: u8, value: &[u8], width: usize) -> Vec<u8> {
+        let mut v = if width > 127 {
+            vec![tag, 0x81, width as u8]
+        } else {
+            vec![tag, width as u8]
+        };
+        v.extend(std::iter::repeat_n(0u8, width - value.len()));
+        v.extend_from_slice(value);
+        v
+    }
+
+    #[test]
+    fn yubico_rsa2048_body_bytes() {
+        let body =
+            import_key_body(&rsa2048_crt_key(), PinPolicy::Default, TouchPolicy::Default).unwrap();
+        let mut want = Vec::new();
+        want.extend(padded_tlv(0x01, &[0x01, 0x02], 128));
+        want.extend(padded_tlv(0x02, &[0x03], 128));
+        want.extend(padded_tlv(0x03, &[0x04, 0x05, 0x06], 128));
+        want.extend(padded_tlv(0x04, &[0x07], 128));
+        want.extend(padded_tlv(0x05, &[0x08], 128));
+        assert_eq!(*body, want);
+    }
+
+    #[test]
+    fn yubico_body_with_policies() {
+        let plain =
+            import_key_body(&rsa2048_crt_key(), PinPolicy::Default, TouchPolicy::Default).unwrap();
+        let with =
+            import_key_body(&rsa2048_crt_key(), PinPolicy::Always, TouchPolicy::Always).unwrap();
+        assert_eq!(with[..plain.len()], plain[..]);
+        assert_eq!(&with[plain.len()..], &[0xAA, 0x01, 0x03, 0xAB, 0x01, 0x02]);
+        let only_touch =
+            import_key_body(&rsa2048_crt_key(), PinPolicy::Default, TouchPolicy::Cached).unwrap();
+        assert_eq!(&only_touch[plain.len()..], &[0xAB, 0x01, 0x03]);
+    }
+
+    #[test]
+    fn ec_p256_body() {
+        let key = ImportKey {
+            alg: KeyAlg::EccP256,
+            alg_id: KeyAlg::EccP256.id(),
+            parts: ImportParts::Ec {
+                scalar: &[0xAA, 0xBB],
+            },
+        };
+        let body = import_key_body(&key, PinPolicy::Default, TouchPolicy::Default).unwrap();
+        assert_eq!(*body, padded_tlv(0x06, &[0xAA, 0xBB], 32));
+        let p384 = ImportKey {
+            alg: KeyAlg::EccP384,
+            alg_id: KeyAlg::EccP384.id(),
+            parts: ImportParts::Ec {
+                scalar: &[0x01; 48],
+            },
+        };
+        let body = import_key_body(&p384, PinPolicy::Once, TouchPolicy::Default).unwrap();
+        let mut want = vec![0x06, 0x30];
+        want.extend([0x01; 48]);
+        want.extend([0xAA, 0x01, 0x02]);
+        assert_eq!(*body, want);
+    }
+
+    #[test]
+    fn ed25519_body() {
+        let key = ImportKey {
+            alg: KeyAlg::Ed25519,
+            alg_id: KeyAlg::Ed25519.id(),
+            parts: ImportParts::Ed25519 { seed: &[0x42; 32] },
+        };
+        let body = import_key_body(&key, PinPolicy::Default, TouchPolicy::Default).unwrap();
+        let mut want = vec![0x07, 0x20];
+        want.extend([0x42; 32]);
+        assert_eq!(*body, want);
+    }
+
+    #[test]
+    fn x25519_body() {
+        let key = ImportKey {
+            alg: KeyAlg::X25519,
+            alg_id: KeyAlg::X25519.id(),
+            parts: ImportParts::X25519 {
+                scalar: &[0x07; 31],
+            },
+        };
+        let body = import_key_body(&key, PinPolicy::Default, TouchPolicy::Never).unwrap();
+        let mut want = vec![0x08, 0x20, 0x00];
+        want.extend([0x07; 31]);
+        want.extend([0xAB, 0x01, 0x01]);
+        assert_eq!(*body, want);
+    }
+
+    #[test]
+    fn nitrokey_body_uses_p_q_e() {
+        let key = ImportKey {
+            alg: KeyAlg::Rsa2048,
+            alg_id: KeyAlg::Rsa2048.id(),
+            parts: ImportParts::RsaPrimes {
+                p: &[0x01; 128],
+                q: &[0x02; 127],
+                e: &[0x01, 0x00, 0x01],
+            },
+        };
+        let body = import_key_body(&key, PinPolicy::Default, TouchPolicy::Default).unwrap();
+        let mut want = vec![0x01, 0x81, 0x80];
+        want.extend([0x01; 128]);
+        want.extend([0x02, 0x81, 0x80, 0x00]);
+        want.extend([0x02; 127]);
+        want.extend([0x03, 0x03, 0x01, 0x00, 0x01]);
+        assert_eq!(*body, want);
+    }
+
+    #[test]
+    fn import_body_rejects_bad_parts_without_panicking() {
+        let too_long = ImportKey {
+            alg: KeyAlg::EccP256,
+            alg_id: KeyAlg::EccP256.id(),
+            parts: ImportParts::Ec { scalar: &[1; 33] },
+        };
+        assert_eq!(
+            import_key_body(&too_long, PinPolicy::Default, TouchPolicy::Default).unwrap_err(),
+            ImportBodyError::PartTooLong
+        );
+        let mismatch = ImportKey {
+            alg: KeyAlg::EccP256,
+            alg_id: KeyAlg::EccP256.id(),
+            parts: ImportParts::Ed25519 { seed: &[1; 32] },
+        };
+        assert_eq!(
+            import_key_body(&mismatch, PinPolicy::Default, TouchPolicy::Default).unwrap_err(),
+            ImportBodyError::PartsMismatch
+        );
+        let p521 = ImportKey {
+            alg: KeyAlg::EccP521,
+            alg_id: KeyAlg::EccP521.id(),
+            parts: ImportParts::Ec { scalar: &[1; 66] },
+        };
+        assert!(import_key_body(&p521, PinPolicy::Default, TouchPolicy::Default).is_err());
+        let long_rsa = ImportKey {
+            alg: KeyAlg::Rsa2048,
+            alg_id: KeyAlg::Rsa2048.id(),
+            parts: ImportParts::RsaCrt {
+                p: &[1; 129],
+                q: &[],
+                dp: &[],
+                dq: &[],
+                qinv: &[],
+            },
+        };
+        assert_eq!(
+            import_key_body(&long_rsa, PinPolicy::Default, TouchPolicy::Default).unwrap_err(),
+            ImportBodyError::PartTooLong
+        );
+    }
+
+    #[test]
+    fn import_apdu_header() {
+        let apdu = import_key(Slot::Authentication, KeyAlg::Rsa2048.id(), &[0x01, 0x02]);
+        assert_eq!(&apdu[..4], &[0x00, 0xFE, 0x07, 0x9A]);
+        assert_eq!(&apdu[4..], &[0x02, 0x01, 0x02]);
+        // A big body switches to extended Lc (00 hi lo), with no Le after it.
+        let body = vec![0xEE; 700];
+        let apdu = import_key(Slot::Authentication, 0x07, &body);
+        assert_eq!(&apdu[..7], &[0x00, 0xFE, 0x07, 0x9A, 0x00, 0x02, 0xBC]);
+        assert_eq!(apdu.len(), 7 + 700);
+    }
+
+    #[test]
+    fn chained_import_splits_and_sets_cla_10() {
+        let key = ImportKey {
+            alg: KeyAlg::Rsa4096,
+            alg_id: KeyAlg::Rsa4096.id(),
+            parts: ImportParts::RsaCrt {
+                p: &[1; 256],
+                q: &[2; 256],
+                dp: &[3; 256],
+                dq: &[4; 256],
+                qinv: &[5; 256],
+            },
+        };
+        let body = import_key_body(&key, PinPolicy::Default, TouchPolicy::Default).unwrap();
+        let apdus = import_key_chained(Slot::Signature, key.alg_id, &body, 255);
+        assert!(apdus.len() > 1);
+        let last = apdus.len() - 1;
+        let mut joined = Vec::new();
+        for (i, a) in apdus.iter().enumerate() {
+            assert_eq!(a[0], if i < last { 0x10 } else { 0x00 });
+            assert_eq!(&a[1..4], &[0xFE, 0x16, 0x9C]);
+            assert_eq!(a[4] as usize, a.len() - 5);
+            joined.extend_from_slice(&a[5..]);
+        }
+        assert_eq!(joined, *body);
+        // An out-of-range chunk size is clamped, not a panic.
+        assert!(!import_key_chained(Slot::Signature, 0x07, &[1, 2, 3], 0).is_empty());
+        assert!(!import_key_chained(Slot::Signature, 0x07, &[1, 2, 3], 9999).is_empty());
     }
 }

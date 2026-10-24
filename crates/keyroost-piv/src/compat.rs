@@ -337,6 +337,20 @@ pub enum PivExtension {
     /// [`FeatureGate::Unsupported`], since only HID Crescendo's XAUTH key can
     /// be removed outright rather than only ever replaced.
     ManagementKeyAlgorithm(MgmtAlgChoice),
+    /// Whether a given [`crate::KeyAlg`] can be imported into a slot as an
+    /// existing private key (from a PKCS#12 file, say) rather than generated
+    /// on the device — same plain payload-free-per-value shape as
+    /// [`Self::SlotKeyAlgorithm`], and never more permissive than it: where
+    /// generating the algorithm is [`FeatureGate::Unsupported`], so is
+    /// importing it ([`resolve`] enforces that). A YubiKey resolves exactly
+    /// as its [`Self::SlotKeyAlgorithm`] does, since import shares the card's
+    /// algorithm support; a Nitrokey (Trussed `piv-authenticator`) imports
+    /// RSA-2048/3072/4096 only; other fingerprints have no import data of
+    /// their own and resolve [`FeatureGate::Unverified`] unless generation is
+    /// known unsupported. Says nothing about which slots accept an import —
+    /// see [`import_slot_allowed`] — or which key layout the applet expects —
+    /// see [`import_layout`].
+    ImportKey(KeyAlg),
 }
 
 impl PivExtension {
@@ -413,6 +427,9 @@ impl PivExtension {
             }
             PivExtension::SlotKeyAlgorithm(alg) => {
                 format!("Not every key can generate {} keys.", alg.label())
+            }
+            PivExtension::ImportKey(alg) => {
+                format!("Not every key can import {} keys.", alg.label())
             }
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete) => {
                 "Deleting the management key outright uses the device's own command (e.g. \
@@ -3168,10 +3185,30 @@ const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    // `piv-authenticator`'s import command (since 0.3.6, firmware 1.8) takes
+    // RSA-2048/3072/4096 only, in slot 9A only — source-verified, not yet
+    // hardware-verified. Every other `ImportKey` algorithm is in the row above.
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[1, 8],
+            verdict: Verdict::KnownSupported,
         }],
     },
     ExtensionVerdicts {
@@ -3667,6 +3704,25 @@ pub fn resolve(
     applet_version: Option<&[u8]>,
     firmware_version: Option<&[u8]>,
 ) -> FeatureGate {
+    // Importing a key is never more permissive than generating one: where
+    // generation is known unsupported, so is import, whatever rows (or lack
+    // of them) the fingerprint carries. A YubiKey shares the card's algorithm
+    // support exactly, so it resolves as generation does and carries no
+    // `ImportKey` rows that could drift from its `SlotKeyAlgorithm` ones.
+    if let PivExtension::ImportKey(alg) = extension {
+        let generation = resolve(
+            PivExtension::SlotKeyAlgorithm(alg),
+            fingerprint,
+            applet_version,
+            firmware_version,
+        );
+        if generation == FeatureGate::Unsupported {
+            return FeatureGate::Unsupported;
+        }
+        if fingerprint == AppletFingerprint::YubiKey {
+            return generation;
+        }
+    }
     if extension == PivExtension::GetSlotKeyStatus
         && applet_verdicts(fingerprint, PivExtension::GetSlotKeyStatus).is_none()
     {
@@ -3691,6 +3747,28 @@ pub fn resolve(
     let applet_gate = resolve_in(applet_verdicts(fingerprint, extension), applet_version);
     let firmware_gate = resolve_in(firmware_verdicts(fingerprint, extension), firmware_version);
     merge_gates(axis_merge_mode(fingerprint), applet_gate, firmware_gate)
+}
+
+/// Which private-key layout `fingerprint`'s import command expects: the
+/// Trussed Nitrokey takes RSA as `p`, `q`, `e`; every other applet gets
+/// Yubico's layout.
+#[must_use]
+pub fn import_layout(fingerprint: AppletFingerprint) -> crate::ImportLayout {
+    match fingerprint {
+        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => crate::ImportLayout::NitrokeyRsa,
+        _ => crate::ImportLayout::Yubico,
+    }
+}
+
+/// Whether `fingerprint`'s import command accepts `slot`: the Trussed
+/// Nitrokey imports into the authentication slot (9A) only; every other
+/// applet is not restricted here.
+#[must_use]
+pub fn import_slot_allowed(fingerprint: AppletFingerprint, slot: crate::Slot) -> bool {
+    match fingerprint {
+        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => slot == crate::Slot::Authentication,
+        _ => true,
+    }
 }
 
 /// [`AxisMergeMode::MergeStrict`]'s rule: [`FeatureGate::Unsupported`] wins
@@ -8041,5 +8119,180 @@ mod tests {
                 "{alg:?}"
             );
         }
+    }
+    // --- import key (#174) ---
+
+    const NITROKEY: AppletFingerprint = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+
+    #[test]
+    fn nitrokey_import_gate() {
+        let fw: Option<&[u8]> = Some(&[1, 9, 1]);
+        for alg in [KeyAlg::Rsa2048, KeyAlg::Rsa3072, KeyAlg::Rsa4096] {
+            assert_eq!(
+                resolve(PivExtension::ImportKey(alg), NITROKEY, None, fw),
+                FeatureGate::Supported,
+                "{alg:?}"
+            );
+        }
+        for alg in [
+            KeyAlg::Rsa1024,
+            KeyAlg::EccP256,
+            KeyAlg::EccP384,
+            KeyAlg::EccP521,
+            KeyAlg::Ed25519,
+            KeyAlg::X25519,
+        ] {
+            assert_eq!(
+                resolve(PivExtension::ImportKey(alg), NITROKEY, None, fw),
+                FeatureGate::Unsupported,
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_is_never_more_permissive_than_generation() {
+        // R9: wherever generating the algorithm is Unsupported, importing it
+        // is too, on every fingerprint and a spread of versions.
+        let versions: [Option<&[u8]>; 5] = [
+            None,
+            Some(&[]),
+            Some(&[1, 8]),
+            Some(&[1, 8, 1]),
+            Some(&[5, 7, 0]),
+        ];
+        let fps = [
+            AppletFingerprint::Generic,
+            AppletFingerprint::YubiKey,
+            AppletFingerprint::Token2,
+            NITROKEY,
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+            AppletFingerprint::AuthentrendATKey,
+        ];
+        for fp in fps {
+            for alg in KeyAlg::ALL {
+                for a in versions {
+                    for f in versions {
+                        let slot = resolve(PivExtension::SlotKeyAlgorithm(alg), fp, a, f);
+                        let imp = resolve(PivExtension::ImportKey(alg), fp, a, f);
+                        if slot == FeatureGate::Unsupported {
+                            assert_eq!(imp, FeatureGate::Unsupported, "{fp:?} {alg:?} {a:?} {f:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yubikey_import_mirrors_generation() {
+        let versions: [Option<&[u8]>; 6] = [
+            None,
+            Some(&[]),
+            Some(&[4, 3, 7]),
+            Some(&[5, 1, 0]),
+            Some(&[5, 2, 7]),
+            Some(&[5, 7, 1]),
+        ];
+        for alg in KeyAlg::ALL {
+            for a in versions {
+                assert_eq!(
+                    resolve(
+                        PivExtension::ImportKey(alg),
+                        AppletFingerprint::YubiKey,
+                        a,
+                        None
+                    ),
+                    resolve(
+                        PivExtension::SlotKeyAlgorithm(alg),
+                        AppletFingerprint::YubiKey,
+                        a,
+                        None
+                    ),
+                    "{alg:?} {a:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn token2_import_is_unverified() {
+        // Token2 import is a user report, not seen on project hardware.
+        assert_eq!(
+            resolve(
+                PivExtension::ImportKey(KeyAlg::Rsa2048),
+                AppletFingerprint::Token2,
+                Some(&[5, 4, 0]),
+                None
+            ),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn token2_import_unsupported_where_generation_unsupported() {
+        let mut checked = 0;
+        for alg in KeyAlg::ALL {
+            for v in [&[][..], &[5, 4, 0][..], &[6, 0, 0][..]] {
+                let slot = resolve(
+                    PivExtension::SlotKeyAlgorithm(alg),
+                    AppletFingerprint::Token2,
+                    Some(v),
+                    None,
+                );
+                let imp = resolve(
+                    PivExtension::ImportKey(alg),
+                    AppletFingerprint::Token2,
+                    Some(v),
+                    None,
+                );
+                if slot == FeatureGate::Unsupported {
+                    assert_eq!(imp, FeatureGate::Unsupported, "{alg:?} {v:?}");
+                    checked += 1;
+                } else {
+                    assert_eq!(imp, FeatureGate::Unverified, "{alg:?} {v:?}");
+                }
+            }
+        }
+        assert!(checked > 0, "Token2 has at least one unsupported algorithm");
+    }
+
+    #[test]
+    fn nitrokey_slot_rule() {
+        use crate::Slot;
+        assert!(import_slot_allowed(NITROKEY, Slot::Authentication));
+        assert!(!import_slot_allowed(NITROKEY, Slot::Signature));
+        assert!(!import_slot_allowed(NITROKEY, Slot::Retired(1)));
+        assert!(import_slot_allowed(
+            AppletFingerprint::YubiKey,
+            Slot::Signature
+        ));
+        assert!(import_slot_allowed(
+            AppletFingerprint::Token2,
+            Slot::Retired(1)
+        ));
+    }
+
+    #[test]
+    fn import_layout_by_fingerprint() {
+        assert_eq!(import_layout(NITROKEY), crate::ImportLayout::NitrokeyRsa);
+        assert_eq!(
+            import_layout(AppletFingerprint::YubiKey),
+            crate::ImportLayout::Yubico
+        );
+        assert_eq!(
+            import_layout(AppletFingerprint::Token2),
+            crate::ImportLayout::Yubico
+        );
+    }
+
+    #[test]
+    fn import_requirement_names_the_algorithm() {
+        let s = PivExtension::ImportKey(KeyAlg::EccP384).requirement();
+        assert!(
+            s.contains("P-384") || s.contains(KeyAlg::EccP384.label()),
+            "{s}"
+        );
     }
 }
