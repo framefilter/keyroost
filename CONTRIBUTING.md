@@ -40,7 +40,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 python3 packaging/assemble-changelog.py --check
 ```
 
-MSRV is Rust 1.85 for the workspace (1.92 for the `keyroost` GUI crate).
+MSRV is Rust 1.87 for the workspace (1.92 for the `keyroost` GUI crate).
 
 Two project rules worth knowing up front:
 

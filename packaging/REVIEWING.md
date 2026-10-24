@@ -14,7 +14,7 @@ integrity") are the trust boundary for what ships.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`
 - [ ] `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`
-- [ ] MSRV: `cargo +1.85 check --workspace --exclude keyroost --all-targets
+- [ ] MSRV: `cargo +1.87 check --workspace --exclude keyroost --all-targets
       --locked`
 - [ ] `cd fuzz && cargo build` — a PR that renames or reshapes a parser
       breaks the fuzz workspace without failing any main-workspace gate

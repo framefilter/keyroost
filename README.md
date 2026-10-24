@@ -413,7 +413,7 @@ The prebuilt binaries need `libpcsclite` at runtime — on a FIDO-only machine i
 
 ### cargo (from source)
 
-Needs the Rust toolchain — **1.92+ for the GUI** (`keyroost`), 1.85+ for the CLI
+Needs the Rust toolchain — **1.92+ for the GUI** (`keyroost`), 1.87+ for the CLI
 (`keyroostctl`) and libraries — and, on Linux, the PC/SC dev package plus the
 GUI's X11/Wayland/GL libraries (see
 [Smart-card prerequisite](#smart-card-prerequisite)):

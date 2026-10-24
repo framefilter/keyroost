@@ -251,7 +251,7 @@ fn split_signature(algo: u8, sig: Vec<u8>) -> Result<Vec<Vec<u8>>, Error> {
     match algo {
         ALGO_RSA if !sig.is_empty() => Ok(vec![sig]),
         ALGO_EDDSA if sig.len() == 64 => Ok(vec![sig[..32].to_vec(), sig[32..].to_vec()]),
-        ALGO_ECDSA if !sig.is_empty() && sig.len() % 2 == 0 => {
+        ALGO_ECDSA if !sig.is_empty() && sig.len().is_multiple_of(2) => {
             let (r, s) = sig.split_at(sig.len() / 2);
             Ok(vec![r.to_vec(), s.to_vec()])
         }

@@ -122,11 +122,11 @@ jobs:
 
   # Enforce the declared MSRV so an accidental use of a newer language/library
   # feature (or a dependency that bumped its own MSRV) can't ship silently to
-  # distro/crates.io consumers. The workspace floor is rust-version = "1.85"; the
+  # distro/crates.io consumers. The workspace floor is rust-version = "1.87"; the
   # `keyroost` GUI overrides to 1.92 (its eframe/egui stack needs it), so it is
   # excluded here and covered by the stable `test` job above instead.
   msrv:
-    name: MSRV (1.85, libs + CLI)
+    name: MSRV (1.87, libs + CLI)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -140,14 +140,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
         with:
-          toolchain: "1.85"
+          toolchain: "1.87"
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # `--locked` so a dependency update that raises its MSRV above 1.85 is
+      # `--locked` so a dependency update that raises its MSRV above 1.87 is
       # caught here too, not just our own code.
       - name: Check on the MSRV toolchain (workspace minus the GUI)
-        run: cargo +1.85 check --workspace --exclude keyroost --all-targets --locked
+        run: cargo +1.87 check --workspace --exclude keyroost --all-targets --locked
 
   # The library crates' API docs are published on docs.rs, where a broken or
   # private intra-doc link renders as a dead or missing link. rustdoc only
@@ -232,7 +232,7 @@ jobs:
   # package lists are verified, not assumed, and a distro-specific build break is
   # caught here. Linux is distro-neutral (sysfs/hidraw + PC/SC), so this is a
   # smoke build, not a second clippy pass — the os matrix above already enforces
-  # lints. Distro toolchains (both well past our 1.85 MSRV) stand in for rustup.
+  # lints. Distro toolchains (both well past our 1.87 MSRV) stand in for rustup.
   linux-distros:
     name: build + test (${{ matrix.distro }})
     runs-on: ubuntu-latest

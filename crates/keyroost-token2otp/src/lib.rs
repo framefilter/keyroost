@@ -571,7 +571,7 @@ pub fn parse_otp_serial(data: &[u8]) -> Result<u128, ParseError> {
 
 /// Decode an even-length ASCII-hex byte slice (spec §6.10 SN field).
 fn decode_ascii_hex(hex: &[u8]) -> Result<Vec<u8>, ParseError> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(ParseError::Malformed("serial hex length is odd"));
     }
     let mut out = Vec::with_capacity(hex.len() / 2);

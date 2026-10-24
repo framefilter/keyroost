@@ -31,7 +31,7 @@ pub fn pad_iso7816(data: &[u8]) -> Vec<u8> {
 /// 16-byte boundary; if already aligned, do nothing. This matches molto2.py's
 /// behaviour for seed/title payloads.
 pub fn pad_iso7816_minimal(data: &[u8]) -> Vec<u8> {
-    if data.len() % 16 == 0 {
+    if data.len().is_multiple_of(16) {
         return data.to_vec();
     }
     let mut out = Vec::with_capacity(((data.len() / 16) + 1) * 16);

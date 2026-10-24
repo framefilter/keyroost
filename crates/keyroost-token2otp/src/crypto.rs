@@ -341,7 +341,7 @@ pub fn session_encrypt(key: &[u8; 32], iv: &[u8; 16], cleartext: &[u8]) -> Vec<u
 /// recovers it, not a debug aid. Returns an empty vector for input that is not
 /// a whole number of blocks — callers check the recovered length.
 pub fn session_decrypt_raw(key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Vec<u8> {
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
         return Vec::new();
     }
     let mut buf = ciphertext.to_vec();
@@ -357,7 +357,7 @@ pub fn session_decrypt(
     iv: &[u8; 16],
     ciphertext: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, EncryptError> {
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
         return Err(EncryptError::BadCiphertext);
     }
     let mut buf = Zeroizing::new(ciphertext.to_vec());
@@ -606,7 +606,7 @@ fn aes256_cbc_encrypt_nopad(
     iv: &[u8; 16],
     data: &[u8],
 ) -> Result<Vec<u8>, EncryptError> {
-    if data.is_empty() || data.len() % 16 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(16) {
         return Err(EncryptError::BadLength);
     }
     let mut buf = data.to_vec();

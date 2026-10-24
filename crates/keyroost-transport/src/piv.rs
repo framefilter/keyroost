@@ -6560,7 +6560,7 @@ fn block_crypt(
     use cipher::generic_array::GenericArray;
     use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 
-    if data.is_empty() || data.len() % alg.block_size() != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(alg.block_size()) {
         return Err(TransportError::MalformedResponse(
             "PIV witness/challenge length is not a whole cipher block",
         ));

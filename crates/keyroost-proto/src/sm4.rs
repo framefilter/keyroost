@@ -136,7 +136,7 @@ impl Sm4 {
     /// SM4-ECB on whole blocks. Caller is responsible for padding.
     pub fn encrypt_ecb(&self, data: &mut [u8]) {
         assert!(
-            data.len() % BLOCK_SIZE == 0,
+            data.len().is_multiple_of(BLOCK_SIZE),
             "ECB requires block-aligned input"
         );
         for chunk in data.chunks_exact_mut(BLOCK_SIZE) {
@@ -148,7 +148,7 @@ impl Sm4 {
     /// SM4-CBC encrypt with caller-supplied IV. Whole blocks only.
     pub fn encrypt_cbc(&self, iv: &[u8; BLOCK_SIZE], data: &mut [u8]) {
         assert!(
-            data.len() % BLOCK_SIZE == 0,
+            data.len().is_multiple_of(BLOCK_SIZE),
             "CBC requires block-aligned input"
         );
         let mut prev = *iv;

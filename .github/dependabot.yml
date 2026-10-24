@@ -105,7 +105,7 @@ updates:
       - dependency-name: wgpu
         versions: ['>=30']
       # proptest 1.12 raised its minimum Rust to 1.88, past the workspace's
-      # 1.85 MSRV; the MSRV job builds tests, so it can't move until the MSRV
+      # 1.87 MSRV; the MSRV job builds tests, so it can't move until the MSRV
       # does. Test-only: nothing that ships depends on it.
       - dependency-name: proptest
         versions: ['>=1.12']

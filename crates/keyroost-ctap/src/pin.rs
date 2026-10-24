@@ -227,7 +227,7 @@ impl PinProtocol for ProtocolV2 {
 /// format.
 fn aes256_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
     assert!(
-        plaintext.len() % 16 == 0,
+        plaintext.len().is_multiple_of(16),
         "PIN protocol plaintext must be block-aligned"
     );
     let mut out = plaintext.to_vec();
@@ -244,7 +244,7 @@ fn aes256_cbc_decrypt(
     iv: &[u8; 16],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, PinError> {
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
         return Err(PinError::InvalidCiphertextLength);
     }
     let mut out = ciphertext.to_vec();

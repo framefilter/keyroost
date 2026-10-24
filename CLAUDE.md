@@ -134,7 +134,7 @@ workflow during bring-up is:
 - **Linux build prerequisite:** `sudo apt install libpcsclite-dev pcscd` for the
   CLI; the GUI additionally needs `libxkbcommon-dev libwayland-dev libxcb1-dev
   libgl1-mesa-dev` (full per-distro list in the README's "Smart-card
-  prerequisite" section). GUI crate MSRV is 1.92; the rest of the workspace 1.85.
+  prerequisite" section). GUI crate MSRV is 1.92; the rest of the workspace 1.87.
 
 ## Running
 

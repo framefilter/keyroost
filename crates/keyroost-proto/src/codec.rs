@@ -21,7 +21,7 @@ impl std::error::Error for DecodeError {}
 
 pub fn hex_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(DecodeError::InvalidLength);
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
