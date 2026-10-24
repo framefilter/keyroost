@@ -4253,13 +4253,11 @@ impl<'tx> PivSession<'tx> {
             .remember(slot.key_ref(), Some((alg, key)));
     }
 
-    /// Import the private key `key` into `slot` (IMPORT ASYMMETRIC KEY, a
-    /// Yubico extension other applets share), with `pin_policy` /
-    /// `touch_policy` (each sent only when not `Default`). `layout` is the
-    /// form the applet takes ([`keyroost_piv::compat::import_layout`]); parts
-    /// of the other form are refused before anything is sent, as are values
-    /// too long for their field ([`TransportError::PivImportKeyBody`]).
-    /// Requires prior management-key auth.
+    /// Send an IMPORT ASYMMETRIC KEY `body` ([`import_key_body_for`]) for
+    /// `slot` with P1 `alg_id` (a Yubico extension other applets share).
+    /// Requires prior management-key auth; only
+    /// [`crate::piv_import::run_import`] calls it, after the import plan's
+    /// checks.
     ///
     /// Sent as one APDU (extended length when the key needs it), or chained
     /// on a T=0 link, after a reader failure of the extended APDU, or when the
@@ -4271,20 +4269,6 @@ impl<'tx> PivSession<'tx> {
     /// (the PKCS#12 import writes the matching one first); it evicts the
     /// slot's cached policy and public key the same way, then reads the
     /// policy back.
-    pub fn import_key(
-        &mut self,
-        slot: Slot,
-        key: &piv::ImportKey<'_>,
-        pin_policy: PinPolicy,
-        touch_policy: TouchPolicy,
-        layout: piv::ImportLayout,
-    ) -> Result<(), TransportError> {
-        let body = import_key_body_for(key, pin_policy, touch_policy, layout)?;
-        self.write_import_key(slot, key.alg_id, &body)
-    }
-
-    /// Send an IMPORT ASYMMETRIC KEY `body` ([`keyroost_piv::import_key_body`])
-    /// for `slot` with P1 `alg_id` — [`Self::import_key`] after its checks.
     pub(crate) fn write_import_key(
         &mut self,
         slot: Slot,
@@ -6074,14 +6058,13 @@ pub(crate) fn send_import_key(
 /// The IMPORT ASYMMETRIC KEY body for `key`, refused when its parts are not
 /// the form `layout` takes (RSA CRT parts for Yubico, primes and exponent for
 /// the Nitrokey layout; EC and 25519 keys are the same in both) or don't fit
-/// their fields. Pure, so [`PivSession::import_key`]'s checks are tested
-/// without a card.
+/// their fields. Pure, so the checks are tested without a card.
 pub(crate) fn import_key_body_for(
     key: &piv::ImportKey<'_>,
     pin_policy: PinPolicy,
     touch_policy: TouchPolicy,
     layout: piv::ImportLayout,
-) -> Result<Zeroizing<Vec<u8>>, TransportError> {
+) -> Result<Zeroizing<Vec<u8>>, piv::ImportBodyError> {
     use piv::{ImportLayout, ImportParts};
     let fits = match key.parts {
         ImportParts::RsaCrt { .. } => layout == ImportLayout::Yubico,
@@ -6089,11 +6072,9 @@ pub(crate) fn import_key_body_for(
         ImportParts::Ec { .. } | ImportParts::Ed25519 { .. } | ImportParts::X25519 { .. } => true,
     };
     if !fits {
-        return Err(TransportError::PivImportKeyBody(
-            piv::ImportBodyError::PartsMismatch,
-        ));
+        return Err(piv::ImportBodyError::PartsMismatch);
     }
-    piv::import_key_body(key, pin_policy, touch_policy).map_err(TransportError::PivImportKeyBody)
+    piv::import_key_body(key, pin_policy, touch_policy)
 }
 
 /// Whether a direct (single-APDU) certificate PUT DATA that came back as
@@ -7535,9 +7516,7 @@ mod tests {
         ] {
             assert!(matches!(
                 body(k, layout),
-                Err(TransportError::PivImportKeyBody(
-                    piv::ImportBodyError::PartsMismatch
-                ))
+                Err(piv::ImportBodyError::PartsMismatch)
             ));
         }
         let ec = piv::ImportKey {

@@ -334,10 +334,6 @@ pub enum TransportError {
         slot_algorithm: keyroost_piv::KeyAlg,
         certificate_algorithm: keyroost_piv::KeyAlg,
     },
-    /// `PivSession::import_key` refused a private key before sending it: its
-    /// parts are not in the form the applet's layout takes, or a value is too
-    /// long for its field.
-    PivImportKeyBody(keyroost_piv::ImportBodyError),
     /// A PIV write failed after an earlier attempt at it failed at the reader
     /// (PC/SC layer) and was retried: that attempt may have been applied, so
     /// the card may hold what was being written. Carries the retry's error.
@@ -726,9 +722,6 @@ impl fmt::Display for TransportError {
                 slot_algorithm.label(),
                 certificate_algorithm.label()
             ),
-            TransportError::PivImportKeyBody(e) => {
-                write!(f, "the key can't be sent to the card: {e}")
-            }
             TransportError::PivWriteUnconfirmed(retry) => write!(
                 f,
                 "the write may or may not have gone through: the first attempt failed \
@@ -755,7 +748,6 @@ impl std::error::Error for TransportError {
             | TransportError::PivDeleteKeyHidCrescendoGenericFailed(e)
             | TransportError::PivWriteUnconfirmed(e) => Some(e.as_ref()),
             TransportError::X509(e) => Some(e),
-            TransportError::PivImportKeyBody(e) => Some(e),
             _ => None,
         }
     }

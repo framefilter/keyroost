@@ -1148,21 +1148,23 @@ enum PivKeyCmd {
         /// With none of these, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
         mgmt_key: Option<SecretSource>,
-        /// The PIN, for the test after the import: env:NAME reads that
-        /// environment variable, stdin reads one line (the line after the file
-        /// password and management key when they come from stdin too: second
-        /// line after one of them, third after both; hidden when typed at a
-        /// terminal). With neither, a terminal asks.
+        /// The PIN, checked before anything is written and then used for the
+        /// test after the import: env:NAME reads that environment variable,
+        /// stdin reads one line (the line after the file password and
+        /// management key when they come from stdin too: second line after
+        /// one of them, third after both; hidden when typed at a terminal).
+        /// With neither, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
-        /// When the imported key may be used. `default` sends the standard
-        /// PIV command every card accepts; the other values are a Yubico
-        /// extension (firmware-dependent).
+        /// When the imported key may be used. `default` sends no policy and
+        /// leaves it to the card; the other values need a card that takes a
+        /// PIN policy (a Yubico extension, firmware-dependent).
         #[arg(long, value_enum, default_value = "default")]
         pin_policy: CliPinPolicy,
-        /// Whether using the imported key requires a physical touch. Same
-        /// caveat: only `default` is standard PIV, the rest are a Yubico
-        /// extension (firmware-dependent).
+        /// Whether using the imported key requires a physical touch.
+        /// `default` sends no policy and leaves it to the card; the other
+        /// values need a card that takes a touch policy (a Yubico extension,
+        /// firmware-dependent).
         #[arg(long, value_enum, default_value = "default")]
         touch_policy: CliTouchPolicy,
         #[command(flatten)]
@@ -10229,7 +10231,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // The file first: what it holds decides whether this key can
             // take it, before any key is selected.
             let bytes =
-                std::fs::read(input).map_err(|e| format!("read {}: {}", input.display(), e))?;
+                keyroost_transport::piv_import::read_key_file(input).map_err(|e| match e {
+                    keyroost_transport::piv_import::KeyFileError::Io(e) => {
+                        format!("read {}: {}", input.display(), e)
+                    }
+                    e => e.to_string(),
+                })?;
             let password = sec.read(
                 &P12_FILE_PASSWORD,
                 Source::from_flag(file_password.as_ref()),

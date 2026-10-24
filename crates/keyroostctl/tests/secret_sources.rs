@@ -411,6 +411,32 @@ fn piv_key_import_checks_the_file_before_selecting_a_key() {
     }
 }
 
+/// A file over the 1 MiB a .p12/.pfx should ever need is refused before
+/// it is opened, and before any key is looked at.
+#[test]
+fn piv_key_import_refuses_an_oversized_file() {
+    let dir = common::TempDir::new("piv-import-big");
+    std::fs::write(dir.join("big.p12"), vec![0u8; 1024 * 1024 + 1]).unwrap();
+    let out = common::keyroostctl()
+        .args(["piv", "key", "import", "--slot", "9a", "--yes"])
+        .args(["--in", "big.p12", "--file-password", "env:KR_TEST_P12"])
+        .args(["--mgmt-key", "stdin", "--pin", "env:KR_TEST_PIN"])
+        .env("KR_TEST_P12", "x")
+        .env("KR_TEST_PIN", "123456")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("This file is larger than a .p12/.pfx key file should be (over 1 MiB)."),
+        "{err}"
+    );
+    assert!(!err.contains('\u{2192}'), "went past the file check: {err}");
+}
+
 /// One literal value per secret flag (and a few shapes of it): each is
 /// refused with exit 2 and never echoed.
 const LITERAL_CASES: &[&[&str]] = &[

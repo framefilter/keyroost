@@ -16,6 +16,8 @@ use keyroost_piv::{
 };
 use keyroost_pivtest::{Outcome, SelfTest};
 
+use zeroize::Zeroizing;
+
 use crate::{CertCompression, CertImport, PivSession, TransportError};
 
 /// What [`plan_import`] decided: which entry goes where, and how the applet
@@ -40,7 +42,9 @@ pub enum ImportRefusal {
     /// The file holds no private key.
     NoKey,
     /// The file holds several keys and none was picked; the labels are in
-    /// file order (numbered from 1 in messages).
+    /// file order (numbered from 1 in messages). The labels are untrusted
+    /// text from the file, and `Display` prints them as they are: a caller
+    /// sanitizes them (or this message) before showing them.
     ChooseEntry(Vec<String>),
     /// The pick (1-based) is not one of the file's entries.
     EntryOutOfRange {
@@ -135,6 +139,63 @@ pub fn certificate_name(der: &[u8]) -> String {
     }
 }
 
+/// The largest .p12/.pfx file [`read_key_file`] reads. A real one holds a
+/// key and a few certificates: kilobytes, not megabytes.
+pub const MAX_KEY_FILE_BYTES: usize = 1024 * 1024;
+
+/// Why [`read_key_file`] returned no bytes.
+#[derive(Debug)]
+pub enum KeyFileError {
+    /// The file is over [`MAX_KEY_FILE_BYTES`].
+    TooLarge,
+    /// The file couldn't be read.
+    Io(std::io::Error),
+}
+
+impl fmt::Display for KeyFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge => {
+                f.write_str("This file is larger than a .p12/.pfx key file should be (over 1 MiB).")
+            }
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for KeyFileError {}
+
+/// Read a .p12/.pfx file for [`keyroost_p12::open`], the same in the CLI and
+/// the app: at most [`MAX_KEY_FILE_BYTES`], into a buffer that is wiped when
+/// dropped (the file holds an encrypted private key).
+///
+/// # Errors
+/// [`KeyFileError::TooLarge`] past the limit (nothing more is read), else
+/// [`KeyFileError::Io`].
+pub fn read_key_file(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, KeyFileError> {
+    let file = std::fs::File::open(path).map_err(KeyFileError::Io)?;
+    read_key_file_from(file, MAX_KEY_FILE_BYTES)
+}
+
+/// [`read_key_file`] on any reader, with the limit given.
+fn read_key_file_from(
+    reader: impl std::io::Read,
+    limit: usize,
+) -> Result<Zeroizing<Vec<u8>>, KeyFileError> {
+    use std::io::Read as _;
+    // Room for one byte past the limit up front, so reading never grows
+    // (and copies) the buffer, which would leave unwiped copies behind.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(limit + 1));
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(KeyFileError::Io)?;
+    if bytes.len() > limit {
+        return Err(KeyFileError::TooLarge);
+    }
+    Ok(bytes)
+}
+
 /// A PKCS#12 reading error as a plain sentence, the same in the CLI and the
 /// app.
 #[must_use]
@@ -154,6 +215,9 @@ pub fn file_error_message(e: keyroost_p12::P12Error) -> String {
             check and holds an unencrypted key, so keyroost won't import it. Export it again \
             with a password."
             .to_string(),
+        P12Error::Unsupported(what) if what == keyroost_p12::TOO_MUCH_WORK => {
+            "This file asks for more password-hashing work than keyroost allows.".to_string()
+        }
         P12Error::Unsupported(what) => {
             format!("This file uses something keyroost can't import yet: {what}.")
         }
@@ -231,7 +295,8 @@ pub fn choose_entry(contents: &Contents, choice: Option<usize>) -> Result<&Entry
 /// RSA exponent, then policies (the extension, then a value the firmware is
 /// known to refuse). A non-default PIN or touch policy is refused
 /// where the applet is known not to take it; where support is merely unverified
-/// it is allowed, as `piv key generate` does.
+/// it is allowed, as `piv key generate` does. A Token2 is never sent a touch
+/// policy on import, whatever its version: [`import_touch_policy_refused`].
 #[allow(clippy::too_many_arguments)]
 pub fn plan_import<'a>(
     contents: &'a Contents,
@@ -267,7 +332,8 @@ pub fn plan_import<'a>(
         return Err(ImportRefusal::PinPolicyNotSupported);
     }
     if touch_policy != TouchPolicy::Default
-        && gate(PivExtension::SlotTouchPolicy) == FeatureGate::Unsupported
+        && (import_touch_policy_refused(fp)
+            || gate(PivExtension::SlotTouchPolicy) == FeatureGate::Unsupported)
     {
         return Err(ImportRefusal::TouchPolicyNotSupported);
     }
@@ -291,6 +357,15 @@ pub fn plan_import<'a>(
         touch_policy,
         skipped_authorities: contents.authorities.len(),
     })
+}
+
+/// Whether `fp`'s import is refused any touch policy but the default, at
+/// every version. A Token2's touch-policy row is known unsupported only up to
+/// the newest firmware on record, so a newer one would otherwise resolve as
+/// unverified and let the policy through; import never sends it one.
+#[must_use]
+pub fn import_touch_policy_refused(fp: AppletFingerprint) -> bool {
+    fp == AppletFingerprint::Token2
 }
 
 /// [`plan_import`] for the applet on `session`, using its fingerprint and
@@ -362,8 +437,8 @@ pub enum ImportFailure {
     PinNotVerified(TransportError),
     /// The certificate step failed, so the key was not written. The step is
     /// storing the entry's certificate (`storing_certificate`), or for a
-    /// key-only entry deleting the slot's old one. `slot_key_unchanged` is
-    /// always true: the key is written only after this step succeeds.
+    /// key-only entry deleting the slot's old one. The slot's key is
+    /// unchanged: the key is written only after this step succeeds.
     ///
     /// `certificate_cleared` is `None` when the card refused the step outright
     /// (the slot's old certificate is still there). Otherwise the exchange may
@@ -374,7 +449,6 @@ pub enum ImportFailure {
         slot: Slot,
         error: TransportError,
         storing_certificate: bool,
-        slot_key_unchanged: bool,
         certificate_cleared: Option<bool>,
     },
     /// The key write failed after the certificate step. The certificate is
@@ -438,6 +512,9 @@ impl fmt::Display for ImportFailure {
             Self::Refused(r) => write!(f, "{r} Nothing was changed on the card."),
             Self::PinNotVerified(error) => {
                 match error {
+                    TransportError::PivPinRejected {
+                        tries_remaining: Some(0),
+                    } => f.write_str("The PIN is blocked.")?,
                     TransportError::PivPinRejected {
                         tries_remaining: Some(1),
                     } => f.write_str("Wrong PIN (1 try left).")?,
@@ -696,8 +773,9 @@ fn run_import_with(
         alg_id: card.algorithm_id(alg),
         parts: import_parts(&entry.key, plan.layout),
     };
-    let body = keyroost_piv::import_key_body(&key, plan.pin_policy, plan.touch_policy)
-        .map_err(|e| ImportFailure::Refused(ImportRefusal::KeyNotEncodable(e)))?;
+    let body =
+        crate::piv::import_key_body_for(&key, plan.pin_policy, plan.touch_policy, plan.layout)
+            .map_err(|e| ImportFailure::Refused(ImportRefusal::KeyNotEncodable(e)))?;
     // A correct VERIFY costs no try; the self-test verifies again as it goes.
     if let Some(pin) = pin {
         card.verify_pin(pin)
@@ -717,7 +795,6 @@ fn run_import_with(
                     slot,
                     error,
                     storing_certificate: true,
-                    slot_key_unchanged: true,
                     certificate_cleared,
                 });
             }
@@ -731,7 +808,6 @@ fn run_import_with(
                     certificate_cleared: (!card_refused(&error)).then_some(false),
                     error,
                     storing_certificate: false,
-                    slot_key_unchanged: true,
                 })?;
             None
         }
@@ -999,6 +1075,35 @@ mod tests {
             .unwrap_err(),
             ImportRefusal::TouchPolicyNotSupported
         );
+    }
+
+    #[test]
+    fn token2_touch_policy_refused_on_newer_versions_too() {
+        // Past the newest Token2 version on record the touch-policy row
+        // reads unverified; import still never sends one.
+        let c = load("rsa2048-modern");
+        let plan = |version: &[u8], touch| {
+            plan_import(
+                &c,
+                None,
+                Slot::Authentication,
+                AppletFingerprint::Token2,
+                Some(version),
+                None,
+                PinPolicy::Default,
+                touch,
+            )
+        };
+        for version in [&[5u8, 113, 0][..], &[6, 0, 0]] {
+            for touch in [TouchPolicy::Always, TouchPolicy::Cached, TouchPolicy::Never] {
+                assert_eq!(
+                    plan(version, touch).unwrap_err(),
+                    ImportRefusal::TouchPolicyNotSupported,
+                    "{version:?} {touch:?}"
+                );
+            }
+            assert!(plan(version, TouchPolicy::Default).is_ok(), "{version:?}");
+        }
     }
 
     #[test]
@@ -1328,6 +1433,41 @@ mod run_tests {
     }
 
     #[test]
+    fn key_file_reads_up_to_the_limit_and_no_further() {
+        let at_limit = [7u8; 64];
+        assert_eq!(
+            &read_key_file_from(&at_limit[..], 64).unwrap()[..],
+            &at_limit[..]
+        );
+        let over = [7u8; 65];
+        let e = read_key_file_from(&over[..], 64).unwrap_err();
+        assert!(matches!(e, KeyFileError::TooLarge));
+        assert_eq!(
+            e.to_string(),
+            "This file is larger than a .p12/.pfx key file should be (over 1 MiB)."
+        );
+        // An endless reader stops one byte past the limit.
+        let e = read_key_file_from(std::io::repeat(1), MAX_KEY_FILE_BYTES).unwrap_err();
+        assert!(matches!(e, KeyFileError::TooLarge));
+    }
+
+    #[test]
+    fn missing_key_file_is_an_io_error() {
+        let e = read_key_file(std::path::Path::new("tests/fixtures/no-such-file.p12")).unwrap_err();
+        assert!(matches!(e, KeyFileError::Io(_)));
+    }
+
+    #[test]
+    fn too_much_work_reads_plainly() {
+        assert_eq!(
+            file_error_message(keyroost_p12::P12Error::Unsupported(
+                keyroost_p12::TOO_MUCH_WORK
+            )),
+            "This file asks for more password-hashing work than keyroost allows."
+        );
+    }
+
+    #[test]
     fn a_wrong_pin_stops_before_any_write() {
         for (name, tries, want) in [
             (
@@ -1344,6 +1484,11 @@ mod run_tests {
                 "rsa2048-modern",
                 None,
                 "The PIN was refused; it may be blocked. Nothing was written.",
+            ),
+            (
+                "rsa2048-modern",
+                Some(0),
+                "The PIN is blocked. Nothing was written.",
             ),
         ] {
             let c = load(name);
@@ -1466,7 +1611,6 @@ mod run_tests {
         match &err {
             ImportFailure::CertificateNotStored {
                 error: TransportError::PivCertTooLarge { .. },
-                slot_key_unchanged: true,
                 certificate_cleared: None,
                 ..
             } => {}
@@ -1613,7 +1757,6 @@ mod run_tests {
         assert!(matches!(
             err,
             ImportFailure::CertificateNotStored {
-                slot_key_unchanged: true,
                 certificate_cleared: None,
                 ..
             }
@@ -1875,7 +2018,6 @@ mod run_tests {
             slot: Slot::Authentication,
             error: TransportError::Pcsc(pcsc::Error::CommError),
             storing_certificate: false,
-            slot_key_unchanged: true,
             certificate_cleared: Some(false),
         };
         let msg = err.to_string();
