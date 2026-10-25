@@ -15,9 +15,7 @@ use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
 use keyroost_proto::trace::{format_line, Dir};
-use pcsc::{
-    Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State, Transaction,
-};
+use pcsc::{Card, Error as PcscError, Protocols, ReaderState, ShareMode, State, Transaction};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use zeroize::Zeroizing;
 
@@ -1468,7 +1466,7 @@ impl<'tx> PivSession<'tx> {
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
         let mut contact = FirstContact::new(reader_name, traced, "piv");
         loop {
-            let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+            let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
             let mut card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
                 Ok(card) => card,
                 Err(e) => {
@@ -1650,7 +1648,7 @@ impl<'tx> PivSession<'tx> {
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
         let mut contact = FirstContact::new(reader_name, traced, "piv");
         loop {
-            let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+            let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
 
             // Card-free. The input baseline here doesn't matter for what's
             // actually compared (the event counter, read unconditionally below)
@@ -1963,7 +1961,7 @@ impl<'tx> PivSession<'tx> {
 
     /// Names of connected readers whose PIV applet answers `SELECT` with `9000`.
     pub fn list_piv_readers() -> Result<Vec<String>, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let mut buf = [0u8; 4096];
         let names: Vec<std::ffi::CString> = ctx
             .list_readers(&mut buf)

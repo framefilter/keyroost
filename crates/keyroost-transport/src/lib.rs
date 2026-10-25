@@ -31,6 +31,16 @@ use pcsc::{
     PNP_NOTIFICATION,
 };
 
+/// The one place a PC/SC context is established. Under the test-only
+/// `KEYROOST_DEVICE_TEST=none` switch there is no PC/SC service to talk to, so
+/// no key can be reached.
+pub(crate) fn establish_context() -> Result<Context, PcscError> {
+    if keyroost_proto::devices_hidden() {
+        return Err(PcscError::NoService);
+    }
+    Context::establish(Scope::User)
+}
+
 mod oath;
 pub use oath::OathSession;
 
@@ -807,7 +817,7 @@ impl Session {
 
     /// Find the first Molto2 reader and open a card connection.
     pub fn open() -> Result<Self, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let mut readers_buf = [0u8; 2048];
         let mut readers = ctx
             .list_readers(&mut readers_buf)
@@ -826,7 +836,7 @@ impl Session {
     /// Open a session against a specific reader name (useful when the user has
     /// multiple Token2 devices plugged in).
     pub fn open_named(reader_name: &str) -> Result<Self, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let cstring = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
         let card = ctx.connect(&cstring, ShareMode::Shared, Protocols::ANY)?;
@@ -839,7 +849,7 @@ impl Session {
 
     /// List the names of all connected PC/SC readers, Molto2 or not. Useful for diagnostics.
     pub fn list_readers() -> Result<Vec<String>, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let mut buf = [0u8; 4096];
         Ok(ctx
             .list_readers(&mut buf)
@@ -1076,7 +1086,7 @@ pub struct YubiKeyCcid {
 /// `serial: None`) so callers can see them. An empty PC/SC reader list yields an
 /// empty vec; only PC/SC-service failures error.
 pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
-    let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+    let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
     let mut buf = [0u8; 4096];
     let names: Vec<std::ffi::CString> = ctx
         .list_readers(&mut buf)
@@ -1238,7 +1248,7 @@ fn probe_note(body: &str) {
 /// PC/SC service failure errors; an individual reader that can't be connected is
 /// returned with all-false capabilities rather than failing the whole scan.
 pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
-    let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+    let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
     let mut buf = [0u8; 4096];
     let names: Vec<std::ffi::CString> = ctx
         .list_readers(&mut buf)
@@ -1514,7 +1524,7 @@ impl ReaderWatcher {
                 // Outer loop re-establishes the context if the PC/SC service
                 // drops (e.g. pcscd restart).
                 while !stop_thread.load(Ordering::Relaxed) {
-                    let Ok(ctx) = Context::establish(Scope::User) else {
+                    let Ok(ctx) = crate::establish_context() else {
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     };

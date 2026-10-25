@@ -15,6 +15,7 @@ fn run(args: &[&str]) -> (i32, String, String) {
         .config_in(&dir)
         // pcsc-lite: no daemon reachable, so nothing can talk to a card.
         .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+        .env("KEYROOST_DEVICE_TEST", "none")
         .output()
         .unwrap();
     (

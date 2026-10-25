@@ -19,6 +19,14 @@ pub use commands::{
     ProfilePublicData, PublicDataError, TimeStep, DEFAULT_CUSTOMER_KEY,
 };
 
+/// Test-only switch: true when `KEYROOST_DEVICE_TEST` is exactly `none`, which
+/// makes keyroost act as if no keys are connected (no PC/SC, no HID). Read on
+/// every call. Not for users; the tests set it so they can't reach a real key.
+#[must_use]
+pub fn devices_hidden() -> bool {
+    std::env::var("KEYROOST_DEVICE_TEST").as_deref() == Ok("none")
+}
+
 /// USB Vendor ID assigned to Token2. Shared across the whole product line —
 /// the Molto2 token *and* Token2's FIDO keys (PIN+, FIDO2+) all use it — so VID
 /// alone does not identify a Molto2; classify by PID with [`token2_product`].
@@ -589,5 +597,26 @@ mod token2_pid_tests {
         assert_eq!(token2_functions(0x0999), None);
         assert!(token2_pid_may_have_otp(0x0999));
         assert!(token2_pid_may_have_otp(0x0027));
+    }
+}
+
+#[cfg(test)]
+mod device_test_switch_tests {
+    // The only test that touches KEYROOST_DEVICE_TEST, so setting it here
+    // cannot race another test reading it.
+    #[test]
+    fn devices_hidden_only_for_none() {
+        std::env::remove_var("KEYROOST_DEVICE_TEST");
+        assert!(!crate::devices_hidden(), "unset: devices visible");
+        for (value, hidden) in [
+            ("none", true),
+            ("None", false),
+            ("", false),
+            ("NONE", false),
+        ] {
+            std::env::set_var("KEYROOST_DEVICE_TEST", value);
+            assert_eq!(crate::devices_hidden(), hidden, "value {value:?}");
+        }
+        std::env::remove_var("KEYROOST_DEVICE_TEST");
     }
 }

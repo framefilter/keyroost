@@ -13,6 +13,7 @@ pub fn run(args: &[&str]) -> (i32, String, String) {
         .args(args)
         .config_in(&dir)
         .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+        .env("KEYROOST_DEVICE_TEST", "none")
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -385,4 +386,22 @@ fn molto_import_points_binary_key_material_elsewhere() {
     ]);
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("keyroost can't import this file"), "{err}");
+}
+
+/// `KEYROOST_DEVICE_TEST=none` makes keyroost see no keys at all, with the
+/// real PC/SC service and HID nodes reachable (no `PCSCLITE_CSOCK_NAME`).
+#[test]
+fn device_test_none_hides_keys() {
+    let dir = common::TempDir::new("out");
+    let out = common::keyroostctl()
+        .args(["--json", "list"])
+        .config_in(&dir)
+        .env_remove("PCSCLITE_CSOCK_NAME")
+        .env("KEYROOST_DEVICE_TEST", "none")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["keys"], serde_json::json!([]), "{v}");
 }

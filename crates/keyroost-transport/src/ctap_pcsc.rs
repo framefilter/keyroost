@@ -34,7 +34,7 @@
 
 use keyroost_ctap::cmd::CtapError;
 use keyroost_ctap::transport::CtapTransport;
-use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use pcsc::{Card, Protocols, ShareMode};
 
 /// FIDO applet AID — `A0 00 00 06 47 2F 00 01`.
 const FIDO_AID: [u8; 8] = [0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01];
@@ -84,7 +84,7 @@ impl CtapPcscDevice {
     /// transport. Fails if the reader has no card, or the card has no FIDO
     /// applet (e.g. an OATH-only or PIV-only card).
     pub fn open(reader_name: &str) -> Result<Self, CtapError> {
-        let ctx = Context::establish(Scope::User)
+        let ctx = crate::establish_context()
             .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?;
         let cname = std::ffi::CString::new(reader_name)
             .map_err(|_| CtapError::Transport("reader name contains NUL".into()))?;
@@ -114,7 +114,7 @@ impl CtapPcscDevice {
     /// avoids resetting the card (see the `Drop` impl) because a power cycle
     /// tears down other sessions on the same card.
     pub fn open_after_power_cycle(reader_name: &str) -> Result<Self, CtapError> {
-        let ctx = Context::establish(Scope::User)
+        let ctx = crate::establish_context()
             .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?;
         let cname = std::ffi::CString::new(reader_name)
             .map_err(|_| CtapError::Transport("reader name contains NUL".into()))?;
@@ -140,7 +140,7 @@ impl CtapPcscDevice {
     /// skipped, so a front-end can auto-pick a lone FIDO card or list the
     /// choices — the same shape as the OATH/OpenPGP/PIV listers.
     pub fn list_fido_readers() -> Result<Vec<String>, CtapError> {
-        let ctx = Context::establish(Scope::User)
+        let ctx = crate::establish_context()
             .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?;
         let mut buf = [0u8; 4096];
         let names: Vec<std::ffi::CString> = ctx

@@ -155,6 +155,9 @@ pub fn hid_supported() -> bool {
 /// enumeration reads sysfs only. Returns an empty list on platforms without a
 /// HID backend (see [`hid_supported`]).
 pub fn enumerate() -> Result<Vec<HidDevice>, HidError> {
+    if keyroost_proto::devices_hidden() {
+        return Ok(Vec::new());
+    }
     // Linux uses the dependency-free sysfs backend; macOS/Windows use hidapi.
     // The `hidapi-backend` feature forces hidapi on (for building/testing the
     // cross-platform path on Linux too).

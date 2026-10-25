@@ -16,7 +16,7 @@
 
 use crate::{trace, TransportError};
 use keyroost_proto::trace::{format_line, Dir};
-use pcsc::{Card, Context, ReaderState, Scope, State};
+use pcsc::{Card, ReaderState, State};
 use std::time::{Duration, Instant};
 
 /// The longest to wait for the card to come back before the one retry.
@@ -59,10 +59,7 @@ fn card_ready(state: State) -> bool {
 fn wait_for_card(reader: &str) {
     let deadline = Instant::now() + CARD_RETURN_TIMEOUT;
     std::thread::sleep(CARD_SETTLE);
-    let (Ok(ctx), Ok(name)) = (
-        Context::establish(Scope::User),
-        std::ffi::CString::new(reader),
-    ) else {
+    let (Ok(ctx), Ok(name)) = (crate::establish_context(), std::ffi::CString::new(reader)) else {
         return;
     };
     loop {

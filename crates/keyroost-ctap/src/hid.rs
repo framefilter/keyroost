@@ -289,6 +289,9 @@ pub const KEEPALIVE_STATUS_UPNEEDED: u8 = 0x02;
 impl CtapHidDevice {
     /// Open a HID device by path and allocate a CTAPHID channel.
     pub fn open(path: &Path) -> Result<(Self, InitResponse), HidTransportError> {
+        if keyroost_proto::devices_hidden() {
+            return Err(Self::hidden_error());
+        }
         let io = Self::open_io(path)?;
         let mut dev = Self {
             io,
@@ -309,7 +312,16 @@ impl CtapHidDevice {
     /// the Linux hidraw backend a permission problem surfaces as
     /// [`HidTransportError::Io`] with [`io::ErrorKind::PermissionDenied`].
     pub fn check_access(path: &Path) -> Result<(), HidTransportError> {
+        if keyroost_proto::devices_hidden() {
+            return Err(Self::hidden_error());
+        }
         Self::open_io(path).map(drop)
+    }
+
+    /// What opening a device reports under the test-only
+    /// `KEYROOST_DEVICE_TEST=none` switch: it isn't there.
+    fn hidden_error() -> HidTransportError {
+        HidTransportError::Io(io::Error::from(io::ErrorKind::NotFound))
     }
 
     /// Install a cooperative-cancel flag. When set to `true` from another

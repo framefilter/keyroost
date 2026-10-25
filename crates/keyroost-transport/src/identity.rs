@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use pcsc::{Context, Protocols, Scope, ShareMode};
+use pcsc::{Protocols, ShareMode};
 
 use crate::trace;
 use keyroost_proto::trace::{format_line, Dir};
@@ -172,7 +172,7 @@ pub fn ccid_applet_read(
     if keyroost_proto::is_molto2_reader(reader) {
         return None;
     }
-    let ctx = Context::establish(Scope::User).ok()?;
+    let ctx = crate::establish_context().ok()?;
     let name = std::ffi::CString::new(reader).ok()?;
     let card = match ctx.connect(&name, ShareMode::Shared, Protocols::ANY) {
         Ok(c) => c,

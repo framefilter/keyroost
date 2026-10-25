@@ -11,6 +11,7 @@ fn run(args: &[&str]) -> (i32, String, String) {
         .args(args)
         .config_in(&dir)
         .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+        .env("KEYROOST_DEVICE_TEST", "none")
         .stdin(Stdio::null())
         .output()
         .unwrap();

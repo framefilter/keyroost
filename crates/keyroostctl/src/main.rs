@@ -6732,6 +6732,9 @@ const ADMIN_ONLY_FIDO_NOTE: &str = "note: a FIDO key is plugged in, but Windows 
 /// open. Seen through the HID usage page alone, without opening the device.
 /// Always false elsewhere.
 fn admin_only_fido_key_present() -> bool {
+    if keyroost_proto::devices_hidden() {
+        return false;
+    }
     keyroost_winwebauthn::fido_key_present()
 }
 

@@ -82,7 +82,8 @@ pub fn keyroostctl() -> Isolated {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_keyroostctl"));
     cmd.config_in(config.path())
         // pcsc-lite: no daemon reachable, so nothing can talk to a card.
-        .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc");
+        .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+        .env("KEYROOST_DEVICE_TEST", "none");
     Isolated {
         cmd,
         _config: config,

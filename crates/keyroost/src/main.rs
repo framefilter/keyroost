@@ -9528,9 +9528,12 @@ impl App {
                     // card for these.
                     #[cfg(windows)]
                     {
-                        let fido_keys =
+                        let fido_keys = if keyroost_proto::devices_hidden() {
+                            Vec::new()
+                        } else {
                             std::panic::catch_unwind(keyroost_winwebauthn::detect_fido_keys)
-                                .unwrap_or_default();
+                                .unwrap_or_default()
+                        };
                         if !fido_keys.is_empty() {
                             if devices.iter().any(|d| d.kind == DeviceKind::Key) {
                                 for d in devices.iter_mut() {
@@ -17262,6 +17265,7 @@ impl App {
                     // "Reading key…". The Manage → jump opens the full card.
                     #[cfg(windows)]
                     let non_admin = self.security_keys.info.is_none()
+                        && !keyroost_proto::devices_hidden()
                         && keyroost_winwebauthn::fido_key_present();
                     #[cfg(not(windows))]
                     let non_admin = false;
@@ -17620,7 +17624,10 @@ impl App {
         #[cfg(windows)]
         {
             let no_access = self.security_keys.info.is_none();
-            if no_access && keyroost_winwebauthn::fido_key_present() {
+            if no_access
+                && !keyroost_proto::devices_hidden()
+                && keyroost_winwebauthn::fido_key_present()
+            {
                 self.fido2_non_admin_card(ui, p);
                 return;
             }

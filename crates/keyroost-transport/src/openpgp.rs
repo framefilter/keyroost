@@ -14,7 +14,7 @@ use crate::recover::{self, FirstContact};
 use crate::{trace, TransportError};
 use keyroost_openpgp as pgp;
 use keyroost_proto::trace::{format_line, Dir};
-use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use pcsc::{Card, Protocols, ShareMode};
 use zeroize::Zeroizing;
 
 /// `SW 6A82`: selected file/application not found — i.e. no OpenPGP applet.
@@ -140,7 +140,7 @@ impl OpenPgpSession {
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
         let mut contact = FirstContact::new(reader_name, debug, "openpgp");
         loop {
-            let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+            let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
             let card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
                 Ok(card) => card,
                 Err(e) => {
@@ -171,7 +171,7 @@ impl OpenPgpSession {
     /// `9000`. Cards without the applet (e.g. the test Solo 2) are skipped, so a
     /// front-end can auto-pick a lone OpenPGP card or list the choices.
     pub fn list_openpgp_readers() -> Result<Vec<String>, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let mut buf = [0u8; 4096];
         let names: Vec<std::ffi::CString> = ctx
             .list_readers(&mut buf)

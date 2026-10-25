@@ -9,6 +9,7 @@ fn run(args: &[&str]) -> (i32, String) {
         .stdin(Stdio::null())
         // pcsc-lite: no daemon reachable, so nothing can talk to a card.
         .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+        .env("KEYROOST_DEVICE_TEST", "none")
         .output()
         .unwrap();
     (
@@ -282,7 +283,8 @@ fn every_required_secret_refuses_without_a_source_and_names_real_flags() {
                 .args(&extra)
                 .current_dir(&dir)
                 .stdin(Stdio::null())
-                .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc");
+                .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+                .env("KEYROOST_DEVICE_TEST", "none");
             for (j, prev) in required[..i].iter().enumerate() {
                 let p = prev.split('|').next().unwrap();
                 let var = format!("KR_TEST_SECRET_{j}");
@@ -340,6 +342,7 @@ fn import_key_checks_the_key_file_before_selecting_a_key() {
             .env("KR_TEST_ADMIN_PIN", "12345678")
             .stdin(Stdio::null())
             .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+            .env("KEYROOST_DEVICE_TEST", "none")
             .output()
             .unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
@@ -396,6 +399,7 @@ fn piv_key_import_checks_the_file_before_selecting_a_key() {
             .current_dir(&dir)
             .stdin(Stdio::null())
             .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+            .env("KEYROOST_DEVICE_TEST", "none")
             .output()
             .unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
@@ -426,6 +430,7 @@ fn piv_key_import_refuses_an_oversized_file() {
         .current_dir(&dir)
         .stdin(Stdio::null())
         .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+        .env("KEYROOST_DEVICE_TEST", "none")
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);

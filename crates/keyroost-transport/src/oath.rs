@@ -16,7 +16,7 @@
 use crate::recover::{self, FirstContact};
 use crate::TransportError;
 use keyroost_oath as oath;
-use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use pcsc::{Card, Protocols, ShareMode};
 use zeroize::Zeroizing;
 
 /// "Security status not satisfied": no VALIDATE yet, or (Nitrokey) no touch.
@@ -59,7 +59,7 @@ impl OathSession {
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
         let mut contact = FirstContact::new(reader_name, debug, "oath");
         loop {
-            let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+            let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
             let mut card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
                 Ok(card) => card,
                 Err(e) => {
@@ -217,7 +217,7 @@ impl OathSession {
     /// Lets a front-end auto-pick a lone OATH key, or list choices when several
     /// are present (never guessing — same posture as the FIDO picker).
     pub fn list_oath_readers() -> Result<Vec<String>, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let mut buf = [0u8; 4096];
         let names: Vec<std::ffi::CString> = ctx
             .list_readers(&mut buf)
