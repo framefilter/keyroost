@@ -383,6 +383,12 @@ impl HidOtpTransport {
 
     /// Open a specific hidraw / platform device path.
     pub fn open_path(path: &Path) -> Result<Self, OtpTransportError> {
+        if keyroost_proto::devices_hidden() {
+            // Same answer as the CTAP HID gate: the device isn't there.
+            return Err(OtpTransportError::TransportUnavailable(
+                std::io::Error::from(std::io::ErrorKind::NotFound).to_string(),
+            ));
+        }
         let io = Self::open_io(path)?;
         Ok(Self {
             io,
@@ -410,11 +416,6 @@ impl HidOtpTransport {
 
     #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
     fn open_io(path: &Path) -> Result<HidIo, OtpTransportError> {
-        if keyroost_proto::devices_hidden() {
-            return Err(OtpTransportError::TransportUnavailable(
-                "no devices (test switch)".into(),
-            ));
-        }
         let api = hidapi::HidApi::new()
             .map_err(|e| OtpTransportError::TransportUnavailable(e.to_string()))?;
         let cpath = std::ffi::CString::new(path.to_string_lossy().as_bytes())
