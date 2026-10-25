@@ -123,6 +123,12 @@ pub struct OpenPgpSession {
     debug: bool,
 }
 
+/// Map a public-key read to "known to hold a key": success is `Some(true)`,
+/// every error is `None`, never `Some(false)`.
+fn key_present_from<T>(read: Result<T, TransportError>) -> Option<bool> {
+    read.ok().map(|_| true)
+}
+
 impl OpenPgpSession {
     /// Connect to `reader_name` and SELECT the OpenPGP applet. Returns
     /// [`TransportError::NoOpenPgpApplet`] when the card has no OpenPGP applet.
@@ -777,13 +783,21 @@ impl OpenPgpSession {
         }
     }
 
-    /// Read the public key currently in `crt`'s slot. Read-only; no PIN. Returns
-    /// an `OpenPgpParse` error if the slot is empty or holds a key of a kind
-    /// this crate can't parse.
+    /// Read the public key currently in `crt`'s slot. Read-only; no PIN. An
+    /// empty slot can return an APDU error (6F00 is observed on some cards), while
+    /// an unrecognized public-key encoding returns `OpenPgpParse`.
     pub fn read_public_key(&mut self, crt: pgp::KeyCrt) -> Result<pgp::PublicKey, TransportError> {
         let (data, sw) = self.transmit_full(&pgp::read_public_key(crt))?;
         ok_or_apdu("openpgp read public key", sw)?;
         pgp::parse_generated_public_key(&data).map_err(TransportError::OpenPgpParse)
+    }
+
+    /// Whether `crt`'s slot is known to hold a key: `Some(true)` when its public
+    /// key reads back, `None` for every failure (status word, parse, transport).
+    /// Never `Some(false)`: a status such as 6F00 is not proof the slot is empty.
+    /// Read-only; no PIN.
+    pub fn key_present(&mut self, crt: pgp::KeyCrt) -> Option<bool> {
+        key_present_from(self.read_public_key(crt))
     }
 
     /// Compute a signature over `digest_info` (PSO:CDS). The caller supplies the
@@ -1258,6 +1272,21 @@ fn needs_attribute_write(current: &[u8], alg: pgp::KeyAlg) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_present_is_true_or_unknown_never_false() {
+        assert_eq!(key_present_from(Ok(())), Some(true));
+        for sw in [(0x6A, 0x88), (0x6F, 0x00), (0x69, 0x82)] {
+            let err = TransportError::Apdu {
+                label: "openpgp read public key",
+                sw1: sw.0,
+                sw2: sw.1,
+            };
+            assert_eq!(key_present_from::<()>(Err(err)), None);
+        }
+        let parse = TransportError::OpenPgpParse(keyroost_openpgp::ParseError::Truncated);
+        assert_eq!(key_present_from::<()>(Err(parse)), None);
+    }
 
     #[test]
     fn needs_attribute_write_only_when_the_slot_differs() {

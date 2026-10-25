@@ -956,12 +956,23 @@ impl Drop for OathAddDialog {
     }
 }
 
+/// One OpenPGP card read: status, supported algorithms, per-slot key presence.
+type OpenPgpRead = (
+    keyroost_transport::OpenPgpStatus,
+    Option<keyroost_transport::AlgorithmInformation>,
+    [Option<bool>; 3],
+);
+
 /// State for the OpenPGP pane. Like OATH, the applet is driven over PC/SC, so a
 /// reader name identifies the card.
 #[derive(Default)]
 struct OpenPgpState {
     /// Last status read from the selected card.
     status: Option<keyroost_transport::OpenPgpStatus>,
+    /// Per slot (sign, decrypt, auth): `Some(true)` when the public key read
+    /// back, `None` when unknown. Set with a fresh status read and cleared
+    /// whenever a write replaces `status`.
+    key_present: [Option<bool>; 3],
     /// User-facing error from the last operation.
     error: Option<String>,
     /// Success/info line from the last write operation.
@@ -8358,25 +8369,25 @@ impl App {
         };
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading OpenPGP status\u{2026}", move || {
-            let result = (|| -> Result<
-                (
-                    keyroost_transport::OpenPgpStatus,
-                    Option<keyroost_transport::AlgorithmInformation>,
-                ),
-                TransportError,
-            > {
+            let result = (|| -> Result<OpenPgpRead, TransportError> {
                 let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
                 let status = session.status()?;
                 let supported = session.supported_algorithms().unwrap_or(None);
-                Ok((status, supported))
+                let present = [
+                    session.key_present(keyroost_transport::KeyCrt::Sign),
+                    session.key_present(keyroost_transport::KeyCrt::Decrypt),
+                    session.key_present(keyroost_transport::KeyCrt::Auth),
+                ];
+                Ok((status, supported, present))
             })();
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok((status, supported)) => {
+                    Ok((status, supported, present)) => {
                         app.openpgp.status = Some(status);
+                        app.openpgp.key_present = present;
                         app.openpgp.supported = supported;
                         app.openpgp.loaded = true;
                     }
@@ -8406,6 +8417,7 @@ impl App {
         match result {
             Ok(status) => {
                 app.openpgp.status = Some(status);
+                app.openpgp.key_present = [None; 3];
                 app.openpgp.loaded = true;
                 app.openpgp.error = None;
                 app.openpgp.notice = Some(notice);
@@ -8510,6 +8522,7 @@ impl App {
                 match result {
                     Ok((status, fpr)) => {
                         app.openpgp.status = Some(status);
+                app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice =
@@ -8619,6 +8632,7 @@ impl App {
                 match result {
                     Ok((status, kind, fpr)) => {
                         app.openpgp.status = Some(status);
+                app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice = Some(format!(
@@ -8768,6 +8782,7 @@ impl App {
                     Ok(status) => {
                         app.openpgp.created = None;
                         app.openpgp.status = Some(status);
+                        app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice = Some(format!(
@@ -8899,6 +8914,7 @@ impl App {
                     Ok(status) => {
                         app.openpgp.restore_loaded = None;
                         app.openpgp.status = Some(status);
+                        app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice = Some(format!("Loaded {what} from {path}."));
@@ -17375,7 +17391,11 @@ impl App {
                                 ui,
                                 &format!(
                                     "Signature \u{00B7} {}",
-                                    slot_summary(&st.sig_attrs, &st.fingerprint_sig)
+                                    slot_summary(
+                                        &st.sig_attrs,
+                                        &st.fingerprint_sig,
+                                        self.openpgp.key_present[0]
+                                    )
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -17384,7 +17404,11 @@ impl App {
                                 ui,
                                 &format!(
                                     "Encryption \u{00B7} {}",
-                                    slot_summary(&st.dec_attrs, &st.fingerprint_dec)
+                                    slot_summary(
+                                        &st.dec_attrs,
+                                        &st.fingerprint_dec,
+                                        self.openpgp.key_present[1]
+                                    )
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -17393,7 +17417,11 @@ impl App {
                                 ui,
                                 &format!(
                                     "Auth \u{00B7} {}",
-                                    slot_summary(&st.aut_attrs, &st.fingerprint_aut)
+                                    slot_summary(
+                                        &st.aut_attrs,
+                                        &st.fingerprint_aut,
+                                        self.openpgp.key_present[2]
+                                    )
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -25920,10 +25948,19 @@ fn editor_row(ui: &mut egui::Ui, p: &Palette, label: &str, add: impl FnOnce(&mut
     ui.add_space(8.0);
 }
 
-/// Summarize an OpenPGP key slot: its algorithm label, or "empty" when no key.
-fn slot_summary(attrs: &[u8], fpr: &[u8; 20]) -> String {
+/// Summarize an OpenPGP key slot: its algorithm label, "empty" when there is
+/// no fingerprint, or "{algorithm}, no fingerprint" when there is none but the
+/// slot's public key read back. `None` (unknown) never changes the text.
+fn slot_summary(attrs: &[u8], fpr: &[u8; 20], key_present: Option<bool>) -> String {
     if fpr.iter().all(|&b| b == 0) {
-        "empty".to_string()
+        if key_present == Some(true) {
+            format!(
+                "{}, no fingerprint",
+                keyroost_transport::describe_algorithm_attributes(attrs)
+            )
+        } else {
+            "empty".to_string()
+        }
     } else {
         keyroost_transport::describe_algorithm_attributes(attrs)
     }
@@ -25942,6 +25979,22 @@ mod tests {
         assert!(dir.starts_with(&tmp), "{dir:?} is outside {tmp:?}");
         assert!(keyroost_keyring::config_path().unwrap().starts_with(&tmp));
         assert!(settings::config_path().unwrap().starts_with(&tmp));
+    }
+
+    #[test]
+    fn slot_summary_notes_a_key_without_a_fingerprint() {
+        let attrs = keyroost_transport::OpenPgpKeyAlg::Ed25519
+            .attributes(keyroost_transport::KeyCrt::Sign)
+            .unwrap();
+        let algo = keyroost_transport::describe_algorithm_attributes(&attrs);
+        let zero = [0u8; 20];
+        let some = [0xABu8; 20];
+        assert_eq!(
+            slot_summary(&attrs, &zero, Some(true)),
+            format!("{algo}, no fingerprint")
+        );
+        assert_eq!(slot_summary(&attrs, &zero, None), "empty");
+        assert_eq!(slot_summary(&attrs, &some, Some(true)), algo);
     }
 
     /// A `period/` prefix is shown as the period, not as part of the issuer.

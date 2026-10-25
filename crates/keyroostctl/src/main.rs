@@ -9298,6 +9298,14 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         OpenpgpCmd::Info { reader } => {
             let mut session = open_openpgp(reader.as_deref(), debug)?;
             let status = session.status()?;
+            // Read-only public-key reads (no PIN); any failure is "unknown".
+            let present = |s: &mut keyroost_transport::OpenPgpSession,
+                           crt: keyroost_openpgp::KeyCrt| {
+                s.key_present(crt)
+            };
+            let key_present_sig = present(&mut session, keyroost_openpgp::KeyCrt::Sign);
+            let key_present_dec = present(&mut session, keyroost_openpgp::KeyCrt::Decrypt);
+            let key_present_aut = present(&mut session, keyroost_openpgp::KeyCrt::Auth);
 
             if json_output() {
                 // An all-zero fingerprint means "no key in that slot" — mirror the
@@ -9318,6 +9326,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                     fingerprint_sig: fpr(&status.fingerprint_sig),
                     fingerprint_dec: fpr(&status.fingerprint_dec),
                     fingerprint_aut: fpr(&status.fingerprint_aut),
+                    key_present_sig,
+                    key_present_dec,
+                    key_present_aut,
                     user_pin_retries: status.tries_pw1,
                     reset_code_retries: status.tries_rc,
                     admin_pin_retries: status.tries_pw3,
@@ -9340,9 +9351,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 status.algorithm_label(keyroost_openpgp::KeyCrt::Decrypt),
                 status.algorithm_label(keyroost_openpgp::KeyCrt::Auth),
             );
-            print_fingerprint("Signature  fpr", &status.fingerprint_sig);
-            print_fingerprint("Decryption fpr", &status.fingerprint_dec);
-            print_fingerprint("Auth       fpr", &status.fingerprint_aut);
+            print_fingerprint("Signature  fpr", &status.fingerprint_sig, key_present_sig);
+            print_fingerprint("Decryption fpr", &status.fingerprint_dec, key_present_dec);
+            print_fingerprint("Auth       fpr", &status.fingerprint_aut, key_present_aut);
             println!(
                 "PIN retries:    PW1={} RC={} PW3={}",
                 status.tries_pw1, status.tries_rc, status.tries_pw3
@@ -12313,11 +12324,22 @@ fn load_pubkey_material(
 }
 
 /// Print a key fingerprint, rendering an all-zero (no key) slot as "(none)".
-fn print_fingerprint(label: &str, fpr: &[u8; 20]) {
+fn print_fingerprint(label: &str, fpr: &[u8; 20], key_present: Option<bool>) {
+    println!("{}: {}", label, fingerprint_text(fpr, key_present));
+}
+
+/// The value half of an `openpgp info` fingerprint line. An all-zero
+/// fingerprint is "(none)"; if the slot's public key read back anyway, say
+/// so. `None` (the read failed, for any reason) never changes the text.
+fn fingerprint_text(fpr: &[u8; 20], key_present: Option<bool>) -> String {
     if fpr.iter().all(|&b| b == 0) {
-        println!("{}: (none)", label);
+        if key_present == Some(true) {
+            "(none), but a key is present".to_string()
+        } else {
+            "(none)".to_string()
+        }
     } else {
-        println!("{}: {}", label, hex_encode(fpr));
+        hex_encode(fpr)
     }
 }
 
@@ -23646,6 +23668,20 @@ mod cli_tests {
     }
 
     #[test]
+    fn fingerprint_text_notes_a_key_without_a_fingerprint() {
+        let zero = [0u8; 20];
+        let some = [0xABu8; 20];
+        assert_eq!(
+            fingerprint_text(&zero, Some(true)),
+            "(none), but a key is present"
+        );
+        assert_eq!(fingerprint_text(&zero, None), "(none)");
+        assert_eq!(fingerprint_text(&zero, Some(false)), "(none)");
+        assert_eq!(fingerprint_text(&some, Some(true)), hex_encode(&some));
+        assert_eq!(fingerprint_text(&some, None), hex_encode(&some));
+    }
+
+    #[test]
     fn openpgp_status_json_serializes() {
         let o = json_out::OpenpgpStatusJson {
             aid: "d2760001240103040006...".into(),
@@ -23656,6 +23692,9 @@ mod cli_tests {
             fingerprint_sig: Some("aabb...".into()),
             fingerprint_dec: None,
             fingerprint_aut: None,
+            key_present_sig: Some(true),
+            key_present_dec: None,
+            key_present_aut: None,
             user_pin_retries: 3,
             reset_code_retries: 0,
             admin_pin_retries: 3,
