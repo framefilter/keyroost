@@ -170,14 +170,15 @@ impl CtapPcscDevice {
         &self.selected_version
     }
 
-    /// `get_info`, except that a card selected as `U2F_V2` which explicitly
-    /// rejects the command (`6D00`, `6E00` or CTAP2 status `01`) returns
-    /// `Ok(None)`: it speaks U2F only. `U2F_V2` also names dual-protocol cards,
-    /// so GetInfo is always asked first; every other error passes through.
+    /// `get_info`, except that a card selected as `U2F_V2` (some cards add
+    /// trailing bytes to that answer) which explicitly rejects the command
+    /// (`6D00`, `6E00` or CTAP2 status `01`) returns `Ok(None)`: it speaks
+    /// U2F only. `U2F_V2` also names dual-protocol cards, so GetInfo is
+    /// always asked first; every other error passes through.
     pub fn get_info_unless_u2f_only(
         &mut self,
     ) -> Result<Option<keyroost_ctap::AuthenticatorInfo>, CtapError> {
-        let u2f = self.selected_version == b"U2F_V2";
+        let u2f = selected_u2f(&self.selected_version);
         info_unless_u2f_only(self, u2f)
     }
 
@@ -351,6 +352,12 @@ impl CtapTransport for CtapPcscDevice {
     }
 }
 
+/// Whether the FIDO applet's SELECT answer is `U2F_V2`; some cards add
+/// trailing bytes after it.
+fn selected_u2f(version: &[u8]) -> bool {
+    version.starts_with(b"U2F_V2")
+}
+
 fn info_unless_u2f_only(
     dev: &mut impl CtapTransport,
     u2f_selected: bool,
@@ -395,6 +402,16 @@ mod tests {
             .unwrap()
             .expect("dual-protocol card must expose CTAP2");
         assert!(info.versions.iter().any(|v| v == "FIDO_2_0"));
+    }
+
+    #[test]
+    fn a_u2f_v2_select_answer_may_carry_trailing_bytes() {
+        assert!(selected_u2f(b"U2F_V2"));
+        assert!(selected_u2f(b"U2F_V2\x00"));
+        assert!(selected_u2f(b"U2F_V2 extra"));
+        assert!(!selected_u2f(b"FIDO_2_0"));
+        assert!(!selected_u2f(b"U2F_V"));
+        assert!(!selected_u2f(b""));
     }
 
     #[test]

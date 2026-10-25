@@ -378,11 +378,12 @@ fn open_fido(target: &FidoTarget) -> Result<OpenFido, String> {
         FidoTarget::Pcsc(reader) => {
             let mut dev =
                 keyroost_transport::CtapPcscDevice::open(reader).map_err(|e| e.to_string())?;
-            // A card selected as U2F_V2 may still speak CTAP2, so GetInfo is
-            // asked; only an explicit "unsupported" answer means U2F-only, which
-            // takes the same path as a U2F-only key over USB.
-            // Only an explicit U2F-only answer clears `cbor`; on any other error
-            // keep it set, so PIN changes still work and the later call reports it.
+            // A card selected as U2F_V2 (some add trailing bytes to that
+            // answer) may still speak CTAP2, so GetInfo is asked; only an
+            // explicit "unsupported" answer means U2F-only, which takes the
+            // same path as a U2F-only key over USB. On any other error `cbor`
+            // stays set, so PIN changes still work and the later call
+            // reports it.
             let cbor = !matches!(dev.get_info_unless_u2f_only(), Ok(None));
             Ok((Box::new(dev), cbor, None))
         }
