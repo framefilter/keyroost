@@ -112,6 +112,7 @@ fn typed_device(reader: Option<String>, hid_path: Option<PathBuf>, typed: &str) 
         reader,
         hid_serial: None,
         naming: Default::default(),
+        smart_card_unlisted: false,
     }
 }
 
@@ -422,6 +423,7 @@ mod tests {
             reader: Some("Yubico YubiKey OTP+FIDO+CCID 00 00".into()),
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         }
     }
 

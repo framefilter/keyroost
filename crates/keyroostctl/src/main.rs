@@ -6600,7 +6600,43 @@ const HID_PERMISSION_HINT: &str = " — install the udev rules (see README) and 
 #[cfg(not(target_os = "linux"))]
 const HID_PERMISSION_HINT: &str = "";
 
-/// Environment diagnosis: each check prints one ✓/✗/– line with the fix
+/// What `doctor` says about a plugged-in key whose smart-card interface has
+/// no reader listed for it (Linux; see
+/// [`keyroost_resolve::smart_cards_without_reader`]).
+// Used on Linux and by the tests.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn no_reader_hint(card: &keyroost_hid::UsbSmartCard) -> String {
+    let ids = format!("{:04x}:{:04x}", card.vendor_id, card.product_id);
+    let who = if card.product_name.trim().is_empty() {
+        ids
+    } else {
+        format!("{} ({ids})", sanitize_terminal(&card.product_name))
+    };
+    format!(
+        "! {who} has a smart-card interface, but the smart-card service lists no reader for it.\n  \
+         Its PIV/OpenPGP features can't be reached on this system. The usual cause is a smart-card\n  \
+         driver (libccid) that doesn't recognize this model yet."
+    )
+}
+
+/// Linux: one [`no_reader_hint`] per plugged-in key whose smart-card
+/// interface has no reader listed. Reads sysfs and each reader's USB position
+/// (no APDU, never a Molto2); says nothing when any reader's position can't
+/// be read.
+#[cfg(target_os = "linux")]
+fn print_no_reader_hints() {
+    let cards = keyroost_hid::usb_smart_cards();
+    if cards.is_empty() {
+        return;
+    }
+    if let Ok(readers) = keyroost_transport::reader_usb_devices() {
+        for card in keyroost_resolve::smart_cards_without_reader(&cards, &readers) {
+            println!("{}", no_reader_hint(&card));
+        }
+    }
+}
+
+/// Environment diagnosis: each check prints one ✓/✗/–/! line with the fix
 /// inline. Never touches card state and always exits 0 — it's a flashlight,
 /// not a gate.
 fn run_doctor() {
@@ -6624,6 +6660,8 @@ fn run_doctor() {
                     println!("    {}{}", sanitize_terminal(r), tag);
                 }
             }
+            #[cfg(target_os = "linux")]
+            print_no_reader_hints();
         }
         Err(e) => {
             println!("✗ PC/SC unavailable: {}", e);
@@ -15447,6 +15485,43 @@ mod human_style_tests {
             )
         );
     }
+
+    fn smart_card(name: &str) -> keyroost_hid::UsbSmartCard {
+        keyroost_hid::UsbSmartCard {
+            vendor_id: 0x349e,
+            product_id: 0x0024,
+            product_name: name.into(),
+            usb_device: keyroost_hid::UsbDeviceKey::BusAddr(1, 7),
+        }
+    }
+
+    #[test]
+    fn doctor_no_reader_hint_text() {
+        assert_eq!(
+            no_reader_hint(&smart_card("PIN+ Key")),
+            "! PIN+ Key (349e:0024) has a smart-card interface, but the smart-card \
+             service lists no reader for it.\n  \
+             Its PIV/OpenPGP features can't be reached on this system. The usual \
+             cause is a smart-card\n  \
+             driver (libccid) that doesn't recognize this model yet."
+        );
+    }
+
+    #[test]
+    fn doctor_no_reader_hint_neutralizes_the_product_name() {
+        let hint = no_reader_hint(&smart_card("Evil\x1b[2J\nKey"));
+        assert!(!hint.contains('\x1b'), "{hint:?}");
+        assert_eq!(hint.lines().count(), 3, "{hint:?}");
+    }
+
+    #[test]
+    fn doctor_no_reader_hint_without_a_product_name() {
+        let hint = no_reader_hint(&smart_card(""));
+        assert!(
+            hint.starts_with("! 349e:0024 has a smart-card interface"),
+            "{hint:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -18235,6 +18310,7 @@ mod cli_tests {
             reader: None,
             hid_serial: None,
             naming: Default::default(),
+            smart_card_unlisted: false,
         }
     }
 
@@ -18334,6 +18410,7 @@ mod cli_tests {
             reader: Some("R 00".into()),
             hid_serial: None,
             naming: Default::default(),
+            smart_card_unlisted: false,
         };
         assert_eq!(
             fido_route(&both, false),
@@ -19809,6 +19886,7 @@ mod cli_tests {
                 reader: reader.map(str::to_owned),
                 hid_serial: None,
                 naming: keyroost_resolve::Naming::local(Some(name)),
+                smart_card_unlisted: false,
             }
         }
 
@@ -19868,6 +19946,7 @@ mod cli_tests {
             reader: Some("Some Reader".to_string()),
             hid_serial: None,
             naming: Default::default(),
+            smart_card_unlisted: false,
         };
         match otp_target_for(&row, OtpTransportArg::Auto) {
             Ok(OtpTarget::Reader(r)) => assert_eq!(r, "Some Reader"),
@@ -24181,6 +24260,7 @@ mod cli_tests {
             reader: Some("Yubico 00".into()),
             hid_serial: None,
             naming: Default::default(),
+            smart_card_unlisted: false,
         };
         let hid = keyroost_hid::HidDevice {
             path: "/dev/hidraw16".into(),
@@ -24241,6 +24321,7 @@ mod cli_tests {
             reader: None,
             hid_serial: None,
             naming: Default::default(),
+            smart_card_unlisted: false,
         };
         // A normal detected row with a serial is nameable.
         assert!(nameable(&base).is_ok());
@@ -24280,6 +24361,7 @@ mod cli_tests {
                 reader: Some(reader.into()),
                 hid_serial: None,
                 naming: keyroost_resolve::Naming::local(Some(name)),
+                smart_card_unlisted: false,
             }
         }
         let devs = [
@@ -24654,6 +24736,7 @@ mod cli_tests {
             reader: reader.map(str::to_owned),
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         };
         let devs = [
             mk(Some("yubi-test"), "2", Some("Y 00")),
@@ -24734,6 +24817,7 @@ mod cli_tests {
             reader: reader.map(str::to_owned),
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         };
         let devs = [
             mk(Some("yubi-test"), "2", Some("Y 00")),
@@ -24788,6 +24872,7 @@ mod prop_tests {
             reader: reader.map(String::from),
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         }
     }
 

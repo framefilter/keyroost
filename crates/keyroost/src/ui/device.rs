@@ -251,6 +251,7 @@ mod tests {
                 on_key,
                 ..Naming::default()
             },
+            smart_card_unlisted: false,
         }
     }
 

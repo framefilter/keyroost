@@ -400,9 +400,97 @@ fn read_usb_serial(usb_dir: &Path) -> Option<String> {
 }
 
 /// Read a small decimal sysfs attribute (e.g. `busnum`, `devnum`) as a `u8`.
-#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
-fn read_sysfs_u8(path: &Path) -> Option<u8> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+// Used by the sysfs backends and the tests; dead off Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_sysfs_u8(path: &std::path::Path) -> Option<u8> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// USB interface class of a smart-card (CCID) interface.
+const USB_CLASS_SMART_CARD: u8 = 0x0B;
+
+/// A plugged-in USB device with a smart-card (CCID, interface class `0x0B`)
+/// interface, as the system's device list shows it. Found without opening
+/// the device; whether a smart-card reader is listed for it is a separate
+/// question (the PC/SC side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbSmartCard {
+    /// USB vendor ID.
+    pub vendor_id: u16,
+    /// USB product ID.
+    pub product_id: u16,
+    /// The USB product string, or empty when the device has none.
+    pub product_name: String,
+    /// Which physical USB device this is (bus + address on Linux), to compare
+    /// with a reader's [`UsbDeviceKey`].
+    pub usb_device: UsbDeviceKey,
+}
+
+/// Every plugged-in USB device with a smart-card interface. Linux only (read
+/// from sysfs, never opening a device); empty elsewhere and under the
+/// test-only `KEYROOST_DEVICE_TEST=none` switch.
+#[must_use]
+pub fn usb_smart_cards() -> Vec<UsbSmartCard> {
+    if keyroost_proto::devices_hidden() {
+        return Vec::new();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        usb_smart_cards_in(std::path::Path::new("/sys/bus/usb/devices"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+/// [`usb_smart_cards`] over a sysfs-shaped `root` (`/sys/bus/usb/devices`):
+/// each entry with an `idVendor` is a USB device, and it has a smart-card
+/// interface when one of its interface subdirectories has `bInterfaceClass`
+/// `0b`. A device whose bus or address can't be read is skipped (no evidence
+/// to compare). Sorted by entry name, so the order is stable.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn usb_smart_cards_in(root: &std::path::Path) -> Vec<UsbSmartCard> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    let read = |p: PathBuf| std::fs::read_to_string(p).ok();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let (Some(vid), Some(pid)) = (
+            read(dir.join("idVendor")).and_then(|s| parse_hex_u16(&s)),
+            read(dir.join("idProduct")).and_then(|s| parse_hex_u16(&s)),
+        ) else {
+            continue;
+        };
+        let has_ccid = std::fs::read_dir(&dir).is_ok_and(|kids| {
+            kids.flatten().any(|k| {
+                read(k.path().join("bInterfaceClass"))
+                    .and_then(|s| u8::from_str_radix(s.trim(), 16).ok())
+                    == Some(USB_CLASS_SMART_CARD)
+            })
+        });
+        if !has_ccid {
+            continue;
+        }
+        let Some(usb_device) = UsbDeviceKey::from_bus_addr(
+            read_sysfs_u8(&dir.join("busnum")),
+            read_sysfs_u8(&dir.join("devnum")),
+        ) else {
+            continue;
+        };
+        out.push(UsbSmartCard {
+            vendor_id: vid,
+            product_id: pid,
+            product_name: read(dir.join("product"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default(),
+            usb_device,
+        });
+    }
+    out
 }
 
 // Used by the sysfs backend and the tests; dead on the hidapi-only build.
@@ -555,6 +643,122 @@ mod tests {
             ..fido
         };
         assert!(dfu.bootloader_label().is_some());
+    }
+
+    /// A throwaway fake of `/sys/bus/usb/devices`, removed on drop.
+    struct FakeSysfs(PathBuf);
+
+    impl FakeSysfs {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("keyroost-hid-sysfs-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        /// One USB device `name` with the given attributes and one interface
+        /// per class in `classes`. `None` attributes are left out.
+        fn device(
+            &self,
+            name: &str,
+            ids: (&str, &str),
+            product: Option<&str>,
+            bus_dev: (Option<&str>, Option<&str>),
+            classes: &[&str],
+        ) {
+            let dir = self.0.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("idVendor"), format!("{}\n", ids.0)).unwrap();
+            std::fs::write(dir.join("idProduct"), format!("{}\n", ids.1)).unwrap();
+            if let Some(p) = product {
+                std::fs::write(dir.join("product"), format!("{p}\n")).unwrap();
+            }
+            if let Some(b) = bus_dev.0 {
+                std::fs::write(dir.join("busnum"), format!("{b}\n")).unwrap();
+            }
+            if let Some(d) = bus_dev.1 {
+                std::fs::write(dir.join("devnum"), format!("{d}\n")).unwrap();
+            }
+            // Non-interface subdirectories real sysfs has too.
+            std::fs::create_dir_all(dir.join("power")).unwrap();
+            for (i, class) in classes.iter().enumerate() {
+                let iface = dir.join(format!("{name}:1.{i}"));
+                std::fs::create_dir_all(&iface).unwrap();
+                std::fs::write(iface.join("bInterfaceClass"), format!("{class}\n")).unwrap();
+            }
+            // Real sysfs also lists each interface at the top level, without
+            // `idVendor`.
+            std::fs::create_dir_all(self.0.join(format!("{name}:1.0"))).unwrap();
+        }
+    }
+
+    impl Drop for FakeSysfs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn usb_smart_cards_lists_only_ccid_devices_with_an_address() {
+        let sys = FakeSysfs::new("ccid");
+        // A key with HID + CCID interfaces.
+        sys.device(
+            "1-2",
+            ("349e", "0024"),
+            Some("PIN+ Key"),
+            (Some("1"), Some("7")),
+            &["03", "0b"],
+        );
+        // HID only: not a smart card.
+        sys.device(
+            "1-3",
+            ("1050", "0120"),
+            Some("Keyboard"),
+            (Some("1"), Some("8")),
+            &["03"],
+        );
+        // CCID, but its bus number can't be read: skipped, never guessed.
+        sys.device(
+            "1-4",
+            ("20a0", "42b2"),
+            Some("Other Key"),
+            (None, Some("9")),
+            &["0b"],
+        );
+        // CCID with no product string: listed with an empty name.
+        sys.device(
+            "2-1",
+            ("1209", "beee"),
+            None,
+            (Some("2"), Some("3")),
+            &["0B"],
+        );
+
+        let cards = usb_smart_cards_in(&sys.0);
+        assert_eq!(
+            cards,
+            vec![
+                UsbSmartCard {
+                    vendor_id: 0x349e,
+                    product_id: 0x0024,
+                    product_name: "PIN+ Key".into(),
+                    usb_device: UsbDeviceKey::BusAddr(1, 7),
+                },
+                UsbSmartCard {
+                    vendor_id: 0x1209,
+                    product_id: 0xbeee,
+                    product_name: String::new(),
+                    usb_device: UsbDeviceKey::BusAddr(2, 3),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn usb_smart_cards_of_a_missing_root_is_empty() {
+        let sys = FakeSysfs::new("missing");
+        assert!(usb_smart_cards_in(&sys.0.join("absent")).is_empty());
     }
 }
 

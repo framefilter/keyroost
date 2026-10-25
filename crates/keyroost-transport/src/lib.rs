@@ -1125,6 +1125,43 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
     Ok(out)
 }
 
+/// Which physical USB device each listed PC/SC reader belongs to, one entry per
+/// reader, `None` where it can't be told. Sends no APDU: on Linux and macOS
+/// each reader is connected shared, its `CHANNEL_ID` read, and the connection
+/// released with `LeaveCard`; on Windows the device tree answers without a
+/// connection. A Molto2 reader is never connected (see [`probe_readers`]), so
+/// its entry is `None`, as is a reader that can't be connected.
+///
+/// For a caller that doesn't probe the readers anyway (`doctor`); a scan that
+/// runs [`probe_readers`] already has these in [`ReaderProbe::usb_device`].
+/// Only PC/SC-service failures error.
+pub fn reader_usb_devices() -> Result<Vec<Option<UsbDeviceKey>>, TransportError> {
+    let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
+    let mut buf = [0u8; 4096];
+    let names: Vec<std::ffi::CString> = ctx
+        .list_readers(&mut buf)
+        .map_err(TransportError::PcscUnavailable)?
+        .map(|r| r.to_owned())
+        .collect();
+    let tree = reader_devtree_keys(&names);
+    Ok(names
+        .into_iter()
+        .zip(tree)
+        .map(|(name, (tree_key, _))| {
+            if cfg!(windows) || keyroost_proto::is_molto2_reader(&name.to_string_lossy()) {
+                return tree_key;
+            }
+            let card = ctx
+                .connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY)
+                .ok()?;
+            let key = read_channel_id(&card);
+            // Release without resetting (pcsc's `Drop` would reset the card).
+            let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+            key
+        })
+        .collect())
+}
+
 /// One PC/SC reader, probed in a single connection: which applets it answers,
 /// plus YubiKey serial/topology when it is a YubiKey. Molto2 readers are flagged
 /// but deliberately *not* connected.

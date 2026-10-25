@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey};
+use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey, UsbSmartCard};
 use keyroost_keyring::Keyring;
 use keyroost_proto::trace::{format_line, Dir};
 use keyroost_transport::identity::InitAnswer;
@@ -124,6 +124,10 @@ pub struct Device {
     /// How the row is named (see [`crate::names::apply_names`]); `name` is
     /// the text to show.
     pub naming: Naming,
+    /// The key has a smart-card interface, but the smart-card service lists
+    /// no reader for it (Linux only; see [`smart_cards_without_reader`]).
+    /// `false` whenever that can't be shown, including when PC/SC is down.
+    pub smart_card_unlisted: bool,
 }
 
 impl Device {
@@ -686,6 +690,7 @@ pub fn correlate_with(
             reader: Some(p.reader_name.clone()),
             hid_serial: None,
             naming: Naming::default(),
+            smart_card_unlisted: false,
         });
     }
 
@@ -713,6 +718,7 @@ pub fn correlate_with(
             reader: Some(p.reader_name.clone()),
             hid_serial: None,
             naming: Naming::default(),
+            smart_card_unlisted: false,
         });
     }
 
@@ -789,6 +795,7 @@ pub fn correlate_with(
             reader: Some(p.reader_name.clone()),
             hid_serial: None,
             naming: Naming::default(),
+            smart_card_unlisted: false,
         });
     }
 
@@ -944,6 +951,7 @@ pub fn correlate_with(
                 reader: reader_name,
                 hid_serial: None,
                 naming: Naming::default(),
+                smart_card_unlisted: false,
             });
         }
     }
@@ -1430,10 +1438,83 @@ pub fn add_key_names(devices: &mut [Device], debug: bool) {
     name_from_keys(devices, &keyring, may_save, debug);
 }
 
+/// The USB smart cards (see [`keyroost_hid::usb_smart_cards`]) that no
+/// listed reader belongs to, given each listed reader's USB device. Empty
+/// when any reader's device is unknown (`None`): that reader might be any of
+/// the cards, so nothing is proven.
+#[must_use]
+pub fn smart_cards_without_reader(
+    cards: &[UsbSmartCard],
+    readers: &[Option<UsbDeviceKey>],
+) -> Vec<UsbSmartCard> {
+    if readers.iter().any(Option::is_none) {
+        return Vec::new();
+    }
+    cards
+        .iter()
+        .filter(|c| {
+            !readers
+                .iter()
+                .any(|r| same_usb_device(r.as_ref(), Some(&c.usb_device)))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Set [`Device::smart_card_unlisted`] on each row whose FIDO HID node is on
+/// the same USB device as a smart card no reader belongs to. `readers` is
+/// each listed reader's USB device, or `None` when PC/SC couldn't be asked:
+/// then no row is marked.
+fn mark_smart_card_unlisted(
+    devices: &mut [Device],
+    hids: &[HidDevice],
+    cards: &[UsbSmartCard],
+    readers: Option<&[Option<UsbDeviceKey>]>,
+) {
+    let unlisted = match readers {
+        Some(readers) => smart_cards_without_reader(cards, readers),
+        None => Vec::new(),
+    };
+    for d in devices {
+        let hid = d
+            .hid_path
+            .as_ref()
+            .and_then(|path| hids.iter().find(|h| &h.path == path));
+        d.smart_card_unlisted = hid.is_some_and(|h| {
+            unlisted
+                .iter()
+                .any(|c| same_usb_device(h.usb_device.as_ref(), Some(&c.usb_device)))
+        });
+    }
+}
+
+/// [`mark_smart_card_unlisted`] for a live scan: the readers' USB devices
+/// come from the probe the scan already ran (no second connection), and the
+/// smart cards from sysfs (Linux only; elsewhere none, so nothing is marked).
+fn mark_live_smart_cards(
+    devices: &mut [Device],
+    hids: &[HidDevice],
+    probes: &[ReaderProbe],
+    pcsc_up: bool,
+) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let readers: Vec<Option<UsbDeviceKey>> = probes.iter().map(|p| p.usb_device.clone()).collect();
+    mark_smart_card_unlisted(
+        devices,
+        hids,
+        &keyroost_hid::usb_smart_cards(),
+        pcsc_up.then_some(readers.as_slice()),
+    );
+}
+
 /// Build the unified device list (see [`enumerate`]) with options.
 pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
     let hids = keyroost_hid::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
-    let probes = keyroost_transport::probe_readers().unwrap_or_default();
+    let probed = keyroost_transport::probe_readers();
+    let pcsc_up = probed.is_ok();
+    let probes = probed.unwrap_or_default();
     let (keyring, may_save) = load_keyring_for_scan(opts.debug);
     if opts.skip_identity_reads {
         // A quick re-check scan uses INIT answers already known; it asks no
@@ -1441,6 +1522,7 @@ pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
         let mut devices = correlate(&hids, &probes, &keyring);
         let (u2f_only, unknown) = fido_protocol_paths(&hids, opts.may_ask_protocol(), opts.debug);
         mark_fido_protocol(&mut devices, &u2f_only, &unknown);
+        mark_live_smart_cards(&mut devices, &hids, &probes, pcsc_up);
         return Ok(devices);
     }
     let mut devices = correlate_live_asking(
@@ -1450,6 +1532,7 @@ pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
         opts.debug,
         opts.may_ask_protocol(),
     );
+    mark_live_smart_cards(&mut devices, &hids, &probes, pcsc_up);
     if !opts.skip_key_names {
         name_from_keys(&mut devices, &keyring, may_save, opts.debug);
     }
@@ -1788,6 +1871,83 @@ mod tests {
             usb_device: UsbDeviceKey::from_bus_addr(bus, addr),
             usb_product: None,
         }
+    }
+
+    fn smart_card(bus: u8, addr: u8) -> UsbSmartCard {
+        UsbSmartCard {
+            vendor_id: 0x349e,
+            product_id: 0x0024,
+            product_name: "PIN+ Key".into(),
+            usb_device: UsbDeviceKey::BusAddr(bus, addr),
+        }
+    }
+
+    #[test]
+    fn a_smart_card_with_a_listed_reader_is_not_unlisted() {
+        let cards = [smart_card(1, 7)];
+        let readers = [Some(UsbDeviceKey::BusAddr(1, 7))];
+        assert!(smart_cards_without_reader(&cards, &readers).is_empty());
+    }
+
+    #[test]
+    fn a_smart_card_no_reader_matches_is_unlisted() {
+        let cards = [smart_card(1, 7), smart_card(1, 9)];
+        let readers = [Some(UsbDeviceKey::BusAddr(1, 7))];
+        assert_eq!(
+            smart_cards_without_reader(&cards, &readers),
+            vec![smart_card(1, 9)]
+        );
+        // No readers at all: every card is unlisted.
+        assert_eq!(
+            smart_cards_without_reader(&cards, &[]),
+            cards.to_vec(),
+            "no reader listed"
+        );
+    }
+
+    #[test]
+    fn a_reader_of_unknown_device_suppresses_every_hint() {
+        // That reader might be either card, so nothing is proven.
+        let cards = [smart_card(1, 7), smart_card(1, 9)];
+        let readers = [Some(UsbDeviceKey::BusAddr(1, 7)), None];
+        assert!(smart_cards_without_reader(&cards, &readers).is_empty());
+    }
+
+    #[test]
+    fn the_key_row_of_an_unlisted_smart_card_is_marked() {
+        let hids = [
+            hid(0x349e, 0x0024, "/dev/hidraw0", None, Some(1), Some(9)),
+            hid(0x1050, 0x0407, "/dev/hidraw1", None, Some(1), Some(7)),
+        ];
+        let mut devs = correlate(&hids, &[], &Keyring::default());
+        assert!(devs.iter().all(|d| !d.smart_card_unlisted), "default off");
+        let cards = [smart_card(1, 7), smart_card(1, 9)];
+        let readers = [Some(UsbDeviceKey::BusAddr(1, 7))];
+        mark_smart_card_unlisted(&mut devs, &hids, &cards, Some(&readers));
+        let marked: Vec<_> = devs
+            .iter()
+            .filter(|d| d.smart_card_unlisted)
+            .map(|d| d.hid_path.clone())
+            .collect();
+        assert_eq!(marked, vec![Some(PathBuf::from("/dev/hidraw0"))]);
+    }
+
+    #[test]
+    fn no_smart_card_hint_when_pcsc_is_down() {
+        let hids = [hid(0x349e, 0x0024, "/dev/hidraw0", None, Some(1), Some(9))];
+        let mut devs = correlate(&hids, &[], &Keyring::default());
+        let cards = [smart_card(1, 9)];
+        mark_smart_card_unlisted(&mut devs, &hids, &cards, None);
+        assert!(!devs[0].smart_card_unlisted);
+    }
+
+    #[test]
+    fn no_smart_card_hint_when_a_reader_device_is_unknown() {
+        let hids = [hid(0x349e, 0x0024, "/dev/hidraw0", None, Some(1), Some(9))];
+        let mut devs = correlate(&hids, &[], &Keyring::default());
+        let cards = [smart_card(1, 9)];
+        mark_smart_card_unlisted(&mut devs, &hids, &cards, Some(&[None]));
+        assert!(!devs[0].smart_card_unlisted);
     }
 
     #[test]

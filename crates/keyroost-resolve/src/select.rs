@@ -823,6 +823,7 @@ mod tests {
             reader: reader.map(str::to_owned),
             hid_serial: None,
             naming: Naming::local(name),
+            smart_card_unlisted: false,
         }
     }
     fn yubi() -> Device {

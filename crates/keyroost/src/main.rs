@@ -9586,6 +9586,7 @@ impl App {
                                         reader: None,
                                         hid_serial: None,
                                         naming: Default::default(),
+                                        smart_card_unlisted: false,
                                     });
                                 }
                             }
@@ -14204,6 +14205,15 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
 /// Height of one device card in the full list.
 const DEVICE_CARD_H: f32 = 68.0;
 
+/// The muted line under a key's card when its smart-card part has no reader
+/// listed (Linux; [`Device::smart_card_unlisted`]). Held back while the scan
+/// burst after a plug-in runs (`pending_scans`), since a key's reader can
+/// register a beat after the key itself.
+fn no_reader_line(dev: &Device, pending_scans: u8) -> Option<&'static str> {
+    (dev.smart_card_unlisted && pending_scans == 0)
+        .then_some("Smart-card features unavailable: no reader is listed for this key.")
+}
+
 /// The key's square tile: an amber clock for programmable tokens, else the
 /// first letter of the vendor. Shared by the card and the rail.
 fn paint_device_tile(ui: &egui::Ui, p: &Palette, dev: &Device, tile: egui::Rect) {
@@ -16117,6 +16127,7 @@ impl App {
                         );
                     });
                 }
+                let pending_scans = self.pending_scans;
                 for dev in self
                     .devices
                     .iter()
@@ -16125,6 +16136,13 @@ impl App {
                     let selected = self.selected_device.as_deref() == Some(dev.id.as_str());
                     if device_row(ui, p, dev, selected) {
                         ev.picked = Some(dev.id.clone());
+                    }
+                    if let Some(line) = no_reader_line(dev, pending_scans) {
+                        ui.label(
+                            egui::RichText::new(line)
+                                .font(theme::f_reg(11.5))
+                                .color(p.txt3),
+                        );
                     }
                     ui.add_space(2.0);
                 }
@@ -30309,7 +30327,20 @@ mod tests {
             reader: None,
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         }
+    }
+
+    #[test]
+    fn no_reader_line_waits_for_the_scan_burst() {
+        let mut dev = test_key("k", "1", None);
+        assert_eq!(no_reader_line(&dev, 0), None, "reader listed");
+        dev.smart_card_unlisted = true;
+        assert_eq!(no_reader_line(&dev, 2), None, "burst still running");
+        assert_eq!(
+            no_reader_line(&dev, 0),
+            Some("Smart-card features unavailable: no reader is listed for this key.")
+        );
     }
 
     /// Issue #84: a FIDO2 card in a reader must take the in-place reset route,
@@ -31210,6 +31241,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            smart_card_unlisted: false,
         }
     }
 

@@ -365,6 +365,7 @@ mod tests {
             reader: None,
             hid_serial: None,
             naming: Naming::default(),
+            smart_card_unlisted: false,
         }
     }
 

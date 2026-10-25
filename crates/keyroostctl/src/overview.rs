@@ -193,6 +193,7 @@ mod tests {
             reader: None,
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         }
     }
 
