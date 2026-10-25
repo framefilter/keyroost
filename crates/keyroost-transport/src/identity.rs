@@ -96,9 +96,10 @@ pub enum InitAnswer {
     /// invalid channel or sequence). Nothing is known about the key; worth
     /// asking again.
     NotOpened,
-    /// The interface opened, but INIT timed out or the reply was malformed
-    /// (too short, too long, wrong command, nonce mismatch, out of sequence)
-    /// or another device error.
+    /// The interface opened, but INIT timed out, the reply was malformed
+    /// (too short, too long, wrong command, out of sequence) or it was
+    /// another device error. An INIT answer carrying another program's
+    /// nonce is skipped, not counted.
     NoProperAnswer,
 }
 
@@ -125,7 +126,6 @@ pub fn init_answer_from(
         Err(
             E::Timeout
             | E::InitResponseTooShort
-            | E::NonceMismatch
             | E::UnexpectedCommand { .. }
             | E::OutOfSequence { .. }
             | E::PayloadTooLarge(_),
@@ -416,7 +416,6 @@ mod tests {
         for no_proper_answer in [
             E::Timeout,
             E::InitResponseTooShort,
-            E::NonceMismatch,
             E::UnexpectedCommand {
                 expected: 0x86,
                 got: 0x83,

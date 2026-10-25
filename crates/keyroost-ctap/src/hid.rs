@@ -110,7 +110,6 @@ pub enum HidTransportError {
         got: u8,
     },
     DeviceError(u8),
-    NonceMismatch,
     /// A cooperative cancel was requested (see [`CtapHidDevice::set_cancel_flag`])
     /// while waiting on the device.
     Cancelled,
@@ -146,9 +145,6 @@ impl std::fmt::Display for HidTransportError {
                 Some((name, hint)) => write!(f, "{} (CTAPHID error 0x{:02X} {})", hint, c, name),
                 None => write!(f, "device reported CTAPHID_ERROR code 0x{:02X}", c),
             },
-            HidTransportError::NonceMismatch => {
-                write!(f, "CTAPHID_INIT response carried the wrong nonce")
-            }
             HidTransportError::Cancelled => write!(f, "operation cancelled"),
             HidTransportError::Backend(s) => write!(f, "HID backend error: {}", s),
         }
@@ -552,28 +548,35 @@ impl CtapHidDevice {
             eprintln!("{}", ctap_line(Dir::Sent, CTAPHID_INIT, nonce.len(), &body));
         }
         self.send(CTAPHID_BROADCAST_CID, CTAPHID_INIT, &nonce)?;
-        let resp = self.recv(CTAPHID_BROADCAST_CID, CTAPHID_INIT)?;
-        if ctap_trace_enabled() {
-            let body = hexline(&resp);
-            eprintln!(
-                "{}",
-                ctap_line(Dir::Received, CTAPHID_INIT, resp.len(), &body)
-            );
+        // One deadline for the whole exchange, so answers meant for others
+        // can't keep it open.
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let resp = self.recv_by(CTAPHID_BROADCAST_CID, CTAPHID_INIT, deadline)?;
+            if ctap_trace_enabled() {
+                let body = hexline(&resp);
+                eprintln!(
+                    "{}",
+                    ctap_line(Dir::Received, CTAPHID_INIT, resp.len(), &body)
+                );
+            }
+            if resp.len() < 17 {
+                return Err(HidTransportError::InitResponseTooShort);
+            }
+            // Another program's INIT answer on the broadcast channel: skip
+            // it, like a frame on another channel.
+            if resp[..8] != nonce {
+                continue;
+            }
+            return Ok(InitResponse {
+                channel_id: u32::from_be_bytes([resp[8], resp[9], resp[10], resp[11]]),
+                protocol_version: resp[12],
+                device_major: resp[13],
+                device_minor: resp[14],
+                device_build: resp[15],
+                capabilities: resp[16],
+            });
         }
-        if resp.len() < 17 {
-            return Err(HidTransportError::InitResponseTooShort);
-        }
-        if resp[..8] != nonce {
-            return Err(HidTransportError::NonceMismatch);
-        }
-        Ok(InitResponse {
-            channel_id: u32::from_be_bytes([resp[8], resp[9], resp[10], resp[11]]),
-            protocol_version: resp[12],
-            device_major: resp[13],
-            device_minor: resp[14],
-            device_build: resp[15],
-            capabilities: resp[16],
-        })
     }
 
     fn send(&mut self, cid: u32, cmd: u8, payload: &[u8]) -> Result<(), HidTransportError> {
@@ -634,7 +637,18 @@ impl CtapHidDevice {
     }
 
     fn recv(&mut self, expected_cid: u32, expected_cmd: u8) -> Result<Vec<u8>, HidTransportError> {
-        let mut deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + self.timeout;
+        self.recv_by(expected_cid, expected_cmd, deadline)
+    }
+
+    /// [`Self::recv`] with the deadline given; a KEEPALIVE still pushes it
+    /// out.
+    fn recv_by(
+        &mut self,
+        expected_cid: u32,
+        expected_cmd: u8,
+        mut deadline: Instant,
+    ) -> Result<Vec<u8>, HidTransportError> {
         let mut buf = [0u8; CTAPHID_REPORT_SIZE];
 
         loop {
@@ -1149,6 +1163,78 @@ mod tests {
         dev.set_keepalive_hook(Box::new(move |status| log.lock().unwrap().push(status)));
         assert_eq!(dev.transact(CTAPHID_CBOR, &[0x04]).unwrap(), vec![0x00]);
         assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+    }
+
+    /// A CTAPHID_INIT answer on the broadcast channel echoing `nonce` and
+    /// assigning channel `cid`.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    fn init_answer(nonce: &[u8], cid: u32) -> [u8; CTAPHID_REPORT_SIZE] {
+        let mut f = [0u8; CTAPHID_REPORT_SIZE];
+        f[..4].copy_from_slice(&CTAPHID_BROADCAST_CID.to_be_bytes());
+        f[4] = CTAPHID_INIT;
+        f[6] = 17; // BCNT
+        f[7..15].copy_from_slice(nonce);
+        f[15..19].copy_from_slice(&cid.to_be_bytes());
+        f[19] = 2; // CTAPHID protocol version
+        f[23] = CAPABILITY_CBOR;
+        f
+    }
+
+    /// Read the INIT request `do_init` wrote and return its nonce.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    fn read_init_nonce(peer: &mut std::os::unix::net::UnixStream) -> [u8; 8] {
+        use std::io::Read;
+        let mut req = [0u8; CTAPHID_REPORT_SIZE + 1];
+        peer.read_exact(&mut req).unwrap();
+        assert_eq!(req[5], CTAPHID_INIT);
+        req[8..16].try_into().unwrap()
+    }
+
+    /// Another program's INIT answer on the broadcast channel (a different
+    /// nonce) is skipped like a frame on another channel; ours still lands.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    #[test]
+    fn init_skips_an_answer_carrying_another_nonce() {
+        let (mut dev, mut peer) = paired_device(Duration::from_millis(500));
+        let device = std::thread::spawn(move || {
+            let nonce = read_init_nonce(&mut peer);
+            let mut other = nonce;
+            other[0] ^= 0xFF;
+            queue_frames(
+                &mut peer,
+                &[
+                    init_answer(&other, 0x0BAD_0BAD),
+                    init_answer(&nonce, 0x0000_0042),
+                ],
+            );
+            peer
+        });
+        let init = dev.do_init().expect("our answer follows the foreign one");
+        assert_eq!(init.channel_id, 0x0000_0042);
+        assert!(init.supports_cbor());
+        drop(device.join().unwrap());
+    }
+
+    /// Answers carrying only other nonces never end INIT early; it ends at
+    /// the timeout.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    #[test]
+    fn init_with_only_foreign_answers_times_out() {
+        let (mut dev, mut peer) = paired_device(Duration::from_millis(300));
+        let device = std::thread::spawn(move || {
+            let mut other = read_init_nonce(&mut peer);
+            other[0] ^= 0xFF;
+            queue_frames(&mut peer, &[init_answer(&other, 7), init_answer(&other, 8)]);
+            peer
+        });
+        let start = Instant::now();
+        let res = dev.do_init();
+        assert!(
+            matches!(res, Err(HidTransportError::Timeout)),
+            "expected Timeout, got {res:?}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        drop(device.join().unwrap());
     }
 
     /// A `CtapHidDevice` on one end of a socketpair (channel 1) and the raw
