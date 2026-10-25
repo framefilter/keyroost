@@ -274,6 +274,18 @@ pub(crate) fn select_fido(path: Option<&Path>) -> Result<Device, Box<dyn Error>>
     })
 }
 
+/// Select a FIDO key over USB or a smart-card reader, adding the bootloader
+/// hint when none is found.
+pub(crate) fn select_fido_any(
+    reader: Option<&str>,
+    path: Option<&Path>,
+) -> Result<Device, Box<dyn Error>> {
+    select(Need::FidoAny, reader, path).map_err(|e| {
+        let bl = keyroost_hid::bootloader_device_present().map(|b| b.to_string());
+        add_bootloader_hint(e, bl.as_deref())
+    })
+}
+
 /// The HID path of the selected FIDO key.
 pub(crate) fn fido_path(path: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
     hid_path_of(&select_fido(path)?)

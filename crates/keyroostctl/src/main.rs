@@ -2610,8 +2610,8 @@ enum MoltoCustomerKeyCmd {
     },
 }
 
-/// FIDO2 / CTAP2 subcommands. These talk to the key over USB HID (`fido reset
-/// --reader` can use a smart-card reader instead).
+/// FIDO2 / CTAP2 subcommands. These talk to the key over USB HID (`fido info
+/// --reader` and `fido reset --reader` can use a smart-card reader instead).
 #[derive(Subcommand)]
 enum FidoCmd {
     /// Show the key's FIDO2 capabilities and settings.
@@ -13065,15 +13065,15 @@ fn fido_reverify_with<I: crate::secrets::SecretIo>(
 fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         FidoCmd::Info { path, reader } => {
-            let dev = crate::target::select(Need::FidoAny, reader.as_deref(), path.as_deref())?;
+            let dev = crate::target::select_fido_any(reader.as_deref(), path.as_deref())?;
             match fido_route(&dev, reader.is_some())? {
                 FidoRoute::Card { reader } => run_fido_info_reader(&reader)?,
-                FidoRoute::Hid { path } => run_fido_info(Some(&path))?,
+                FidoRoute::Hid { path } => run_fido_info(&path)?,
             }
             Ok(())
         }
         FidoCmd::Reset { yes, path, reader } => {
-            let dev = crate::target::select(Need::FidoAny, reader.as_deref(), path.as_deref())?;
+            let dev = crate::target::select_fido_any(reader.as_deref(), path.as_deref())?;
             // The USB ids are what a key with no serial is re-found by after
             // the replug; read them now, while the key is surely connected,
             // not after a question the user may answer with it unplugged.
@@ -14360,9 +14360,8 @@ fn run_fido_info_reader(reader: &str) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let path = crate::target::fido_path(path)?;
-    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+fn run_fido_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(path)?;
     let json = json_output();
     let mut caps = Vec::new();
     if init.supports_wink() {
@@ -14498,9 +14497,9 @@ enum FidoRoute {
     Card { reader: String },
 }
 
-/// Pick the route to `dev`'s FIDO2 applet: HID when the key
-/// has a FIDO HID node, unless `--reader` asked for the card interface (or
-/// there is no HID node, as for a card in a reader).
+/// Pick the route to `dev`'s FIDO2 applet: HID when the key has a FIDO HID
+/// node, unless `--reader` asked for the card interface (or there is no HID
+/// node, as for a card in a reader).
 fn fido_route(dev: &keyroost_resolve::Device, reader_given: bool) -> Result<FidoRoute, String> {
     match (&dev.hid_path, &dev.reader) {
         (Some(path), _) if !reader_given => Ok(FidoRoute::Hid { path: path.clone() }),
@@ -18294,7 +18293,7 @@ mod cli_tests {
     }
 
     #[test]
-    fn fido_route_prefers_replug_unless_a_reader_was_asked_for() {
+    fn fido_route_prefers_hid_unless_a_reader_was_asked_for() {
         use keyroost_resolve::{Caps, Device, DeviceKind};
         let mut caps = Caps::default();
         caps.insert(Caps::FIDO2);

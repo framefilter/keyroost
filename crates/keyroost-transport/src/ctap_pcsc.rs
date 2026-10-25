@@ -414,7 +414,9 @@ mod tests {
             assert!(info_unless_u2f_only(&mut Reply(Err(err)), true).is_err());
         }
         // Not a U2F_V2 selection: the error passes through.
-        assert!(info_unless_u2f_only(&mut Reply(Err(apdu(0x6D, 0x00))), false).is_err());
+        for err in [apdu(0x6D, 0x00), apdu(0x6E, 0x00), CtapError::StatusCode(1)] {
+            assert!(info_unless_u2f_only(&mut Reply(Err(err)), false).is_err());
+        }
         assert!(info_unless_u2f_only(&mut Reply(Ok(vec![0, 0xff])), true).is_err());
     }
 
