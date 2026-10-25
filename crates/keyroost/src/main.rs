@@ -13062,29 +13062,20 @@ fn piv_move_dest_note(occupancy: PivOccupancy, slot: &str) -> Option<String> {
         .then(|| format!("keyroost can't tell whether {slot} holds a key; the card decides."))
 }
 
-/// Whether a slot-emptiness-sensitive button should dim specifically because
-/// the active slot is confirmed empty — the narrower criterion
-/// `keyroost_piv::compat::PivExtension::GetSlotKeyStatus` unlocks. Shared by
-/// "Delete key" (distinct from "Delete certificate"'s `selected_has_cert`
-/// check — a different object, gated by a different extension) and "Import
-/// certificate" (which has no separate firmware gate of its own to check
-/// first, unlike "Delete key" — see that button's call site for why this is
-/// only meaningful there once `delete_key_gate` itself isn't
-/// `FeatureGate::Unsupported`).
+/// Whether the active slot is confirmed empty — the narrower criterion
+/// `keyroost_piv::compat::PivExtension::GetSlotKeyStatus` unlocks. "Delete
+/// key" dims on it, and the certificate-import dialog adds its keyless note
+/// on it.
 ///
 /// `true` only when `get_slot_key_status_gate` resolves
 /// [`FeatureGate::Supported`](keyroost_piv::compat::FeatureGate::Supported)
-/// *and* `selected_has_key` is `false` — this device has a confirmed,
+/// *and* `selected_has_key` is `false`: this device has a confirmed,
 /// device-reported way to know slot occupancy (GET METADATA, or HID
 /// Crescendo's own GET PIV PROPERTIES), and it says this slot has no key.
-/// Every other combination — the gate isn't `Supported`, or it is and the
-/// slot does hold a key — leaves the button enabled: without a reliable
-/// device signal, a `None` algorithm reading could just as easily mean
-/// "this device can't tell us" as "genuinely empty" (see
-/// [`keyroost_piv::compat::PivExtension::GetSlotKeyStatus`]'s doc), and
-/// hiding a real capability on a guess is worse than occasionally offering a
-/// delete that fails deep with "slot has no key", or an import that a
-/// key loaded out-of-band this session can't see would in fact have matched.
+/// Every other combination leaves the button enabled and the note off:
+/// without a reliable device signal, a `None` algorithm reading could just as
+/// easily mean "this device can't tell us" as "genuinely empty" (see
+/// [`keyroost_piv::compat::PivExtension::GetSlotKeyStatus`]'s doc).
 #[must_use]
 fn slot_confirmed_empty(
     get_slot_key_status_gate: keyroost_piv::compat::FeatureGate,
@@ -13092,6 +13083,20 @@ fn slot_confirmed_empty(
 ) -> bool {
     use keyroost_piv::compat::FeatureGate;
     get_slot_key_status_gate == FeatureGate::Supported && !selected_has_key
+}
+
+/// The note the certificate-import dialog shows for a slot that holds no key:
+/// `Some` only when this device confirms the slot is empty (the same
+/// [`slot_confirmed_empty`] gate as "Delete key"), so a slot that merely
+/// can't be read never gets a claim about it.
+#[must_use]
+fn cert_import_note(
+    get_slot_key_status_gate: keyroost_piv::compat::FeatureGate,
+    selected_has_key: bool,
+    slot: keyroost_piv::Slot,
+) -> Option<String> {
+    slot_confirmed_empty(get_slot_key_status_gate, selected_has_key)
+        .then(|| keyroost_piv::keyless_cert_note(slot))
 }
 
 fn move_key_eligible_destinations(
@@ -20643,6 +20648,33 @@ impl App {
         // and (set by its fields below) whether the file is open and this key
         // can take it, which enables Import.
         let selected_has_cert = self.piv_selected_test_target().1;
+        let cert_note = {
+            let (fp, ver, fw_ver) = self.piv.status.as_ref().map_or(
+                (
+                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                    None,
+                    None,
+                ),
+                |s| {
+                    (
+                        s.applet_fingerprint,
+                        s.version.as_deref(),
+                        s.version_firmware.as_deref(),
+                    )
+                },
+            );
+            let gate = self.piv_gate(
+                keyroost_piv::compat::PivExtension::GetSlotKeyStatus,
+                fp,
+                ver,
+                fw_ver,
+            );
+            cert_import_note(
+                gate,
+                self.piv_selected_occupied(),
+                self.piv.selected_slot.to_slot(),
+            )
+        };
         let mut import_ready = true;
 
         // Move-key flow: precompute the source slot and the eligible destination
@@ -20883,6 +20915,9 @@ impl App {
                                     p,
                                     &format!("This replaces the certificate currently in {slot}."),
                                 );
+                            }
+                            if let Some(note) = &cert_note {
+                                card_note(ui, p, note);
                             }
                             card_note(ui, p, "Authorizes writing the certificate to the slot.");
                         }
@@ -23721,15 +23756,6 @@ impl App {
             "This slot has no key to move \u{2014} generate one in this slot first.";
         let no_del_cert_hint = "This slot holds no certificate to delete.";
         let no_del_key_hint = "This slot holds no key to delete.";
-        // "Import certificate" dims only when this device *confirms* the
-        // slot is empty (same `slot_confirmed_empty` gate as "Delete key" —
-        // see its doc): a certificate can't possibly match a key this slot
-        // doesn't hold. When occupancy can't be confirmed, the button stays
-        // enabled — a matching key may have been loaded out of band and this
-        // session just can't see it; `PivSession::import_certificate` itself
-        // still compares against whatever key it *can* find before writing.
-        let no_import_cert_hint = "This slot has no key for a certificate to match \u{2014} \
-             generate or move one into this slot first.";
         // --- Slot sub-tab strip ---------------------------------------------
         // Each PIV slot is a tab (the same strip as FIDO2 and OpenPGP).
         // Clicking a tab selects that slot; every action card below targets
@@ -24343,17 +24369,9 @@ impl App {
                                 .on_hover_text(no_slot_cert_hint);
                         }
                         ui.add_space(8.0);
-                        if slot_confirmed_empty(get_slot_key_status_gate, selected_has_key) {
-                            theme::button_disabled(ui, p, "Import certificate\u{2026}")
-                                .on_hover_text(no_import_cert_hint);
-                        } else if theme::button(
-                            ui,
-                            p,
-                            BtnKind::Default,
-                            "Import certificate\u{2026}",
-                        )
-                        .clicked()
-                        {
+                        if theme::button(ui, p, BtnKind::Default, "Import certificate\u{2026}")
+                            .clicked()
+                                                {
                             open_import = true;
                         }
                     },
@@ -29203,6 +29221,23 @@ mod tests {
         // `GetSlotKeyStatus` rather than trusting `selected_has_key` alone.
         assert!(!slot_confirmed_empty(FeatureGate::Unverified, false));
         assert!(!slot_confirmed_empty(FeatureGate::Unsupported, false));
+    }
+
+    #[test]
+    fn cert_import_note_only_for_a_confirmed_empty_slot() {
+        use keyroost_piv::compat::FeatureGate;
+        let slot = keyroost_piv::Slot::Authentication;
+        let note = cert_import_note(FeatureGate::Supported, false, slot);
+        assert_eq!(
+            note.as_deref(),
+            Some(keyroost_piv::keyless_cert_note(slot).as_str())
+        );
+        assert_eq!(cert_import_note(FeatureGate::Supported, true, slot), None);
+        assert_eq!(cert_import_note(FeatureGate::Unverified, false, slot), None);
+        assert_eq!(
+            cert_import_note(FeatureGate::Unsupported, false, slot),
+            None
+        );
     }
 
     /// Given occupancy (slot -> has_key), the eligible move destinations are the

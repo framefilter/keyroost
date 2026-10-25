@@ -10382,6 +10382,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
+                    let keyless = s.slot_key_presence(slot.to_slot())
+                        == keyroost_transport::SlotKeyPresence::NoKey;
                     let choice = compression.choice();
                     let stored = s
                         .import_certificate(slot.to_slot(), &der, choice)
@@ -10394,6 +10396,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         ),
                         &stored,
                     );
+                    if keyless {
+                        output::note(&keyroost_piv::keyless_cert_note(slot.to_slot()));
+                    }
                     Ok(())
                 },
             )?;

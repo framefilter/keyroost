@@ -224,6 +224,16 @@ pub enum Slot {
     Retired(u8),
 }
 
+/// The note both front ends show when a certificate goes into a slot that
+/// holds no key: the slot as its two-hex key reference, then what follows.
+#[must_use]
+pub fn keyless_cert_note(slot: Slot) -> String {
+    format!(
+        "Slot {:02X} has no key. This certificate won't work until a matching key is put in this slot.",
+        slot.key_ref()
+    )
+}
+
 impl Slot {
     /// The key-reference byte (`9A`/`9C`/`9D`/`9E`, or `82`..=`95` for retired).
     #[must_use]
@@ -2441,6 +2451,18 @@ pub fn read_ber_len(buf: &[u8]) -> Result<(usize, usize), ParseError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyless_cert_note_wording() {
+        assert_eq!(
+            keyless_cert_note(Slot::Authentication),
+            "Slot 9A has no key. This certificate won't work until a matching key is put in this slot."
+        );
+        assert_eq!(
+            keyless_cert_note(Slot::retired(1).unwrap()),
+            "Slot 82 has no key. This certificate won't work until a matching key is put in this slot."
+        );
+    }
+
     use super::*;
 
     #[test]
