@@ -1153,6 +1153,10 @@ pub struct ReaderProbe {
     /// reader (NFC or contact). Lets the GUI offer the FIDO2 tab for reader-
     /// attached keys, served by [`CtapPcscDevice`].
     pub has_fido: bool,
+    /// The FIDO applet's SELECT answer named CTAP2 (`FIDO_2_0`). `U2F_V2`
+    /// doesn't settle it: keys that speak both protocols answer it too
+    /// (CTAP 2.1, 11.3.3).
+    pub fido_ctap2_confirmed: bool,
     /// True when the card answers a SELECT of the Token2 on-device OTP applet
     /// (`F00000014F747001`). Detected by actually selecting the applet rather
     /// than guessing from the reader name, so the OTP tab is offered only for
@@ -1284,6 +1288,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 has_openpgp: false,
                 has_piv: false,
                 has_fido: false,
+                fido_ctap2_confirmed: false,
                 has_otp: false,
                 is_prog: false,
                 prog_serial: None,
@@ -1303,6 +1308,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             has_openpgp: false,
             has_piv: false,
             has_fido: false,
+            fido_ctap2_confirmed: false,
             has_otp: false,
             is_prog: false,
             prog_serial: None,
@@ -1351,10 +1357,21 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             // FIDO2/U2F: a SELECT of the FIDO applet that the card accepts means
             // a security key is reachable over this reader (NFC or contact), to
             // be driven by CtapPcscDevice.
-            probe.has_fido = answers(
-                "fido",
-                keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
-            );
+            let fido_select =
+                keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID);
+            let fido_answer = transmit_apdu(&card, &fido_select);
+            if trace {
+                match &fido_answer {
+                    Ok((_, s1, s2)) => probe_note(&format!("fido select -> {s1:02X}{s2:02X}")),
+                    Err(e) => probe_note(&format!("fido select -> error: {e}")),
+                }
+            }
+            if let Ok((data, s1, s2)) = fido_answer {
+                probe.has_fido = sw_ok(s1, s2) || s1 == 0x61 || s1 == 0x6C;
+                // U2F_V2 doesn't mean U2F only. A continuation or any other
+                // answer leaves CTAP2 unconfirmed.
+                probe.fido_ctap2_confirmed = sw_ok(s1, s2) && data == b"FIDO_2_0";
+            }
             // Token2 on-device OTP applet — select it to confirm presence,
             // rather than inferring from the reader name (which mislabels any
             // key on a "Token2" reader as having OTP).

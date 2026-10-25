@@ -277,6 +277,21 @@ mod tests {
         assert!(d.tabs().contains(&CapTab::Overview));
     }
 
+    /// A key whose FIDO protocol isn't known shows "FIDO2?" like an
+    /// unverified OTP: the tab is still offered, marked unverified.
+    #[test]
+    fn unknown_fido_protocol_keeps_an_unverified_fido2_tab() {
+        let mut d = dev(true, true, KeyLabel::default());
+        d.caps.insert(Caps::FIDO_PROTOCOL_UNKNOWN);
+        d.unverified.insert(Caps::FIDO2);
+        assert!(d.tabs().contains(&CapTab::Fido2));
+        assert!(d.tab_unverified(CapTab::Fido2));
+        assert_eq!(
+            d.cap_badge_states().first(),
+            Some(&("FIDO2", CapState::Unverified))
+        );
+    }
+
     #[test]
     fn store_choices_fido_with_large_blob_offers_both() {
         for l in [

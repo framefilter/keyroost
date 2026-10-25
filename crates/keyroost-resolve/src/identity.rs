@@ -662,6 +662,7 @@ mod tests {
             has_openpgp: false,
             has_piv: false,
             has_fido: false,
+            fido_ctap2_confirmed: false,
             has_otp: false,
             is_prog: false,
             prog_serial: None,
