@@ -199,6 +199,11 @@ pub(crate) struct PivStatusJson {
     /// beyond — the same rendering `piv info`'s text output uses.
     pub serial: Option<String>,
     pub pin_retries: Option<u8>,
+    /// `true` when the card reported the PIN verified in the session that
+    /// read this status (then `pin_retries` is `null`). `piv info` never
+    /// verifies the PIN itself, so this is true only when the card kept a
+    /// verification from elsewhere.
+    pub pin_verified: bool,
     pub chuid: Option<PivChuidJson>,
     pub slots: Vec<PivSlotJson>,
     /// Best-effort applet fingerprint — from ATR/SELECT text as well as
@@ -252,6 +257,20 @@ pub(crate) struct PivSlotJson {
     /// `true` when the certificate is stored gzip-compressed; `cert_len` is
     /// still the DER length.
     pub cert_compressed: bool,
+    /// Whether the slot holds a private key: `true`, `false`, or `null` when
+    /// keyroost can't tell ([`piv_key_present`]).
+    pub key_present: Option<bool>,
+}
+
+/// The JSON form of a slot's key presence. Only a definite answer becomes a
+/// bool; `Unknown` (and any variant added later) is `null`.
+pub(crate) fn piv_key_present(k: keyroost_transport::SlotKeyPresence) -> Option<bool> {
+    use keyroost_transport::SlotKeyPresence;
+    match k {
+        SlotKeyPresence::Present => Some(true),
+        SlotKeyPresence::NoKey => Some(false),
+        _ => None,
+    }
 }
 
 /// The value `--slot` takes for this slot: "9a", "9c", "9d", "9e", "82".."95".
@@ -880,6 +899,7 @@ mod tests {
             ("cert_len", "number"),
             ("cert_unreadable", "string|null"),
             ("cert_compressed", "bool"),
+            ("key_present", "bool|null"),
         ];
         let slot = keyroost_piv::Slot::Authentication;
         for (unreadable, compressed) in [(Some("damaged"), false), (None, true), (None, false)] {
@@ -890,6 +910,7 @@ mod tests {
                 cert_len: 0,
                 cert_unreadable: unreadable,
                 cert_compressed: compressed,
+                key_present: Some(true),
             });
             assert_shape(&v, &shape);
             assert_eq!(v["slot"], "9a");
@@ -898,11 +919,20 @@ mod tests {
     }
 
     #[test]
+    fn piv_key_present_maps_all_three() {
+        use keyroost_transport::SlotKeyPresence;
+        assert_eq!(piv_key_present(SlotKeyPresence::Present), Some(true));
+        assert_eq!(piv_key_present(SlotKeyPresence::NoKey), Some(false));
+        assert_eq!(piv_key_present(SlotKeyPresence::Unknown), None);
+    }
+
+    #[test]
     fn piv_status_shape() {
         let shape = [
             ("version", "string|null"),
             ("serial", "string|null"),
             ("pin_retries", "number|null"),
+            ("pin_verified", "bool"),
             ("chuid", "object|null"),
             ("slots", "array"),
             ("applet_fingerprint", "string"),
@@ -914,6 +944,7 @@ mod tests {
                 version: some.then(|| "5.7.1".to_string()),
                 serial: some.then(|| "12345678".to_string()),
                 pin_retries: some.then_some(3),
+                pin_verified: !some,
                 chuid: some.then(|| PivChuidJson {
                     fasc_n: "d4".into(),
                     guid: "00".into(),

@@ -13031,14 +13031,14 @@ fn piv_import_not_written(e: impl std::fmt::Display) -> String {
     format!("{} Nothing was written.", sentence(e))
 }
 
-/// The PIN part of the PIV header: the tries left, or "PIN accepted" when the
+/// The PIN part of the PIV header: the tries left, or "PIN verified" when the
 /// card reported the PIN verified in the session that read this status
-/// instead of a count. "Accepted", not "verified": the snapshot outlives that
-/// session, which resets the card when it ends.
+/// instead of a count. The snapshot can outlive that session, which resets
+/// the card when it ends.
 fn piv_header_pin(st: &keyroost_transport::PivStatus) -> String {
     match st.pin_retries {
         Some(n) => format!("PIN retries {n}"),
-        None if st.pin_verified => "PIN accepted".to_string(),
+        None if st.pin_verified => "PIN verified".to_string(),
         None => "PIN retries \u{2014}".to_string(),
     }
 }
@@ -29824,14 +29824,14 @@ mod tests {
     /// After a PIN-using operation the card reports "verified" instead of a
     /// count; the header says so rather than showing a dash.
     #[test]
-    fn piv_header_says_pin_accepted_instead_of_a_dash() {
+    fn piv_header_says_pin_verified_instead_of_a_dash() {
         let mut st = keyroost_transport::PivStatus::default();
         assert_eq!(piv_header_pin(&st), "PIN retries \u{2014}");
         st.pin_retries = Some(3);
         assert_eq!(piv_header_pin(&st), "PIN retries 3");
         st.pin_retries = None;
         st.pin_verified = true;
-        assert_eq!(piv_header_pin(&st), "PIN accepted");
+        assert_eq!(piv_header_pin(&st), "PIN verified");
     }
 
     /// The Generate and Import dialogs' policy rows follow the compat rows,

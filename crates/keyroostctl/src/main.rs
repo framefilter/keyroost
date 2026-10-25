@@ -9702,6 +9702,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 .map(keyroost_piv::format_version_bytes),
                             serial: status.serial.map(keyroost_piv::format_serial_short),
                             pin_retries: status.pin_retries,
+                            pin_verified: status.pin_verified,
                             chuid: status.chuid.as_ref().map(|c| json_out::PivChuidJson {
                                 fasc_n: c.fasc_n_display(),
                                 guid: c.guid_display(),
@@ -9719,6 +9720,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                     cert_len: if s.cert_present { s.cert_len } else { 0 },
                                     cert_unreadable: s.cert_unreadable.map(|r| r.code()),
                                     cert_compressed: s.cert_compressed,
+                                    key_present: json_out::piv_key_present(s.key),
                                 })
                                 .collect(),
                             applet_fingerprint: status.applet_fingerprint.to_string(),
@@ -9779,7 +9781,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         // `piv info` never verifies the PIN and opens its
                         // own session, so this shows only if the card kept
                         // a verification from elsewhere; still say so.
-                        None if status.pin_verified => println!("PIN retries: (PIN accepted)"),
+                        None if status.pin_verified => println!("PIN retries: (PIN verified)"),
                         None => println!("PIN retries: (unavailable)"),
                     }
                     match &status.chuid {
@@ -23357,6 +23359,7 @@ mod cli_tests {
             version: Some("5.4.3".into()),
             serial: Some("12345678".into()),
             pin_retries: Some(3),
+            pin_verified: false,
             chuid: Some(json_out::PivChuidJson {
                 fasc_n: "d4e739da...".into(),
                 guid: "aabbccdd-eeff-1122-3344-556677889900".into(),
@@ -23371,6 +23374,7 @@ mod cli_tests {
                 cert_len: 800,
                 cert_unreadable: None,
                 cert_compressed: false,
+                key_present: None,
             }],
             applet_fingerprint: "YubiKey".into(),
             applet_name: "YubiKey".into(),
@@ -23382,6 +23386,7 @@ mod cli_tests {
                 "version",
                 "serial",
                 "pin_retries",
+                "pin_verified",
                 "chuid",
                 "slots",
                 "applet_fingerprint",
@@ -23503,6 +23508,7 @@ mod cli_tests {
             cert_len: 6164,
             cert_unreadable: None,
             cert_compressed,
+            key_present: None,
         };
         let v = serde_json::to_value(slot(true)).expect("serialize");
         assert_eq!(v["cert_compressed"], true);
@@ -23519,6 +23525,7 @@ mod cli_tests {
             cert_len: 0,
             cert_unreadable,
             cert_compressed: false,
+            key_present: None,
         };
         let v = serde_json::to_value(slot(Some("damaged"))).expect("serialize");
         assert_eq!(v["cert_unreadable"], "damaged");
