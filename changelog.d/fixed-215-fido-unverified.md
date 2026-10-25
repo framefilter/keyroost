@@ -4,5 +4,4 @@
   FIDO2? and gets neither until it answers. A key keyroost can't open at
   all keeps FIDO2 as before, and a failed question is asked again on the
   next scan. A key reached only through a smart-card reader now shows
-  FIDO2? unless its FIDO applet reports FIDO2, and as FIDO2? it gets no
-  FIDO2 step in the whole-key reset. ([#215])
+  FIDO2? unless its FIDO applet reports FIDO2. ([#215])

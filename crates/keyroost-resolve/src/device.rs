@@ -32,11 +32,12 @@ impl Caps {
     /// pairing and selection; what needs CTAP2 (the badge, the FIDO2 tab, the
     /// FIDO2 reset step) checks this bit.
     pub const U2F_ONLY: Caps = Caps(1 << 7);
-    /// Not an applet: a FIDO interface whose protocol isn't known. The key
-    /// opened but gave no proper answer to CTAPHID INIT, or (a reader-only
-    /// row) its FIDO SELECT didn't name CTAP2. `FIDO2` stays set and is
-    /// marked unverified ("FIDO2?"); no name is read from the key and there
-    /// is no FIDO2 reset step until it answers.
+    /// Not an applet: a FIDO HID interface whose protocol isn't known. The
+    /// key opened but gave no proper answer to CTAPHID INIT. `FIDO2` stays
+    /// set and is marked unverified ("FIDO2?"); no name is read from the key
+    /// and there is no FIDO2 reset step until it answers. A reader-only row
+    /// whose FIDO SELECT didn't name CTAP2 is only marked unverified, not
+    /// this: it keeps its FIDO2 reset step.
     pub const FIDO_PROTOCOL_UNKNOWN: Caps = Caps(1 << 8);
 
     pub fn has(self, c: Caps) -> bool {
@@ -738,9 +739,9 @@ pub fn correlate_with(
         if p.has_fido {
             caps.insert(Caps::FIDO2);
             // A SELECT answered `U2F_V2` (or a continuation) doesn't say
-            // whether the key also speaks CTAP2.
+            // whether the key also speaks CTAP2: FIDO2?, but the reset step
+            // stays (`FIDO_PROTOCOL_UNKNOWN` is the HID INIT's verdict).
             if !p.fido_ctap2_confirmed {
-                caps.insert(Caps::FIDO_PROTOCOL_UNKNOWN);
                 unverified.insert(Caps::FIDO2);
             }
         }
@@ -1708,9 +1709,9 @@ impl ResetStep {
 /// Callers pass [`Device::caps`], the *offered* set, so an unverified
 /// capability (see [`CapState::Unverified`]) gets its reset step too:
 /// unverified behaves as "offer it", and the attempt itself reports
-/// whether the applet is really there. The exception is FIDO2 whose
-/// protocol isn't known ([`Caps::FIDO_PROTOCOL_UNKNOWN`]): no FIDO2 step
-/// until the key answers. [`ResetStep::Piv`] is the one other case this
+/// whether the applet is really there. The exception is a FIDO HID
+/// interface that gave no proper INIT answer
+/// ([`Caps::FIDO_PROTOCOL_UNKNOWN`]): no FIDO2 step until the key answers. [`ResetStep::Piv`] is the one other case this
 /// doesn't itself resolve: `Caps::PIV` says the applet is
 /// there, not that it can be reset at all — call
 /// [`exclude_unresettable_piv`] once a live fingerprint confirms it can't.
@@ -1729,7 +1730,7 @@ pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
         steps.push(ResetStep::Piv);
     }
     // U2F has no reset command: a U2F-only interface has no FIDO2 step, and
-    // neither has one whose protocol isn't known.
+    // neither has a HID interface that gave no proper INIT answer.
     if caps.has(Caps::FIDO2) && !caps.has(Caps::U2F_ONLY) && !caps.has(Caps::FIDO_PROTOCOL_UNKNOWN)
     {
         steps.push(ResetStep::Fido);
@@ -3844,7 +3845,8 @@ mod tests {
 
     /// A reader SELECT of the FIDO applet answering `U2F_V2` doesn't tell a
     /// U2F-only card from one that also speaks CTAP2, so a reader-only row
-    /// shows FIDO2 unverified and gets no FIDO2 reset step; the HID node's
+    /// shows FIDO2 unverified but keeps its FIDO2 reset step (only a HID
+    /// interface that gave no proper INIT answer loses it); the HID node's
     /// own INIT answer decides a merged row.
     #[test]
     fn reader_select_does_not_prove_u2f_exclusivity() {
@@ -3868,7 +3870,21 @@ mod tests {
             reader_only[0].cap_badge_states().first(),
             Some(&("FIDO2", CapState::Unverified))
         );
-        assert!(!factory_reset_plan(reader_only[0].caps).contains(&ResetStep::Fido));
+        assert!(factory_reset_plan(reader_only[0].caps).contains(&ResetStep::Fido));
+        // A FIDO-only card in a reader is still a factory-reset target.
+        let mut fido_only = card.clone();
+        (fido_only.has_oath, fido_only.has_openpgp, fido_only.has_piv) = (false, false, false);
+        let fido_only = correlate(&[], &[fido_only], &Keyring::default());
+        assert_eq!(fido_only[0].cap_state(Caps::FIDO2), CapState::Unverified);
+        assert_eq!(factory_reset_plan(fido_only[0].caps), vec![ResetStep::Fido]);
+        let picked = crate::select::resolve_target(
+            &fido_only,
+            &crate::select::Selector::default(),
+            crate::select::Need::FactoryReset,
+            &mut crate::select::NoPicker,
+        )
+        .expect("a FIDO-only reader card can be factory-reset");
+        assert_eq!(picked.device.id, fido_only[0].id);
 
         // A SELECT that answered FIDO_2_0 proves CTAP2.
         let mut ctap2 = card.clone();
@@ -3884,6 +3900,8 @@ mod tests {
         mark_fido_protocol(&mut devs, &empty, &paths);
         assert_eq!(devs[0].cap_state(Caps::FIDO2), CapState::Unverified);
         assert!(!devs[0].caps.has(Caps::U2F_ONLY));
+        // The HID interface gave no proper answer: no FIDO2 reset step.
+        assert!(!factory_reset_plan(devs[0].caps).contains(&ResetStep::Fido));
 
         // A later successful CTAP2 INIT clears *both* unknown markers.
         mark_fido_protocol(&mut devs, &empty, &empty);
