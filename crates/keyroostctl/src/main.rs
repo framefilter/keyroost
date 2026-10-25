@@ -10382,8 +10382,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
-                    let keyless = s.slot_key_presence(slot.to_slot())
-                        == keyroost_transport::SlotKeyPresence::NoKey;
+                    // `slot_key_presence` resolves the slot itself (at most one
+                    // GET METADATA), so this is a real answer, not just the cache.
+                    let presence = s.slot_key_presence(slot.to_slot());
                     let choice = compression.choice();
                     let stored = s
                         .import_certificate(slot.to_slot(), &der, choice)
@@ -10396,8 +10397,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         ),
                         &stored,
                     );
-                    if keyless {
-                        output::note(&keyroost_piv::keyless_cert_note(slot.to_slot()));
+                    if let Some(note) = keyless_import_note(presence, slot.to_slot()) {
+                        output::note(&note);
                     }
                     Ok(())
                 },
@@ -11282,6 +11283,16 @@ fn guard_piv_policy_value(
 }
 
 /// The slot as typed on the command line (`9a`, `82`, …).
+/// The note after a certificate import, only for a slot confirmed to hold no
+/// key; a present or unreadable key says nothing.
+fn keyless_import_note(
+    presence: keyroost_transport::SlotKeyPresence,
+    slot: keyroost_piv::Slot,
+) -> Option<String> {
+    (presence == keyroost_transport::SlotKeyPresence::NoKey)
+        .then(|| keyroost_piv::keyless_cert_note(slot))
+}
+
 fn slot_name(s: CliPivSlot) -> String {
     s.to_possible_value()
         .map(|v| v.get_name().to_string())
@@ -24382,6 +24393,18 @@ mod cli_tests {
         // Config byte present, bit clear: genuinely empty, no question.
         let clear = DeviceInfo::parse(&[0x07, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         assert!(!button_hotp_maybe_configured(Some(&clear)));
+    }
+
+    #[test]
+    fn keyless_import_note_only_for_no_key() {
+        use keyroost_transport::SlotKeyPresence as P;
+        let slot = keyroost_piv::Slot::Authentication;
+        assert_eq!(
+            keyless_import_note(P::NoKey, slot),
+            Some(keyroost_piv::keyless_cert_note(slot))
+        );
+        assert_eq!(keyless_import_note(P::Present, slot), None);
+        assert_eq!(keyless_import_note(P::Unknown, slot), None);
     }
 
     #[test]

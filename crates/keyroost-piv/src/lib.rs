@@ -2451,6 +2451,8 @@ pub fn read_ber_len(buf: &[u8]) -> Result<(usize, usize), ParseError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn keyless_cert_note_wording() {
         assert_eq!(
@@ -2462,8 +2464,6 @@ mod tests {
             "Slot 82 has no key. This certificate won't work until a matching key is put in this slot."
         );
     }
-
-    use super::*;
 
     #[test]
     fn select_bytes() {
