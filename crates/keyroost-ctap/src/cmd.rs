@@ -37,6 +37,12 @@ pub enum CtapError {
     /// the link level — reader I/O error, card removed, or an ISO 7816 status
     /// word that does not map to a CTAP2 status.
     Transport(String),
+    /// A smart-card reader answered with an ISO 7816 status word that does not
+    /// map to a CTAP2 status (for example `6D00`, instruction not supported).
+    Apdu {
+        sw1: u8,
+        sw2: u8,
+    },
 }
 
 impl CtapError {
@@ -77,6 +83,10 @@ impl std::fmt::Display for CtapError {
             }
             CtapError::InvalidArgument(s) => write!(f, "invalid argument: {}", s),
             CtapError::Transport(s) => write!(f, "reader transport error: {}", s),
+            CtapError::Apdu { sw1, sw2 } => write!(
+                f,
+                "reader transport error: authenticator returned ISO status {sw1:02X}{sw2:02X}"
+            ),
         }
     }
 }

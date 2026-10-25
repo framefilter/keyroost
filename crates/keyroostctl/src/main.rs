@@ -2616,10 +2616,15 @@ enum MoltoCustomerKeyCmd {
 enum FidoCmd {
     /// Show the key's FIDO2 capabilities and settings.
     ///
-    /// Runs authenticatorGetInfo.
+    /// Runs authenticatorGetInfo. Over a smart-card reader, `--json` has only
+    /// `device` (the reader name) and `ctap2`.
     Info {
-        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        #[arg(long, value_name = "PATH", conflicts_with = "reader", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
+        /// Smart-card reader holding the card (name contains this text); talks
+        /// over the smart-card interface instead of USB.
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
     },
     /// Factory-reset FIDO2: wipe every credential (passkeys and security-key
     /// sign-ins) and the PIN. Irreversible: asks first (`--yes` to skip).
@@ -13059,8 +13064,12 @@ fn fido_reverify_with<I: crate::secrets::SecretIo>(
 
 fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        FidoCmd::Info { path } => {
-            run_fido_info(path.as_deref())?;
+        FidoCmd::Info { path, reader } => {
+            let dev = crate::target::select(Need::FidoAny, reader.as_deref(), path.as_deref())?;
+            match fido_route(&dev, reader.is_some())? {
+                FidoRoute::Card { reader } => run_fido_info_reader(&reader)?,
+                FidoRoute::Hid { path } => run_fido_info(Some(&path))?,
+            }
             Ok(())
         }
         FidoCmd::Reset { yes, path, reader } => {
@@ -13073,9 +13082,9 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
                 &keyroost_hid::enumerate().unwrap_or_default(),
             );
             crate::prompt::confirm_on(&dev, *yes, "wipe every FIDO2 credential and the PIN")?;
-            match fido_reset_route(&dev, reader.is_some())? {
-                FidoResetRoute::Card { reader } => run_fido_reset_reader(&reader)?,
-                FidoResetRoute::Replug { path } => fido_reset_after_replug(
+            match fido_route(&dev, reader.is_some())? {
+                FidoRoute::Card { reader } => run_fido_reset_reader(&reader)?,
+                FidoRoute::Hid { path } => fido_reset_after_replug(
                     &path,
                     dev.name.as_deref().unwrap_or(&dev.model),
                     &dev.serial,
@@ -14305,6 +14314,52 @@ fn hex_ascii_dump(bytes: &[u8]) -> String {
     out
 }
 
+fn ctap2_json(info: &keyroost_ctap::AuthenticatorInfo) -> json_out::Ctap2InfoJson {
+    json_out::Ctap2InfoJson {
+        versions: info.versions.clone(),
+        extensions: info.extensions.clone(),
+        aaguid: format_aaguid(&info.aaguid),
+        options: info
+            .options
+            .iter()
+            .map(|(k, v)| json_out::OptionJson {
+                name: k.clone(),
+                value: *v,
+            })
+            .collect(),
+        max_msg_size: info.max_msg_size,
+        pin_uv_auth_protocols: info.pin_uv_auth_protocols.clone(),
+        transports: info.transports.clone(),
+        min_pin_length: info.min_pin_length,
+        force_pin_change: info.force_pin_change,
+        firmware_version: info.firmware_version,
+    }
+}
+
+/// `fido info` for a card in a smart-card reader: no CTAPHID facts exist
+/// there, so the output is the reader name and the CTAP2 block.
+fn run_fido_info_reader(reader: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut dev = keyroost_transport::CtapPcscDevice::open(reader)?;
+    let ctap2 = dev.get_info_unless_u2f_only()?;
+    if json_output() {
+        emit_json(&json_out::FidoReaderInfoJson {
+            device: reader.to_owned(),
+            ctap2: ctap2.as_ref().map(ctap2_json),
+        })?;
+        return Ok(());
+    }
+    println!(
+        "{}",
+        output::kv_block(&[("Device", sanitize_terminal(reader))])
+    );
+    println!();
+    match ctap2 {
+        Some(info) => println!("{}", output::kv_block(&fido_info_rows(&info))),
+        None => println!("(device is U2F-only; CTAP2 GetInfo not available)"),
+    }
+    Ok(())
+}
+
 fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
     let path = crate::target::fido_path(path)?;
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
@@ -14380,25 +14435,7 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
             ),
             hid_caps: caps,
             hid_caps_raw: init.capabilities,
-            ctap2: Some(json_out::Ctap2InfoJson {
-                versions: info.versions.clone(),
-                extensions: info.extensions.clone(),
-                aaguid: format_aaguid(&info.aaguid),
-                options: info
-                    .options
-                    .iter()
-                    .map(|(k, v)| json_out::OptionJson {
-                        name: k.clone(),
-                        value: *v,
-                    })
-                    .collect(),
-                max_msg_size: info.max_msg_size,
-                pin_uv_auth_protocols: info.pin_uv_auth_protocols.clone(),
-                transports: info.transports.clone(),
-                min_pin_length: info.min_pin_length,
-                force_pin_change: info.force_pin_change,
-                firmware_version: info.firmware_version,
-            }),
+            ctap2: Some(ctap2_json(&info)),
         })?;
         return Ok(());
     }
@@ -14452,30 +14489,27 @@ fn fido_info_rows(info: &keyroost_ctap::AuthenticatorInfo) -> Vec<(&'static str,
     rows
 }
 
-/// How `fido reset` reaches the selected key's FIDO2 applet.
+/// How `fido info` and `fido reset` reach the selected key's FIDO2 applet.
 #[derive(Debug, PartialEq, Eq)]
-enum FidoResetRoute {
-    /// Over USB HID: the key is replugged to open the reset window.
-    Replug { path: std::path::PathBuf },
-    /// A card in a PC/SC reader: power-cycled in place instead.
+enum FidoRoute {
+    /// Over USB HID (a reset replugs the key to open its window).
+    Hid { path: std::path::PathBuf },
+    /// A card in a PC/SC reader (a reset power-cycles it in place instead).
     Card { reader: String },
 }
 
-/// Pick the route for a FIDO2 reset of `dev`: HID with a replug when the key
+/// Pick the route to `dev`'s FIDO2 applet: HID when the key
 /// has a FIDO HID node, unless `--reader` asked for the card interface (or
 /// there is no HID node, as for a card in a reader).
-fn fido_reset_route(
-    dev: &keyroost_resolve::Device,
-    reader_given: bool,
-) -> Result<FidoResetRoute, String> {
+fn fido_route(dev: &keyroost_resolve::Device, reader_given: bool) -> Result<FidoRoute, String> {
     match (&dev.hid_path, &dev.reader) {
-        (Some(path), _) if !reader_given => Ok(FidoResetRoute::Replug { path: path.clone() }),
-        (_, Some(reader)) => Ok(FidoResetRoute::Card {
+        (Some(path), _) if !reader_given => Ok(FidoRoute::Hid { path: path.clone() }),
+        (_, Some(reader)) => Ok(FidoRoute::Card {
             reader: reader.clone(),
         }),
-        (Some(path), None) => Ok(FidoResetRoute::Replug { path: path.clone() }),
+        (Some(path), None) => Ok(FidoRoute::Hid { path: path.clone() }),
         (None, None) => Err(format!(
-            "'{}' has neither a FIDO HID interface nor a smart-card reader to reset it over",
+            "'{}' has neither a FIDO HID interface nor a smart-card reader to reach it over",
             sanitize_terminal(dev.name.as_deref().unwrap_or(&dev.model))
         )),
     }
@@ -18260,7 +18294,7 @@ mod cli_tests {
     }
 
     #[test]
-    fn fido_reset_route_prefers_replug_unless_a_reader_was_asked_for() {
+    fn fido_route_prefers_replug_unless_a_reader_was_asked_for() {
         use keyroost_resolve::{Caps, Device, DeviceKind};
         let mut caps = Caps::default();
         caps.insert(Caps::FIDO2);
@@ -18281,28 +18315,28 @@ mod cli_tests {
             naming: Default::default(),
         };
         assert_eq!(
-            fido_reset_route(&both, false),
-            Ok(FidoResetRoute::Replug {
+            fido_route(&both, false),
+            Ok(FidoRoute::Hid {
                 path: "/dev/hidraw3".into()
             })
         );
         assert_eq!(
-            fido_reset_route(&both, true),
-            Ok(FidoResetRoute::Card {
+            fido_route(&both, true),
+            Ok(FidoRoute::Card {
                 reader: "R 00".into()
             })
         );
         let mut card = both.clone();
         card.hid_path = None;
         assert_eq!(
-            fido_reset_route(&card, false),
-            Ok(FidoResetRoute::Card {
+            fido_route(&card, false),
+            Ok(FidoRoute::Card {
                 reader: "R 00".into()
             })
         );
         let mut none = card;
         none.reader = None;
-        assert!(fido_reset_route(&none, false).is_err());
+        assert!(fido_route(&none, false).is_err());
     }
 
     /// Run `wait_for_replug` against scripted HID scans (the last one repeats)
@@ -23297,6 +23331,33 @@ mod cli_tests {
             drift_seconds: -3,
         };
         assert_json_has_keys(&m, &["serial", "utc_time", "drift_seconds"]);
+    }
+
+    #[test]
+    fn fido_info_reader_json_shape() {
+        let v = serde_json::to_value(json_out::FidoReaderInfoJson {
+            device: "Test reader".into(),
+            ctap2: None,
+        })
+        .unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["ctap2", "device"]);
+        assert!(v["ctap2"].is_null());
+    }
+
+    #[test]
+    fn fido_info_reader_conflicts_with_path() {
+        assert!(Cli::try_parse_from([
+            "keyroostctl",
+            "fido",
+            "info",
+            "--reader",
+            "X",
+            "--path",
+            "Y"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["keyroostctl", "fido", "info", "--reader", "X"]).is_ok());
     }
 
     #[test]

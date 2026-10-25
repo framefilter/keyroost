@@ -170,6 +170,17 @@ impl CtapPcscDevice {
         &self.selected_version
     }
 
+    /// `get_info`, except that a card selected as `U2F_V2` which explicitly
+    /// rejects the command (`6D00`, `6E00` or CTAP2 status `01`) returns
+    /// `Ok(None)`: it speaks U2F only. `U2F_V2` also names dual-protocol cards,
+    /// so GetInfo is always asked first; every other error passes through.
+    pub fn get_info_unless_u2f_only(
+        &mut self,
+    ) -> Result<Option<keyroost_ctap::AuthenticatorInfo>, CtapError> {
+        let u2f = self.selected_version == b"U2F_V2";
+        info_unless_u2f_only(self, u2f)
+    }
+
     fn select_fido_applet(&mut self) -> Result<(), CtapError> {
         // SELECT by DF name: 00 A4 04 00 Lc <AID> 00
         let mut apdu = vec![0x00, 0xA4, 0x04, 0x00, FIDO_AID.len() as u8];
@@ -314,9 +325,7 @@ impl CtapPcscDevice {
 
         let (data, sw1, sw2) = last;
         if (sw1, sw2) != (0x90, 0x00) {
-            return Err(CtapError::Transport(format!(
-                "authenticator returned ISO status {sw1:02X}{sw2:02X}"
-            )));
+            return Err(CtapError::Apdu { sw1, sw2 });
         }
         Ok(data)
     }
@@ -339,5 +348,85 @@ impl CtapTransport for CtapPcscDevice {
             )));
         }
         self.send_ctap_message(payload)
+    }
+}
+
+fn info_unless_u2f_only(
+    dev: &mut impl CtapTransport,
+    u2f_selected: bool,
+) -> Result<Option<keyroost_ctap::AuthenticatorInfo>, CtapError> {
+    match keyroost_ctap::get_info(dev) {
+        Ok(info) => Ok(Some(info)),
+        Err(
+            CtapError::Apdu {
+                sw1: 0x6D | 0x6E,
+                sw2: 0x00,
+            }
+            | CtapError::StatusCode(0x01),
+        ) if u2f_selected => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Reply(Result<Vec<u8>, CtapError>);
+
+    impl CtapTransport for Reply {
+        fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            assert_eq!(cmd, keyroost_ctap::hid::CTAPHID_CBOR);
+            assert_eq!(payload, &[keyroost_ctap::cmd::CTAP2_GET_INFO]);
+            std::mem::replace(&mut self.0, Err(CtapError::EmptyResponse))
+        }
+    }
+
+    #[test]
+    fn reader_info_probes_ctap2_after_u2f_select() {
+        // Status OK; {1: ["U2F_V2", "FIDO_2_0"], 3: h'0000...'}.
+        let mut reply = vec![0, 0xa2, 1, 0x82, 0x66];
+        reply.extend_from_slice(b"U2F_V2");
+        reply.push(0x68);
+        reply.extend_from_slice(b"FIDO_2_0");
+        reply.extend_from_slice(&[3, 0x50]);
+        reply.extend_from_slice(&[0; 16]);
+        let info = info_unless_u2f_only(&mut Reply(Ok(reply)), true)
+            .unwrap()
+            .expect("dual-protocol card must expose CTAP2");
+        assert!(info.versions.iter().any(|v| v == "FIDO_2_0"));
+    }
+
+    #[test]
+    fn reader_info_only_falls_back_on_explicit_unsupported_commands() {
+        let apdu = |sw1, sw2| CtapError::Apdu { sw1, sw2 };
+        for err in [apdu(0x6D, 0x00), apdu(0x6E, 0x00), CtapError::StatusCode(1)] {
+            assert!(info_unless_u2f_only(&mut Reply(Err(err)), true)
+                .unwrap()
+                .is_none());
+        }
+        for err in [
+            apdu(0x69, 0x82),
+            apdu(0x6F, 0x00),
+            CtapError::Transport("card removed".into()),
+            CtapError::EmptyResponse,
+        ] {
+            assert!(info_unless_u2f_only(&mut Reply(Err(err)), true).is_err());
+        }
+        // Not a U2F_V2 selection: the error passes through.
+        assert!(info_unless_u2f_only(&mut Reply(Err(apdu(0x6D, 0x00))), false).is_err());
+        assert!(info_unless_u2f_only(&mut Reply(Ok(vec![0, 0xff])), true).is_err());
+    }
+
+    #[test]
+    fn apdu_error_keeps_the_old_wording() {
+        assert_eq!(
+            CtapError::Apdu {
+                sw1: 0x6D,
+                sw2: 0x00
+            }
+            .to_string(),
+            "reader transport error: authenticator returned ISO status 6D00"
+        );
     }
 }

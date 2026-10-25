@@ -153,6 +153,15 @@ pub(crate) struct FidoInfoJson {
     pub ctap2: Option<Ctap2InfoJson>,
 }
 
+/// `keyroostctl fido --json info --reader` — a card in a smart-card reader has
+/// no CTAPHID facts, so only the reader name and the CTAP2 payload.
+#[derive(Serialize)]
+pub(crate) struct FidoReaderInfoJson {
+    pub device: String,
+    /// `null` when the card speaks U2F only.
+    pub ctap2: Option<Ctap2InfoJson>,
+}
+
 /// The authenticatorGetInfo payload (CTAP2 devices only).
 #[derive(Serialize)]
 pub(crate) struct Ctap2InfoJson {
