@@ -24371,7 +24371,7 @@ impl App {
                         ui.add_space(8.0);
                         if theme::button(ui, p, BtnKind::Default, "Import certificate\u{2026}")
                             .clicked()
-                                                {
+                        {
                             open_import = true;
                         }
                     },

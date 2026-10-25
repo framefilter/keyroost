@@ -11282,7 +11282,6 @@ fn guard_piv_policy_value(
     .into())
 }
 
-/// The slot as typed on the command line (`9a`, `82`, …).
 /// The note after a certificate import, only for a slot confirmed to hold no
 /// key; a present or unreadable key says nothing.
 fn keyless_import_note(
@@ -11293,6 +11292,7 @@ fn keyless_import_note(
         .then(|| keyroost_piv::keyless_cert_note(slot))
 }
 
+/// The slot as typed on the command line (`9a`, `82`, …).
 fn slot_name(s: CliPivSlot) -> String {
     s.to_possible_value()
         .map(|v| v.get_name().to_string())
