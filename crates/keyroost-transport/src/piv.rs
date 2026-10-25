@@ -148,7 +148,7 @@ pub struct PivStatus {
     /// formatting.
     pub version: Option<Vec<u8>>,
     /// The applet's own firmware version, when a specific fingerprint's probe
-    /// discovered one — a Nitrokey (`Trussed(NitroKey)`, via Trussed's admin
+    /// discovered one — a Nitrokey (`Trussed(Nitrokey)`, via Trussed's admin
     /// application) or a Token2 (`AppletFingerprint::Token2` only, not
     /// `Thetis`). Not necessarily equal to [`Self::version`]: that field is
     /// the *PIV applet's* own version (Yubico's `GET VERSION` extension,
@@ -202,7 +202,7 @@ pub struct PivStatus {
     pub applet_fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
     /// The token's own name, when a specific one was actually discovered:
     /// currently a Nitrokey's admin application (for
-    /// [`AppletFingerprint::Trussed`](keyroost_piv::fingerprint::AppletFingerprint::Trussed)`(`[`NitroKey`](keyroost_piv::fingerprint::TrussedVariant::NitroKey)`)`),
+    /// [`AppletFingerprint::Trussed`](keyroost_piv::fingerprint::AppletFingerprint::Trussed)`(`[`Nitrokey`](keyroost_piv::fingerprint::TrussedVariant::Nitrokey)`)`),
     /// a YubiKey's own major version (for
     /// [`AppletFingerprint::YubiKey`](keyroost_piv::fingerprint::AppletFingerprint::YubiKey)),
     /// or HID Crescendo's SELECT response Application Label (for
@@ -2082,7 +2082,7 @@ impl<'tx> PivSession<'tx> {
     /// skip than to run, tried in that order before finally settling for
     /// `Generic`. Once the fingerprint itself is resolved, at most one
     /// further, fingerprint-specific step produces `applet_name`/version/
-    /// serial: a Nitrokey (`Trussed(NitroKey)`) gets
+    /// serial: a Nitrokey (`Trussed(Nitrokey)`) gets
     /// `Self::probe_nitrokey_admin` for its firmware, hardware variant, and
     /// serial; a YubiKey names itself from its own `GET VERSION` reply; HID
     /// Crescendo (C2300 and C4000) names itself from its SELECT response's
@@ -2202,7 +2202,7 @@ impl<'tx> PivSession<'tx> {
         // `Option<Vec<u8>>` `version`/`version_firmware` sit next to each
         // other.
         let result = match id {
-            fingerprint::AppletFingerprint::Trussed(fingerprint::TrussedVariant::NitroKey) => {
+            fingerprint::AppletFingerprint::Trussed(fingerprint::TrussedVariant::Nitrokey) => {
                 self.probe_nitrokey_admin(id, version)
             }
             fingerprint::AppletFingerprint::YubiKey => {
@@ -2463,7 +2463,7 @@ impl<'tx> PivSession<'tx> {
     ///
     /// `id` and `version` are folded straight into the returned
     /// [`AppletFingerprintResult`] unchanged — this probe doesn't produce
-    /// either of them itself (`id` is already known to be `Trussed(NitroKey)`
+    /// either of them itself (`id` is already known to be `Trussed(Nitrokey)`
     /// by the time `Self::applet_fingerprint` calls this; `version` is
     /// Yubico's own GET VERSION reply, which a Nitrokey answers same as any
     /// other applet) — so the caller doesn't have to unpack a probe-shaped
@@ -2859,7 +2859,7 @@ impl<'tx> PivSession<'tx> {
     /// Yubico-default byte otherwise. See
     /// [`keyroost_piv::compat::slot_key_algorithm_apdu_id`] — passed this
     /// session's firmware version too, via `Self::identity`, since that
-    /// function's `Trussed`/`NitroKey` entry is gated by it. Cached via
+    /// function's `Trussed`/`Nitrokey` entry is gated by it. Cached via
     /// `Self::identity`, so this costs no extra round trip once the
     /// fingerprint has already been probed this session.
     pub(crate) fn slot_key_algorithm_apdu_id(&mut self, alg: KeyAlg) -> u8 {

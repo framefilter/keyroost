@@ -207,7 +207,7 @@ pub(crate) struct PivStatusJson {
     /// form — e.g. `"YubiKey"` or `"OpenFips201::SwissbitIShield2"`.
     pub applet_fingerprint: String,
     /// The token's own reported name, when one was actually discovered
-    /// (currently: a Nitrokey's admin application, for `Trussed::NitroKey`).
+    /// (currently: a Nitrokey's admin application, for `Trussed::Nitrokey`).
     /// Empty when none was — not backfilled with a generic name for
     /// `applet_fingerprint`, so an empty string here means specifically
     /// "the token didn't tell us its name," not "fingerprinting failed."
@@ -216,7 +216,7 @@ pub(crate) struct PivStatusJson {
     pub applet_name: String,
     /// The applet's own firmware version, dotted (same formatting as
     /// `version`), when a specific fingerprint's probe discovered one —
-    /// currently `Trussed::NitroKey` (Trussed's admin application) only.
+    /// currently `Trussed::Nitrokey` (Trussed's admin application) only.
     /// Not necessarily equal to `version`, which is the PIV applet's own
     /// version. `None` when no such probe applies or it found nothing
     /// parseable.

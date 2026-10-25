@@ -313,7 +313,7 @@ pub enum PivExtension {
     /// itself, not just its own proprietary GET PIV PROPERTIES / INJECT PKI
     /// KEY commands. Almost every entry in that table is non-versioned — one
     /// wire byte for the fingerprint's whole lifetime — except
-    /// `Trussed::NitroKey`'s: its RSA-4096 byte itself changed, from `0xE1`
+    /// `Trussed::Nitrokey`'s: its RSA-4096 byte itself changed, from `0xE1`
     /// pre-1.8.2 firmware to Yubico's own `0x16` at 1.8.2 and later, so that
     /// one entry is gated by firmware version like this variant's own
     /// known-support tables are. See `slot_key_algorithm_apdu_id_override`'s
@@ -786,7 +786,7 @@ struct VersionQuirks {
 /// observable effect on any resolved verdict or quirk right now:** no
 /// fingerprint reports genuinely conflicting data on both axes for the same
 /// extension. The one fingerprint with real verdict data on both axes,
-/// `Trussed(NitroKey)`, has its applet-axis and firmware-axis rows agree
+/// `Trussed(Nitrokey)`, has its applet-axis and firmware-axis rows agree
 /// wherever both have an opinion (see `TRUSSED_NITROKEY_APPLET_VERDICTS`'s
 /// doc) — so [`Self::MergeRelaxed`] and [`Self::MergeStrict`] resolve
 /// identically for it, and [`Self::AppletWins`]/[`Self::FirmwareWins`]'s
@@ -906,7 +906,7 @@ fn applet_verdicts(
             AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_APPLET_VERDICTS,
             AppletFingerprint::Feitian => FEITIAN_APPLET_VERDICTS,
             AppletFingerprint::IdPrime => IDPRIME_APPLET_VERDICTS,
-            AppletFingerprint::Trussed(TrussedVariant::NitroKey) => {
+            AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => {
                 TRUSSED_NITROKEY_APPLET_VERDICTS
             }
             AppletFingerprint::UTrust(UTrustVariant::Generic) => UTRUST_GENERIC_APPLET_VERDICTS,
@@ -959,7 +959,7 @@ fn firmware_verdicts(
             AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_FIRMWARE_VERDICTS,
             AppletFingerprint::Feitian => FEITIAN_FIRMWARE_VERDICTS,
             AppletFingerprint::IdPrime => IDPRIME_FIRMWARE_VERDICTS,
-            AppletFingerprint::Trussed(TrussedVariant::NitroKey) => {
+            AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => {
                 TRUSSED_NITROKEY_FIRMWARE_VERDICTS
             }
             AppletFingerprint::UTrust(UTrustVariant::Generic) => UTRUST_GENERIC_FIRMWARE_VERDICTS,
@@ -1026,7 +1026,7 @@ fn applet_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
         AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_APPLET_QUIRKS,
         AppletFingerprint::Feitian => FEITIAN_APPLET_QUIRKS,
         AppletFingerprint::IdPrime => IDPRIME_APPLET_QUIRKS,
-        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => TRUSSED_NITROKEY_APPLET_QUIRKS,
+        AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => TRUSSED_NITROKEY_APPLET_QUIRKS,
         AppletFingerprint::UTrust(UTrustVariant::Generic) => UTRUST_GENERIC_APPLET_QUIRKS,
         AppletFingerprint::UTrust(UTrustVariant::Gov) => UTRUST_GOV_APPLET_QUIRKS,
     }
@@ -1067,7 +1067,7 @@ fn firmware_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
         AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_FIRMWARE_QUIRKS,
         AppletFingerprint::Feitian => FEITIAN_FIRMWARE_QUIRKS,
         AppletFingerprint::IdPrime => IDPRIME_FIRMWARE_QUIRKS,
-        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => TRUSSED_NITROKEY_FIRMWARE_QUIRKS,
+        AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => TRUSSED_NITROKEY_FIRMWARE_QUIRKS,
         AppletFingerprint::UTrust(UTrustVariant::Generic) => UTRUST_GENERIC_FIRMWARE_QUIRKS,
         AppletFingerprint::UTrust(UTrustVariant::Gov) => UTRUST_GOV_FIRMWARE_QUIRKS,
     }
@@ -1107,7 +1107,7 @@ fn axis_merge_mode(fingerprint: AppletFingerprint) -> AxisMergeMode {
         AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_AXIS_MERGE_MODE,
         AppletFingerprint::Feitian => FEITIAN_AXIS_MERGE_MODE,
         AppletFingerprint::IdPrime => IDPRIME_AXIS_MERGE_MODE,
-        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => TRUSSED_NITROKEY_AXIS_MERGE_MODE,
+        AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => TRUSSED_NITROKEY_AXIS_MERGE_MODE,
         AppletFingerprint::UTrust(UTrustVariant::Generic) => UTRUST_GENERIC_AXIS_MERGE_MODE,
         AppletFingerprint::UTrust(UTrustVariant::Gov) => UTRUST_GOV_AXIS_MERGE_MODE,
     }
@@ -3099,11 +3099,11 @@ const IDPRIME_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const IDPRIME_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
-/// The Trussed-based Nitrokey's (`Trussed::NitroKey`) cross-axis merge mode
+/// The Trussed-based Nitrokey's (`Trussed::Nitrokey`) cross-axis merge mode
 /// — see [`AxisMergeMode`]'s doc.
 const TRUSSED_NITROKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
-/// The Trussed-based Nitrokey's (`Trussed::NitroKey`) applet-axis
+/// The Trussed-based Nitrokey's (`Trussed::Nitrokey`) applet-axis
 /// known-support table — see `GENERIC_APPLET_VERDICTS`'s doc for why this
 /// fingerprint gets an explicit [`PivExtension::ResetGlobal`] entry, same
 /// single-row shape as every other non-HID-Crescendo fingerprint's
@@ -3152,7 +3152,7 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
     }],
 }];
 
-/// The Trussed-based Nitrokey's (`Trussed::NitroKey`) firmware-axis
+/// The Trussed-based Nitrokey's (`Trussed::Nitrokey`) firmware-axis
 /// known-support table — the one exception to [`YUBIKEY_FIRMWARE_VERDICTS`]'s
 /// "every `_FIRMWARE_VERDICTS` const is empty" doc, because keyroost's
 /// evidence for these extensions is firmware-version keyed, not
@@ -3369,12 +3369,12 @@ const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
     },
 ];
 
-/// The Trussed-based Nitrokey's (`Trussed::NitroKey`) applet-axis quirks. The
+/// The Trussed-based Nitrokey's (`Trussed::Nitrokey`) applet-axis quirks. The
 /// Trussed `piv-authenticator`'s own default management key is the same
 /// YubiKey-standard value seeded here, hard-coded as `DEFAULT_MANAGEMENT_KEY`
 /// in its `constants.rs` —
 /// <https://github.com/trussed-dev/piv-authenticator/blob/main/src/constants.rs>.
-/// Only `NitroKey` is fingerprinted today (see that variant's doc), but the
+/// Only `Nitrokey` is fingerprinted today (see that variant's doc), but the
 /// value is a property of the shared Trussed applet code, not a
 /// Nitrokey-specific customization, so any future `TrussedVariant` seeded
 /// here should get its own const with this same row.
@@ -4016,7 +4016,7 @@ fn axis_floor(
 #[must_use]
 pub fn import_layout(fingerprint: AppletFingerprint) -> crate::ImportLayout {
     match fingerprint {
-        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => crate::ImportLayout::NitrokeyRsa,
+        AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => crate::ImportLayout::NitrokeyRsa,
         _ => crate::ImportLayout::Yubico,
     }
 }
@@ -4028,7 +4028,7 @@ pub fn import_layout(fingerprint: AppletFingerprint) -> crate::ImportLayout {
 #[must_use]
 pub fn import_slot_allowed(fingerprint: AppletFingerprint, slot: crate::Slot) -> bool {
     match fingerprint {
-        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => slot == crate::Slot::Authentication,
+        AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => slot == crate::Slot::Authentication,
         _ => true,
     }
 }
@@ -4206,7 +4206,7 @@ fn resolve_in(verdicts: Option<&[VersionVerdict]>, version: Option<&[u8]>) -> Fe
 /// this doesn't extend past the one sub-fingerprint it was actually
 /// observed on.
 ///
-/// `Trussed(`[`TrussedVariant::NitroKey`]`)` carries the one entry that
+/// `Trussed(`[`TrussedVariant::Nitrokey`]`)` carries the one entry that
 /// actually needs `firmware_version`: pre-1.8.2 firmware answers RSA-4096 as
 /// `0xE1` — [`KeyAlg::id`]'s own default byte for [`KeyAlg::X25519`], not
 /// RSA-4096 — while 1.8.2 and later switch to Yubico's usual `0x16`, matching
@@ -4238,7 +4238,7 @@ fn slot_key_algorithm_apdu_id_override(
         {
             Some(0x32)
         }
-        AppletFingerprint::Trussed(TrussedVariant::NitroKey)
+        AppletFingerprint::Trussed(TrussedVariant::Nitrokey)
             if key_alg == KeyAlg::Rsa4096
                 && firmware_version.is_some_and(|v| v < [1, 8, 2].as_slice()) =>
         {
@@ -4255,7 +4255,7 @@ fn slot_key_algorithm_apdu_id_override(
 /// otherwise. A caller building such an APDU should always go through this
 /// rather than [`KeyAlg::id`] directly — see that method's doc.
 /// `firmware_version` only ever changes the answer for
-/// `Trussed(`[`TrussedVariant::NitroKey`]`)`'s RSA-4096 entry — see
+/// `Trussed(`[`TrussedVariant::Nitrokey`]`)`'s RSA-4096 entry — see
 /// `slot_key_algorithm_apdu_id_override`'s own doc — so passing `None` for
 /// any other fingerprint is equivalent to omitting a firmware version this
 /// fingerprint doesn't key anything on.
@@ -4277,7 +4277,7 @@ pub fn slot_key_algorithm_apdu_id(
 /// [`KeyAlg::from_id`]'s Yubico-default table. Tries every [`KeyAlg::ALL`]
 /// variant, in declaration order, through [`slot_key_algorithm_apdu_id`] and
 /// returns the first one whose resolved byte matches `id` — see
-/// `slot_key_algorithm_apdu_id_override`'s own `Trussed`/`NitroKey` doc for
+/// `slot_key_algorithm_apdu_id_override`'s own `Trussed`/`Nitrokey` doc for
 /// why that ordering is load-bearing on pre-1.8.2 firmware, not incidental —
 /// falling back to [`KeyAlg::from_id`] when none does, which also covers
 /// every fingerprint with no override data at all (every candidate then
@@ -5608,7 +5608,7 @@ mod tests {
             AppletFingerprint::AuthentrendATKey,
             AppletFingerprint::Feitian,
             AppletFingerprint::IdPrime,
-            AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+            AppletFingerprint::Trussed(TrussedVariant::Nitrokey),
             AppletFingerprint::UTrust(UTrustVariant::Generic),
             AppletFingerprint::UTrust(UTrustVariant::Gov),
         ] {
@@ -5750,7 +5750,7 @@ mod tests {
             AppletFingerprint::AuthentrendATKey,
             AppletFingerprint::UTrust(UTrustVariant::Generic),
             AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
-            AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+            AppletFingerprint::Trussed(TrussedVariant::Nitrokey),
         ];
         for fp in yubikey_mimics {
             assert_eq!(
@@ -6535,7 +6535,7 @@ mod tests {
         // Source-read up to 1.9.1: policy tags ignored (1.8.0-1.9.1) or
         // refused (1.7.x), never applied — see
         // `TRUSSED_NITROKEY_FIRMWARE_VERDICTS`'s doc.
-        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
         for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
             // Backward from 1.9.1 to every older firmware, and with no
             // firmware version read at all.
@@ -6805,7 +6805,7 @@ mod tests {
             AppletFingerprint::AuthentrendATKey,
             AppletFingerprint::Feitian,
             AppletFingerprint::IdPrime,
-            AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+            AppletFingerprint::Trussed(TrussedVariant::Nitrokey),
             AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
             AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
             AppletFingerprint::Thetis,
@@ -6836,13 +6836,13 @@ mod tests {
     #[test]
     fn trussed_nitrokey_reset_global_row_is_duplicated_on_both_axes() {
         // Unlike every other fingerprint in the loop above,
-        // `Trussed(NitroKey)` carries this same `KnownUnsupportedSince` row
+        // `Trussed(Nitrokey)` carries this same `KnownUnsupportedSince` row
         // on *both* `TRUSSED_NITROKEY_APPLET_VERDICTS` and
         // `TRUSSED_NITROKEY_FIRMWARE_VERDICTS` — see either const's own doc
         // for why. Reporting a version on only one axis at a time still
         // resolves `Unsupported`, proving each axis' row stands on its own
         // rather than one silently depending on the other.
-        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
         for version in [&[0][..], &[9, 9, 9][..]] {
             assert_eq!(
                 resolve(PivExtension::ResetGlobal, fp, Some(version), None),
@@ -7496,7 +7496,7 @@ mod tests {
         }
     }
 
-    // `Trussed(NitroKey)`'s `SetManagementKey` row lives entirely on the
+    // `Trussed(Nitrokey)`'s `SetManagementKey` row lives entirely on the
     // firmware axis now — see `trussed_nitrokey_1_8_set_management_key_reset_get_metadata_are_supported`
     // below, and `TRUSSED_NITROKEY_FIRMWARE_VERDICTS`'s own doc for why.
 
@@ -7533,7 +7533,7 @@ mod tests {
         // Confirmed against the Trussed `piv-authenticator` source and a
         // live unit at firmware 1.8.3 — see `TRUSSED_NITROKEY_FIRMWARE_VERDICTS`'s
         // doc.
-        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
         for ext in [
             PivExtension::SetManagementKey,
             PivExtension::Reset,
@@ -7572,7 +7572,7 @@ mod tests {
         // Hardware-observed known-unsupported verdicts, pinned to exactly the
         // firmware version keyroost has evidence for — see
         // `TRUSSED_NITROKEY_FIRMWARE_VERDICTS`'s doc.
-        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
         for ext in [
             PivExtension::SetPinPukRetries,
             PivExtension::MoveKey,
@@ -7939,7 +7939,7 @@ mod tests {
 
     #[test]
     fn nitrokey_algorithm_support_gains_rsa3072_eccp384_at_firmware_1_8_2() {
-        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
         // Supported on every firmware, old and new alike.
         for alg in [KeyAlg::Rsa2048, KeyAlg::Rsa4096, KeyAlg::EccP256] {
             assert_eq!(
@@ -8008,7 +8008,7 @@ mod tests {
 
     #[test]
     fn nitrokey_rsa4096_apdu_id_switches_at_firmware_1_8_2() {
-        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
         // Pre-1.8.2: the collision byte with `KeyAlg::id()`'s own X25519
         // default.
         assert_eq!(
@@ -8340,7 +8340,7 @@ mod tests {
 
     #[test]
     fn nitrokey_firmware_axis_gates_mgmt_alg_by_firmware_1_8_3() {
-        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
         // 3DES/AES-256 supported at any reported firmware.
         for alg in [MgmtAlgChoice::TripleDes, MgmtAlgChoice::Aes256] {
             assert_eq!(
@@ -8385,7 +8385,7 @@ mod tests {
     }
     // --- import key (#174) ---
 
-    const NITROKEY: AppletFingerprint = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+    const NITROKEY: AppletFingerprint = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
 
     #[test]
     fn nitrokey_import_gate() {
@@ -8612,7 +8612,7 @@ mod tests {
     /// name the firmware that lifts it, read from the same rows.
     #[test]
     fn nitrokey_import_floor_is_firmware_1_8() {
-        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
         let floor = |alg, fw: Option<&[u8]>| {
             supported_from(PivExtension::ImportKey(alg), fp, Some(&[6, 6, 6]), fw)
         };
@@ -8654,7 +8654,7 @@ mod tests {
             None
         );
         // Refused for good (`KnownUnsupportedSince`): no floor either.
-        let nitrokey = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let nitrokey = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
         assert_eq!(
             resolve(PivExtension::ResetGlobal, nitrokey, None, Some(&[1, 8])),
             FeatureGate::Unsupported

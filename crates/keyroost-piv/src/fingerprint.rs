@@ -43,7 +43,7 @@ pub const IDPRIME_SECONDARY_PIV_AID: [u8; 11] = [
 ];
 
 /// Trussed's admin application AID. On a Nitrokey
-/// ([`AppletFingerprint::Trussed`]`(`[`TrussedVariant::NitroKey`]`)`), its
+/// ([`AppletFingerprint::Trussed`]`(`[`TrussedVariant::Nitrokey`]`)`), its
 /// firmware version ([`NITROKEY_GET_VERSION_STRING`]) and hardware variant
 /// ([`NITROKEY_GET_ADMIN_STATUS`]) are read through this application's
 /// management commands rather than anything PIV-specific.
@@ -1067,11 +1067,11 @@ pub fn parse_nitrokey_variant(data: &[u8]) -> Option<&'static str> {
 }
 
 /// The display name for
-/// [`AppletFingerprint::Trussed`]`(`[`TrussedVariant::NitroKey`]`)` once its
-/// hardware variant is known: `"NitroKey (<variant>)"`.
+/// [`AppletFingerprint::Trussed`]`(`[`TrussedVariant::Nitrokey`]`)` once its
+/// hardware variant is known: `"Nitrokey (<variant>)"`.
 #[must_use]
 pub fn format_nitrokey_name(variant: &str) -> String {
-    format!("NitroKey ({variant})")
+    format!("Nitrokey ({variant})")
 }
 
 /// The display name for [`AppletFingerprint::YubiKey`]: `"Yubico YubiKey
@@ -1210,7 +1210,7 @@ pub enum TrussedVariant {
     /// A Nitrokey running the Trussed `piv-authenticator` — recognised by
     /// its select identity, not its ATR (Nitrokey's ATR doesn't carry a
     /// usable card-issuer-data field; the select identity does).
-    NitroKey,
+    Nitrokey,
 }
 
 /// Sub-fingerprint within [`AppletFingerprint::OpenFips201`].
@@ -1293,7 +1293,7 @@ impl core::fmt::Display for HidCrescendoVariant {
 impl core::fmt::Display for TrussedVariant {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            TrussedVariant::NitroKey => "NitroKey",
+            TrussedVariant::Nitrokey => "Nitrokey",
         })
     }
 }
@@ -1342,7 +1342,7 @@ impl AppletFingerprint {
             AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300) => "HID Crescendo C2300",
             AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000) => "HID Crescendo C4000",
             AppletFingerprint::IdPrime => "IdPrime PIV Series",
-            AppletFingerprint::Trussed(TrussedVariant::NitroKey) => "NitroKey",
+            AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => "Nitrokey",
             AppletFingerprint::OpenFips201(OpenFips201Variant::Generic) => "Generic OpenFIPS201",
             AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2) => {
                 "Swissbit iShield 2 Series"
@@ -1520,7 +1520,7 @@ pub fn classify(
             _ => HidCrescendoVariant::Generic,
         })
     } else if sel.is_some_and(|s| s.starts_with("nitrokey")) {
-        AppletFingerprint::Trussed(TrussedVariant::NitroKey)
+        AppletFingerprint::Trussed(TrussedVariant::Nitrokey)
     } else if open_fips_201 {
         AppletFingerprint::OpenFips201(OpenFips201Variant::Generic)
     } else if atr.is_some_and(|a| a.starts_with("tk\0piv") || a.starts_with("tk piv")) {
@@ -1844,7 +1844,7 @@ mod tests {
                 false,
                 false
             ),
-            AppletFingerprint::Trussed(TrussedVariant::NitroKey)
+            AppletFingerprint::Trussed(TrussedVariant::Nitrokey)
         );
         assert_eq!(
             classify(Some("Nitrokey"), None, false, false, false),
@@ -1971,8 +1971,8 @@ mod tests {
             ),
             (AppletFingerprint::IdPrime, "IdPrime PIV Series"),
             (
-                AppletFingerprint::Trussed(TrussedVariant::NitroKey),
-                "NitroKey",
+                AppletFingerprint::Trussed(TrussedVariant::Nitrokey),
+                "Nitrokey",
             ),
             (
                 AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
@@ -2013,8 +2013,8 @@ mod tests {
             "ArekinathPivApplet::Generic"
         );
         assert_eq!(
-            AppletFingerprint::Trussed(TrussedVariant::NitroKey).to_string(),
-            "Trussed::NitroKey"
+            AppletFingerprint::Trussed(TrussedVariant::Nitrokey).to_string(),
+            "Trussed::Nitrokey"
         );
         assert_eq!(
             AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000).to_string(),
@@ -2075,7 +2075,7 @@ mod tests {
 
     #[test]
     fn format_nitrokey_name_wraps_the_variant() {
-        assert_eq!(format_nitrokey_name("NRF52"), "NitroKey (NRF52)");
+        assert_eq!(format_nitrokey_name("NRF52"), "Nitrokey (NRF52)");
     }
 
     // --- YubiKey display name from the already-fetched GET VERSION reply --

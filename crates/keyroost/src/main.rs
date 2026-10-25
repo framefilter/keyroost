@@ -29669,7 +29669,7 @@ mod tests {
         use keyroost_piv::fingerprint::{AppletFingerprint, TrussedVariant};
         let mut app = App::default();
         let mut status =
-            piv_status_with(AppletFingerprint::Trussed(TrussedVariant::NitroKey), None);
+            piv_status_with(AppletFingerprint::Trussed(TrussedVariant::Nitrokey), None);
         status.version_firmware = Some(vec![1, 9, 1]);
         app.piv.status = Some(status);
         app.piv.selected_slot = PivSlotSel::Sign;
@@ -29744,7 +29744,7 @@ mod tests {
         use keyroost_piv::fingerprint::{AppletFingerprint, TrussedVariant};
         let mut app = App::default();
         let mut status =
-            piv_status_with(AppletFingerprint::Trussed(TrussedVariant::NitroKey), None);
+            piv_status_with(AppletFingerprint::Trussed(TrussedVariant::Nitrokey), None);
         status.version_firmware = Some(vec![1, 9, 1]);
         app.piv.status = Some(status);
         app.piv.selected_slot = PivSlotSel::Auth;
@@ -29851,7 +29851,7 @@ mod tests {
         let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
         let nitrokey = || {
             let mut st = piv_status_with(
-                AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+                AppletFingerprint::Trussed(TrussedVariant::Nitrokey),
                 Some(vec![6, 6, 6]),
             );
             st.version_firmware = Some(vec![1, 9, 1]);

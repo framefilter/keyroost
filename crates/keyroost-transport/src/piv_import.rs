@@ -159,7 +159,7 @@ impl std::error::Error for ImportRefusal {}
 /// Nitrokey 3), else that label.
 fn product_name(fp: AppletFingerprint) -> &'static str {
     match fp {
-        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => "Nitrokey 3",
+        AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => "Nitrokey 3",
         other => other.applet_name(),
     }
 }
@@ -964,7 +964,7 @@ mod tests {
         keyroost_p12::open(&bytes, Some(PW)).unwrap()
     }
 
-    const NK: AppletFingerprint = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+    const NK: AppletFingerprint = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
     const NK_FW: Option<&[u8]> = Some(&[1, 9, 1]);
     const YK_APPLET: Option<&[u8]> = Some(&[5, 7, 1]);
 
@@ -1958,7 +1958,7 @@ mod run_tests {
             &c,
             None,
             Slot::Authentication,
-            AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+            AppletFingerprint::Trussed(TrussedVariant::Nitrokey),
             None,
             Some(&[1, 9, 1]),
             PinPolicy::Default,
