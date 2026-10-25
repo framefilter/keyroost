@@ -8,17 +8,13 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Next: the soon item below (smart-card driver hint), after #174 lands.
-
 ---
 
 ## In flight
 
 Being worked on right now — check with whoever holds it before starting.
 
-- **PIV: import a key and certificate from a .p12 file
-  ([#174](https://github.com/framefilter/keyroost/issues/174)).** Branch
-  `feat/174-pkcs12-import`.
+- **v0.15 loose ends** (`feat/v015-loose-ends`): see the PR.
 
 ---
 
@@ -34,13 +30,6 @@ Being worked on right now — check with whoever holds it before starting.
   `packaging/RELEASING.md`, which is the playbook for the whole release.
 
 **Next:**
-
-- **Soon: say when a key's smart-card interface has no reader.** Spot a key
-  whose USB descriptor has a smart-card (CCID, class 0x0B) interface while the
-  smart-card service lists no reader for it, and say so in `doctor` and the
-  app (one line: the system's smart-card driver doesn't list this key yet;
-  PIV/OpenPGP need a newer driver). Evidence from the machine; never a list of
-  driver versions. (S)
 
 **Later:**
 
@@ -91,6 +80,14 @@ Being worked on right now — check with whoever holds it before starting.
   indicator while the device worker is busy, per-action busy/disabled button
   states, a cue on long ops. Keep it tasteful — over-animation reads as cheap.
   Research what feels alive vs. annoying before building.
+
+- **Firmware version has three JSON names.** `firmware` (`list`),
+  `firmware_version` (`fido info` ctap2), `version_firmware` (`piv info`); pick
+  one name with retired aliases. A decision for later. (S)
+
+- **Research: restoring missing OpenPGP fingerprints** from the user's public
+  key file. Investigate only; may be a hornet's nest (key-generation times,
+  which key matches, writing to the card). (research)
 
 - **Drop the broken-pipe workaround when stable Rust lands the SIGPIPE fix.**
   `install_broken_pipe_guard()` in `crates/keyroostctl/src/main.rs` plus its
@@ -154,6 +151,10 @@ plan's two-key manual steps were never executed):
 - **Linux hidraw bounded reads:** unplug a key mid-`fido info` — the command must
   error within the read budget, not hang.
 
+- **YubiKey NEO FIDO version query.** Yubico's old NEO Manager lists SELECT
+  `A0000006472F0001` then `00 42 00 00` for the U2F applet version; untested.
+  Needs a test on a real NEO before anyone builds it.
+
 **Feature verification:**
 
 - **OATH applet reset:** on a password-PROTECTED test key, reset from the GUI
@@ -190,8 +191,8 @@ plan's two-key manual steps were never executed):
 
 ## Deferred to a later release
 
-- **Keep copied codes out of clipboard history on native Wayland** (after
-  v0.15). Copies are marked `x-kde-passwordManagerHint=secret` on X11 and
+- **Keep copied codes out of clipboard history on native Wayland** (waits for
+  GNOME). Copies are marked `x-kde-passwordManagerHint=secret` on X11 and
   with the platform markers on Windows and macOS, but on native Wayland they
   go through egui's own clipboard, which can't add the marker. arboard's
   `wayland-data-control` feature would (9 more crates, among them
@@ -204,7 +205,8 @@ plan's two-key manual steps were never executed):
   arboard falls back to X11 through XWayland there. COSMIC, Sway and (from a
   coming Plasma release) KDE withhold data-control from sandboxed apps, so the
   Flatpak would get the fallback too. Until then, `KEYROOST_X11=1` runs the
-  app under X11, where the marker already works. (M)
+  app under X11, where the marker already works. Revisit when GNOME's Mutter
+  supports a data-control protocol. (M)
 
 - **Submit keyroost to Flathub** — deferred, not ruled out; not in v0.14.0.
   The maintainer submits it himself. Flathub's generative-AI

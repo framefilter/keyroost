@@ -93,6 +93,8 @@ jobs:
           # keyroost uses, so it also needs a one-time hand publish first.
           # keyroost-pivtest (new in the release after 0.9.0) depends only on
           # keyroost-piv, so it follows it; same one-time hand publish first.
+          # keyroost-p12 (new after 0.14.0) depends on keyroost-oath/-proto/-piv,
+          # so it follows keyroost-piv; same one-time hand publish first.
           # keyroost-pgpkey's optional `card` feature names keyroost-transport
           # at this version, so it must follow keyroost-transport; it is new
           # too, so it needs the same one-time hand publish (and its Trusted
@@ -104,7 +106,7 @@ jobs:
           for crate in keyroost-proto keyroost-windevtree keyroost-hid \
                        keyroost-keyring keyroost-rsakey \
                        keyroost-ctap keyroost-oath keyroost-openpgp keyroost-piv \
-                       keyroost-pivtest \
+                       keyroost-pivtest keyroost-p12 \
                        keyroost-token2otp keyroost-token2prog keyroost-import \
                        keyroost-transport keyroost-pgpkey keyroost-resolve keyroost-qr \
                        keyroost-winwebauthn keyroost-screengrab \
