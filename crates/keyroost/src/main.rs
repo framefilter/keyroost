@@ -8424,15 +8424,20 @@ impl App {
     }
 
     /// Re-read status after a write and store it, surfacing `notice` on success.
+    /// `keys_changed`: the write replaced or wiped keys, so what was read about
+    /// key presence no longer holds; other writes (name, URL, PINs) keep it.
     fn apply_openpgp_write(
         app: &mut App,
         result: Result<keyroost_transport::OpenPgpStatus, TransportError>,
         notice: String,
+        keys_changed: bool,
     ) {
         match result {
             Ok(status) => {
                 app.openpgp.status = Some(status);
-                app.openpgp.key_present = [None; 3];
+                if keys_changed {
+                    app.openpgp.key_present = [None; 3];
+                }
                 app.openpgp.loaded = true;
                 app.openpgp.error = None;
                 app.openpgp.notice = Some(notice);
@@ -8488,7 +8493,7 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                Self::apply_openpgp_write(app, result, "Cardholder name set.".into())
+                Self::apply_openpgp_write(app, result, "Cardholder name set.".into(), false)
             })
         });
     }
@@ -8508,7 +8513,7 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                Self::apply_openpgp_write(app, result, "Public-key URL set.".into())
+                Self::apply_openpgp_write(app, result, "Public-key URL set.".into(), false)
             })
         });
     }
@@ -8537,7 +8542,7 @@ impl App {
                 match result {
                     Ok((status, fpr)) => {
                         app.openpgp.status = Some(status);
-                app.openpgp.key_present = [None; 3];
+                        app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice =
@@ -8647,7 +8652,7 @@ impl App {
                 match result {
                     Ok((status, kind, fpr)) => {
                         app.openpgp.status = Some(status);
-                app.openpgp.key_present = [None; 3];
+                        app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice = Some(format!(
@@ -9143,6 +9148,7 @@ impl App {
                     app,
                     result,
                     "OpenPGP applet reset; keys wiped, PINs back to defaults.".into(),
+                    true,
                 )
             })
         })
@@ -9166,7 +9172,7 @@ impl App {
             Box::new(move |app: &mut App| {
                 wipe(&mut app.openpgp.user_pin_old);
                 wipe(&mut app.openpgp.user_pin_new);
-                Self::apply_openpgp_write(app, result, "User PIN (PW1) changed.".into());
+                Self::apply_openpgp_write(app, result, "User PIN (PW1) changed.".into(), false);
             })
         });
     }
@@ -9188,7 +9194,7 @@ impl App {
             Box::new(move |app: &mut App| {
                 wipe(&mut app.openpgp.admin_pin_old);
                 wipe(&mut app.openpgp.admin_pin_new);
-                Self::apply_openpgp_write(app, result, "Admin PIN (PW3) changed.".into());
+                Self::apply_openpgp_write(app, result, "Admin PIN (PW3) changed.".into(), false);
             })
         });
     }
@@ -9210,7 +9216,7 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.openpgp.unblock_new);
-                Self::apply_openpgp_write(app, result, "User PIN (PW1) unblocked.".into());
+                Self::apply_openpgp_write(app, result, "User PIN (PW1) unblocked.".into(), false);
             })
         });
     }
