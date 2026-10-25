@@ -14,8 +14,6 @@ pair rotted because version-named files accumulate layers nobody rereads.
 
 Being worked on right now — check with whoever holds it before starting.
 
-- **v0.15 loose ends** (`feat/v015-loose-ends`): see the PR.
-
 ---
 
 ## Ready to pick up
