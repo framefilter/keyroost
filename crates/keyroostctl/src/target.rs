@@ -33,6 +33,7 @@ pub(crate) fn enumerate() -> Result<Vec<Device>, Box<dyn Error>> {
         debug: debug_on(),
         skip_identity_reads: false,
         skip_key_names: false,
+        skip_protocol_asks: false,
     })?)
 }
 
@@ -44,6 +45,7 @@ pub(crate) fn enumerate_without_key_names() -> Result<Vec<Device>, Box<dyn Error
         debug: debug_on(),
         skip_identity_reads: false,
         skip_key_names: true,
+        skip_protocol_asks: false,
     })?)
 }
 
@@ -55,6 +57,7 @@ pub(crate) fn enumerate_without_identity_reads() -> Result<Vec<Device>, Box<dyn 
         debug: debug_on(),
         skip_identity_reads: true,
         skip_key_names: true,
+        skip_protocol_asks: true,
     })?)
 }
 

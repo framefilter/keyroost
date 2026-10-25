@@ -1022,6 +1022,18 @@ pub fn correlate_live(
     keyring: &Keyring,
     debug: bool,
 ) -> Vec<Device> {
+    correlate_live_asking(hids, probes, keyring, debug, true)
+}
+
+/// [`correlate_live`], asking FIDO interfaces their protocol only when
+/// `may_ask` (else using the answers already known).
+fn correlate_live_asking(
+    hids: &[HidDevice],
+    probes: &[ReaderProbe],
+    keyring: &Keyring,
+    debug: bool,
+    may_ask: bool,
+) -> Vec<Device> {
     let mut opts = MatchOptions {
         trace: debug,
         ..MatchOptions::default()
@@ -1038,7 +1050,7 @@ pub fn correlate_live(
     let plan = crate::identity::plan_identity_reads(h, p, registry);
     let ids = crate::identity::read_identities_once(&plan, h, p, registry, debug);
     let mut devices = correlate_with(h, p, keyring, &ids, &opts);
-    let (u2f_only, unknown) = fido_protocol_paths(hids, true, debug);
+    let (u2f_only, unknown) = fido_protocol_paths(hids, may_ask, debug);
     mark_fido_protocol(&mut devices, &u2f_only, &unknown);
     devices
 }
@@ -1055,6 +1067,19 @@ pub struct EnumerateOptions {
     pub skip_identity_reads: bool,
     /// Don't read names stored on keys (local names only).
     pub skip_key_names: bool,
+    /// Don't ask FIDO interfaces which protocol they speak (CTAPHID INIT);
+    /// use the answers already known. For a scan repeated in a tight loop
+    /// that needs no badges, where a key that doesn't answer would cost every
+    /// scan the INIT timeout. Implied by `skip_identity_reads`.
+    pub skip_protocol_asks: bool,
+}
+
+impl EnumerateOptions {
+    /// Whether a scan with these options may ask FIDO interfaces their
+    /// protocol.
+    fn may_ask_protocol(&self) -> bool {
+        !self.skip_identity_reads && !self.skip_protocol_asks
+    }
 }
 
 /// Warnings already given in this process, and those a front end hasn't
@@ -1414,11 +1439,17 @@ pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
         // A quick re-check scan uses INIT answers already known; it asks no
         // key.
         let mut devices = correlate(&hids, &probes, &keyring);
-        let (u2f_only, unknown) = fido_protocol_paths(&hids, false, opts.debug);
+        let (u2f_only, unknown) = fido_protocol_paths(&hids, opts.may_ask_protocol(), opts.debug);
         mark_fido_protocol(&mut devices, &u2f_only, &unknown);
         return Ok(devices);
     }
-    let mut devices = correlate_live(&hids, &probes, &keyring, opts.debug);
+    let mut devices = correlate_live_asking(
+        &hids,
+        &probes,
+        &keyring,
+        opts.debug,
+        opts.may_ask_protocol(),
+    );
     if !opts.skip_key_names {
         name_from_keys(&mut devices, &keyring, may_save, opts.debug);
     }
@@ -3775,6 +3806,79 @@ mod tests {
             read_key_labels(&devices, false).get(&devices[0].id),
             Some(&KeyLabel::ReadFailed)
         );
+    }
+
+    /// Unplugging forgets an interface's answer, and the same path at a new
+    /// USB position (a replug) is asked again.
+    #[test]
+    fn unplug_or_replug_forgets_the_answer() {
+        let at = |addr| {
+            [hid(
+                0x1050,
+                0x0407,
+                "/dev/hidraw7",
+                None,
+                Some(1),
+                Some(addr),
+            )]
+        };
+        let mut cache = FidoProtocolCache::new();
+        fido_protocols_from(&mut cache, &at(2), true, |_| InitAnswer::Cbor(false));
+        assert_eq!(cache.len(), 1);
+
+        // Unplugged: the scan sees no interface, and the answer is gone.
+        fido_protocols_from(&mut cache, &[], true, |_| panic!("nothing to ask"));
+        assert!(cache.is_empty());
+
+        // Back at a new position after an answer: asked again.
+        fido_protocols_from(&mut cache, &at(2), true, |_| InitAnswer::Cbor(false));
+        let mut asked = 0;
+        let (u2f, unknown) = fido_protocols_from(&mut cache, &at(3), true, |_| {
+            asked += 1;
+            InitAnswer::Cbor(true)
+        });
+        assert_eq!(asked, 1);
+        assert!(u2f.is_empty() && unknown.is_empty());
+    }
+
+    /// A key that couldn't be opened last time keeps FIDO2 on a scan that may
+    /// not ask: its cached answer is in neither set.
+    #[test]
+    fn cached_not_opened_is_in_neither_set_when_not_asking() {
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw7", None, Some(1), Some(2))];
+        let mut cache = FidoProtocolCache::new();
+        fido_protocols_from(&mut cache, &hids, true, |_| InitAnswer::NotOpened);
+        let (u2f, unknown) = fido_protocols_from(&mut cache, &hids, false, |_| panic!("asked"));
+        assert!(u2f.is_empty() && unknown.is_empty());
+    }
+
+    /// A scan with `skip_protocol_asks` (the app's reset-arm poll) or
+    /// `skip_identity_reads` never asks, even an interface whose last
+    /// answer was no proper answer; a default scan does ask.
+    #[test]
+    fn a_may_not_ask_scan_never_asks() {
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw7", None, Some(1), Some(2))];
+        let mut cache = FidoProtocolCache::new();
+        fido_protocols_from(&mut cache, &hids, true, |_| InitAnswer::NoProperAnswer);
+        for opts in [
+            EnumerateOptions {
+                skip_protocol_asks: true,
+                skip_key_names: true,
+                ..Default::default()
+            },
+            EnumerateOptions {
+                skip_identity_reads: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!opts.may_ask_protocol());
+            let (_, unknown) =
+                fido_protocols_from(&mut cache, &hids, opts.may_ask_protocol(), |_| {
+                    panic!("asked on a may-not-ask scan")
+                });
+            assert!(unknown.contains(&PathBuf::from("/dev/hidraw7")));
+        }
+        assert!(EnumerateOptions::default().may_ask_protocol());
     }
 
     /// A failed ask isn't kept until unplug: the next scan that may ask asks

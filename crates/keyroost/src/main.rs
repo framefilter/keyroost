@@ -8222,7 +8222,9 @@ impl App {
     /// which resolves the reinserted key from the same correlated device
     /// list for exactly this reason. Names stored on keys are not read here
     /// (`skip_key_names`), so the poll never talks CTAP to the key being
-    /// reset.
+    /// reset, and FIDO interfaces aren't asked their protocol
+    /// (`skip_protocol_asks`): this runs every poll on the UI thread, and a
+    /// key that doesn't answer INIT would stall each one for the timeout.
     ///
     /// `None` when the device is gone or the identity can't be read *yet* (a
     /// just-replugged key's CCID interface takes a beat to register with
@@ -8230,6 +8232,7 @@ impl App {
     fn fido_effective_serial(path: &std::path::Path) -> Option<String> {
         keyroost_resolve::enumerate_with(&keyroost_resolve::EnumerateOptions {
             skip_key_names: true,
+            skip_protocol_asks: true,
             ..Default::default()
         })
         .unwrap_or_default()

@@ -91,13 +91,14 @@ pub enum InitAnswer {
     /// `false` for U2F (CTAP1) only.
     Cbor(bool),
     /// The interface didn't open (no permission, held by another program,
-    /// gone), or INIT got a "not now" CTAPHID error (busy, locked to another
-    /// channel, message timeout, invalid channel or sequence). Nothing is
-    /// known about the key; worth asking again.
+    /// gone), an I/O or backend error stopped INIT, or INIT got a "not now"
+    /// CTAPHID error (busy, locked to another channel, message timeout,
+    /// invalid channel or sequence). Nothing is known about the key; worth
+    /// asking again.
     NotOpened,
     /// The interface opened, but INIT timed out or the reply was malformed
-    /// (too short, wrong command, nonce mismatch, out of sequence) or another
-    /// device error.
+    /// (too short, too long, wrong command, nonce mismatch, out of sequence)
+    /// or another device error.
     NoProperAnswer,
 }
 
@@ -126,7 +127,8 @@ pub fn init_answer_from(
             | E::InitResponseTooShort
             | E::NonceMismatch
             | E::UnexpectedCommand { .. }
-            | E::OutOfSequence { .. },
+            | E::OutOfSequence { .. }
+            | E::PayloadTooLarge(_),
         ) => InitAnswer::NoProperAnswer,
         // I/O on the interface failed (the open for INIT, or a read or
         // write): no exchange took place.
@@ -423,6 +425,7 @@ mod tests {
                 expected: 0,
                 got: 3,
             },
+            E::PayloadTooLarge(70_000),
             E::DeviceError(CTAPHID_ERR_INVALID_CMD),
             E::DeviceError(CTAPHID_ERR_OTHER),
         ] {
