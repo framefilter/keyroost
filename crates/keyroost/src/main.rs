@@ -445,6 +445,9 @@ struct SecurityKeysState {
     /// The firmware read from the key's admin application, when its INIT
     /// reports none (version 0.0.0, as the Nitrokey 3 does).
     admin_firmware: Option<String>,
+    /// The last read found no CTAP2 interface (U2F only), so GetInfo was
+    /// never asked: the pane says so instead of "Reading key…".
+    u2f_only: bool,
     /// User-facing error from the last enumeration / open / GetInfo call.
     error: Option<String>,
     /// Live PIN entry field (cleared after submit).
@@ -2564,6 +2567,20 @@ fn pin_support(info: Option<&AuthenticatorInfo>) -> PinSupport {
             Some(false) => PinSupport::NotSet,
             Some(true) => PinSupport::Set,
         },
+    }
+}
+
+/// What the FIDO2 pane says while it has no getInfo answer: a key that
+/// showed no CTAP2 interface gets the CLI's `fido info` line word for word,
+/// shown muted (it isn't an error); else a failed read, else a read still
+/// under way.
+fn fido_unread_line(u2f_only: bool, read_failed: bool) -> &'static str {
+    if u2f_only {
+        "(device is U2F-only; CTAP2 GetInfo not available)"
+    } else if read_failed {
+        "Couldn't read this key."
+    } else {
+        "Reading key\u{2026}"
     }
 }
 
@@ -5470,6 +5487,7 @@ impl App {
         self.security_keys.info = None;
         self.security_keys.init = None;
         self.security_keys.admin_firmware = None;
+        self.security_keys.u2f_only = false;
         self.security_keys.error = None;
         let Some(target) = self.selected_fido_target() else {
             return;
@@ -5524,14 +5542,10 @@ impl App {
                             }
                             None => {
                                 // CBOR was reported unavailable and we never even
-                                // attempted GetInfo. Record it as an error rather
-                                // than leaving the pane spinning on "Reading key…"
-                                // forever (the spinner re-fires while info is None).
-                                app.security_keys.error = Some(
-                                    "this key did not present a CTAP2 (FIDO2) interface over \
-                                     the reader; only U2F was detected"
-                                        .to_string(),
-                                );
+                                // attempted GetInfo. Record that, so the pane says
+                                // so rather than spinning on "Reading key…" forever
+                                // (the spinner re-fires while info is None).
+                                app.security_keys.u2f_only = true;
                             }
                         }
                         app.apply_key_details();
@@ -9744,6 +9758,7 @@ impl App {
         self.security_keys.info = None;
         self.security_keys.init = None;
         self.security_keys.admin_firmware = None;
+        self.security_keys.u2f_only = false;
         self.security_keys.session = None;
         self.security_keys.session_device = None;
         self.security_keys.error = None;
@@ -17349,9 +17364,12 @@ impl App {
                             }
                             None => {
                                 ui.label(
-                                    egui::RichText::new("Reading key\u{2026}")
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt3),
+                                    egui::RichText::new(fido_unread_line(
+                                        self.security_keys.u2f_only,
+                                        false,
+                                    ))
+                                    .font(theme::f_reg(13.0))
+                                    .color(p.txt3),
                                 );
                             }
                         }
@@ -17783,19 +17801,16 @@ impl App {
                     });
                 }
                 PinSupport::Unknown => {
-                    let msg = if self.security_keys.error.is_some() {
-                        "Couldn't read this key."
-                    } else {
-                        // The initial read can be dropped if the worker was
-                        // busy at selection time; retry rather than showing
-                        // "Reading key…" forever.
-                        if self.security_keys.info.is_none() && !self.busy() {
-                            self.fetch_selected_info();
-                        }
-                        "Reading key\u{2026}"
-                    };
+                    let u2f_only = self.security_keys.u2f_only;
+                    let failed = self.security_keys.error.is_some();
+                    // The initial read can be dropped if the worker was busy
+                    // at selection time; retry rather than showing "Reading
+                    // key…" forever.
+                    if !u2f_only && !failed && self.security_keys.info.is_none() && !self.busy() {
+                        self.fetch_selected_info();
+                    }
                     ui.label(
-                        egui::RichText::new(msg)
+                        egui::RichText::new(fido_unread_line(u2f_only, failed))
                             .font(theme::f_reg(13.0))
                             .color(p.txt3),
                     );
@@ -28076,6 +28091,19 @@ mod tests {
         let previous = app.selected_device.replace("serial:AAA".into());
         app.on_device_selected(previous);
         assert_eq!(app.cap_tab, CapTab::Piv);
+    }
+
+    /// A key that showed no CTAP2 interface gets the CLI's `fido info` line
+    /// word for word, as a muted note; a failed read and a read still under
+    /// way keep their own lines.
+    #[test]
+    fn unread_fido_info_line_names_a_u2f_only_key_like_the_cli() {
+        assert_eq!(
+            fido_unread_line(true, false),
+            "(device is U2F-only; CTAP2 GetInfo not available)"
+        );
+        assert_eq!(fido_unread_line(false, true), "Couldn't read this key.");
+        assert_eq!(fido_unread_line(false, false), "Reading key\u{2026}");
     }
 
     /// getInfo with no `clientPin` option means the key has no PIN feature —
