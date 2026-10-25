@@ -29,8 +29,6 @@ Being worked on right now — check with whoever holds it before starting.
   flatpak broke at release time because a source was pruned). Full sequence:
   `packaging/RELEASING.md`, which is the playbook for the whole release.
 
-**Next:**
-
 **Later:**
 
 - **AppImage-only republish.** Add an `appimage_only` input to
