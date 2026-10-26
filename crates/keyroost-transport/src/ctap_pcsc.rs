@@ -55,6 +55,21 @@ const MAX_SHORT_DATA: usize = 255;
 /// PC/SC receive buffer (large-blob reads can return a few KB per APDU).
 const RECV_BUF: usize = 4096;
 
+/// The error for a failed `SCardTransmit`. On Windows a program that isn't
+/// running as administrator gets `SCARD_E_NO_ACCESS` ("Access is denied to
+/// this file") for the FIDO applet `SELECT`, where an administrator's reaches
+/// the card: say that instead of the raw PC/SC text.
+fn transmit_error(e: pcsc::Error) -> CtapError {
+    if cfg!(windows) && e == pcsc::Error::NoAccess {
+        return CtapError::Transport(
+            "Windows lets only a program running as administrator reach a key's \
+             FIDO2 side, through its smart-card reader too"
+                .into(),
+        );
+    }
+    CtapError::Transport(format!("APDU transmit failed: {e}"))
+}
+
 /// A FIDO2 authenticator reached over a PC/SC reader (NFC or contact).
 pub struct CtapPcscDevice {
     /// `Option` so `Drop` can `take()` the card and disconnect it with
@@ -204,9 +219,7 @@ impl CtapPcscDevice {
             .card
             .as_mut()
             .ok_or_else(|| CtapError::Transport("card already disconnected".into()))?;
-        let resp = card
-            .transmit(apdu, &mut buf)
-            .map_err(|e| CtapError::Transport(format!("APDU transmit failed: {e}")))?;
+        let resp = card.transmit(apdu, &mut buf).map_err(transmit_error)?;
         if resp.len() < 2 {
             return Err(CtapError::Transport(format!(
                 "APDU response too short ({} bytes)",
@@ -402,6 +415,15 @@ mod tests {
             .unwrap()
             .expect("dual-protocol card must expose CTAP2");
         assert!(info.versions.iter().any(|v| v == "FIDO_2_0"));
+    }
+
+    #[test]
+    fn a_refused_transmit_names_administrator_rights_only_on_windows() {
+        let msg = transmit_error(pcsc::Error::NoAccess).to_string();
+        assert_eq!(msg.contains("administrator"), cfg!(windows), "{msg}");
+        // Any other failure keeps the PC/SC text.
+        let msg = transmit_error(pcsc::Error::RemovedCard).to_string();
+        assert!(msg.contains("APDU transmit failed"), "{msg}");
     }
 
     #[test]
