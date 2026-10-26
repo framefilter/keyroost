@@ -493,7 +493,7 @@ fn usb_smart_cards_in(root: &std::path::Path) -> Vec<UsbSmartCard> {
     out
 }
 
-// Used by the sysfs backend and the tests; dead on the hidapi-only build.
+// Used by the sysfs backend and the tests; dead off Linux and with the hidapi backend.
 #[cfg_attr(
     any(not(target_os = "linux"), feature = "hidapi-backend"),
     allow(dead_code)
@@ -507,7 +507,7 @@ fn parse_hex_u16(s: &str) -> Option<u16> {
 /// Walk a HID report descriptor and return the first
 /// `(usage_page, usage)` pair, which describes the device's top-level
 /// application collection.
-// Used by the sysfs backend and the tests; dead on the hidapi-only build.
+// Used by the sysfs backend and the tests; dead off Linux and with the hidapi backend.
 #[cfg_attr(
     any(not(target_os = "linux"), feature = "hidapi-backend"),
     allow(dead_code)

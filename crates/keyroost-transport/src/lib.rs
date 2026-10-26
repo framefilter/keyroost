@@ -1265,6 +1265,13 @@ pub fn set_probe_trace(on: bool) {
     PROBE_TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether a FIDO applet SELECT answer names CTAP2: success status and data
+/// starting `FIDO_2_0` (cards may add trailing bytes, as with the `U2F_V2`
+/// prefix rule in `get_info_unless_u2f_only`).
+fn select_names_fido2(data: &[u8], s1: u8, s2: u8) -> bool {
+    sw_ok(s1, s2) && data.starts_with(b"FIDO_2_0")
+}
+
 fn probe_trace_on() -> bool {
     PROBE_TRACE.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var_os("KEYROOST_PROBE_DEBUG").is_some()
@@ -1405,7 +1412,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 probe.has_fido = accepted(s1, s2);
                 // U2F_V2 doesn't mean U2F only. A continuation or any other
                 // answer leaves CTAP2 unconfirmed.
-                probe.fido_ctap2_confirmed = sw_ok(s1, s2) && data == b"FIDO_2_0";
+                probe.fido_ctap2_confirmed = select_names_fido2(&data, s1, s2);
             }
             // Token2 on-device OTP applet — select it to confirm presence,
             // rather than inferring from the reader name (which mislabels any
@@ -2184,6 +2191,14 @@ mod reader_poll_tests {
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    #[test]
+    fn fido_select_names_ctap2_by_prefix() {
+        assert!(select_names_fido2(b"FIDO_2_0", 0x90, 0x00));
+        assert!(select_names_fido2(b"FIDO_2_0_extra", 0x90, 0x00));
+        assert!(!select_names_fido2(b"U2F_V2", 0x90, 0x00));
+        assert!(!select_names_fido2(b"FIDO_2_0", 0x6A, 0x82));
+    }
 
     /// The applet reassembly loop must distinguish `61xx` (more data),
     /// `6Cxx` (wrong Le — reissue with the corrected length; issue #84), and

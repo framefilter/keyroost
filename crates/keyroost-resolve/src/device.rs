@@ -78,7 +78,9 @@ pub enum CapState {
     /// The surface is offered, but the device didn't confirm it: an applet
     /// offered on a label-grade hint (the Token2 vendor id offering OTP,
     /// exactly as `has_otp = is_token2` always did), or a FIDO interface
-    /// whose protocol isn't known ([`Caps::FIDO_PROTOCOL_UNKNOWN`]). Rendered
+    /// whose protocol isn't known ([`Caps::FIDO_PROTOCOL_UNKNOWN`]), or a
+    /// reader-only FIDO row whose applet `SELECT` did not name FIDO2 (no
+    /// `FIDO_PROTOCOL_UNKNOWN` there; it keeps its reset step). Rendered
     /// distinctly so an offer is never mistaken for verified presence.
     Unverified,
 }
@@ -111,7 +113,9 @@ pub struct Device {
     /// The subset of `caps` that keyroost could not verify against the device:
     /// no card channel answered a `SELECT` for it (offered on a label-grade
     /// hint only), or FIDO2 whose protocol isn't known
-    /// ([`Caps::FIDO_PROTOCOL_UNKNOWN`]). Invariant: `unverified` ⊆ `caps`,
+    /// ([`Caps::FIDO_PROTOCOL_UNKNOWN`]), or a reader-only FIDO row whose
+    /// applet `SELECT` did not name FIDO2 (no `FIDO_PROTOCOL_UNKNOWN`; it
+    /// keeps its reset step). Invariant: `unverified` ⊆ `caps`,
     /// so every `caps.has(..)` caller keeps today's fail-open behaviour
     /// untouched; consult [`Device::cap_state`] for the honest
     /// per-capability answer.
@@ -1498,9 +1502,6 @@ fn mark_live_smart_cards(
     probes: &[ReaderProbe],
     pcsc_up: bool,
 ) {
-    if !cfg!(target_os = "linux") {
-        return;
-    }
     let readers: Vec<Option<UsbDeviceKey>> = probes.iter().map(|p| p.usb_device.clone()).collect();
     mark_smart_card_unlisted(
         devices,
@@ -1711,8 +1712,8 @@ impl ResetStep {
 /// unverified behaves as "offer it", and the attempt itself reports
 /// whether the applet is really there. The exception is a FIDO HID
 /// interface that gave no proper INIT answer
-/// ([`Caps::FIDO_PROTOCOL_UNKNOWN`]): no FIDO2 step until the key answers. [`ResetStep::Piv`] is the one other case this
-/// doesn't itself resolve: `Caps::PIV` says the applet is
+/// ([`Caps::FIDO_PROTOCOL_UNKNOWN`]): no FIDO2 step until the key answers.
+/// [`ResetStep::Piv`] is the one other case this doesn't itself resolve: `Caps::PIV` says the applet is
 /// there, not that it can be reset at all — call
 /// [`exclude_unresettable_piv`] once a live fingerprint confirms it can't.
 pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
