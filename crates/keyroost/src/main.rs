@@ -14239,8 +14239,8 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
 /// Height of one device card in the full list.
 const DEVICE_CARD_H: f32 = 68.0;
 
-/// The muted line under a key's card when its smart-card part has no reader
-/// listed (Linux; [`Device::smart_card_unlisted`]). Held back while the scan
+/// The muted line in the key's Overview "Smart cards" card when its smart-card
+/// part has no reader listed (Linux; [`Device::smart_card_unlisted`]). Held back while the scan
 /// burst after a plug-in runs (`pending_scans`), since a key's reader can
 /// register a beat after the key itself.
 fn no_reader_line(dev: &Device, pending_scans: u8) -> Option<&'static str> {
@@ -16161,7 +16161,6 @@ impl App {
                         );
                     });
                 }
-                let pending_scans = self.pending_scans;
                 for dev in self
                     .devices
                     .iter()
@@ -16170,13 +16169,6 @@ impl App {
                     let selected = self.selected_device.as_deref() == Some(dev.id.as_str());
                     if device_row(ui, p, dev, selected) {
                         ev.picked = Some(dev.id.clone());
-                    }
-                    if let Some(line) = no_reader_line(dev, pending_scans) {
-                        ui.label(
-                            egui::RichText::new(line)
-                                .font(theme::f_reg(11.5))
-                                .color(p.txt3),
-                        );
                     }
                     ui.add_space(2.0);
                 }
@@ -17569,6 +17561,18 @@ impl App {
                                 .color(p.txt3),
                         );
                     }
+                });
+            }
+            if let Some(line) = no_reader_line(dev, self.pending_scans) {
+                ui.add_space(14.0);
+                theme::card_frame(p).show(ui, |ui| {
+                    head_row(ui, p, "Smart cards", theme::f_sb(14.5), None, |_| {});
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(line)
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt3),
+                    );
                 });
             }
             // Whole-device factory reset — offered only for a Key (Molto2 keeps

@@ -1713,8 +1713,8 @@ impl ResetStep {
 /// whether the applet is really there. The exception is a FIDO HID
 /// interface that gave no proper INIT answer
 /// ([`Caps::FIDO_PROTOCOL_UNKNOWN`]): no FIDO2 step until the key answers.
-/// [`ResetStep::Piv`] is the one other case this doesn't itself resolve: `Caps::PIV` says the applet is
-/// there, not that it can be reset at all — call
+/// [`ResetStep::Piv`] is the one other case this doesn't itself resolve:
+/// `Caps::PIV` says the applet is there, not that it can be reset at all — call
 /// [`exclude_unresettable_piv`] once a live fingerprint confirms it can't.
 pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     let mut steps = Vec::new();
