@@ -6613,7 +6613,7 @@ fn no_reader_hint(card: &keyroost_hid::UsbSmartCard) -> String {
         format!("{} ({ids})", sanitize_terminal(&card.product_name))
     };
     format!(
-        "! {who} has a smart-card interface, but the smart-card service lists no reader for it.\n  \
+        "– {who} has a smart-card interface, but the smart-card service lists no reader for it.\n  \
          Its PIV/OpenPGP features can't be reached on this system. The usual cause is a smart-card\n  \
          driver (libccid) that doesn't recognize this model yet."
     )
@@ -6636,7 +6636,7 @@ fn print_no_reader_hints() {
     }
 }
 
-/// Environment diagnosis: each check prints one ✓/✗/–/! line with the fix
+/// Environment diagnosis: each check prints one ✓/✗/– line with the fix
 /// inline. Never touches card state and always exits 0 — it's a flashlight,
 /// not a gate.
 fn run_doctor() {
@@ -15499,7 +15499,7 @@ mod human_style_tests {
     fn doctor_no_reader_hint_text() {
         assert_eq!(
             no_reader_hint(&smart_card("PIN+ Key")),
-            "! PIN+ Key (349e:0024) has a smart-card interface, but the smart-card \
+            "– PIN+ Key (349e:0024) has a smart-card interface, but the smart-card \
              service lists no reader for it.\n  \
              Its PIV/OpenPGP features can't be reached on this system. The usual \
              cause is a smart-card\n  \
@@ -15518,7 +15518,7 @@ mod human_style_tests {
     fn doctor_no_reader_hint_without_a_product_name() {
         let hint = no_reader_hint(&smart_card(""));
         assert!(
-            hint.starts_with("! 349e:0024 has a smart-card interface"),
+            hint.starts_with("– 349e:0024 has a smart-card interface"),
             "{hint:?}"
         );
     }

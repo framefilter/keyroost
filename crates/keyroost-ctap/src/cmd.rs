@@ -83,10 +83,9 @@ impl std::fmt::Display for CtapError {
             }
             CtapError::InvalidArgument(s) => write!(f, "invalid argument: {}", s),
             CtapError::Transport(s) => write!(f, "reader transport error: {}", s),
-            CtapError::Apdu { sw1, sw2 } => write!(
-                f,
-                "reader transport error: authenticator returned ISO status {sw1:02X}{sw2:02X}"
-            ),
+            CtapError::Apdu { sw1, sw2 } => {
+                write!(f, "the card refused the FIDO request ({sw1:02X}{sw2:02X})")
+            }
         }
     }
 }

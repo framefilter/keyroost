@@ -438,14 +438,14 @@ mod tests {
     }
 
     #[test]
-    fn apdu_error_keeps_the_old_wording() {
+    fn apdu_error_names_the_refusal() {
         assert_eq!(
             CtapError::Apdu {
                 sw1: 0x6D,
                 sw2: 0x00
             }
             .to_string(),
-            "reader transport error: authenticator returned ISO status 6D00"
+            "the card refused the FIDO request (6D00)"
         );
     }
 }
