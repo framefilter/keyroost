@@ -402,6 +402,29 @@ pub fn list() -> Vec<u8> {
     build_apdu_get(0x00, Instruction::List.code(), 0x00, 0x00, 0x00)
 }
 
+/// Build the `LIST` APDU that also asks for each credential's properties:
+/// `00 A1 00 00 01 01 00`, list version 1 in Nitrokey's secrets app, which
+/// then ends every `NAME_LIST` value with a properties byte (see
+/// [`parse_list_with_properties`]). That app has no `CALCULATE ALL`, so this
+/// is how it says which credentials need a touch. The Yubico applet ignores
+/// the byte and answers a plain listing, which [`parse_list_with_properties`]
+/// would misread: send this only to the secrets app
+/// ([`SelectInfo::lists_properties`]).
+#[must_use]
+pub fn list_with_properties() -> Vec<u8> {
+    with_le(build_apdu(
+        0x00,
+        Instruction::List.code(),
+        0x00,
+        0x00,
+        &[0x01],
+    ))
+}
+
+/// Properties-byte bit for a credential that needs a touch to compute, in a
+/// [`list_with_properties`] answer.
+pub const LIST_PROPERTY_TOUCH: u8 = 0x01;
+
 /// Build the `RESET` APDU (`00 04 DE AD`, case 1 — no body, no Le).
 ///
 /// Wipes every credential and clears the access password. Deliberately
@@ -546,6 +569,14 @@ impl SelectInfo {
         } else {
             MoreData::SendRemaining
         }
+    }
+
+    /// True for Nitrokey's secrets app (recognized as in [`Self::more_data`]),
+    /// which answers [`list_with_properties`] with a properties byte per
+    /// credential.
+    #[must_use]
+    pub fn lists_properties(&self) -> bool {
+        self.serial.is_some()
     }
 }
 
@@ -825,6 +856,9 @@ pub struct Listing {
     /// card holds credentials this crate cannot show, and callers should say
     /// so before any destructive operation (e.g. a reset).
     pub skipped: usize,
+    /// Names of the credentials the card says need a touch to compute. Only
+    /// a [`parse_list_with_properties`] listing fills it; empty otherwise.
+    pub touch_required: Vec<String>,
 }
 
 /// Parse a `LIST` response into credential entries.
@@ -833,14 +867,38 @@ pub struct Listing {
 /// `[ (type<<4)|algo, name_utf8... ]`. Non-`NAME_LIST` tags are ignored so the
 /// parser tolerates a card that interleaves other tags.
 pub fn parse_list(buf: &[u8]) -> Result<Listing, ParseError> {
+    parse_name_list(buf, false)
+}
+
+/// Parse the answer to [`list_with_properties`]: as [`parse_list`], but each
+/// `NAME_LIST` value ends with a properties byte, `[ (type<<4)|algo,
+/// name_utf8..., properties ]`. Names whose byte has [`LIST_PROPERTY_TOUCH`]
+/// go to [`Listing::touch_required`].
+pub fn parse_list_with_properties(buf: &[u8]) -> Result<Listing, ParseError> {
+    parse_name_list(buf, true)
+}
+
+fn parse_name_list(buf: &[u8], with_properties: bool) -> Result<Listing, ParseError> {
     let tlvs = parse_tlvs(buf)?;
     let mut out = Vec::new();
     let mut skipped = 0usize;
+    let mut touch_required = Vec::new();
     for tlv in &tlvs {
         if tlv.tag != Tag::NameList.code() {
             continue;
         }
-        let value = tlv.value;
+        let mut value = tlv.value;
+        let mut properties = 0u8;
+        if with_properties {
+            // The prefix byte and the properties byte at least.
+            let Some((&last, rest)) = value.split_last().filter(|(_, rest)| !rest.is_empty())
+            else {
+                skipped += 1;
+                continue;
+            };
+            properties = last;
+            value = rest;
+        }
         // Skip an individual undecodable entry (empty, unknown prefix, or a
         // non-UTF-8 name) rather than failing the whole listing — one corrupt
         // credential must not hide every other credential on the key. The
@@ -861,6 +919,9 @@ pub fn parse_list(buf: &[u8]) -> Result<Listing, ParseError> {
             skipped += 1;
             continue;
         };
+        if properties & LIST_PROPERTY_TOUCH != 0 {
+            touch_required.push(name.to_owned());
+        }
         out.push(CredentialInfo {
             name: name.to_owned(),
             oath_type,
@@ -870,6 +931,7 @@ pub fn parse_list(buf: &[u8]) -> Result<Listing, ParseError> {
     Ok(Listing {
         credentials: out,
         skipped,
+        touch_required,
     })
 }
 
@@ -1418,6 +1480,50 @@ mod tests {
     }
 
     #[test]
+    fn list_with_properties_sends_version_1() {
+        assert_eq!(
+            list_with_properties(),
+            vec![0x00, 0xA1, 0x00, 0x00, 0x01, 0x01, 0x00]
+        );
+    }
+
+    /// The shape a Nitrokey 3 (secrets app) gives a version-1 LIST: each
+    /// NAME_LIST value ends with its properties byte, `00` for a plain
+    /// account and `01` for one saved with "require touch".
+    #[test]
+    fn parse_list_with_properties_reads_the_touch_bit() {
+        let buf = [
+            0x72, 0x05, 0x21, b'a', b'b', b'c', 0x00, // TOTP/SHA1 "abc", no touch
+            0x72, 0x05, 0x21, b't', b'c', b'h', 0x01, // TOTP/SHA1 "tch", touch
+            0x72, 0x04, 0x11, b'h', b'o', 0x05, // HOTP/SHA1 "ho", touch + other bits
+        ];
+        let listing = parse_list_with_properties(&buf).unwrap();
+        assert_eq!(listing.skipped, 0);
+        let names: Vec<&str> = listing
+            .credentials
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, ["abc", "tch", "ho"]);
+        assert_eq!(listing.touch_required, ["tch", "ho"]);
+        // A plain listing never reports touch.
+        assert!(parse_list(&[0x72, 0x03, 0x21, b'a', b'b'])
+            .unwrap()
+            .touch_required
+            .is_empty());
+    }
+
+    #[test]
+    fn parse_list_with_properties_skips_an_entry_too_short_for_the_byte() {
+        // A prefix byte alone has no room for a name and a properties byte.
+        let buf = [0x72, 0x01, 0x21, 0x72, 0x04, 0x21, b'o', b'k', 0x00];
+        let listing = parse_list_with_properties(&buf).unwrap();
+        assert_eq!(listing.skipped, 1);
+        assert_eq!(listing.credentials.len(), 1);
+        assert_eq!(listing.credentials[0].name, "ok");
+    }
+
+    #[test]
     fn select_response_version_tag() {
         // A minimal SELECT bag: VERSION(79) 03 05 02 04
         let buf = [0x79, 0x03, 0x05, 0x02, 0x04];
@@ -1598,6 +1704,7 @@ mod tests {
         let info = parse_select(&yubikey).unwrap();
         assert_eq!(info.serial, None);
         assert_eq!(info.more_data(), MoreData::SendRemaining);
+        assert!(!info.lists_properties());
 
         // Nitrokey 3 answer (firmware 1.9.0, salt shortened): SERIAL NUMBER
         // (0x8F) present, so ISO GET RESPONSE.
@@ -1608,6 +1715,7 @@ mod tests {
         let info = parse_select(&nitrokey).unwrap();
         assert_eq!(info.serial, Some(vec![0x42, 0x68, 0x2E, 0xF7]));
         assert_eq!(info.more_data(), MoreData::GetResponse);
+        assert!(info.lists_properties());
     }
 
     #[test]

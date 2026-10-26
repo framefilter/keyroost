@@ -6798,10 +6798,13 @@ impl App {
         let listing = session.list()?;
         // One CALCULATE ALL answers every 30-second code and flags the touch
         // accounts without waiting for a touch. A key that refuses it gets
-        // the one-by-one reads instead.
+        // the one-by-one reads instead, minus the accounts its listing
+        // already says need a touch (Nitrokey's secrets app).
         let all = session.calculate_all(now).ok();
+        let mut touch = touch.to_vec();
+        touch.extend(listing.touch_required);
         let rows =
-            Self::oath_rows_from(listing.credentials, all.as_ref(), touch, |name, period| {
+            Self::oath_rows_from(listing.credentials, all.as_ref(), &touch, |name, period| {
                 session
                     .calculate_totp(name, now, period)
                     .ok()

@@ -257,7 +257,20 @@ impl OathSession {
     /// `Listing::skipped` is non-zero when the card holds entries this crate
     /// could not decode; callers should surface that — the listing is partial
     /// and destructive operations would also destroy the invisible entries.
+    ///
+    /// Nitrokey's secrets app is asked for each credential's properties too,
+    /// so `Listing::touch_required` names its touch accounts: it has no
+    /// `CALCULATE ALL` to say so. An app that refuses that form gets the
+    /// plain LIST.
     pub fn list(&mut self) -> Result<oath::Listing, TransportError> {
+        if self.select_info.lists_properties() {
+            let (data, sw) = self.transmit_full(&oath::list_with_properties())?;
+            if sw == 0x9000 {
+                if let Ok(listing) = oath::parse_list_with_properties(&data) {
+                    return Ok(listing);
+                }
+            }
+        }
         let (data, sw) = self.transmit_full(&oath::list())?;
         ok_or_apdu("oath list", sw)?;
         oath::parse_list(&data).map_err(TransportError::OathParse)
@@ -461,10 +474,11 @@ mod tests {
             require_touch: false,
             imf: 0,
         };
-        let cases: [(&str, Vec<u8>, bool, bool); 11] = [
+        let cases: [(&str, Vec<u8>, bool, bool); 12] = [
             ("select", oath::select(), false, false),
             ("reset", oath::reset(), false, false),
             ("list", oath::list(), false, true),
+            ("list v1", oath::list_with_properties(), false, true),
             (
                 "calculate",
                 oath::calculate("GitHub:alice", &ch).unwrap(),
