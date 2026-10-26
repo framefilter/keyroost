@@ -438,12 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_interface_is_not_opened() {
-        let p = std::path::Path::new("/nonexistent/keyroost-init-test");
-        assert_eq!(ctaphid_speaks_cbor(p, false), InitAnswer::NotOpened);
-    }
-
-    #[test]
     fn a_reply_that_cant_be_read_is_declined() {
         let reply = KeyAnswer::Reply(vec![1u8]);
         assert_eq!(
@@ -457,9 +451,13 @@ mod tests {
         );
     }
 
+    // Every test that tries to open a HID path lives here, so no two run at
+    // once: in the macOS nix build, two tests opening HID paths in parallel
+    // crashed the test binary.
     #[test]
     fn unreachable_hid_paths_get_no_answer_and_are_traced() {
         let p = std::path::Path::new("/nonexistent/keyroost-identity-test");
+        assert_eq!(ctaphid_speaks_cbor(p, false), InitAnswer::NotOpened);
         crate::trace::begin();
         assert_eq!(
             ctaphid_vendor_read(p, YUBICO_CTAPHID_READ_CONFIG, &[0x00], false),
