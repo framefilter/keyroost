@@ -645,9 +645,13 @@ mod tests {
         assert!(dfu.bootloader_label().is_some());
     }
 
-    /// A throwaway fake of `/sys/bus/usb/devices`, removed on drop.
+    /// A throwaway fake of `/sys/bus/usb/devices`, removed on drop. Unix
+    /// only: sysfs interface names contain `:`, which Windows file names
+    /// can't.
+    #[cfg(unix)]
     struct FakeSysfs(PathBuf);
 
+    #[cfg(unix)]
     impl FakeSysfs {
         fn new(tag: &str) -> Self {
             let root = std::env::temp_dir()
@@ -693,12 +697,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for FakeSysfs {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn usb_smart_cards_lists_only_ccid_devices_with_an_address() {
         let sys = FakeSysfs::new("ccid");
@@ -757,8 +763,9 @@ mod tests {
 
     #[test]
     fn usb_smart_cards_of_a_missing_root_is_empty() {
-        let sys = FakeSysfs::new("missing");
-        assert!(usb_smart_cards_in(&sys.0.join("absent")).is_empty());
+        let absent =
+            std::env::temp_dir().join(format!("keyroost-hid-sysfs-absent-{}", std::process::id()));
+        assert!(usb_smart_cards_in(&absent).is_empty());
     }
 }
 
