@@ -2704,6 +2704,15 @@ enum OpenPgpSlotSel {
 }
 
 impl OpenPgpSlotSel {
+    /// Position in per-key arrays (`key_present`): signature, decryption,
+    /// authentication.
+    fn index(self) -> usize {
+        match self {
+            OpenPgpSlotSel::Sign => 0,
+            OpenPgpSlotSel::Decrypt => 1,
+            OpenPgpSlotSel::Auth => 2,
+        }
+    }
     fn to_crt(self) -> keyroost_transport::KeyCrt {
         match self {
             OpenPgpSlotSel::Sign => keyroost_transport::KeyCrt::Sign,
@@ -9806,6 +9815,7 @@ impl App {
         self.oath.notice = None;
         self.oath.unlocked_password = None;
         self.openpgp.status = None;
+        self.openpgp.key_present = [None; 3];
         self.openpgp.loaded = false;
         self.openpgp.error = None;
         self.openpgp.notice = None;
@@ -13076,8 +13086,10 @@ fn piv_import_not_written(e: impl std::fmt::Display) -> String {
 
 /// The PIN part of the PIV header: the tries left, or "PIN verified" when the
 /// card reported the PIN verified in the session that read this status
-/// instead of a count. The snapshot can outlive that session, which resets
-/// the card when it ends.
+/// instead of a count. After any PIV write the app starts a background status
+/// read on a new connection (`apply_piv_write` -> `load_piv_status`), which
+/// replaces that in-session reading, so "PIN verified" shows only while it is
+/// true.
 fn piv_header_pin(st: &keyroost_transport::PivStatus) -> String {
     match st.pin_retries {
         Some(n) => format!("PIN retries {n}"),
@@ -22880,7 +22892,11 @@ impl App {
             Some(st) => {
                 let (attrs, fpr) = selected.status_fields(st);
                 if fpr.iter().all(|&b| b == 0) {
-                    "no key".to_string()
+                    if self.openpgp.key_present[selected.index()] == Some(true) {
+                        key_without_fingerprint(attrs)
+                    } else {
+                        "no key".to_string()
+                    }
                 } else {
                     format!(
                         "{} \u{00B7} fpr {}",
@@ -24412,10 +24428,8 @@ impl App {
                 // file picker then the management-key modal; Export opens a save
                 // dialog and writes straight to the chosen path — no secret (see
                 // `drain_file_dialogs`). Export dims when the slot holds no cert.
-                // Import dims only when the slot is *confirmed* empty
-                // (`slot_confirmed_empty`, same gate "Delete key" uses) — an
-                // unconfirmed reading leaves it enabled, since a matching key may
-                // have been loaded out of band this session can't see.
+                // Import stays enabled whatever the slot holds: a slot with no
+                // key is allowed, and gets a note saying so.
                 self.adaptive_row(
                     ui,
                     |app, ui| {
@@ -25988,16 +26002,22 @@ fn editor_row(ui: &mut egui::Ui, p: &Palette, label: &str, add: impl FnOnce(&mut
     ui.add_space(8.0);
 }
 
+/// What a key with no fingerprint is called, matching `openpgp info`:
+/// "{algorithm} \u{00B7} fpr (none), but a key is present".
+fn key_without_fingerprint(attrs: &[u8]) -> String {
+    format!(
+        "{} \u{00B7} fpr (none), but a key is present",
+        keyroost_transport::describe_algorithm_attributes(attrs)
+    )
+}
+
 /// Summarize an OpenPGP key slot: its algorithm label, "empty" when there is
-/// no fingerprint, or "{algorithm}, no fingerprint" when there is none but the
+/// no fingerprint, or [`key_without_fingerprint`] when there is none but the
 /// slot's public key read back. `None` (unknown) never changes the text.
 fn slot_summary(attrs: &[u8], fpr: &[u8; 20], key_present: Option<bool>) -> String {
     if fpr.iter().all(|&b| b == 0) {
         if key_present == Some(true) {
-            format!(
-                "{}, no fingerprint",
-                keyroost_transport::describe_algorithm_attributes(attrs)
-            )
+            key_without_fingerprint(attrs)
         } else {
             "empty".to_string()
         }
@@ -26031,9 +26051,13 @@ mod tests {
         let some = [0xABu8; 20];
         assert_eq!(
             slot_summary(&attrs, &zero, Some(true)),
-            format!("{algo}, no fingerprint")
+            format!("{algo} \u{00B7} fpr (none), but a key is present")
         );
         assert_eq!(slot_summary(&attrs, &zero, None), "empty");
+        assert_eq!(
+            key_without_fingerprint(&attrs),
+            slot_summary(&attrs, &zero, Some(true))
+        );
         assert_eq!(slot_summary(&attrs, &some, Some(true)), algo);
     }
 
