@@ -97,6 +97,12 @@ reuse what is there.
 - **Capabilities keyroost couldn't confirm:** the usual label with a `?`
   after it, such as `FIDO2?`, and the label listed in JSON's
   `capabilities_unverified`.
+- **`doctor` lines:** each starts with one mark from a fixed set: `✓` works,
+  `✗` broken, `–` missing or not set up. Don't add new marks.
+- **Error messages:** say what happened in plain words, with any status code
+  in parentheses after it: `FIDO applet not present on this card (SELECT -> 6A82)`.
+- **The app:** uses the same words as the CLI for the same thing, fitted to
+  its layout. A new word in one means the same word in the other.
 
 ## Where to find work
 
