@@ -500,9 +500,10 @@ impl<I: SecretIo> Secrets<I> {
             let mut text = strip_line_ending(&line);
             if n == 1 {
                 // Windows PowerShell 5.1 with a UTF-8 `$OutputEncoding`
-                // starts what it pipes in with a byte-order mark: an
-                // encoding artifact of the stream, not part of the secret.
-                text = text.strip_prefix('\u{feff}').unwrap_or(text);
+                // starts what it pipes in with a byte-order mark, and a
+                // UTF-8 console input encoding adds a second one: encoding
+                // artifacts of the stream, not part of the secret.
+                text = text.trim_start_matches('\u{feff}');
             }
             let trimmed = Zeroizing::new(text.to_owned());
             return finish(spec, trimmed, Origin::Stdin(n));
@@ -738,6 +739,18 @@ mod tests {
         assert_eq!(
             &*s.read(&NEW_PIN, Source::new(None, true)).unwrap(),
             "\u{feff}5678"
+        );
+    }
+
+    /// With a UTF-8 console input encoding (code page 65001) as well as a
+    /// UTF-8 `$OutputEncoding`, Windows PowerShell 5.1 writes one mark for
+    /// each: the stream starts with two.
+    #[test]
+    fn two_byte_order_marks_at_the_start_of_stdin_are_dropped() {
+        let mut s = sec(FakeIo::piped(&["\u{feff}\u{feff}JBSWY3DPEHPK3PXP\r\n"]));
+        assert_eq!(
+            &*s.read(&SEED, Source::new(None, true)).unwrap(),
+            "JBSWY3DPEHPK3PXP"
         );
     }
 
