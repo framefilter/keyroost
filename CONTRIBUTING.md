@@ -77,6 +77,27 @@ Look at the nearest existing command first and reuse its words.
 
 `cargo test -p keyroostctl` catches most of these.
 
+## Words in output and JSON
+
+Check a new JSON field or output word against the existing ones first, and
+reuse what is there.
+
+- **Yes/no facts:** a `true`/`false` field named after the thing:
+  `cert_present`, `occupied`, `touch_required`.
+- **Facts keyroost can't always tell:** `true`, `false` or `null`, where
+  `null` means it couldn't tell: `pin_set`, `force_pin_change`. Never a
+  string such as `"unknown"`.
+- **States:** a word from a fixed list, lowercase, with hyphens between
+  words: `not-connected`, `removed-not-added`. Details such as an error go in
+  a separate field: `result` and `detail`, `outcome` and `error`.
+- **OpenPGP keys:** one field per key, ending in `_sig`, `_dec` or `_aut`:
+  `fingerprint_sig`.
+- **Nothing there, or can't read:** in text output, `(none)` means nothing is
+  there and `(unavailable)` means keyroost couldn't read it.
+- **Capabilities keyroost couldn't confirm:** the usual label with a `?`
+  after it, such as `FIDO2?`, and the label listed in JSON's
+  `capabilities_unverified`.
+
 ## Where to find work
 
 `TODO.md` is the live task list. Items under "Ready to pick up" are
