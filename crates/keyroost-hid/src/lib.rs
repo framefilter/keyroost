@@ -230,11 +230,11 @@ pub const READ_POLL_MS: i32 = 500;
 ///   `keyroost-ctap` rejects `n != buf.len()`; the Token2 OTP framing
 ///   tolerates a short frame and hands `buf[..n]` to its reassembler.
 /// - **Linux hidraw**: the dependency-free production backend on Linux reads
-///   `/dev/hidrawN` through `read_nonblocking_bounded` (Linux-only, so not a
-///   link: this helper's docs are also built where it doesn't exist), the `O_NONBLOCK`
+///   `/dev/hidrawN` through `read_nonblocking_bounded`, the `O_NONBLOCK`
 ///   counterpart of this helper with the same `0 = no report yet` contract;
 ///   this helper governs macOS/Windows (and Linux under the testing-oriented
-///   `hidapi-backend` feature).
+///   `hidapi-backend` feature). That name is not a doc link: it exists only
+///   on Linux, and these docs are also built elsewhere.
 #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
 pub fn read_report_bounded(
     dev: &hidapi::HidDevice,
