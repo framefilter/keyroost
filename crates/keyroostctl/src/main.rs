@@ -6650,14 +6650,8 @@ fn run_doctor() {
                 println!("– no smart-card readers present (plug in a key/token to test further)");
             } else {
                 println!("✓ {} reader(s):", readers.len());
-                let hint = keyroost_proto::READER_NAME_HINT.to_ascii_lowercase();
                 for r in &readers {
-                    let tag = if r.to_ascii_lowercase().contains(&hint) {
-                        "  (Molto2)"
-                    } else {
-                        ""
-                    };
-                    println!("    {}{}", sanitize_terminal(r), tag);
+                    println!("    {}{}", sanitize_terminal(r), doctor_reader_tag(r));
                 }
             }
             #[cfg(target_os = "linux")]
@@ -6763,6 +6757,17 @@ fn run_doctor() {
             path.display()
         ),
         None => println!("– no config dir resolvable (HOME/XDG unset?)"),
+    }
+}
+
+/// The tag `doctor` puts after a reader's name. Token2's FIDO keys have
+/// "TOKEN2" readers too (on Windows, and as a CCID interface elsewhere), so
+/// the brand alone doesn't make a Molto2: [`keyroost_proto::is_molto2_reader`].
+fn doctor_reader_tag(reader: &str) -> &'static str {
+    if keyroost_proto::is_molto2_reader(reader) {
+        "  (Molto2)"
+    } else {
+        ""
     }
 }
 
@@ -16107,6 +16112,17 @@ mod cli_tests {
                 assert!(!h.contains("hidraw"), "{path}: --{:?}", a.get_long());
             }
         }
+    }
+
+    #[test]
+    fn doctor_tags_only_a_molto2_reader() {
+        assert_eq!(
+            doctor_reader_tag("TOKEN2 Molto2 [CCID Interface] 00 00"),
+            "  (Molto2)"
+        );
+        // A Token2 FIDO key's reader, as Windows names it.
+        assert_eq!(doctor_reader_tag("TOKEN2 FIDO2 Security Key(0024) 0"), "");
+        assert_eq!(doctor_reader_tag("Yubico YubiKey OTP+FIDO+CCID 0"), "");
     }
 
     #[test]
