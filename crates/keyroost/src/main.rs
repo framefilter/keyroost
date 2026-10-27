@@ -16930,7 +16930,7 @@ impl App {
                         // naming link don't fit on one line, the two move
                         // to a line of their own, and only a name too long
                         // for a whole line ends in "…".
-                        let one_line = text_width(ui, dev.title(), title_font.clone()) + trailing
+                        let one_line = text_width(ui, &dev.title(), title_font.clone()) + trailing
                             <= ui.available_width();
                         let title = egui::RichText::new(dev.title())
                             .font(title_font)

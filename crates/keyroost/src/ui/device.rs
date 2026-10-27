@@ -11,6 +11,8 @@
 
 pub use keyroost_resolve::{enumerate, CapState, Caps, Device, DeviceId, DeviceKind};
 
+use std::borrow::Cow;
+
 /// Which capability pane is showing for the selected device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CapTab {
@@ -38,7 +40,7 @@ pub fn tab_cap(t: CapTab) -> Option<Caps> {
 /// GUI view helpers on the shared [`Device`]. An extension trait because `Device`
 /// is defined in another crate.
 pub trait DeviceView {
-    fn title(&self) -> &str;
+    fn title(&self) -> Cow<'_, str>;
     fn tabs(&self) -> Vec<CapTab>;
     /// True when the tab's capability is offered without device evidence
     /// ([`CapState::Unverified`]) — the tab still appears and works, it is
@@ -47,8 +49,11 @@ pub trait DeviceView {
 }
 
 impl DeviceView for Device {
-    fn title(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.model)
+    fn title(&self) -> Cow<'_, str> {
+        match &self.name {
+            Some(name) => Cow::Borrowed(name),
+            None => Cow::Owned(self.model_title()),
+        }
     }
 
     fn tab_unverified(&self, t: CapTab) -> bool {

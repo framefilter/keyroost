@@ -66,7 +66,7 @@ pub(crate) fn enumerate_without_identity_reads() -> Result<Vec<Device>, Box<dyn 
 pub(crate) fn announce_line(d: &Device, need: Need) -> String {
     let mut line = format!(
         "\u{2192} {}",
-        sanitize_terminal(d.name.as_deref().unwrap_or(&d.model))
+        sanitize_terminal(&d.name.clone().unwrap_or_else(|| d.model_title()))
     );
     if !d.serial.is_empty() {
         line.push_str(&format!(" \u{b7} serial {}", sanitize_terminal(&d.serial)));

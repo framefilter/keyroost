@@ -1101,14 +1101,14 @@ impl App {
                         .and_then(|(_, _, v)| *v);
                     fit_count(f, store_of(k.store, &dev.vendor, version), d.molto_start)
                 });
-                Some((k.clone(), dest_label(dev.title(), k.store), fit))
+                Some((k.clone(), dest_label(&dev.title(), k.store), fit))
             })
             .collect();
         let dest_name = d
             .dest
             .as_ref()
             .and_then(|k| self.import_device(&k.device))
-            .map(|dev| dev.title().to_owned())
+            .map(|dev| dev.title().into_owned())
             .unwrap_or_default();
         let molto = d.dest.as_ref().filter(|k| k.store == StoreKind::Molto2);
         let input = BlockInput {
@@ -1311,7 +1311,7 @@ impl App {
     fn import_finish(&mut self, id: u64, dest: &DestKey, added: Added) {
         let name = self
             .import_device(&dest.device)
-            .map(|d| d.title().to_owned())
+            .map(|d| d.title().into_owned())
             .unwrap_or_default();
         let selected = self.selected_device.as_ref() == Some(&dest.device);
         if let Added::Done(report, line) = &added {

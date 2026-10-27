@@ -136,6 +136,17 @@ pub struct Device {
 }
 
 impl Device {
+    /// The model as a key's title shows it on its own: the model, or vendor
+    /// and model when the model alone has no letters (a Nitrokey 3's model is
+    /// "3", the vendor word having been stripped from "Nitrokey 3").
+    pub fn model_title(&self) -> String {
+        if self.model.chars().any(char::is_alphabetic) || self.vendor.is_empty() {
+            self.model.clone()
+        } else {
+            format!("{} {}", self.vendor, self.model)
+        }
+    }
+
     /// The tri-state answer for one capability: [`CapState::Present`] when the
     /// device answered for it, [`CapState::Unverified`] when it is offered
     /// without device evidence, [`CapState::Absent`] otherwise.
@@ -2570,6 +2581,28 @@ mod tests {
         p.usb_product = Some("SoloKeys Security Key".into());
         let devs = correlate(&[], &[p], &Keyring::default());
         assert_eq!(devs[0].model, "SoloKeys");
+    }
+
+    #[test]
+    fn model_title_adds_the_vendor_to_a_model_without_letters() {
+        let p = probe(
+            "SoloKeys Solo 2 [CCID/ICCD Interface] (07A9) 01 00",
+            false,
+            true,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        let mut d = correlate(&[], &[p], &Keyring::default()).remove(0);
+        assert_eq!(d.model_title(), "Solo 2");
+        // A Nitrokey 3: the vendor word is stripped from "Nitrokey 3".
+        d.vendor = "Nitrokey".into();
+        d.model = "3".into();
+        assert_eq!(d.model_title(), "Nitrokey 3");
+        d.vendor = String::new();
+        assert_eq!(d.model_title(), "3");
     }
 
     #[test]
