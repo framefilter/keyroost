@@ -4,9 +4,9 @@
   GET RESPONSE command, and keyroost only knew the YubiKey's way of asking.
   keyroost now asks each key the way it expects, so accounts can be listed,
   added, read and deleted. A Nitrokey 3 asks for a touch to reset its
-  Authenticator app and to save or delete an account that requires a touch;
-  the CLI and the app now say so, and a missed touch gets a message that
-  says to try again and touch the key. ([#208])
+  Authenticator app, to delete any account, and to save or read one that
+  requires a touch; the CLI and the app now say so, and a missed touch gets
+  a message that says to try again and touch the key. ([#208])
 - **Authenticator codes no longer drop out while a browser is open.** A
   browser checking the key for smart-card certificates could slip its own
   commands in between keyroost's, and the app then showed **Read code** on

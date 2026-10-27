@@ -278,7 +278,7 @@ impl OathSession {
         let apdu =
             oath::calculate(name, &challenge).map_err(|_| TransportError::OathCredentialTooLong)?;
         let (data, sw) = self.transmit_full(&apdu)?;
-        ok_or_apdu("oath calculate", sw)?;
+        self.write_answer("oath calculate", "compute the code", sw)?;
         oath::parse_calculate(&data).map_err(TransportError::OathParse)
     }
 
@@ -301,7 +301,7 @@ impl OathSession {
     pub fn calculate_hotp(&mut self, name: &str) -> Result<oath::OtpCode, TransportError> {
         let apdu = oath::calculate_hotp(name).map_err(|_| TransportError::OathCredentialTooLong)?;
         let (data, sw) = self.transmit_full(&apdu)?;
-        ok_or_apdu("oath calculate (hotp)", sw)?;
+        self.write_answer("oath calculate (hotp)", "compute the code", sw)?;
         oath::parse_calculate(&data).map_err(TransportError::OathParse)
     }
 
@@ -329,9 +329,10 @@ impl OathSession {
         self.write_answer("oath delete", "delete the account", sw)
     }
 
-    /// A PUT, DELETE or RESET answer. `6982` from an applet with no password
-    /// is the key waiting for a touch it didn't get ([`TransportError::OathNoTouch`]);
-    /// with a password it still means "unlock first".
+    /// A PUT, DELETE, RESET or single CALCULATE answer. `6982` from an applet
+    /// with no password is the key waiting for a touch it didn't get
+    /// ([`TransportError::OathNoTouch`]); with a password it still means
+    /// "unlock first".
     fn write_answer(
         &self,
         label: &'static str,
