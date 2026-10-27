@@ -210,7 +210,8 @@ pub(crate) fn select(
             &sel,
             need,
             &mut picker,
-        )?;
+        )
+        .map_err(|e| add_admin_hint(e, need, crate::admin_only_fido_key_present))?;
         eprintln!("{line}");
         Ok(dev)
     })
@@ -245,6 +246,32 @@ pub(crate) fn reader_of(dev: &Device) -> Result<String, Box<dyn Error>> {
     dev.reader
         .clone()
         .ok_or_else(|| Box::<dyn Error>::from("internal error: a smart-card row without a reader"))
+}
+
+/// Windows lets only an administrator open a key's FIDO USB interface, so a
+/// program that isn't running as one finds no key for a need that opens it
+/// (FIDO2 over USB, Token2 OTP over USB-HID). When a FIDO key is plugged in
+/// all the same, say why. `admin_only_fido` is asked only for such an error;
+/// it is always false off Windows.
+pub(crate) fn add_admin_hint(
+    e: Box<dyn Error>,
+    need: Need,
+    admin_only_fido: impl FnOnce() -> bool,
+) -> Box<dyn Error> {
+    let opens_hid = matches!(need, Need::FidoHid | Need::FidoAny | Need::OtpHid);
+    let no_key = matches!(
+        e.downcast_ref::<SelectError>(),
+        Some(SelectError::NoCandidates { .. } | SelectError::LacksCapability { .. })
+    );
+    if opens_hid && no_key && admin_only_fido() {
+        format!(
+            "{e}. A FIDO key is plugged in, but Windows only lets an administrator open it; \
+             run keyroostctl from an administrator terminal"
+        )
+        .into()
+    } else {
+        e
+    }
 }
 
 pub(crate) fn add_bootloader_hint(e: Box<dyn Error>, bootloader: Option<&str>) -> Box<dyn Error> {
@@ -735,5 +762,25 @@ mod tests {
         assert!(!add_bootloader_hint(other, Some("x"))
             .to_string()
             .contains("re-plug"));
+    }
+
+    #[test]
+    fn admin_hint_only_for_a_usb_need_with_a_hidden_fido_key() {
+        let none = |need| -> Box<dyn std::error::Error> {
+            Box::new(SelectError::NoCandidates {
+                need,
+                connected: Vec::new(),
+            })
+        };
+        let hinted = |e, need, hidden| add_admin_hint(e, need, || hidden).to_string();
+        for need in [Need::FidoHid, Need::FidoAny, Need::OtpHid] {
+            assert!(hinted(none(need), need, true).contains("administrator"));
+            assert!(!hinted(none(need), need, false).contains("administrator"));
+        }
+        // A smart-card need never opens the USB side.
+        assert!(!hinted(none(Need::Piv), Need::Piv, true).contains("administrator"));
+        // Nor does an error that isn't about finding no key.
+        let other: Box<dyn std::error::Error> = Box::new(SelectError::Conflict);
+        assert!(!hinted(other, Need::FidoHid, true).contains("administrator"));
     }
 }
