@@ -288,9 +288,10 @@ fn clean(s: &str) -> String {
 
 /// "name, model, serial S" (name or model first; empty parts dropped).
 pub fn row_label(d: &Device) -> String {
-    let mut s = clean(d.name.as_deref().unwrap_or(&d.model));
+    let model = d.model_title();
+    let mut s = clean(d.name.as_deref().unwrap_or(&model));
     if d.name.is_some() && !d.model.is_empty() {
-        s.push_str(&format!(", {}", clean(&d.model)));
+        s.push_str(&format!(", {}", clean(&model)));
     }
     if !d.serial.is_empty() {
         s.push_str(&format!(", serial {}", clean(&d.serial)));

@@ -334,7 +334,7 @@ pub(crate) fn key_label(d: &Device) -> String {
     if let Some(typed) = crate::target::typed_value(d) {
         return sanitize_terminal(typed);
     }
-    let who = sanitize_terminal(d.name.as_deref().unwrap_or(&d.model));
+    let who = sanitize_terminal(&d.name.clone().unwrap_or_else(|| d.model_title()));
     if d.serial.is_empty() {
         who
     } else {
