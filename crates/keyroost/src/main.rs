@@ -1812,6 +1812,17 @@ fn piv_compat_unsupported_count(
 /// gets the tab; gating the tab on authenticatorConfig — a CTAP 2.1 feature —
 /// hid the only reset path from CTAP 2.0-only keys (#81). The advanced
 /// security-policy controls *inside* the tab stay gated on `authnrCfg`.
+/// Whether the key offers any of the Security policy card's settings, so the
+/// card never shows with no rows: Always UV (`alwaysUv` listed), enterprise
+/// attestation (`ep` listed) or the minimum PIN length (`setMinPINLength`).
+fn fido_policy_offered(info: Option<&AuthenticatorInfo>) -> bool {
+    info.is_some_and(|i| {
+        i.option("alwaysUv").is_some()
+            || i.option("ep").is_some()
+            || i.option("setMinPINLength") == Some(true)
+    })
+}
+
 fn fido_settings_available(info: Option<&AuthenticatorInfo>) -> bool {
     info.is_some_and(|i| i.versions.iter().any(|v| v.starts_with("FIDO_2_")))
 }
@@ -18952,7 +18963,7 @@ impl App {
             // on keys that speak authenticatorConfig (CTAP 2.1). The Reset
             // card below renders unconditionally: authenticatorReset is
             // baseline CTAP2, and it must stay reachable on 2.0-only keys (#81).
-            if supports_cfg {
+            if supports_cfg && fido_policy_offered(self.security_keys.info.as_ref()) {
                 self.render_fido_advanced(ui, p);
             }
 
@@ -28578,6 +28589,30 @@ mod tests {
             .log
             .iter()
             .any(|l| l.text.contains("no longer the one selected")));
+    }
+
+    /// The Security policy card shows only when the key offers one of its
+    /// settings, so it never renders empty.
+    #[test]
+    fn the_policy_card_needs_a_setting_to_offer() {
+        let info = |options: &[(&str, bool)]| AuthenticatorInfo {
+            options: std::iter::once(("authnrCfg".to_string(), true))
+                .chain(options.iter().map(|(k, v)| (k.to_string(), *v)))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(!fido_policy_offered(None));
+        assert!(!fido_policy_offered(Some(&info(&[]))));
+        assert!(!fido_policy_offered(Some(&info(&[(
+            "setMinPINLength",
+            false
+        )]))));
+        assert!(fido_policy_offered(Some(&info(&[("alwaysUv", false)]))));
+        assert!(fido_policy_offered(Some(&info(&[("ep", false)]))));
+        assert!(fido_policy_offered(Some(&info(&[(
+            "setMinPINLength",
+            true
+        )]))));
     }
 
     /// The minimum PIN length and forced PIN change rows show only on keys

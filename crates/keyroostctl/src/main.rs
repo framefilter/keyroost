@@ -13345,12 +13345,18 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         FidoPinCmd::ForceChange { pin, path } => {
+            // As `fido_pin`, with the support check between the source check
+            // (a missing source is refused before any device I/O) and the PIN.
+            let mut sec = Secrets::real();
+            let src = Source::from_flag(pin.as_ref());
+            sec.check(&FIDO_PIN, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let info = fido_info_before_pin(&dev)?;
             if let Some(refusal) = config_unsupported(&info, ConfigSetting::MinPinLength) {
                 return Err(refusal.into());
             }
-            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
+            let pin = sec.read(&FIDO_PIN, src)?;
+            fido_reverify_if_prompted(&sec, &dev)?;
             with_configurator(path.as_deref(), &pin, |cfg, _info| {
                 cfg.force_pin_change()?;
                 println!("A PIN change is now required on next use of this key.");
@@ -13484,14 +13490,7 @@ fn run_fido_always_uv(
     let word = if want_on { "on" } else { "off" };
     // Read the state first (no PIN needed), so a key already in the
     // wanted state is never asked for its PIN.
-    let current = {
-        let (mut hid, init) =
-            keyroost_ctap::CtapHidDevice::open(&crate::target::hid_path_of(&dev)?)?;
-        if !init.supports_cbor() {
-            return Err("device is U2F-only; CTAP2 authenticatorConfig not supported".into());
-        }
-        keyroost_ctap::get_info(&mut hid)?
-    };
+    let current = fido_info_before_pin(&dev)?;
     let already = || {
         println!("\"Always require user verification\" is already {word}; nothing was changed.");
     };
@@ -13534,6 +13533,11 @@ fn config_unsupported(
     info: &keyroost_ctap::AuthenticatorInfo,
     setting: ConfigSetting,
 ) -> Option<String> {
+    if info.option("authnrCfg") != Some(true) {
+        return Some(
+            "this key does not support authenticatorConfig (authnrCfg); nothing was changed".into(),
+        );
+    }
     let (offered, what, option) = match setting {
         ConfigSetting::EnterpriseAttestation => {
             (info.option("ep").is_some(), "enterprise attestation", "ep")
@@ -15797,9 +15801,20 @@ mod cli_tests {
     #[test]
     fn config_settings_a_key_does_not_offer_are_refused_up_front() {
         let info = |options: &[(&str, bool)]| keyroost_ctap::AuthenticatorInfo {
-            options: options.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            options: std::iter::once(("authnrCfg".to_string(), true))
+                .chain(options.iter().map(|(k, v)| (k.to_string(), *v)))
+                .collect(),
             ..Default::default()
         };
+        // No authenticatorConfig at all: nothing is offered.
+        let bare = keyroost_ctap::AuthenticatorInfo {
+            options: vec![("ep".into(), false), ("setMinPINLength".into(), true)],
+            ..Default::default()
+        };
+        assert!(
+            config_unsupported(&bare, ConfigSetting::EnterpriseAttestation)
+                .is_some_and(|r| r.contains("authnrCfg"))
+        );
         let ea = ConfigSetting::EnterpriseAttestation;
         let min = ConfigSetting::MinPinLength;
         let refusal = config_unsupported(&info(&[]), ea).unwrap();
