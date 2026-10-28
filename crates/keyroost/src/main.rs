@@ -5975,24 +5975,34 @@ impl App {
         self.spawn_job("Refreshing credentials\u{2026}", move || {
             let result =
                 Self::refresh_with_token(&target, token, pin).map_err(SessionOpError::from_boxed);
-            Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    // Selection changed mid-refresh; drop the session + PIN.
-                    if app.security_keys.session_device == for_device {
-                        app.security_keys.session = None;
-                        app.security_keys.session_device = None;
-                    }
-                    return;
-                }
-                match result {
-                    Ok(fresh) => {
-                        app.security_keys.session = Some(fresh);
-                        app.security_keys.session_device = for_device.clone();
-                    }
-                    Err(e) => app.fail_session_op(&e, "refresh failed"),
-                }
-            })
+            Box::new(move |app: &mut App| app.apply_refreshed_session(for_device, result))
         });
+    }
+
+    /// The end of a Refresh. The session stayed in place while the job ran,
+    /// so the Lock button (and the idle lock) could end it meanwhile: a fresh
+    /// session lands only on the one it was read for, never re-unlocking a
+    /// key the user just locked.
+    fn apply_refreshed_session(
+        &mut self,
+        for_device: Option<DeviceId>,
+        result: Result<UnlockedSession, SessionOpError>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+            // Selection changed mid-refresh; drop the session + PIN.
+            if self.security_keys.session_device == for_device {
+                self.security_keys.session = None;
+                self.security_keys.session_device = None;
+            }
+            return;
+        }
+        if self.security_keys.session.is_none() || self.security_keys.session_device != for_device {
+            return; // locked mid-refresh: the fresh session and its PIN drop here
+        }
+        match result {
+            Ok(fresh) => self.security_keys.session = Some(fresh),
+            Err(e) => self.fail_session_op(&e, "refresh failed"),
+        }
     }
 
     fn refresh_with_token(
@@ -31248,6 +31258,52 @@ mod tests {
             "a stale dialog must be dropped, not dispatched"
         );
         assert!(app.security_keys.error.is_some(), "the refusal is surfaced");
+    }
+
+    fn unlocked_session(count: u64) -> UnlockedSession {
+        UnlockedSession {
+            token: PinUvAuthToken {
+                protocol: 2,
+                token: vec![7; 32],
+            },
+            metadata: keyroost_ctap::cred_mgmt::CredsMetadata {
+                existing_count: count,
+                max_remaining: 0,
+            },
+            rps: std::sync::Arc::new(Vec::new()),
+            fingerprints: None,
+            pin: zeroize::Zeroizing::new(String::new()),
+        }
+    }
+
+    /// Refresh keeps the session in place while it runs, so a Lock pressed
+    /// meanwhile must win: the fresh session is dropped, not installed.
+    #[test]
+    fn a_refresh_never_unlocks_a_key_locked_while_it_ran() {
+        let key: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(key.clone()),
+            ..Default::default()
+        };
+        app.security_keys.session = Some(unlocked_session(1));
+        app.security_keys.session_device = Some(key.clone());
+
+        app.apply_refreshed_session(Some(key.clone()), Ok(unlocked_session(2)));
+        let count = |app: &App| {
+            app.security_keys
+                .session
+                .as_ref()
+                .map(|s| s.metadata.existing_count)
+        };
+        assert_eq!(count(&app), Some(2), "a refresh replaces the list");
+
+        app.lock_session();
+        app.apply_refreshed_session(Some(key.clone()), Ok(unlocked_session(3)));
+        assert!(
+            app.security_keys.session.is_none(),
+            "Lock pressed mid-refresh stays locked"
+        );
+        assert!(app.security_keys.session_device.is_none());
     }
 
     /// Selecting another device closes (and thereby zeroizes) the dialog.
