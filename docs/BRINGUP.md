@@ -228,7 +228,7 @@ enumerate fresh.
 keyroostctl fido info --device N
 ```
 
-**Expected** (sample from a SoloKeys Solo 2, firmware 2.3.196):
+**Expected** (sample from a SoloKeys Solo 2, firmware 2.964):
 
 ```
 Channel:    0x00000001 (CTAPHID protocol v2)
@@ -294,7 +294,7 @@ The `id=` line is the value you copy — the `cred …` summary above it is
 truncated for readability and is **not** a valid credential ID.
 
 **Use `ecdsa-sk`, not `ed25519-sk`,** if your authenticator's firmware
-doesn't support Ed25519 in `makeCredential`. On Solo 2 firmware 2.3.196,
+doesn't support Ed25519 in `makeCredential`. On Solo 2 firmware 2.964,
 `ed25519-sk` enrollment fails with `Key enrollment failed: invalid format`;
 `ecdsa-sk` (ES256 / P-256) works on every CTAP2 device. A firmware update
 likely adds Ed25519 support.
@@ -311,7 +311,7 @@ Running F1–F5 successfully exercises, end to end against real silicon:
   `enumerateRPsBegin/Next`, `enumerateCredentialsBegin/Next`,
   `deleteCredential`
 
-First successful run: 2026-05-27, SoloKeys Solo 2 firmware 2.3.196, with
+First successful run: 2026-05-27, SoloKeys Solo 2 firmware 2.964, with
 OpenSSH's `ecdsa-sk` support.
 
 ## What to send back if anything goes wrong

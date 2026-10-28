@@ -6,7 +6,7 @@ record). This is an **outline**, not a finished design — go only as deep as ea
 step needs.
 
 Hardware in play (all on hand): Token2 Molto2 (`349e:0300`), YubiKey 5
-(`1050:0407`, fw 5.7.1) ×2, SoloKeys Solo 2 (`1209:beee`, Trussed, fw 2.3.196).
+(`1050:0407`, fw 5.7.1) ×2, SoloKeys Solo 2 (`1209:beee`, Trussed, fw 2.964).
 Nothing here is "incoming" any more — the Solo 2 carried the first successful
 FIDO F1–F5 run (`docs/BRINGUP.md`), and the two-YubiKey case is what the
 correlation work was verified against. Token2 PIN+ / FIDO2+ coverage
@@ -87,7 +87,7 @@ untested because an earlier row already answered the question.
 | AAGUID (E3) | yes | NO | yes | none | reject (model-level) — confirmed; the GUI treats AAGUID as a static *model* table |
 | OTP/CCID serial (E4) | yes | yes — two units told apart on hardware during the correlation work | yes | high (anti-tracking) — mitigated by local-only, opt-in storage | **adopted as the fallback** (`ccid_serial_for`) |
 
-### SoloKey / Solo 2 (`1209:beee`, Trussed, fw 2.3.196)
+### SoloKey / Solo 2 (`1209:beee`, Trussed, fw 2.964)
 | Candidate | Stable re-plug? | Unique per unit? | Read-only? | Privacy cost | Verdict |
 |---|---|---|---|---|---|
 | USB iSerial (E1) | yes | assumed — 32 hex chars, per-unit by design, but only **one** unit was on the bench, so `X_A != X_B` was never run for this model | yes | correlatable across interfaces; mitigated by local-only storage | **adopted as the primary** |

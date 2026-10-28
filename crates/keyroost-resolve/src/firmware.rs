@@ -54,10 +54,13 @@ pub fn key_firmware(
         return Some(v);
     }
     if vendor_id == TOKEN2_VID {
-        return serial
-            .and_then(token2_release)
-            .or_else(|| token2_release_hid(path, debug))
-            .map(str::to_owned);
+        // The row's serial when the scan read one; read it over USB only
+        // when there's none (an unlisted prefix stays unlisted).
+        let release = match serial.filter(|s| s.len() >= 5) {
+            Some(serial) => token2_release(serial),
+            None => token2_release_hid(path, debug),
+        };
+        return release.map(str::to_owned);
     }
     reader.and_then(|r| keyroost_transport::identity::trussed_admin_firmware(r, debug))
 }
