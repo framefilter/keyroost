@@ -1806,12 +1806,6 @@ fn piv_compat_unsupported_count(
         .count()
 }
 
-/// Whether the FIDO Settings subview exists for the selected key.
-/// authenticatorReset is a baseline CTAP2 command (present since CTAP 2.0),
-/// so any key that answered getInfo with a CTAP2 version can be reset and
-/// gets the tab; gating the tab on authenticatorConfig — a CTAP 2.1 feature —
-/// hid the only reset path from CTAP 2.0-only keys (#81). The advanced
-/// security-policy controls *inside* the tab stay gated on `authnrCfg`.
 /// Whether the key offers any of the Security policy card's settings, so the
 /// card never shows with no rows: Always UV (`alwaysUv` listed), enterprise
 /// attestation (`ep` listed) or the minimum PIN length (`setMinPINLength`).
@@ -1823,6 +1817,12 @@ fn fido_policy_offered(info: Option<&AuthenticatorInfo>) -> bool {
     })
 }
 
+/// Whether the FIDO Settings subview exists for the selected key.
+/// authenticatorReset is a baseline CTAP2 command (present since CTAP 2.0),
+/// so any key that answered getInfo with a CTAP2 version can be reset and
+/// gets the tab; gating the tab on authenticatorConfig — a CTAP 2.1 feature —
+/// hid the only reset path from CTAP 2.0-only keys (#81). The advanced
+/// security-policy controls *inside* the tab stay gated on `authnrCfg`.
 fn fido_settings_available(info: Option<&AuthenticatorInfo>) -> bool {
     info.is_some_and(|i| i.versions.iter().any(|v| v.starts_with("FIDO_2_")))
 }
