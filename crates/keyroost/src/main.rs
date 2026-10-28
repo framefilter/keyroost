@@ -931,7 +931,10 @@ fn oath_code_left(now: u64, period: u64, valid_until: Option<u64>) -> (u64, f32)
 /// Move each touch code still in its window from `old` rows into the
 /// matching freshly listed `rows` (which never compute one).
 fn carry_touch_codes(rows: &mut [OathRow], old: &mut [OathRow], now: u64) {
-    for row in rows.iter_mut().filter(|r| r.touch && r.code.is_none()) {
+    for row in rows
+        .iter_mut()
+        .filter(|r| r.touch && !r.hotp && r.code.is_none())
+    {
         if let Some(prev) = old
             .iter_mut()
             .find(|o| o.name == row.name && o.code_at(now).is_some())
@@ -2714,12 +2717,22 @@ fn open_ctap_hid(
     path: &std::path::Path,
 ) -> Result<(CtapHidDevice, keyroost_ctap::InitResponse), keyroost_ctap::hid::HidTransportError> {
     let (mut dev, init) = CtapHidDevice::open(path)?;
-    dev.set_keepalive_hook(Box::new(|status| {
-        if status == keyroost_ctap::hid::KEEPALIVE_STATUS_UPNEEDED {
-            KEY_WANTS_TOUCH.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }));
+    dev.set_keepalive_hook(Box::new(note_keepalive));
     Ok((dev, init))
+}
+
+/// A keepalive from the key says what it is doing now: still waiting for a
+/// touch, or (once touched) working on it.
+fn note_keepalive(status: u8) {
+    note_keepalive_on(&KEY_WANTS_TOUCH, status);
+}
+
+/// [`note_keepalive`] on a given flag (tests use their own).
+fn note_keepalive_on(flag: &std::sync::atomic::AtomicBool, status: u8) {
+    flag.store(
+        status == keyroost_ctap::hid::KEEPALIVE_STATUS_UPNEEDED,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// The Token2 OTP session's button wait, wired to the touch banner the same
@@ -6273,130 +6286,126 @@ impl App {
         self.security_keys.fp_progress = Some(progress.clone());
 
         let for_device = self.selected_device.clone();
-        self.spawn_job(
-            "Enrolling fingerprint \u{2014} touch the sensor\u{2026}",
-            move || {
-                use keyroost_ctap::bio_enroll::sample_status_message;
-                let result = (|| -> Result<Vec<keyroost_ctap::Enrollment>, SessionOpError> {
-                    let (mut dev, cbor, _init) = open_fido(&target).map_err(SessionOpError::msg)?;
-                    if !cbor {
-                        return Err(SessionOpError::msg("device is U2F-only"));
+        self.spawn_job("Enrolling fingerprint\u{2026}", move || {
+            use keyroost_ctap::bio_enroll::sample_status_message;
+            let result = (|| -> Result<Vec<keyroost_ctap::Enrollment>, SessionOpError> {
+                let (mut dev, cbor, _init) = open_fido(&target).map_err(SessionOpError::msg)?;
+                if !cbor {
+                    return Err(SessionOpError::msg("device is U2F-only"));
+                }
+                // Wire the cooperative-cancel flag into the transport so a
+                // capture blocked waiting for a touch aborts promptly (at the
+                // next KEEPALIVE) when the user clicks Cancel.
+                dev.set_cancel_flag(cancel_flag.clone());
+                let info = keyroost_ctap::get_info(&mut dev).map_err(SessionOpError::from_ctap)?;
+                let cmd_code = if info.option("bioEnroll").is_some() {
+                    keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT
+                } else {
+                    keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT_PREVIEW
+                };
+                // Fresh bio token per enroll, derived from the session PIN.
+                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+                    &mut dev,
+                    &pin,
+                    &info,
+                    keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
+                )
+                .map_err(SessionOpError::from_ctap)?;
+                let mut bio =
+                    keyroost_ctap::bio_enroll::BioEnrollment::new(&mut dev, token, cmd_code);
+
+                // Learn how many samples the sensor wants, for the progress bar.
+                let total = bio
+                    .sensor_info()
+                    .map(|i| i.max_capture_samples)
+                    .unwrap_or(0);
+
+                let (template_id, mut status) =
+                    bio.enroll_begin(None).map_err(SessionOpError::from_ctap)?;
+                // captured = total - remaining (clamped), so the bar advances
+                // even though the protocol reports "remaining".
+                let update = |p: &std::sync::Mutex<EnrollProgress>,
+                              total: u64,
+                              remaining: u64,
+                              msg: &str| {
+                    if let Ok(mut g) = p.lock() {
+                        g.total = total;
+                        g.captured = total.saturating_sub(remaining);
+                        g.last_message = msg.to_string();
                     }
-                    // Wire the cooperative-cancel flag into the transport so a
-                    // capture blocked waiting for a touch aborts promptly (at the
-                    // next KEEPALIVE) when the user clicks Cancel.
-                    dev.set_cancel_flag(cancel_flag.clone());
-                    let info =
-                        keyroost_ctap::get_info(&mut dev).map_err(SessionOpError::from_ctap)?;
-                    let cmd_code = if info.option("bioEnroll").is_some() {
-                        keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT
-                    } else {
-                        keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT_PREVIEW
-                    };
-                    // Fresh bio token per enroll, derived from the session PIN.
-                    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
-                        &mut dev,
-                        &pin,
-                        &info,
-                        keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
-                    )
-                    .map_err(SessionOpError::from_ctap)?;
-                    let mut bio =
-                        keyroost_ctap::bio_enroll::BioEnrollment::new(&mut dev, token, cmd_code);
+                };
+                update(
+                    &progress,
+                    total.max(status.remaining_samples + 1),
+                    status.remaining_samples,
+                    sample_status_message(status.last_sample_status),
+                );
 
-                    // Learn how many samples the sensor wants, for the progress bar.
-                    let total = bio
-                        .sensor_info()
-                        .map(|i| i.max_capture_samples)
-                        .unwrap_or(0);
-
-                    let (template_id, mut status) =
-                        bio.enroll_begin(None).map_err(SessionOpError::from_ctap)?;
-                    // captured = total - remaining (clamped), so the bar advances
-                    // even though the protocol reports "remaining".
-                    let update = |p: &std::sync::Mutex<EnrollProgress>,
-                                  total: u64,
-                                  remaining: u64,
-                                  msg: &str| {
-                        if let Ok(mut g) = p.lock() {
-                            g.total = total;
-                            g.captured = total.saturating_sub(remaining);
-                            g.last_message = msg.to_string();
+                while status.remaining_samples > 0 {
+                    // The capture below blocks waiting for a touch, but the
+                    // transport checks the cancel flag on every KEEPALIVE, so a
+                    // cancel returns the "cancelled" error promptly. Map that to
+                    // a device-side cancel + a clean exit.
+                    match bio.enroll_capture_next(&template_id, None) {
+                        Ok(s) => status = s,
+                        Err(e) if e.to_string().contains("cancelled") => {
+                            // Clear the flag first, otherwise the cancel command
+                            // itself would be cancelled at its first KEEPALIVE.
+                            cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                            let _ = bio.cancel_enrollment();
+                            return Err(SessionOpError::msg("cancelled"));
                         }
-                    };
+                        Err(e) => return Err(SessionOpError::from_ctap(e)),
+                    }
+                    let total = total.max(status.remaining_samples + 1);
                     update(
                         &progress,
-                        total.max(status.remaining_samples + 1),
+                        total,
                         status.remaining_samples,
                         sample_status_message(status.last_sample_status),
                     );
-
-                    while status.remaining_samples > 0 {
-                        // The capture below blocks waiting for a touch, but the
-                        // transport checks the cancel flag on every KEEPALIVE, so a
-                        // cancel returns the "cancelled" error promptly. Map that to
-                        // a device-side cancel + a clean exit.
-                        match bio.enroll_capture_next(&template_id, None) {
-                            Ok(s) => status = s,
-                            Err(e) if e.to_string().contains("cancelled") => {
-                                // Clear the flag first, otherwise the cancel command
-                                // itself would be cancelled at its first KEEPALIVE.
-                                cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                                let _ = bio.cancel_enrollment();
-                                return Err(SessionOpError::msg("cancelled"));
-                            }
-                            Err(e) => return Err(SessionOpError::from_ctap(e)),
-                        }
-                        let total = total.max(status.remaining_samples + 1);
-                        update(
-                            &progress,
-                            total,
-                            status.remaining_samples,
-                            sample_status_message(status.last_sample_status),
-                        );
-                    }
-
-                    if let Some(n) = &name {
-                        bio.set_friendly_name(&template_id, n)
-                            .map_err(SessionOpError::from_ctap)?;
-                    }
-                    bio.enumerate().map_err(SessionOpError::from_ctap)
-                })();
-
-                // Mark the shared cell done (success or failure) for the UI.
-                if let Ok(mut g) = progress.lock() {
-                    g.done = Some(result.as_ref().map(|_| ()).map_err(|e| e.message.clone()));
-                    if result.is_ok() {
-                        g.last_message = "Fingerprint enrolled.".into();
-                        g.captured = g.total;
-                    }
                 }
 
-                Box::new(move |app: &mut App| {
-                    if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                        return; // selection changed mid-enroll; the progress cell
-                                // was already dropped + cancelled on selection change
+                if let Some(n) = &name {
+                    bio.set_friendly_name(&template_id, n)
+                        .map_err(SessionOpError::from_ctap)?;
+                }
+                bio.enumerate().map_err(SessionOpError::from_ctap)
+            })();
+
+            // Mark the shared cell done (success or failure) for the UI.
+            if let Ok(mut g) = progress.lock() {
+                g.done = Some(result.as_ref().map(|_| ()).map_err(|e| e.message.clone()));
+                if result.is_ok() {
+                    g.last_message = "Fingerprint enrolled.".into();
+                    g.captured = g.total;
+                }
+            }
+
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-enroll; the progress cell
+                            // was already dropped + cancelled on selection change
+                }
+                match result {
+                    Ok(list) => {
+                        app.security_keys.fingerprints = Some(list);
+                        app.security_keys.fp_new_name.clear();
+                        app.security_keys.error = None;
                     }
-                    match result {
-                        Ok(list) => {
-                            app.security_keys.fingerprints = Some(list);
-                            app.security_keys.fp_new_name.clear();
-                            app.security_keys.error = None;
-                        }
-                        Err(e) if e.message == "cancelled" => {
-                            // User cancelled — dismiss the wizard without an error
-                            // banner, and refresh the list so it reflects reality.
-                            app.security_keys.fp_progress = None;
-                            app.security_keys.error = None;
-                            app.refresh_fingerprints();
-                        }
-                        Err(e) => app.fail_session_op(&e, "enroll failed"),
+                    Err(e) if e.message == "cancelled" => {
+                        // User cancelled — dismiss the wizard without an error
+                        // banner, and refresh the list so it reflects reality.
+                        app.security_keys.fp_progress = None;
+                        app.security_keys.error = None;
+                        app.refresh_fingerprints();
                     }
-                    // Leave fp_progress in place briefly so the UI shows the final
-                    // "enrolled" state; it's cleared on the next user action.
-                })
-            },
-        );
+                    Err(e) => app.fail_session_op(&e, "enroll failed"),
+                }
+                // Leave fp_progress in place briefly so the UI shows the final
+                // "enrolled" state; it's cleared on the next user action.
+            })
+        });
     }
 
     /// Delete one fingerprint by template id, then refresh the list.
@@ -7073,7 +7082,11 @@ impl App {
             // the card out of the server's look-ahead window. The row shows a
             // "Read code" button instead.
             let mut row = OathRow::new(c.name, None, hotp);
-            if !hotp {
+            if hotp {
+                // Its code is read only on request; the listing may still say
+                // it needs a touch then (Nitrokey's secrets app).
+                row.touch = touch.contains(&row.name);
+            } else {
                 let answer = all
                     .and_then(|a| a.entries.iter().find(|e| e.name == row.name))
                     .map(|e| &e.result);
@@ -7123,12 +7136,16 @@ impl App {
             .iter()
             .find(|r| r.name == cred && !r.hotp)
             .map(|r| r.period);
+        // Only a touch account's TOTP code waits for a read on request; an
+        // HOTP one asks for a touch when the listing says it needs one.
+        let touch =
+            totp_period.is_some() || self.oath.creds.iter().any(|r| r.name == cred && r.touch);
         // The listing already consumed (wiped) password_input, so this read
         // sends the retained accepted password — an empty string here could
         // never unlock a protected applet and re-locked the pane every time.
         let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
-        let label = if totp_period.is_some() {
+        let label = if touch {
             "Touch your key to read the code\u{2026}"
         } else {
             "Reading code\u{2026}"
@@ -8502,12 +8519,21 @@ impl App {
     /// content in the job's own words: the top bar's status line is small,
     /// gray and the first thing a narrow window cuts off, and a touch nobody
     /// was told about times out (#218).
-    fn touch_banner(&self, ctx: &egui::Context, p: &Palette) {
-        let Some(label) = touch_prompt(
+    /// What the touch banner says now, or `None`. The fingerprint dialog
+    /// asks for each touch itself, so no banner covers it.
+    fn touch_banner_text(&self) -> Option<String> {
+        if self.security_keys.fp_progress.is_some() {
+            return None;
+        }
+        touch_prompt(
             self.busy_label.as_deref(),
             self.busy(),
             KEY_WANTS_TOUCH.load(std::sync::atomic::Ordering::Relaxed),
-        ) else {
+        )
+    }
+
+    fn touch_banner(&self, ctx: &egui::Context, p: &Palette) {
+        let Some(label) = self.touch_banner_text() else {
             return;
         };
         egui::Area::new(egui::Id::new("touch_banner"))
@@ -9173,61 +9199,64 @@ impl App {
         let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
         let for_device = self.selected_device.clone();
         self.openpgp.notice = None;
-        self.spawn_job("Putting the keys on the card\u{2026}", move || {
-            let backup = created.paths.secret.clone();
-            // Opening the card and verifying the admin PIN write nothing;
-            // any failure from the import on may have left keys behind.
-            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, LoadFailure> {
-                let backup = &backup;
-                let failed = |card_touched: bool| {
-                    move |e: TransportError| LoadFailure {
-                        card_touched,
-                        message: with_backup(e, backup),
+        self.spawn_job(
+            "Putting the keys on the card \u{2014} touch the key if it blinks\u{2026}",
+            move || {
+                let backup = created.paths.secret.clone();
+                // Opening the card and verifying the admin PIN write nothing;
+                // any failure from the import on may have left keys behind.
+                let result = (|| -> Result<keyroost_transport::OpenPgpStatus, LoadFailure> {
+                    let backup = &backup;
+                    let failed = |card_touched: bool| {
+                        move |e: TransportError| LoadFailure {
+                            card_touched,
+                            message: with_backup(e, backup),
+                        }
+                    };
+                    let mut s = Self::openpgp_open_admin(&name, &pin).map_err(failed(false))?;
+                    keyroost_pgpkey::card::import_set(&mut s, &created.set)
+                        .map_err(|e| load_failure(e, backup))?;
+                    s.status().map_err(failed(true))
+                })();
+                drop(created);
+                Box::new(move |app: &mut App| {
+                    if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                        return;
                     }
-                };
-                let mut s = Self::openpgp_open_admin(&name, &pin).map_err(failed(false))?;
-                keyroost_pgpkey::card::import_set(&mut s, &created.set)
-                    .map_err(|e| load_failure(e, backup))?;
-                s.status().map_err(failed(true))
-            })();
-            drop(created);
-            Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    return;
-                }
-                wipe(&mut app.openpgp.admin_pin);
-                match result {
-                    Ok(status) => {
-                        app.openpgp.created = None;
-                        app.openpgp.status = Some(status);
-                        app.openpgp.key_present = [None; 3];
-                        app.openpgp.loaded = true;
-                        app.openpgp.error = None;
-                        app.openpgp.notice = Some(format!(
-                            "Keys loaded. Backup saved to {}; keep it and the revocation \
+                    wipe(&mut app.openpgp.admin_pin);
+                    match result {
+                        Ok(status) => {
+                            app.openpgp.created = None;
+                            app.openpgp.status = Some(status);
+                            app.openpgp.key_present = [None; 3];
+                            app.openpgp.loaded = true;
+                            app.openpgp.error = None;
+                            app.openpgp.notice = Some(format!(
+                                "Keys loaded. Backup saved to {}; keep it and the revocation \
                              certificate offline.",
-                            backup.display()
-                        ));
-                        if let Some(m) = app.openpgp.cred_modal.as_mut() {
-                            m.busy = false;
-                            m.result = Some(Ok(()));
+                                backup.display()
+                            ));
+                            if let Some(m) = app.openpgp.cred_modal.as_mut() {
+                                m.busy = false;
+                                m.result = Some(Ok(()));
+                            }
+                        }
+                        Err(mut f) => {
+                            // An earlier attempt that may have written keys
+                            // still counts after a later one that didn't.
+                            f.card_touched |= app
+                                .openpgp
+                                .created_failure
+                                .as_ref()
+                                .is_some_and(|prev| prev.card_touched);
+                            let msg = f.message.clone();
+                            app.openpgp.created_failure = Some(f);
+                            Self::openpgp_modal_step(app, Some(msg));
                         }
                     }
-                    Err(mut f) => {
-                        // An earlier attempt that may have written keys
-                        // still counts after a later one that didn't.
-                        f.card_touched |= app
-                            .openpgp
-                            .created_failure
-                            .as_ref()
-                            .is_some_and(|prev| prev.card_touched);
-                        let msg = f.message.clone();
-                        app.openpgp.created_failure = Some(f);
-                        Self::openpgp_modal_step(app, Some(msg));
-                    }
-                }
-            })
-        })
+                })
+            },
+        )
     }
 
     /// Restore a backup, step 1 (worker): read `restore_path` with the typed
@@ -9315,36 +9344,39 @@ impl App {
         let path = self.openpgp.restore_path.trim().to_string();
         let for_device = self.selected_device.clone();
         self.openpgp.notice = None;
-        self.spawn_job("Putting the keys on the card\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
-                let mut s = Self::openpgp_open_admin(&name, &pin)?;
-                keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &slots)?;
-                s.status()
-            })();
-            drop(loaded);
-            let what = pgp_slots_text(&slots);
-            Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    return;
-                }
-                wipe(&mut app.openpgp.admin_pin);
-                match result {
-                    Ok(status) => {
-                        app.openpgp.restore_loaded = None;
-                        app.openpgp.status = Some(status);
-                        app.openpgp.key_present = [None; 3];
-                        app.openpgp.loaded = true;
-                        app.openpgp.error = None;
-                        app.openpgp.notice = Some(format!("Loaded {what} from {path}."));
-                        if let Some(m) = app.openpgp.cred_modal.as_mut() {
-                            m.busy = false;
-                            m.result = Some(Ok(()));
-                        }
+        self.spawn_job(
+            "Putting the keys on the card \u{2014} touch the key if it blinks\u{2026}",
+            move || {
+                let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
+                    let mut s = Self::openpgp_open_admin(&name, &pin)?;
+                    keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &slots)?;
+                    s.status()
+                })();
+                drop(loaded);
+                let what = pgp_slots_text(&slots);
+                Box::new(move |app: &mut App| {
+                    if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                        return;
                     }
-                    Err(e) => Self::openpgp_modal_step(app, Some(sentence(e))),
-                }
-            })
-        })
+                    wipe(&mut app.openpgp.admin_pin);
+                    match result {
+                        Ok(status) => {
+                            app.openpgp.restore_loaded = None;
+                            app.openpgp.status = Some(status);
+                            app.openpgp.key_present = [None; 3];
+                            app.openpgp.loaded = true;
+                            app.openpgp.error = None;
+                            app.openpgp.notice = Some(format!("Loaded {what} from {path}."));
+                            if let Some(m) = app.openpgp.cred_modal.as_mut() {
+                                m.busy = false;
+                                m.result = Some(Ok(()));
+                            }
+                        }
+                        Err(e) => Self::openpgp_modal_step(app, Some(sentence(e))),
+                    }
+                })
+            },
+        )
     }
 
     /// Change expiry date, step 1 (worker): read the public key file and
@@ -15843,6 +15875,7 @@ impl App {
                 // the right one (Refresh, menu) needs it mutably.
                 let busy = self.busy();
                 let busy_label = self.busy_label.clone();
+                let touch_wait_now = self.touch_banner_text().is_some();
                 egui::Sides::new()
                     .height(height)
                     .spacing(TOPBAR_SIDE_GAP)
@@ -15890,12 +15923,7 @@ impl App {
                             // A job waiting for a touch says so in the
                             // banner over the content (`touch_banner`), so
                             // the bar shows nothing for it.
-                            let touch_wait = touch_prompt(
-                                busy_label.as_deref(),
-                                busy,
-                                KEY_WANTS_TOUCH.load(std::sync::atomic::Ordering::Relaxed),
-                            )
-                            .is_some();
+                            let touch_wait = touch_wait_now;
                             if busy && !touch_wait {
                                 ui.add_space(12.0);
                                 ui.spinner();
@@ -32056,6 +32084,53 @@ mod tests {
             rows[2].touch,
             "a read that gives nothing back is a touch account"
         );
+    }
+
+    /// A touch HOTP account (Nitrokey's listing says so) is marked, so its
+    /// "Read code" asks for the touch; it is never read during the listing,
+    /// and a refresh never carries an old HOTP code over.
+    #[test]
+    fn a_touch_hotp_account_is_marked_but_not_carried() {
+        let creds = vec![oath_cred("H:touch", true), oath_cred("H:plain", true)];
+        let rows = App::oath_rows_from(creds, None, &["H:touch".to_owned()], |_, _| {
+            panic!("an HOTP code is never read during a listing")
+        });
+        assert!(rows[0].touch && rows[0].hotp);
+        assert!(!rows[1].touch);
+
+        let mut fresh = rows;
+        let mut old = vec![OathRow::new("H:touch".into(), Some("123456".into()), true)];
+        carry_touch_codes(&mut fresh, &mut old, 1_000);
+        assert!(
+            fresh[0].code.is_none(),
+            "an HOTP code has no window to carry"
+        );
+    }
+
+    /// The fingerprint dialog asks for each touch itself: no banner over it,
+    /// even when the key signals it is waiting.
+    #[test]
+    fn no_touch_banner_covers_the_fingerprint_dialog() {
+        let mut app = App {
+            busy_jobs: 1,
+            busy_label: Some("Enrolling fingerprint\u{2026}".into()),
+            ..Default::default()
+        };
+        app.security_keys.fp_progress = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            EnrollProgress::default(),
+        )));
+        assert_eq!(app.touch_banner_text(), None);
+    }
+
+    /// The key's signal follows its keepalives: waiting for a touch sets it,
+    /// working once touched clears it, so the banner goes after the touch.
+    #[test]
+    fn the_key_s_touch_signal_clears_once_touched() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        note_keepalive_on(&flag, keyroost_ctap::hid::KEEPALIVE_STATUS_UPNEEDED);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        note_keepalive_on(&flag, 0x01); // processing
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// Refresh is the only reload button, so it re-reads whatever section is

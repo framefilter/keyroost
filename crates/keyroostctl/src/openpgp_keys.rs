@@ -358,7 +358,7 @@ fn create(
         .verify_pin(PW3_ADMIN, admin.as_bytes())
         .map_err(|e| saved(&e))?;
     drop(admin);
-    output::status("Putting the keys on the card…");
+    crate::prompt::touch("Putting the keys on the card — touch the key if it blinks…");
     let fprs = keyroost_pgpkey::card::import_set(&mut session, &set).map_err(|e| saved(&e))?;
     drop(session);
 
@@ -454,7 +454,7 @@ fn restore(
     let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
     session.verify_pin(PW3_ADMIN, admin.as_bytes())?;
     drop(admin);
-    output::status("Putting the keys on the card…");
+    crate::prompt::touch("Putting the keys on the card — touch the key if it blinks…");
     let fprs = keyroost_pgpkey::card::import_loaded(&mut session, &loaded, &slots)?;
     drop(session);
 

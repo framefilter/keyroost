@@ -8385,13 +8385,16 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let mut session =
                 open_oath_unlocked(&reader, password.as_deref().map(String::as_str), debug)?;
             // Some keys (Nitrokey 3) ask for a touch to delete a touch account.
-            let listing = session.list()?;
+            // Only a hint: a listing that fails doesn't stop the delete.
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_secs();
-            let all = session.calculate_all(now).ok();
-            if oath_needs_touch(&listing, all.as_ref(), name) {
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let needs_touch = session.list().ok().is_some_and(|listing| {
+                let all = session.calculate_all(now).ok();
+                oath_needs_touch(&listing, all.as_ref(), name)
+            });
+            if needs_touch {
                 crate::prompt::touch("Deleting \u{2014} touch the key if it blinks\u{2026}");
             }
             session.delete(name)?;
@@ -8573,9 +8576,7 @@ fn open_otp_on(
         },
     };
     session.set_debug(debug);
-    session.set_button_prompt(Box::new(|| {
-        crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
-    }));
+    session.set_button_prompt(Box::new(crate::prompt::touch_signal));
     Ok(session)
 }
 
@@ -9792,10 +9793,10 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // the bare digest.
             let attrs = session.algorithm_attributes(keyroost_openpgp::KeyCrt::Auth)?;
             let input = openpgp_sign_input("authentication", &attrs, *hash, &data)?;
-            eprintln!(
+            crate::prompt::touch(&format!(
                 "Authenticating ({}) — touch the key if it blinks…",
                 hash.label()
-            );
+            ));
             let sig = session.internal_authenticate(&input)?;
             match out {
                 Some(path) => {
@@ -10347,11 +10348,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         *force,
                     )?;
                     authenticate_piv(s, &mgmt)?;
-                    eprintln!(
+                    crate::prompt::touch(&format!(
                         "Generating {} in {} (touch the key if it blinks)\u{2026}",
                         alg.label(),
                         slot.to_slot().label()
-                    );
+                    ));
                     let pubkey = s.generate_key(
                         slot.to_slot(),
                         alg,
@@ -10499,11 +10500,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
                     let alg = plan.entry.key.alg();
-                    eprintln!(
+                    crate::prompt::touch(&format!(
                         "Importing {} into {} (touch the key if it blinks)\u{2026}",
                         alg.label(),
                         piv_slot.label()
-                    );
+                    ));
                     Ok((
                         alg,
                         keyroost_transport::piv_import::run_import(
@@ -10921,11 +10922,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         &pubkey,
                         pin.as_ref().map(|p| p.as_bytes()),
                         || {
-                            eprintln!(
+                            crate::prompt::touch(&format!(
                                 "\u{2192} Testing {} ({}) on the card (touch if it blinks)\u{2026}",
                                 piv_slot.label(),
                                 alg.label()
-                            );
+                            ));
                         },
                     )?;
 
@@ -11946,11 +11947,11 @@ fn inline_generate_key(
     pub_mode: crate::prompt::OutMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let alg = keygen.algorithm.to_alg();
-    eprintln!(
+    crate::prompt::touch(&format!(
         "Generating {} in {} (touch the key if it blinks)\u{2026}",
         alg.label(),
         slot.label()
-    );
+    ));
     let pubkey = s.generate_key(
         slot,
         alg,
