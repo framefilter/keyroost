@@ -14539,22 +14539,24 @@ fn run_fido_info(
     reader: Option<&str>,
     serial: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The firmware first, with no handle to the key held open: reading it
-    // may open the key again (a Token2's serial), and macOS opens HID
-    // devices exclusively.
-    let firmware = {
-        let (dev, init) = keyroost_ctap::CtapHidDevice::open(path)?;
-        drop(dev);
-        let version = (init.device_major, init.device_minor, init.device_build);
-        keyroost_resolve::firmware::key_firmware(
-            path,
-            version,
-            serial,
-            reader,
-            crate::target::debug_on(),
-        )
-    };
+    // One open: read what this handle gives, close it, then the firmware,
+    // which may open the key again (a Token2's serial; macOS opens HID
+    // devices exclusively). A quick close-and-reopen is what we avoid.
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(path)?;
+    let info = if init.supports_cbor() {
+        Some(keyroost_ctap::get_info(&mut dev)?)
+    } else {
+        None
+    };
+    drop(dev);
+    let version = (init.device_major, init.device_minor, init.device_build);
+    let firmware = keyroost_resolve::firmware::key_firmware(
+        path,
+        version,
+        serial,
+        reader,
+        crate::target::debug_on(),
+    );
     let json = json_output();
     let mut caps = Vec::new();
     if init.supports_wink() {
@@ -14590,7 +14592,7 @@ fn run_fido_info(
         );
     }
 
-    if !init.supports_cbor() {
+    let Some(info) = info else {
         if json {
             emit_json(&json_out::FidoInfoJson {
                 device: path.display().to_string(),
@@ -14606,9 +14608,7 @@ fn run_fido_info(
         println!();
         println!("(device is U2F-only; CTAP2 GetInfo not available)");
         return Ok(());
-    }
-
-    let info = keyroost_ctap::get_info(&mut dev)?;
+    };
 
     if json {
         emit_json(&json_out::FidoInfoJson {
