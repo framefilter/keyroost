@@ -22,7 +22,7 @@ pub struct Help {
 }
 
 /// Look up help content by topic id. Topic ids (use these as the `?` keys):
-///   device, fido2, pin, passkeys, oath, pgp, pgp-keys, pgp-backup, pgp-restore,
+///   device, fido2, pin, passkeys, oath, oath-wait, pgp, pgp-keys, pgp-backup, pgp-restore,
 ///   pgp-expiry, pgp-card-details, piv,
 ///   molto, custkey, reset, piv-generate, piv-certificate,
 ///   piv-import-key, piv-import-export, piv-delete, piv-test, piv-admin, piv-move,
@@ -58,6 +58,11 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             title: "Authenticator codes (OATH)",
             body: "The rolling 6-digit codes you'd normally get from an authenticator app — but stored on the key itself. They survive a lost or wiped phone and never sync to anyone's cloud.",
             slug: "/oath",
+        },
+        "oath-wait" => &Help {
+            title: "Wait for the countdown",
+            body: "When you touch the key for a code, keyroost reads it a few seconds ahead, so the code doesn't run out right after you touch. If that lands near the end of a time window, you get the next window's code. It shows in gray with how long to wait: enter it once its countdown starts, when every site accepts it.",
+            slug: "/oath#touch-codes",
         },
         "otp" => &Help {
             title: "On-device OTP",

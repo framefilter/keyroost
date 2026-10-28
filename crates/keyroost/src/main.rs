@@ -916,6 +916,13 @@ fn carry_touch_codes(rows: &mut [OathRow], old: &mut [OathRow], now: u64) {
     }
 }
 
+/// Seconds until a read-ahead touch code's window begins at `now`, or `None`
+/// once it has (or for a code that follows the current window).
+fn oath_wait_secs(now: u64, period: u64, valid_until: Option<u64>) -> Option<u64> {
+    let start = valid_until?.saturating_sub(period.max(1));
+    (now < start).then(|| start - now)
+}
+
 impl OathRow {
     fn new(name: String, code: Option<String>, hotp: bool) -> Self {
         let oath_type = if hotp {
@@ -17465,7 +17472,7 @@ impl App {
                         for row in self.oath.creds.iter().take(2) {
                             let is_copied =
                                 self.copied.as_ref().is_some_and(|(n, _)| n == &row.name);
-                            if let (Some(code), _, _) = oath_row(ui, p, row, is_copied, false) {
+                            if let Some(code) = oath_row(ui, p, row, is_copied, false, false).copy {
                                 copy = Some((row.name.clone(), code));
                             }
                             ui.add_space(6.0);
@@ -22670,19 +22677,24 @@ impl App {
         let mut copy: Option<(String, String)> = None;
         let mut delete: Option<String> = None;
         let mut read: Option<String> = None;
+        let mut wait_help: Option<egui::Response> = None;
+        let wait_help_open = self.help_open == Some(OATH_WAIT_HELP);
         theme::card_frame(p).show(ui, |ui| {
             let n = self.oath.creds.len();
             for (i, row) in self.oath.creds.iter().enumerate() {
                 let is_copied = self.copied.as_ref().is_some_and(|(nm, _)| nm == &row.name);
-                let (c, d, r) = oath_row(ui, p, row, is_copied, true);
-                if let Some(code) = c {
+                let clicks = oath_row(ui, p, row, is_copied, true, wait_help_open);
+                if let Some(code) = clicks.copy {
                     copy = Some((row.name.clone(), code));
                 }
-                if d {
+                if clicks.delete {
                     delete = Some(row.name.clone());
                 }
-                if r {
+                if clicks.read {
                     read = Some(row.name.clone());
+                }
+                if clicks.wait_help.is_some() {
+                    wait_help = clicks.wait_help;
                 }
                 if i + 1 < n {
                     ui.add_space(5.0);
@@ -22696,6 +22708,9 @@ impl App {
                 }
             }
         });
+        if let Some(r) = &wait_help {
+            self.on_help_dot(ui, r, OATH_WAIT_HELP);
+        }
         if let Some((name, code)) = copy {
             self.copied = Some((name, now_secs_f64() + 1.2));
             self.copy_secret(ui.ctx(), code);
@@ -25936,7 +25951,8 @@ fn oath_row(
     row: &OathRow,
     is_copied: bool,
     with_delete: bool,
-) -> (Option<String>, bool, bool) {
+    wait_help_open: bool,
+) -> OathRowClicks {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -25944,7 +25960,12 @@ fn oath_row(
     let (name, code, hotp) = (row.name.as_str(), row.code_at(now), row.hotp);
     let (issuer, account, period) = oath_display_name(name, hotp);
     let (secs, pct) = oath_code_left(now, u64::from(row.period), row.valid_until);
-    let code_color = if hotp {
+    // A touch code read ahead whose window hasn't begun: gray, with "wait Ns".
+    let wait =
+        oath_wait_secs(now, u64::from(row.period), row.valid_until).filter(|_| code.is_some());
+    let code_color = if wait.is_some() {
+        p.txt3
+    } else if hotp {
         // HOTP codes don't expire — no about-to-roll warning color.
         p.accent
     } else if secs <= 5 {
@@ -25955,6 +25976,7 @@ fn oath_row(
     let mut copy = None;
     let mut delete = false;
     let mut read = false;
+    let mut wait_help = None;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
@@ -26019,7 +26041,21 @@ fn oath_row(
                 }
             }
             ui.add_space(10.0);
-            if !hotp {
+            if let Some(left) = wait {
+                // Before the code's window: what to do, and a full gray ring.
+                // The compact overview card has no help dot to click.
+                if with_delete {
+                    wait_help = Some(ui::help_button(ui, p, wait_help_open));
+                    ui.add_space(6.0);
+                }
+                ui.label(
+                    egui::RichText::new(format!("wait {left}s"))
+                        .font(theme::f_reg(11.0))
+                        .color(p.txt3),
+                );
+                ui.add_space(5.0);
+                theme::ring(ui, 1.0, 20.0, code_color, p.line);
+            } else if !hotp {
                 // The countdown is a TOTP concept; an HOTP code stays valid
                 // until used.
                 ui.label(
@@ -26049,8 +26085,27 @@ fn oath_row(
             }
         });
     });
-    (copy, delete, read)
+    OathRowClicks {
+        copy,
+        delete,
+        read,
+        wait_help,
+    }
 }
+
+/// What a click on one [`oath_row`] asked for.
+struct OathRowClicks {
+    /// The code, when its copy icon was clicked.
+    copy: Option<String>,
+    delete: bool,
+    /// "Read code" (HOTP, or a TOTP code that needs a touch).
+    read: bool,
+    /// The "?" by a "wait Ns" code, for the caller to act on.
+    wait_help: Option<egui::Response>,
+}
+
+/// The help topic of the "?" by a touch code whose window hasn't begun.
+const OATH_WAIT_HELP: &str = "oath-wait";
 
 /// Flatten control characters out of a device-provided title before display
 /// (same policy as the CLI's sanitize_cert_field).
@@ -29612,6 +29667,20 @@ mod tests {
         assert_eq!(secs, 35);
         assert_eq!(pct, 1.0);
         assert_eq!(oath_code_left(start + 60, 30, Some(start + 60)).0, 0);
+    }
+
+    #[test]
+    fn a_read_ahead_code_says_wait_until_its_window_begins() {
+        let start = 33_334 * 30; // the start of a 30 s window
+                                 // Read at :25 for the window :30 to :60: wait 5 s, then 4 s, ...
+        assert_eq!(oath_wait_secs(start + 25, 30, Some(start + 60)), Some(5));
+        assert_eq!(oath_wait_secs(start + 29, 30, Some(start + 60)), Some(1));
+        // ... and nothing once it has begun.
+        assert_eq!(oath_wait_secs(start + 30, 30, Some(start + 60)), None);
+        // A code read for the window it is in never waits.
+        assert_eq!(oath_wait_secs(start + 5, 30, Some(start + 30)), None);
+        // Nor does a listed code.
+        assert_eq!(oath_wait_secs(start + 25, 30, None), None);
     }
 
     #[test]

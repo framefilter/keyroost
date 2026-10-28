@@ -124,6 +124,16 @@ keyroostctl oath import -i export.json  # add every code in an authenticator exp
       shows a numbered list and a script names one with <code>--device</code> (a saved name,
       a serial, or the number <code>keyroostctl list</code> shows). Deleting a credential
       and <code>oath reset</code> ask <strong>y/N</strong> first, naming the key.</p>
+    <h3 id="touch-codes">Codes that need a touch</h3>
+    <p>A code saved with <em>require touch</em> shows <strong>Read code</strong> in the
+      app instead of a code. Click it and touch the key when it blinks. keyroost asks the
+      key for the code 10 seconds ahead, as Yubico Authenticator does, so a code you touch
+      for near the end of its 30 seconds doesn't run out moments later. When that happens,
+      you get the code for the next 30 seconds: the app shows it in gray with
+      <strong>wait 4s</strong> (counting down) until those 30 seconds begin. Enter it once
+      its countdown starts. Some sites accept it a little earlier, but every site accepts
+      it then. The code stays on screen until its time is up.
+      <code>keyroostctl oath code</code> prints the code for the current 30 seconds.</p>
   </section>
 
   <section class="kr-section" id="import">
