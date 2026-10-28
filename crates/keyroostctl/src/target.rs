@@ -64,6 +64,21 @@ pub(crate) fn enumerate_without_identity_reads() -> Result<Vec<Device>, Box<dyn 
 /// `→ <name or model> · serial <S> · <reader | path>` (serial omitted when
 /// unknown; reader or path chosen by what `need` opens).
 pub(crate) fn announce_line(d: &Device, need: Need) -> String {
+    announce_via(d, &endpoint(d, need))
+}
+
+/// [`announce_line`] for a key picked with `--reader`: the line names the
+/// reader the command goes through, even for a need that would otherwise
+/// open the key's HID path (`fido info --reader`).
+fn announce_line_for(d: &Device, need: Need, sel: &Selector<'_>) -> String {
+    match (sel.reader, &d.reader) {
+        (Some(_), Some(reader)) => announce_via(d, &sanitize_terminal(reader)),
+        _ => announce_line(d, need),
+    }
+}
+
+/// The announce line with `via` (already sanitised) as its endpoint.
+fn announce_via(d: &Device, via: &str) -> String {
     let mut line = format!(
         "\u{2192} {}",
         sanitize_terminal(&d.name.clone().unwrap_or_else(|| d.model_title()))
@@ -71,7 +86,6 @@ pub(crate) fn announce_line(d: &Device, need: Need) -> String {
     if !d.serial.is_empty() {
         line.push_str(&format!(" \u{b7} serial {}", sanitize_terminal(&d.serial)));
     }
-    let via = endpoint(d, need);
     if !via.is_empty() {
         line.push_str(&format!(" \u{b7} {via}"));
     }
@@ -160,7 +174,7 @@ fn choose(
     picker: &mut dyn Picker,
 ) -> Result<(Device, String), SelectError> {
     match resolve_target_reading(devices, sel, need, picker, &mut molto_card_serial) {
-        Ok(t) => Ok((t.device.clone(), announce_line(t.device, need))),
+        Ok(t) => Ok((t.device.clone(), announce_line_for(t.device, need, sel))),
         Err(SelectError::ReaderNotFound { reader }) => Ok((
             typed_device(Some(reader.clone()), None, &reader),
             typed_announce_line(&reader),
@@ -542,6 +556,24 @@ mod tests {
         evil.reader = None;
         evil.hid_path = Some("/dev/x\u{1b}[2J".into());
         assert!(!announce_line(&evil, Need::Piv).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_reader_selector_names_the_reader_even_for_a_fido_need() {
+        let d = dev(None, "");
+        let by_reader = Selector {
+            reader: Some("Yubico YubiKey OTP+FIDO+CCID 00 00"),
+            ..Selector::default()
+        };
+        assert_eq!(
+            announce_line_for(&d, Need::FidoAny, &by_reader),
+            "\u{2192} YubiKey 5 NFC \u{b7} Yubico YubiKey OTP+FIDO+CCID 00 00"
+        );
+        // Without --reader a FIDO need still names the HID path.
+        assert_eq!(
+            announce_line_for(&d, Need::FidoAny, &Selector::default()),
+            "\u{2192} YubiKey 5 NFC \u{b7} /dev/hidraw16"
+        );
     }
 
     #[test]

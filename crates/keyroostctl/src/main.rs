@@ -14616,16 +14616,10 @@ fn fido_reset_at(
 /// reader and the reset is sent the moment the applet answers (issue #84 —
 /// the replug ceremony can never complete for a card).
 fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if !keyroost_transport::CtapPcscDevice::list_fido_readers()?
-        .iter()
-        .any(|r| r == exact_reader)
-    {
-        return Err(format!(
-            "'{}' has no FIDO applet answering over this reader",
-            sanitize_terminal(exact_reader)
-        )
-        .into());
-    }
+    // Check that the FIDO applet answers before power-cycling the card, with
+    // the same error `fido info --reader` gives (on Windows without
+    // administrator rights, that one says so).
+    drop(keyroost_transport::CtapPcscDevice::open(exact_reader)?);
     output::status("Power-cycling the card and sending the reset\u{2026}");
     let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(exact_reader)?;
     // Names read from keys before or during the write are stale.
