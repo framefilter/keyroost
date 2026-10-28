@@ -8144,6 +8144,7 @@ fn reset_one_card_applet(
             ResetStep::Piv => unreachable!("handled above, before this closure"),
             ResetStep::Token2Otp => {
                 let mut s = open_otp_on(dev, OtpTransportArg::Auto, debug)?;
+                arm_otp_erase_prompt(&mut s);
                 s.erase_all()?;
             }
             ResetStep::Fido => unreachable!("FIDO handled by the interactive path"),
@@ -8504,6 +8505,20 @@ fn open_otp_on(
         eprintln!("touch your key to continue\u{2026}");
     }));
     Ok(session)
+}
+
+/// One prompt for the one touch an OTP erase needs (`otp reset` and the
+/// factory reset's OTP step). Over USB the key says when it is waiting, so the
+/// prompt waits for that; a reader gives no such sign, so there it comes up
+/// front.
+fn arm_otp_erase_prompt(session: &mut keyroost_transport::Token2OtpSession) {
+    if session.is_pcsc() {
+        eprintln!("touch your key to confirm the erase\u{2026}");
+    } else {
+        session.set_button_prompt(Box::new(|| {
+            eprintln!("touch your key to confirm the erase\u{2026}");
+        }));
+    }
 }
 
 /// Select the key for this `otp` invocation and open its OTP session.
@@ -8911,16 +8926,7 @@ fn run_otp(
             otp_precheck(&dev, sel.transport, debug, OtpFeature::OnDevice)?;
             crate::prompt::confirm_on(&dev, *yes, "erase every OTP entry")?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
-            // One prompt for the one touch. Over USB the key says when it is
-            // waiting, so the prompt waits for that; a reader gives no such
-            // sign, so there it comes up front.
-            if session.is_pcsc() {
-                eprintln!("touch your key to confirm the erase\u{2026}");
-            } else {
-                session.set_button_prompt(Box::new(|| {
-                    eprintln!("touch your key to confirm the erase\u{2026}");
-                }));
-            }
+            arm_otp_erase_prompt(&mut session);
             session.erase_all()?;
             println!("Erased all OTP entries.");
         }

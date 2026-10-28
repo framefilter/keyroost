@@ -2563,6 +2563,18 @@ fn run_card_reset_step(
     }
 }
 
+/// The status line while the factory reset's card sweep runs. The OTP erase
+/// waits for a touch on the key, and the sweep is one job with one label, so
+/// the label asks for the touch up front, as the OATH reset's does.
+fn factory_reset_busy_label(card_steps: &[keyroost_resolve::ResetStep]) -> &'static str {
+    use keyroost_resolve::ResetStep;
+    if card_steps.contains(&ResetStep::Token2Otp) {
+        "Factory-resetting key \u{2014} touch the key if it blinks\u{2026}"
+    } else {
+        "Factory-resetting key\u{2026}"
+    }
+}
+
 /// Whether to render the Reset card *outside* the Settings subview: the key
 /// is CTAP2 (so resettable) but not unlocked. authenticatorReset takes no
 /// PIN, and its primary use case is recovering from a forgotten or blocked
@@ -4418,6 +4430,10 @@ struct App {
     reset_mgmt_auth_input: String,
     /// Live per-step report while a factory reset runs (empty when idle).
     factory_reset_report: Vec<FactoryResetRow>,
+    /// The key whose factory-reset card sweep is on the worker, so its card
+    /// can say what the sweep is waiting for. Only read while `busy()`: a job
+    /// that never reports back leaves it set, but not shown.
+    factory_reset_sweep_on: Option<DeviceId>,
     /// Remaining scans in the current burst. A single scan races slow-to-
     /// register readers (the Molto2's CCID interface appears in pcscd a beat
     /// after the USB device), so startup and every hotplug schedule several
@@ -7843,6 +7859,7 @@ impl App {
         ends_in_fido: bool,
     ) {
         use keyroost_resolve::{ResetStep, StepOutcome};
+        app.factory_reset_sweep_on = None;
         if !completion_still_valid(for_device, app.selected_device.as_ref()) {
             // Selection changed mid-sweep; don't paint A's outcome under B —
             // and deliberately don't open the FIDO dialog either, because
@@ -8032,7 +8049,8 @@ impl App {
             .collect();
         // Clear any stale report so the pane shows this run's progress only.
         self.factory_reset_report.clear();
-        self.spawn_job("Factory-resetting key\u{2026}", move || {
+        let sweep_on = for_device.clone();
+        let queued = self.spawn_job(factory_reset_busy_label(&card_steps), move || {
             let mut reports: Vec<StepReport> = Vec::new();
             for step in card_steps {
                 let outcome = run_card_reset_step(
@@ -8047,7 +8065,11 @@ impl App {
                 wipe(&mut app.reset_mgmt_auth_input);
                 App::apply_factory_reset_sweep(app, for_device.as_ref(), reports, ends_in_fido)
             })
-        })
+        });
+        if queued {
+            self.factory_reset_sweep_on = sweep_on;
+        }
+        queued
     }
 
     /// Reset confirmation: wiping a key is irreversible, so require the user to
@@ -17694,6 +17716,25 @@ impl App {
                                 .font(theme::f_reg(12.5))
                                 .color(p.txt2),
                             );
+                            // The sweep is one job; its label, which asks for
+                            // the OTP erase's touch, shows here as well as in
+                            // the top bar, where a narrow window cuts it off.
+                            if self.busy()
+                                && completion_still_valid(
+                                    self.factory_reset_sweep_on.as_ref(),
+                                    self.selected_device.as_ref(),
+                                )
+                            {
+                                ui.add_space(8.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add(egui::Spinner::new());
+                                    ui.label(
+                                        egui::RichText::new(factory_reset_busy_label(&plan))
+                                            .font(theme::f_reg(12.5))
+                                            .color(p.warn),
+                                    );
+                                });
+                            }
                             // Live per-step report while a reset runs (or its
                             // outcome afterwards, until the selection changes).
                             if !self.factory_reset_report.is_empty() {
@@ -26660,6 +26701,16 @@ mod tests {
                 }),
             "version label {VERSION_LABEL:?} is not vMAJOR.MINOR.PATCH"
         );
+    }
+
+    #[test]
+    fn factory_reset_status_asks_for_a_touch_when_it_erases_otp() {
+        use keyroost_resolve::ResetStep;
+        assert!(
+            factory_reset_busy_label(&[ResetStep::OpenPgp, ResetStep::Token2Otp])
+                .contains("touch the key")
+        );
+        assert!(!factory_reset_busy_label(&[ResetStep::OpenPgp, ResetStep::Piv]).contains("touch"));
     }
 
     #[test]
