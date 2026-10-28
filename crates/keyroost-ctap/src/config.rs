@@ -66,9 +66,7 @@ impl<'a, T: CtapTransport> Configurator<'a, T> {
         info: &AuthenticatorInfo,
     ) -> Result<Self, CtapError> {
         if info.option("authnrCfg") != Some(true) {
-            return Err(CtapError::InvalidResponseShape(
-                "authenticator does not support authenticatorConfig",
-            ));
+            return Err(CtapError::Unsupported("authenticatorConfig"));
         }
         Ok(Self {
             dev,
@@ -90,9 +88,7 @@ impl<'a, T: CtapTransport> Configurator<'a, T> {
     /// that does not report `alwaysUv` does not support this sub-command.
     pub fn toggle_always_uv(&mut self) -> Result<(), CtapError> {
         if !self.always_uv_supported {
-            return Err(CtapError::InvalidResponseShape(
-                "authenticator does not support toggleAlwaysUV",
-            ));
+            return Err(CtapError::Unsupported("toggleAlwaysUv"));
         }
         self.dispatch(SUB_TOGGLE_ALWAYS_UV, None)
     }
@@ -301,7 +297,8 @@ mod tests {
         let mut dev = RecordingTransport::default();
         let mut cfg = configurator(&mut dev, None);
         let error = cfg.toggle_always_uv().unwrap_err();
-        assert!(matches!(error, CtapError::InvalidResponseShape(_)));
+        assert!(matches!(error, CtapError::Unsupported("toggleAlwaysUv")));
+        assert_eq!(error.to_string(), "the key does not support toggleAlwaysUv");
         drop(cfg);
         assert_eq!(dev.calls, 0);
     }
