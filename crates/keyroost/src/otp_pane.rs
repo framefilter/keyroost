@@ -61,7 +61,7 @@ impl OtpTarget {
         // Honor KEYROOST_OTP_DEBUG so a stuck/empty list can be traced from the
         // GUI (matches the KEYROOST_CTAP_DEBUG convention; the CLI has --debug).
         let debug = std::env::var_os("KEYROOST_OTP_DEBUG").is_some();
-        match self {
+        let mut session = match self {
             OtpTarget::HidPath(p) => Token2OtpSession::open_hid_path(p, debug),
             OtpTarget::Reader(r) => Token2OtpSession::open_pcsc_reader(r, debug),
             OtpTarget::HidThenReader(p, r) => match Token2OtpSession::open_hid_path(p, debug) {
@@ -73,7 +73,9 @@ impl OtpTarget {
                     ))
                 }),
             },
-        }
+        }?;
+        crate::signal_otp_touch(&mut session);
+        Ok(session)
     }
 }
 

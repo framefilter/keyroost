@@ -358,7 +358,7 @@ fn create(
         .verify_pin(PW3_ADMIN, admin.as_bytes())
         .map_err(|e| saved(&e))?;
     drop(admin);
-    output::status("Putting the keys on the card…");
+    crate::prompt::touch("Putting the keys on the card — touch the key if it blinks…");
     let fprs = keyroost_pgpkey::card::import_set(&mut session, &set).map_err(|e| saved(&e))?;
     drop(session);
 
@@ -454,7 +454,7 @@ fn restore(
     let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
     session.verify_pin(PW3_ADMIN, admin.as_bytes())?;
     drop(admin);
-    output::status("Putting the keys on the card…");
+    crate::prompt::touch("Putting the keys on the card — touch the key if it blinks…");
     let fprs = keyroost_pgpkey::card::import_loaded(&mut session, &loaded, &slots)?;
     drop(session);
 
@@ -519,7 +519,10 @@ fn import_rsa_file(
     let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
     session.verify_pin(PW3_ADMIN, admin.as_bytes())?;
     drop(admin);
-    output::status(&format!("Importing {} key…", slot.label()));
+    crate::prompt::touch(&format!(
+        "Importing {} key — touch the key if it blinks…",
+        slot.label()
+    ));
     let parts = keyroost_transport::RsaPrivateKeyParts {
         e: &k.e,
         p: &k.p,
@@ -639,7 +642,7 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
             let mut signer =
                 keyroost_pgpkey::card::CardSigner::new(&mut session, &cert, pin.as_bytes())
                     .map_err(plain)?;
-            output::status("Signing with the card — touch the key each time it blinks…");
+            crate::prompt::touch("Signing with the card — touch the key each time it blinks…");
             let new_public = cert::change_expiry(&cert, &mut signer, cert.primary.fpr, *set, now)
                 .map_err(plain)?;
             drop(signer);

@@ -37,6 +37,9 @@ pub enum CtapError {
     /// A caller-supplied argument was rejected before anything was sent to
     /// the device (e.g. a PIN outside the 4–63 byte range).
     InvalidArgument(&'static str),
+    /// The key's getInfo says it doesn't support this operation, so nothing
+    /// was sent (e.g. `toggleAlwaysUv` on a key that doesn't list `alwaysUv`).
+    Unsupported(&'static str),
     /// A non-HID transport (e.g. PC/SC over NFC or a contact reader) failed at
     /// the link level — reader I/O error, card removed, or an ISO 7816 status
     /// word that does not map to a CTAP2 status.
@@ -89,6 +92,7 @@ impl std::fmt::Display for CtapError {
                 write!(f, "authenticator response had wrong shape: {}", s)
             }
             CtapError::InvalidArgument(s) => write!(f, "invalid argument: {}", s),
+            CtapError::Unsupported(s) => write!(f, "the key does not support {s}"),
             CtapError::Transport(s) => write!(f, "reader transport error: {}", s),
             CtapError::Apdu { sw1, sw2 } => {
                 write!(f, "the card refused the FIDO request ({sw1:02X}{sw2:02X})")
