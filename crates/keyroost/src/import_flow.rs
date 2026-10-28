@@ -1160,7 +1160,18 @@ impl App {
                 *g = (done, total);
             }
         };
-        let label = format!("Adding codes to {}\u{2026}", dev.title());
+        // A Nitrokey 3 may ask for a touch for each code it replaces.
+        let label = if shown
+            .notes
+            .contains(&keyroost_import::plan::Note::Nitrokey3TouchToReplace)
+        {
+            format!(
+                "Adding codes to {} \u{2014} touch the key if it blinks\u{2026}",
+                dev.title()
+            )
+        } else {
+            format!("Adding codes to {}\u{2026}", dev.title())
+        };
         let queued = match dest.store {
             StoreKind::Molto2 => {
                 if !self.authenticated {

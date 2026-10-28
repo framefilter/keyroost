@@ -275,7 +275,7 @@ fn write_key_name(
         apply_label_plan, plan_label_change, random_nonce, read_label, DeviceLabel, LabelState,
         WRITER_KEYROOST,
     };
-    let (mut dev, init) = CtapHidDevice::open(path).map_err(|e| e.to_string())?;
+    let (mut dev, init) = open_ctap_hid(path).map_err(|e| e.to_string())?;
     if !init.supports_cbor() {
         return Err(KEY_NAME_NO_STORAGE.into());
     }
@@ -371,7 +371,7 @@ fn record_key_name(
 fn open_fido(target: &FidoTarget) -> Result<OpenFido, String> {
     match target {
         FidoTarget::Hid(path) => {
-            let (dev, init) = CtapHidDevice::open(path).map_err(|e| e.to_string())?;
+            let (dev, init) = open_ctap_hid(path).map_err(|e| e.to_string())?;
             let cbor = init.supports_cbor();
             Ok((Box::new(dev), cbor, Some(init)))
         }
@@ -931,7 +931,10 @@ fn oath_code_left(now: u64, period: u64, valid_until: Option<u64>) -> (u64, f32)
 /// Move each touch code still in its window from `old` rows into the
 /// matching freshly listed `rows` (which never compute one).
 fn carry_touch_codes(rows: &mut [OathRow], old: &mut [OathRow], now: u64) {
-    for row in rows.iter_mut().filter(|r| r.touch && r.code.is_none()) {
+    for row in rows
+        .iter_mut()
+        .filter(|r| r.touch && !r.hotp && r.code.is_none())
+    {
         if let Some(prev) = old
             .iter_mut()
             .find(|o| o.name == row.name && o.code_at(now).is_some())
@@ -2588,6 +2591,7 @@ fn run_card_reset_step(
                     }
                     (None, None) => return Err("no transport for the OTP applet".to_string()),
                 };
+                signal_otp_touch(&mut s);
                 s.erase_all().map_err(|e| e.to_string())?;
             }
             ResetStep::Fido => {}
@@ -2601,11 +2605,12 @@ fn run_card_reset_step(
 }
 
 /// The status line while the factory reset's card sweep runs. The OTP erase
-/// waits for a touch on the key, and the sweep is one job with one label, so
-/// the label asks for the touch up front, as the OATH reset's does.
+/// waits for a touch on the key, and some keys (Nitrokey 3) ask for one to
+/// reset OATH; the sweep is one job with one label, so the label asks for the
+/// touch up front, as the OATH reset's does.
 fn factory_reset_busy_label(card_steps: &[keyroost_resolve::ResetStep]) -> &'static str {
     use keyroost_resolve::ResetStep;
-    if card_steps.contains(&ResetStep::Token2Otp) {
+    if card_steps.contains(&ResetStep::Token2Otp) || card_steps.contains(&ResetStep::Oath) {
         "Factory-resetting key \u{2014} touch the key if it blinks\u{2026}"
     } else {
         "Factory-resetting key\u{2026}"
@@ -2692,11 +2697,61 @@ fn fido_unread_line(u2f_only: bool, read_failed: bool) -> &'static str {
     }
 }
 
-/// Whether a job's status text asks for a touch on the key. Every job that
-/// waits for one says so in its label, so the label decides when
-/// [`App::touch_banner`] shows.
+/// Whether a job's status text asks for a touch on the key: a job that knows
+/// it needs (or may need) one says so in its label.
 fn job_waits_for_touch(label: &str) -> bool {
     label.to_lowercase().contains("touch")
+}
+
+/// Set from the worker when the key reports over USB that it is waiting for
+/// a touch (CTAPHID KEEPALIVE, user presence needed; the Token2 OTP button
+/// wait). Cleared when a job starts and when the last one ends.
+static KEY_WANTS_TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the touch banner says while a job runs, or `None` for no banner: the
+/// job's own label when it asks for a touch, else a plain prompt once the key
+/// itself reports it is waiting for one.
+fn touch_prompt(label: Option<&str>, busy: bool, key_wants_touch: bool) -> Option<String> {
+    if !busy {
+        return None;
+    }
+    match label {
+        Some(label) if job_waits_for_touch(label) => Some(label.to_owned()),
+        _ if key_wants_touch => Some("Touch your key to continue\u{2026}".to_owned()),
+        _ => None,
+    }
+}
+
+/// [`CtapHidDevice::open`] with the key's "waiting for a touch" signal wired
+/// to the touch banner ([`KEY_WANTS_TOUCH`]), for every command sent on it.
+fn open_ctap_hid(
+    path: &std::path::Path,
+) -> Result<(CtapHidDevice, keyroost_ctap::InitResponse), keyroost_ctap::hid::HidTransportError> {
+    let (mut dev, init) = CtapHidDevice::open(path)?;
+    dev.set_keepalive_hook(Box::new(note_keepalive));
+    Ok((dev, init))
+}
+
+/// A keepalive from the key says what it is doing now: still waiting for a
+/// touch, or (once touched) working on it.
+fn note_keepalive(status: u8) {
+    note_keepalive_on(&KEY_WANTS_TOUCH, status);
+}
+
+/// [`note_keepalive`] on a given flag (tests use their own).
+fn note_keepalive_on(flag: &std::sync::atomic::AtomicBool, status: u8) {
+    flag.store(
+        status == keyroost_ctap::hid::KEEPALIVE_STATUS_UPNEEDED,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The Token2 OTP session's button wait, wired to the touch banner the same
+/// way (HID only; a reader gives no such sign).
+fn signal_otp_touch(session: &mut keyroost_transport::Token2OtpSession) {
+    session.set_button_prompt(Box::new(|| {
+        KEY_WANTS_TOUCH.store(true, std::sync::atomic::Ordering::Relaxed);
+    }));
 }
 
 /// The reset dialogs' note, before anything is confirmed, for a key with no
@@ -5036,6 +5091,7 @@ impl App {
             Some(worker) => {
                 self.busy_jobs += 1;
                 self.busy_label = Some(label.into());
+                KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 if worker.job_tx.send(Box::new(job)).is_err() {
                     // Worker died; undo the bookkeeping so the UI doesn't hang.
                     self.busy_jobs -= 1;
@@ -5076,6 +5132,7 @@ impl App {
             self.busy_jobs = self.busy_jobs.saturating_sub(1);
             if self.busy_jobs == 0 {
                 self.busy_label = None;
+                KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             apply(self);
         }
@@ -5755,7 +5812,7 @@ impl App {
             return;
         }
         let for_device = self.selected_device.clone();
-        self.spawn_job("Unlocking\u{2026} (enter PIN / touch)", move || {
+        self.spawn_job("Unlocking\u{2026}", move || {
             let result = Self::open_and_unlock(&target, &pin);
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
@@ -6988,7 +7045,7 @@ impl App {
                 // moment to accept opens; retry briefly before giving up.
                 let mut dev = None;
                 for attempt in 0..10 {
-                    match CtapHidDevice::open(&path) {
+                    match open_ctap_hid(&path) {
                         Ok((d, _)) => {
                             dev = Some(d);
                             break;
@@ -7117,7 +7174,11 @@ impl App {
             // the card out of the server's look-ahead window. The row shows a
             // "Read code" button instead.
             let mut row = OathRow::new(c.name, None, hotp);
-            if !hotp {
+            if hotp {
+                // Its code is read only on request; the listing may still say
+                // it needs a touch then (Nitrokey's secrets app).
+                row.touch = touch.contains(&row.name);
+            } else {
                 let answer = all
                     .and_then(|a| a.entries.iter().find(|e| e.name == row.name))
                     .map(|e| &e.result);
@@ -7167,12 +7228,16 @@ impl App {
             .iter()
             .find(|r| r.name == cred && !r.hotp)
             .map(|r| r.period);
+        // Only a touch account's TOTP code waits for a read on request; an
+        // HOTP one asks for a touch when the listing says it needs one.
+        let touch =
+            totp_period.is_some() || self.oath.creds.iter().any(|r| r.name == cred && r.touch);
         // The listing already consumed (wiped) password_input, so this read
         // sends the retained accepted password — an empty string here could
         // never unlock a protected applet and re-locked the pane every time.
         let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
-        let label = if totp_period.is_some() {
+        let label = if touch {
             "Touch your key to read the code\u{2026}"
         } else {
             "Reading code\u{2026}"
@@ -8546,13 +8611,23 @@ impl App {
     /// content in the job's own words: the top bar's status line is small,
     /// gray and the first thing a narrow window cuts off, and a touch nobody
     /// was told about times out (#218).
+    /// What the touch banner says now, or `None`. The fingerprint dialog
+    /// asks for each touch itself, so no banner covers it.
+    fn touch_banner_text(&self) -> Option<String> {
+        if self.security_keys.fp_progress.is_some() {
+            return None;
+        }
+        touch_prompt(
+            self.busy_label.as_deref(),
+            self.busy(),
+            KEY_WANTS_TOUCH.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     fn touch_banner(&self, ctx: &egui::Context, p: &Palette) {
-        let Some(label) = self.busy_label.as_deref() else {
+        let Some(label) = self.touch_banner_text() else {
             return;
         };
-        if !self.busy() || !job_waits_for_touch(label) {
-            return;
-        }
         egui::Area::new(egui::Id::new("touch_banner"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
@@ -9216,61 +9291,64 @@ impl App {
         let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
         let for_device = self.selected_device.clone();
         self.openpgp.notice = None;
-        self.spawn_job("Putting the keys on the card\u{2026}", move || {
-            let backup = created.paths.secret.clone();
-            // Opening the card and verifying the admin PIN write nothing;
-            // any failure from the import on may have left keys behind.
-            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, LoadFailure> {
-                let backup = &backup;
-                let failed = |card_touched: bool| {
-                    move |e: TransportError| LoadFailure {
-                        card_touched,
-                        message: with_backup(e, backup),
+        self.spawn_job(
+            "Putting the keys on the card \u{2014} touch the key if it blinks\u{2026}",
+            move || {
+                let backup = created.paths.secret.clone();
+                // Opening the card and verifying the admin PIN write nothing;
+                // any failure from the import on may have left keys behind.
+                let result = (|| -> Result<keyroost_transport::OpenPgpStatus, LoadFailure> {
+                    let backup = &backup;
+                    let failed = |card_touched: bool| {
+                        move |e: TransportError| LoadFailure {
+                            card_touched,
+                            message: with_backup(e, backup),
+                        }
+                    };
+                    let mut s = Self::openpgp_open_admin(&name, &pin).map_err(failed(false))?;
+                    keyroost_pgpkey::card::import_set(&mut s, &created.set)
+                        .map_err(|e| load_failure(e, backup))?;
+                    s.status().map_err(failed(true))
+                })();
+                drop(created);
+                Box::new(move |app: &mut App| {
+                    if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                        return;
                     }
-                };
-                let mut s = Self::openpgp_open_admin(&name, &pin).map_err(failed(false))?;
-                keyroost_pgpkey::card::import_set(&mut s, &created.set)
-                    .map_err(|e| load_failure(e, backup))?;
-                s.status().map_err(failed(true))
-            })();
-            drop(created);
-            Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    return;
-                }
-                wipe(&mut app.openpgp.admin_pin);
-                match result {
-                    Ok(status) => {
-                        app.openpgp.created = None;
-                        app.openpgp.status = Some(status);
-                        app.openpgp.key_present = [None; 3];
-                        app.openpgp.loaded = true;
-                        app.openpgp.error = None;
-                        app.openpgp.notice = Some(format!(
-                            "Keys loaded. Backup saved to {}; keep it and the revocation \
+                    wipe(&mut app.openpgp.admin_pin);
+                    match result {
+                        Ok(status) => {
+                            app.openpgp.created = None;
+                            app.openpgp.status = Some(status);
+                            app.openpgp.key_present = [None; 3];
+                            app.openpgp.loaded = true;
+                            app.openpgp.error = None;
+                            app.openpgp.notice = Some(format!(
+                                "Keys loaded. Backup saved to {}; keep it and the revocation \
                              certificate offline.",
-                            backup.display()
-                        ));
-                        if let Some(m) = app.openpgp.cred_modal.as_mut() {
-                            m.busy = false;
-                            m.result = Some(Ok(()));
+                                backup.display()
+                            ));
+                            if let Some(m) = app.openpgp.cred_modal.as_mut() {
+                                m.busy = false;
+                                m.result = Some(Ok(()));
+                            }
+                        }
+                        Err(mut f) => {
+                            // An earlier attempt that may have written keys
+                            // still counts after a later one that didn't.
+                            f.card_touched |= app
+                                .openpgp
+                                .created_failure
+                                .as_ref()
+                                .is_some_and(|prev| prev.card_touched);
+                            let msg = f.message.clone();
+                            app.openpgp.created_failure = Some(f);
+                            Self::openpgp_modal_step(app, Some(msg));
                         }
                     }
-                    Err(mut f) => {
-                        // An earlier attempt that may have written keys
-                        // still counts after a later one that didn't.
-                        f.card_touched |= app
-                            .openpgp
-                            .created_failure
-                            .as_ref()
-                            .is_some_and(|prev| prev.card_touched);
-                        let msg = f.message.clone();
-                        app.openpgp.created_failure = Some(f);
-                        Self::openpgp_modal_step(app, Some(msg));
-                    }
-                }
-            })
-        })
+                })
+            },
+        )
     }
 
     /// Restore a backup, step 1 (worker): read `restore_path` with the typed
@@ -9358,36 +9436,39 @@ impl App {
         let path = self.openpgp.restore_path.trim().to_string();
         let for_device = self.selected_device.clone();
         self.openpgp.notice = None;
-        self.spawn_job("Putting the keys on the card\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
-                let mut s = Self::openpgp_open_admin(&name, &pin)?;
-                keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &slots)?;
-                s.status()
-            })();
-            drop(loaded);
-            let what = pgp_slots_text(&slots);
-            Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    return;
-                }
-                wipe(&mut app.openpgp.admin_pin);
-                match result {
-                    Ok(status) => {
-                        app.openpgp.restore_loaded = None;
-                        app.openpgp.status = Some(status);
-                        app.openpgp.key_present = [None; 3];
-                        app.openpgp.loaded = true;
-                        app.openpgp.error = None;
-                        app.openpgp.notice = Some(format!("Loaded {what} from {path}."));
-                        if let Some(m) = app.openpgp.cred_modal.as_mut() {
-                            m.busy = false;
-                            m.result = Some(Ok(()));
-                        }
+        self.spawn_job(
+            "Putting the keys on the card \u{2014} touch the key if it blinks\u{2026}",
+            move || {
+                let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
+                    let mut s = Self::openpgp_open_admin(&name, &pin)?;
+                    keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &slots)?;
+                    s.status()
+                })();
+                drop(loaded);
+                let what = pgp_slots_text(&slots);
+                Box::new(move |app: &mut App| {
+                    if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                        return;
                     }
-                    Err(e) => Self::openpgp_modal_step(app, Some(sentence(e))),
-                }
-            })
-        })
+                    wipe(&mut app.openpgp.admin_pin);
+                    match result {
+                        Ok(status) => {
+                            app.openpgp.restore_loaded = None;
+                            app.openpgp.status = Some(status);
+                            app.openpgp.key_present = [None; 3];
+                            app.openpgp.loaded = true;
+                            app.openpgp.error = None;
+                            app.openpgp.notice = Some(format!("Loaded {what} from {path}."));
+                            if let Some(m) = app.openpgp.cred_modal.as_mut() {
+                                m.busy = false;
+                                m.result = Some(Ok(()));
+                            }
+                        }
+                        Err(e) => Self::openpgp_modal_step(app, Some(sentence(e))),
+                    }
+                })
+            },
+        )
     }
 
     /// Change expiry date, step 1 (worker): read the public key file and
@@ -15893,6 +15974,7 @@ impl App {
                 // the right one (Refresh, menu) needs it mutably.
                 let busy = self.busy();
                 let busy_label = self.busy_label.clone();
+                let touch_wait_now = self.touch_banner_text().is_some();
                 egui::Sides::new()
                     .height(height)
                     .spacing(TOPBAR_SIDE_GAP)
@@ -15940,7 +16022,7 @@ impl App {
                             // A job waiting for a touch says so in the
                             // banner over the content (`touch_banner`), so
                             // the bar shows nothing for it.
-                            let touch_wait = busy_label.as_deref().is_some_and(job_waits_for_touch);
+                            let touch_wait = touch_wait_now;
                             if busy && !touch_wait {
                                 ui.add_space(12.0);
                                 ui.spinner();
@@ -27091,6 +27173,8 @@ mod tests {
                 .contains("touch the key")
         );
         assert!(!factory_reset_busy_label(&[ResetStep::OpenPgp, ResetStep::Piv]).contains("touch"));
+        // Some keys (Nitrokey 3) ask for a touch to reset OATH.
+        assert!(factory_reset_busy_label(&[ResetStep::Oath]).contains("touch the key"));
     }
 
     #[test]
@@ -28449,6 +28533,28 @@ mod tests {
         ));
         assert!(!job_waits_for_touch("Reading OATH codes\u{2026}"));
         assert!(!job_waits_for_touch("Resetting card\u{2026}"));
+    }
+
+    /// The banner shows for a job that asks for a touch, and for any job once
+    /// the key itself reports it is waiting for one; never while idle.
+    #[test]
+    fn the_touch_banner_follows_the_label_or_the_key() {
+        let asks = "Resetting OATH applet \u{2014} touch the key if it blinks\u{2026}";
+        assert_eq!(touch_prompt(Some(asks), true, false).as_deref(), Some(asks));
+        assert_eq!(
+            touch_prompt(Some("Refreshing credentials\u{2026}"), true, false),
+            None
+        );
+        assert_eq!(
+            touch_prompt(Some("Refreshing credentials\u{2026}"), true, true).as_deref(),
+            Some("Touch your key to continue\u{2026}")
+        );
+        assert_eq!(
+            touch_prompt(Some(asks), false, true),
+            None,
+            "no job, no banner"
+        );
+        assert_eq!(touch_prompt(None, false, false), None);
     }
 
     #[test]
@@ -32282,6 +32388,53 @@ mod tests {
             rows[2].touch,
             "a read that gives nothing back is a touch account"
         );
+    }
+
+    /// A touch HOTP account (Nitrokey's listing says so) is marked, so its
+    /// "Read code" asks for the touch; it is never read during the listing,
+    /// and a refresh never carries an old HOTP code over.
+    #[test]
+    fn a_touch_hotp_account_is_marked_but_not_carried() {
+        let creds = vec![oath_cred("H:touch", true), oath_cred("H:plain", true)];
+        let rows = App::oath_rows_from(creds, None, &["H:touch".to_owned()], |_, _| {
+            panic!("an HOTP code is never read during a listing")
+        });
+        assert!(rows[0].touch && rows[0].hotp);
+        assert!(!rows[1].touch);
+
+        let mut fresh = rows;
+        let mut old = vec![OathRow::new("H:touch".into(), Some("123456".into()), true)];
+        carry_touch_codes(&mut fresh, &mut old, 1_000);
+        assert!(
+            fresh[0].code.is_none(),
+            "an HOTP code has no window to carry"
+        );
+    }
+
+    /// The fingerprint dialog asks for each touch itself: no banner over it,
+    /// even when the key signals it is waiting.
+    #[test]
+    fn no_touch_banner_covers_the_fingerprint_dialog() {
+        let mut app = App {
+            busy_jobs: 1,
+            busy_label: Some("Enrolling fingerprint\u{2026}".into()),
+            ..Default::default()
+        };
+        app.security_keys.fp_progress = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            EnrollProgress::default(),
+        )));
+        assert_eq!(app.touch_banner_text(), None);
+    }
+
+    /// The key's signal follows its keepalives: waiting for a touch sets it,
+    /// working once touched clears it, so the banner goes after the touch.
+    #[test]
+    fn the_key_s_touch_signal_clears_once_touched() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        note_keepalive_on(&flag, keyroost_ctap::hid::KEEPALIVE_STATUS_UPNEEDED);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        note_keepalive_on(&flag, 0x01); // processing
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// Refresh is the only reload button, so it re-reads whatever section is

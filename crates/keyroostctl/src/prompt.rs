@@ -440,9 +440,46 @@ pub(crate) fn confirm_typed_on(
     reverify_if_asked(d, asked)
 }
 
+/// Whether this run already told the user to touch the key.
+static TOUCH_PROMPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The generic prompt for a key that reports it is waiting for a touch.
+pub(crate) const TOUCH_SIGNAL_PROMPT: &str = "touch your key to continue\u{2026}";
+
+/// Print a touch prompt for a step that knows it needs (or may need) a
+/// touch, up front.
+pub(crate) fn touch(msg: &str) {
+    TOUCH_PROMPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("{msg}");
+}
+
+/// The key reported over USB that it is waiting for a touch: say so, unless
+/// this run already printed a touch prompt.
+pub(crate) fn touch_signal() {
+    if let Some(line) = touch_signal_line(&TOUCH_PROMPTED) {
+        eprintln!("{line}");
+    }
+}
+
+/// What [`touch_signal`] prints: the prompt the first time, then nothing.
+fn touch_signal_line(prompted: &std::sync::atomic::AtomicBool) -> Option<&'static str> {
+    (!prompted.swap(true, std::sync::atomic::Ordering::Relaxed)).then_some(TOUCH_SIGNAL_PROMPT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_key_s_touch_signal_prompts_once_and_not_after_a_prompt() {
+        let prompted = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(touch_signal_line(&prompted), Some(TOUCH_SIGNAL_PROMPT));
+        assert_eq!(touch_signal_line(&prompted), None, "once per run");
+
+        // A step that prompted up front has already asked for the touch.
+        let prompted = std::sync::atomic::AtomicBool::new(true);
+        assert_eq!(touch_signal_line(&prompted), None);
+    }
 
     #[test]
     fn write_error_says_what_the_card_already_holds() {
