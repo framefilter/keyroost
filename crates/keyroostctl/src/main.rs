@@ -13235,8 +13235,14 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
                 &keyroost_hid::enumerate().unwrap_or_default(),
             );
             let route = fido_route(&dev, reader.is_some())?;
-            if matches!(route, FidoRoute::Hid { .. }) {
-                refuse_serial_less_reset_with_others(&dev)?;
+            match &route {
+                FidoRoute::Hid { .. } => refuse_serial_less_reset_with_others(&dev)?,
+                // A reader whose FIDO applet doesn't answer is refused before
+                // the question, with the error `fido info --reader` gives (on
+                // Windows without administrator rights, that one says so).
+                FidoRoute::Card { reader } => {
+                    drop(keyroost_transport::CtapPcscDevice::open(reader)?)
+                }
             }
             crate::prompt::confirm_on(&dev, *yes, "wipe every FIDO2 credential and the PIN")?;
             match route {
