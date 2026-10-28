@@ -7132,6 +7132,11 @@ fn run_factory_reset(
         .map(|s| s.label())
         .collect::<Vec<_>>()
         .join(", ");
+    // Before the question, so a FIDO2 step that would be refused after the
+    // replug stops the run before any card applet is wiped.
+    if plan.contains(&ResetStep::Fido) && dev.hid_path.is_some() {
+        refuse_serial_less_reset_with_others(&dev)?;
+    }
     let asked =
         crate::prompt::confirm_typed_then_read(&dev, yes, "reset", &factory_reset_action(&labels))?;
     // The PIV credential, if one was given, is read now — after the question
@@ -7582,6 +7587,34 @@ fn reinsert_settled(found: &ReinsertMatch, candidates: &[Candidate<'_>]) -> bool
         ReinsertMatch::Found(i) => matches!(candidates.get(i), Some(c) if c.fido),
         ReinsertMatch::Ambiguous => true,
     }
+}
+
+/// Refuse a FIDO2 reset over USB of a key with no serial while anything else
+/// is connected ([`keyroost_resolve::serial_less_reset_blockers`]): after the
+/// replug, [`reinserted_serial_less_target`] would refuse it anyway, so say so
+/// before the question rather than after a replug, or after a factory reset
+/// has already wiped the card applets.
+fn refuse_serial_less_reset_with_others(
+    dev: &keyroost_resolve::Device,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A path keyroost did not detect is used as typed, with nothing known
+    // about it; the check after the replug still decides that one.
+    if !dev.serial.is_empty() || dev.id.starts_with("override:") {
+        return Ok(());
+    }
+    let present = crate::target::enumerate_without_identity_reads()?;
+    let others = keyroost_resolve::serial_less_reset_blockers(dev, &present);
+    if others.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "'{}' has no serial number, so keyroost can only reset it while it is the \
+         only key plugged in: after the replug, that is how it knows the key that \
+         came back is this one. Unplug {} and run this again.",
+        sanitize_terminal(dev.name.as_deref().unwrap_or(&dev.model)),
+        sanitize_terminal(&others.join(", "))
+    )
+    .into())
 }
 
 /// One post-replug look: the resolved devices reduced to candidates, matched
@@ -13201,8 +13234,12 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
                 dev.hid_path.as_deref(),
                 &keyroost_hid::enumerate().unwrap_or_default(),
             );
+            let route = fido_route(&dev, reader.is_some())?;
+            if matches!(route, FidoRoute::Hid { .. }) {
+                refuse_serial_less_reset_with_others(&dev)?;
+            }
             crate::prompt::confirm_on(&dev, *yes, "wipe every FIDO2 credential and the PIN")?;
-            match fido_route(&dev, reader.is_some())? {
+            match route {
                 FidoRoute::Card { reader } => run_fido_reset_reader(&reader)?,
                 FidoRoute::Hid { path } => fido_reset_after_replug(
                     &path,

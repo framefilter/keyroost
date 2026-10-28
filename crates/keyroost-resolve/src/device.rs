@@ -3,7 +3,7 @@
 //! classification. Consumed by both the GUI and the CLI so they never drift.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey, UsbSmartCard};
 use keyroost_keyring::Keyring;
@@ -1768,6 +1768,59 @@ pub fn exclude_unresettable_piv(plan: &mut Vec<ResetStep>) {
     plan.retain(|s| *s != ResetStep::Piv);
 }
 
+/// The other connected devices that stop a FIDO2 reset of `target` over USB,
+/// by name; empty when nothing does.
+///
+/// A USB key accepts a reset only just after power-up, so the reset is sent
+/// to the key that comes back after a replug, and keyroost has to know that
+/// is the key the wipe was confirmed for. A key with a serial is recognized
+/// by it. One without has nothing to be recognized by, so it can only be
+/// reset while it is the only device connected: then the key that comes back
+/// can be no other (see [`serial_less_reinsert`]). Checked before the reset is
+/// confirmed, so a key that would be refused after the replug is refused
+/// before anything is wiped. Every device counts, not just FIDO keys: the
+/// same rule decides after the replug, where one more row of any kind means
+/// the key can't be singled out.
+pub fn serial_less_reset_blockers(target: &Device, devices: &[Device]) -> Vec<String> {
+    if !target.serial.is_empty() {
+        return Vec::new();
+    }
+    // The target's own row is matched by its FIDO node as well as its id:
+    // a caller may hold the target from one scan and `devices` from another.
+    let is_target =
+        |d: &Device| d.id == target.id || (d.hid_path.is_some() && d.hid_path == target.hid_path);
+    devices
+        .iter()
+        .filter(|d| !is_target(d))
+        .map(|d| d.name.clone().unwrap_or_else(|| d.model_title()))
+        .collect()
+}
+
+/// What to do with a fresh FIDO connection while a reset is armed for a key
+/// with no serial ([`serial_less_reset_blockers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialLessReinsert {
+    /// It is the only device connected and has no serial: send the reset.
+    Fire,
+    /// Not settled yet (the key is still coming up): look again.
+    Wait,
+    /// Another device is connected, so the key can't be singled out: refuse.
+    Refuse,
+}
+
+/// Decide a fresh FIDO connection at `cand_path` for a reset armed on a key
+/// with no serial, given every device connected now. The caller has already
+/// checked that the connection is new and has the armed key's USB ids.
+pub fn serial_less_reinsert(cand_path: &Path, devices: &[Device]) -> SerialLessReinsert {
+    match devices {
+        [only] if only.hid_path.as_deref() == Some(cand_path) && only.serial.is_empty() => {
+            SerialLessReinsert::Fire
+        }
+        [] | [_] => SerialLessReinsert::Wait,
+        _ => SerialLessReinsert::Refuse,
+    }
+}
+
 /// The step name to show for a [`StepOutcome::WipedGlobal`] report line,
 /// naming the whole device rather than just [`ResetStep::Piv`] — see that
 /// variant's doc for why. Shared between the CLI and GUI so the two never
@@ -1834,6 +1887,77 @@ mod tests {
     use crate::identity::{CanonicalId, IdScheme, Identities};
     use keyroost_hid::{HID_USAGE_FIDO_AUTHENTICATOR, HID_USAGE_PAGE_FIDO};
     use std::path::PathBuf;
+
+    /// A connected row for the serial-less reset rule: `hid` is its FIDO node.
+    fn row(id: &str, model: &str, serial: &str, hid: Option<&str>) -> Device {
+        Device {
+            id: id.into(),
+            name: None,
+            vendor: "Token2".into(),
+            model: model.into(),
+            serial: serial.into(),
+            transport: String::new(),
+            firmware: String::new(),
+            caps: Caps::default(),
+            unverified: Caps::default(),
+            kind: DeviceKind::Key,
+            hid_path: hid.map(PathBuf::from),
+            reader: None,
+            hid_serial: None,
+            naming: Naming::default(),
+            smart_card_unlisted: false,
+        }
+    }
+
+    #[test]
+    fn a_serial_less_key_resets_only_when_it_is_alone() {
+        let key = row("k", "PIN+ Series", "", Some("/dev/hidraw7"));
+        assert!(serial_less_reset_blockers(&key, std::slice::from_ref(&key)).is_empty());
+        // The same key from another scan, under another id, is still itself.
+        let rescanned = row("k2", "PIN+ Series", "", Some("/dev/hidraw7"));
+        assert!(serial_less_reset_blockers(&key, &[rescanned]).is_empty());
+        // Any other row stops it, a token with no FIDO side included: the
+        // check after the replug counts every row too.
+        let mut molto = row("m", "Molto2", "ABC", None);
+        assert_eq!(
+            serial_less_reset_blockers(&key, &[key.clone(), molto.clone()]),
+            vec!["Molto2".to_string()]
+        );
+        molto.name = Some("desk token".into());
+        assert_eq!(
+            serial_less_reset_blockers(&key, &[molto, key.clone()]),
+            vec!["desk token".to_string()]
+        );
+        // A key with a serial is recognized by it: nothing stops it.
+        let yubi = row("y", "YubiKey", "37806840", Some("/dev/hidraw3"));
+        assert!(serial_less_reset_blockers(&yubi, &[yubi.clone(), key]).is_empty());
+    }
+
+    #[test]
+    fn a_serial_less_reinsert_fires_only_on_the_lone_key() {
+        let p = Path::new("/dev/hidraw9");
+        let key = row("k", "PIN+ Series", "", Some("/dev/hidraw9"));
+        assert_eq!(
+            serial_less_reinsert(p, std::slice::from_ref(&key)),
+            SerialLessReinsert::Fire
+        );
+        // Not up yet, or up under another node: look again.
+        assert_eq!(serial_less_reinsert(p, &[]), SerialLessReinsert::Wait);
+        let elsewhere = row("k", "PIN+ Series", "", Some("/dev/hidraw4"));
+        assert_eq!(
+            serial_less_reinsert(p, &[elsewhere]),
+            SerialLessReinsert::Wait
+        );
+        // Came back with a serial: not the serial-less key that was confirmed.
+        let serial = row("k", "PIN+ Series", "1234", Some("/dev/hidraw9"));
+        assert_eq!(serial_less_reinsert(p, &[serial]), SerialLessReinsert::Wait);
+        // Anything else connected and the key can't be singled out.
+        let other = row("o", "PIN+ Series", "", Some("/dev/hidraw5"));
+        assert_eq!(
+            serial_less_reinsert(p, &[key, other]),
+            SerialLessReinsert::Refuse
+        );
+    }
 
     fn hid(
         vid: u16,
