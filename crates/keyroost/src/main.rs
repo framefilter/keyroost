@@ -2648,6 +2648,13 @@ fn fido_unread_line(u2f_only: bool, read_failed: bool) -> &'static str {
     }
 }
 
+/// Whether a job's status text asks for a touch on the key. Every job that
+/// waits for one says so in its label, so the label decides when
+/// [`App::touch_banner`] shows.
+fn job_waits_for_touch(label: &str) -> bool {
+    label.to_lowercase().contains("touch")
+}
+
 /// The reset dialogs' note, before anything is confirmed, for a key with no
 /// serial while `others` are connected.
 fn serial_less_reset_note(others: &[String]) -> String {
@@ -8339,6 +8346,49 @@ impl App {
         self.selected_device()
             .map(|d| keyroost_resolve::serial_less_reset_blockers(d, &self.devices))
             .unwrap_or_default()
+    }
+
+    /// While the running job waits for a touch on the key, say so over the
+    /// content in the job's own words: the top bar's status line is small,
+    /// gray and the first thing a narrow window cuts off, and a touch nobody
+    /// was told about times out (#218).
+    fn touch_banner(&self, ctx: &egui::Context, p: &Palette) {
+        let Some(label) = self.busy_label.as_deref() else {
+            return;
+        };
+        if !self.busy() || !job_waits_for_touch(label) {
+            return;
+        }
+        egui::Area::new(egui::Id::new("touch_banner"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame {
+                    inner_margin: egui::Margin::symmetric(18, 12),
+                    corner_radius: egui::CornerRadius::same(10),
+                    fill: p.pop,
+                    stroke: egui::Stroke::new(1.5, p.accent),
+                    shadow: egui::epaint::Shadow {
+                        offset: [0, 8],
+                        blur: 28,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(90),
+                    },
+                    ..Default::default()
+                }
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(18.0).color(p.accent));
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(label)
+                                .font(theme::f_sb(15.0))
+                                .color(p.txt),
+                        );
+                    });
+                });
+            });
     }
 
     /// Report a FIDO2 reset that will not happen, where it will be read.
@@ -14951,6 +15001,7 @@ impl eframe::App for App {
         self.render_piv_cred_modal(ctx, &p);
         self.molto_dialogs(ctx);
         self.render_import(ctx, &p);
+        self.touch_banner(ctx, &p);
 
         // Help popover, painted last so it sits above everything.
         if let Some(topic) = self.help_open {
@@ -15685,7 +15736,11 @@ impl App {
                             if fit.count_compact {
                                 count.on_hover_text(&count_full);
                             }
-                            if busy {
+                            // A job waiting for a touch says so in the
+                            // banner over the content (`touch_banner`), so
+                            // the bar shows nothing for it.
+                            let touch_wait = busy_label.as_deref().is_some_and(job_waits_for_touch);
+                            if busy && !touch_wait {
                                 ui.add_space(12.0);
                                 ui.spinner();
                                 if let Some(label) = &busy_label {
@@ -28123,6 +28178,18 @@ mod tests {
 
     /// A key with no serial of either kind arms when it is the only device
     /// connected, and is refused, naming what to unplug, when it isn't.
+    #[test]
+    fn the_touch_banner_follows_the_job_label() {
+        assert!(job_waits_for_touch(
+            "Touch your key to read the code\u{2026}"
+        ));
+        assert!(job_waits_for_touch(
+            "Adding credential \u{2014} touch the key if it blinks\u{2026}"
+        ));
+        assert!(!job_waits_for_touch("Reading OATH codes\u{2026}"));
+        assert!(!job_waits_for_touch("Resetting card\u{2026}"));
+    }
+
     #[test]
     fn a_serial_less_key_arms_only_when_it_is_alone() {
         let path = std::path::PathBuf::from("/dev/hidraw7");
