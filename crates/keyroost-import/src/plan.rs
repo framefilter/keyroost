@@ -71,7 +71,7 @@ impl OathFamily {
         match self {
             // The whole stored name, `period/` and `issuer:` included [S1].
             OathFamily::YubiKey { .. } => Some(64),
-            // Measured on Solo 2 firmware 2.3.196 (2026-10-09): 127 bytes
+            // Measured on Solo 2 firmware 2.964 (2026-10-09): 127 bytes
             // stored, 128 makes the key stop responding until replugged.
             OathFamily::Solo2 => Some(SOLO2_NAME_MAX),
             // Label is a Trussed `ShortData`, 128 bytes [S14][S19].
@@ -543,7 +543,7 @@ pub fn limits(store: Store) -> Limits {
             },
         },
         Store::Oath(OathFamily::Solo2) => Limits {
-            // Measured 2026-10-09 on firmware 2.3.196.
+            // Measured 2026-10-09 on firmware 2.964.
             name_max: Some(SOLO2_NAME_MAX),
             ascii_only: false,
             // SHA-512 is accepted at PUT but can't compute codes [S11].

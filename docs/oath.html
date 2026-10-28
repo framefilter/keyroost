@@ -177,7 +177,7 @@ keyroostctl oath import -i export.json --file-password env:EXPORT_PW   # encrypt
       <li><strong>Solo&nbsp;2:</strong> doesn't report how many codes it holds, so writing
         stops if it fills up. Names up to 127 bytes: a longer name is refused by the import,
         <code>oath add</code> and the app before anything is sent, because on firmware
-        2.3.196 a 128-byte name made the key stop responding until it was unplugged. No
+        2.964 a 128-byte name made the key stop responding until it was unplugged. No
         SHA-512 codes.</li>
       <li><strong>Nitrokey&nbsp;3:</strong> 50 codes. Only 30-second codes, because the key
         doesn't store the period. No SHA-512 codes. Import into a Nitrokey&nbsp;3 is built

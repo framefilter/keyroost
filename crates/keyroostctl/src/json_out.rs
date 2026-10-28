@@ -146,7 +146,9 @@ pub(crate) struct FidoInfoJson {
     pub device: String,
     pub channel_id: u32,
     pub ctaphid_protocol_version: u8,
-    pub firmware: String,
+    /// As the vendor states it ("5.7.4", a Solo 2's "2.964", a Token2's
+    /// "R3.4"); `null` when the key doesn't say.
+    pub firmware: Option<String>,
     pub hid_caps: Vec<&'static str>,
     pub hid_caps_raw: u8,
     /// `null` when the device does not speak CTAP2 (U2F-only).
@@ -853,7 +855,7 @@ mod tests {
             ("device", "string"),
             ("channel_id", "number"),
             ("ctaphid_protocol_version", "number"),
-            ("firmware", "string"),
+            ("firmware", "string|null"),
             ("hid_caps", "array"),
             ("hid_caps_raw", "number"),
             ("ctap2", "object|null"),
@@ -874,7 +876,7 @@ mod tests {
             device: "/dev/hidraw0".into(),
             channel_id: 1,
             ctaphid_protocol_version: 2,
-            firmware: "1.2.3".into(),
+            firmware: Some("1.2.3".into()),
             hid_caps: vec!["WINK"],
             hid_caps_raw: 1,
             ctap2,

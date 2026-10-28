@@ -13227,7 +13227,11 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             let dev = crate::target::select_fido_any(reader.as_deref(), path.as_deref())?;
             match fido_route(&dev, reader.is_some())? {
                 FidoRoute::Card { reader } => run_fido_info_reader(&reader)?,
-                FidoRoute::Hid { path } => run_fido_info(&path, dev.reader.as_deref())?,
+                FidoRoute::Hid { path } => run_fido_info(
+                    &path,
+                    dev.reader.as_deref(),
+                    Some(dev.serial.as_str()).filter(|s| !s.is_empty()),
+                )?,
             }
             Ok(())
         }
@@ -14528,39 +14532,29 @@ fn run_fido_info_reader(reader: &str) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// The firmware version for `fido info`, as the app's header shows it: the
-/// CTAPHID INIT version read the vendor's way
-/// ([`keyroost_resolve::firmware`]); for a Token2, the release its serial
-/// number names; when INIT says 0.0.0 (a Nitrokey 3), what the key's admin
-/// application reports over its smart-card `reader`. `None` when the key
-/// doesn't say.
-fn fido_firmware(
-    path: &std::path::Path,
-    init: &keyroost_ctap::InitResponse,
-    reader: Option<&str>,
-) -> Option<String> {
-    use keyroost_resolve::firmware;
-    let (vendor_id, product_id) = keyroost_hid::enumerate()
-        .ok()
-        .and_then(|ds| ds.into_iter().find(|d| d.path == path))
-        .map_or((0, 0), |d| (d.vendor_id, d.product_id));
-    let version = (init.device_major, init.device_minor, init.device_build);
-    let debug = crate::target::debug_on();
-    if let Some(v) = firmware::init_firmware(vendor_id, product_id, version) {
-        return Some(v);
-    }
-    if firmware::is_token2(vendor_id) {
-        return firmware::token2_release_hid(path, debug).map(str::to_owned);
-    }
-    reader.and_then(|r| keyroost_transport::identity::trussed_admin_firmware(r, debug))
-}
-
+/// `fido info` for the key at HID `path`; `reader` and `serial` are its
+/// row's, for the firmware ([`keyroost_resolve::firmware::key_firmware`]).
 fn run_fido_info(
     path: &std::path::Path,
     reader: Option<&str>,
+    serial: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // The firmware first, with no handle to the key held open: reading it
+    // may open the key again (a Token2's serial), and macOS opens HID
+    // devices exclusively.
+    let firmware = {
+        let (dev, init) = keyroost_ctap::CtapHidDevice::open(path)?;
+        drop(dev);
+        let version = (init.device_major, init.device_minor, init.device_build);
+        keyroost_resolve::firmware::key_firmware(
+            path,
+            version,
+            serial,
+            reader,
+            crate::target::debug_on(),
+        )
+    };
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(path)?;
-    let firmware = fido_firmware(path, &init, reader);
     let json = json_output();
     let mut caps = Vec::new();
     if init.supports_wink() {
@@ -14602,7 +14596,7 @@ fn run_fido_info(
                 device: path.display().to_string(),
                 channel_id: init.channel_id,
                 ctaphid_protocol_version: init.protocol_version,
-                firmware: firmware.clone().unwrap_or_default(),
+                firmware: firmware.clone(),
                 hid_caps: caps,
                 hid_caps_raw: init.capabilities,
                 ctap2: None,
@@ -14621,7 +14615,7 @@ fn run_fido_info(
             device: path.display().to_string(),
             channel_id: init.channel_id,
             ctaphid_protocol_version: init.protocol_version,
-            firmware: firmware.unwrap_or_default(),
+            firmware,
             hid_caps: caps,
             hid_caps_raw: init.capabilities,
             ctap2: Some(ctap2_json(&info)),
@@ -23647,7 +23641,7 @@ mod cli_tests {
             device: "/dev/hidraw0".into(),
             channel_id: 0xdead_beef,
             ctaphid_protocol_version: 2,
-            firmware: "5.4.3".into(),
+            firmware: Some("5.4.3".into()),
             hid_caps: vec!["CBOR", "U2F"],
             hid_caps_raw: 0x0d,
             ctap2: Some(json_out::Ctap2InfoJson {
@@ -23675,7 +23669,7 @@ mod cli_tests {
             device: "/dev/hidraw1".into(),
             channel_id: 1,
             ctaphid_protocol_version: 2,
-            firmware: "1.0.0".into(),
+            firmware: Some("1.0.0".into()),
             hid_caps: vec!["U2F"],
             hid_caps_raw: 0x08,
             ctap2: None,

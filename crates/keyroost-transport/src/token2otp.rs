@@ -487,6 +487,9 @@ impl HidOtpTransport {
     }
 }
 
+/// How long [`token2_serial_reply_hid`] waits for the serial itself.
+const SERIAL_READ_TIMEOUT: Duration = Duration::from_millis(1500);
+
 /// The §6.10 GET_INFO serial reply over USB-HID, raw (`D1 len …`), for
 /// identity matching (#51). Read-only, short timeout. A status word other
 /// than `9000` is the key declining; a transport failure is no answer,
@@ -498,13 +501,18 @@ pub fn token2_serial_reply_hid(path: &Path, debug: bool) -> KeyAnswer<Vec<u8>> {
         Err(_) => KeyAnswer::NoAnswer,
     };
     let probe_declined = match CtapOtpTransport::probe(path, debug) {
-        Ok(mut t) => return answer(t.transmit(&t2::read_serial_request(), false)),
+        Ok(mut t) => {
+            // The probe left the 20 s an OTP operation may need; a serial
+            // read answers at once or not at all.
+            t.dev.set_timeout(SERIAL_READ_TIMEOUT);
+            return answer(t.transmit(&t2::read_serial_request(), false));
+        }
         Err(declined) => declined,
     };
     let fallback = match HidOtpTransport::open_path(path) {
         Ok(mut t) => {
             t.set_debug(debug);
-            t.timeout = Duration::from_millis(1500);
+            t.timeout = SERIAL_READ_TIMEOUT;
             answer(t.transmit(&t2::read_serial_request(), false))
         }
         Err(_) => KeyAnswer::NoAnswer,
@@ -2278,7 +2286,7 @@ mod ctap_reply_tests {
 
     #[test]
     fn a_ctap_reply_splits_into_data_and_status_word() {
-        // GET_ECDH_PUBKEY on a PIN+ (fw 2.1.2): 64 key bytes, then 90 00.
+        // GET_ECDH_PUBKEY on a PIN+ (R3.4): 64 key bytes, then 90 00.
         let mut reply = vec![0xAB; 64];
         reply.extend_from_slice(&[0x90, 0x00]);
         let (data, sw) = split_ctap_reply(reply).unwrap();

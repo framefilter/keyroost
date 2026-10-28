@@ -717,7 +717,7 @@ mod tests {
 
     #[test]
     fn oath_6985_needs_auth() {
-        // A password-protected Solo 2 (fw 2.3.196) answers a PUT sent after its
+        // A password-protected Solo 2 (fw 2.964) answers a PUT sent after its
         // one-command unlock lapsed with 6985, not 6982 (seen on hardware).
         assert_eq!(oath_put_answer(0x6985), OathAnswer::NeedsAuth);
         assert_eq!(oath_delete_answer(0x6985), OathAnswer::NeedsAuth);

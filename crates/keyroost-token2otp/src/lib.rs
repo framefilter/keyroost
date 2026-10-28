@@ -511,7 +511,7 @@ pub fn erase_all() -> Vec<u8> {
 
 /// [`erase_all`] for USB-HID: extended Lc `00 00 00` and no data, as spec §3
 /// frames every command but SELECT and Token2's reference client sends it.
-/// A PIN+ (fw 2.1.2) answers the bodyless form with `6FFB` over USB and
+/// A PIN+ (R3.4) answers the bodyless form with `6FFB` over USB and
 /// accepts this one (it then waits for the confirming button press).
 pub fn erase_all_usb() -> Vec<u8> {
     let mut apdu = cmd::WRITE_SEED.to_vec();
@@ -520,7 +520,7 @@ pub fn erase_all_usb() -> Vec<u8> {
 }
 
 /// [`read_config`] for USB-HID: the byte count as a one-byte body behind an
-/// extended Lc (spec §3, §6.9). A PIN+ (fw 2.1.2) answers the short `Le` form
+/// extended Lc (spec §3, §6.9). A PIN+ (R3.4) answers the short `Le` form
 /// with `6FFB` over USB and this one with `9000`.
 pub fn read_config_usb(num_bytes: u8) -> Vec<u8> {
     let mut apdu = cmd::READ_CONFIG.to_vec();
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn usb_forms_use_extended_lc() {
-        // Over USB-HID a PIN+ (fw 2.1.2) answers the two short forms above
+        // Over USB-HID a PIN+ (R3.4) answers the two short forms above
         // with 6FFB and accepts these, the framing of spec §3 and of Token2's
         // reference client: extended Lc, no Le.
         assert_eq!(

@@ -40,13 +40,16 @@ def page_table(text):
             html.unescape(re.sub(r"<[^>]+>", "", c)).strip()
             for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.S)
         ]
-        if len(cells) < 4 or not re.match(r"^R\d", cells[0]):
+        if len(cells) < 4:
+            continue
+        # "R3.4 (PIV + OTP Protection)" -> "R3.4"; "Initial (R1)" -> "R1"
+        m = re.search(r"\bR\d+(?:\.\d+)?\b", cells[0])
+        if not m:
             continue
         prefix = cells[-1]
         if not re.fullmatch(r"\d{5}", prefix):
             continue
-        # "R3.4 (PIV + OTP Protection)" -> "R3.4"
-        release = cells[0].split()[0]
+        release = m.group(0)
         if table.get(prefix, release) != release:
             sys.exit(f"the page lists prefix {prefix} under two releases")
         table[prefix] = release

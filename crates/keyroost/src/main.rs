@@ -1626,33 +1626,22 @@ fn wipe(s: &mut String) {
     s.zeroize();
 }
 
-/// The firmware to show for the key at `target`, read the way its vendor
-/// states it ([`keyroost_resolve::firmware`]): the CTAPHID INIT version
-/// ("5.7.4", a Solo 2's "2.964"); for a Token2, the release its serial
-/// number names ("R3.4"); when INIT says 0.0.0 (a Nitrokey 3), what its
-/// admin application reports over `reader`. `None` over PC/SC (no INIT) or
-/// when the key doesn't say. Runs on the worker: it may ask the key.
+/// The firmware to show for the key at `target`, as the vendor states it
+/// ([`keyroost_resolve::firmware::key_firmware`]: "5.7.4", a Solo 2's
+/// "2.964", a Token2's "R3.4"); `serial` and `reader` are its row's. `None`
+/// over PC/SC (no INIT) or when the key doesn't say. Runs on the worker,
+/// with the FIDO handle closed: it may ask the key.
 fn key_firmware(
     target: &FidoTarget,
     init: Option<&InitResponse>,
+    serial: Option<&str>,
     reader: Option<&str>,
 ) -> Option<String> {
-    use keyroost_resolve::firmware;
     let (FidoTarget::Hid(path), Some(init)) = (target, init) else {
         return None;
     };
-    let (vendor_id, product_id) = keyroost_hid::enumerate()
-        .ok()
-        .and_then(|ds| ds.into_iter().find(|d| &d.path == path))
-        .map_or((0, 0), |d| (d.vendor_id, d.product_id));
     let version = (init.device_major, init.device_minor, init.device_build);
-    if let Some(v) = firmware::init_firmware(vendor_id, product_id, version) {
-        return Some(v);
-    }
-    if firmware::is_token2(vendor_id) {
-        return firmware::token2_release_hid(path, false).map(str::to_owned);
-    }
-    reader.and_then(|r| keyroost_transport::identity::trussed_admin_firmware(r, false))
+    keyroost_resolve::firmware::key_firmware(path, version, serial, reader, false)
 }
 
 /// Shared device-binding guard for background-job completions and modal
@@ -5654,6 +5643,11 @@ impl App {
             return;
         };
         let reader = self.selected_device().and_then(|d| d.reader.clone());
+        // The serial the scan read, if any: a Token2's names its firmware.
+        let serial = self
+            .selected_device()
+            .map(|d| d.serial.clone())
+            .filter(|s| !s.is_empty());
         // Tag the job with the device it reads — if the user switches devices
         // while it's in flight, the result must not be painted into the new
         // device's pane (or its row in the sidebar).
@@ -5672,7 +5666,8 @@ impl App {
                     // Done with this handle before the firmware read, which
                     // may open the key again (a Token2's serial).
                     drop(dev);
-                    let firmware = key_firmware(&target, init.as_ref(), reader.as_deref());
+                    let firmware =
+                        key_firmware(&target, init.as_ref(), serial.as_deref(), reader.as_deref());
                     Ok((init, info, firmware))
                 }
                 Err(e) => Err(format!("could not open key: {e}")),
@@ -5714,8 +5709,8 @@ impl App {
         });
     }
 
-    /// Put what the selected key's info says on its row: the firmware from
-    /// the CTAPHID INIT ("fw 5.7.4") and the model its AAGUID names
+    /// Put what the selected key's info says on its row: the firmware as its
+    /// vendor states it ("fw 5.7.4", [`key_firmware`]) and the model its AAGUID names
     /// ("YubiKey" -> "YubiKey 5 Series with NFC"). Called when the info is
     /// read and after every scan, which rebuilds the rows from scratch.
     fn apply_key_details(&mut self) {
