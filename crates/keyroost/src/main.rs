@@ -68,12 +68,12 @@ fn idle_locked_msg() -> String {
     )
 }
 
-/// Shown where the idle lock only hid codes that need no unlock to show again.
 /// What a dialog the idle lock closed says.
 fn idle_closed_msg() -> String {
     format!("Closed after {} of inactivity.", idle_lock_span())
 }
 
+/// Shown where the idle lock only hid codes that need no unlock to show again.
 fn idle_hidden_msg() -> String {
     format!("Codes hidden after {} of inactivity.", idle_lock_span())
 }
@@ -1314,7 +1314,6 @@ fn load_failure(e: TransportError, backup: &std::path::Path) -> LoadFailure {
     }
 }
 
-/// The create dialog closed after the three files were written.
 /// [`canceled_after_write`] when the idle lock closed the dialog.
 fn idle_closed_after_write(backup: &std::path::Path) -> String {
     format!(
@@ -1325,6 +1324,7 @@ fn idle_closed_after_write(backup: &std::path::Path) -> String {
     )
 }
 
+/// The create dialog closed after the three files were written.
 fn canceled_after_write(backup: &std::path::Path) -> String {
     format!(
         "Canceled; the card was not changed. The new keys are saved at {} (delete those \
@@ -6097,6 +6097,7 @@ impl App {
         }
         if self.piv.key_import.contents.is_some() {
             self.piv_cred_modal_close();
+            self.piv.error = None;
             self.piv.notice = Some(idle_closed_msg());
         }
         // Every other typed secret: the boxes empty, their forms stay open.
