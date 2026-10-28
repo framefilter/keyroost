@@ -5956,30 +5956,33 @@ impl App {
     }
 
     fn refresh_credentials(&mut self) {
-        // Check busy *before* taking the session — spawn_job would silently
-        // drop the job, destroying the unlocked session (and its PIN token)
-        // and logging the user out for clicking Reload at the wrong moment.
+        // Check busy first — spawn_job would silently drop the job.
         if self.busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
             return;
         };
-        if self.fido_session().is_none() {
+        // The session stays in place while the job runs (busy keeps every
+        // other op off it), so the tab keeps showing the unlocked list
+        // instead of flashing the locked view until the new one lands.
+        let Some(session) = self.fido_session() else {
             return; // no session, or one bound to a different device (KEY-012)
-        }
-        let Some(session) = self.security_keys.session.take() else {
-            return;
         };
-        let token = session.token;
-        let pin = session.pin;
+        let token = session.token.clone();
+        let pin = session.pin.clone();
         let for_device = self.selected_device.clone();
         self.spawn_job("Refreshing credentials\u{2026}", move || {
             let result =
                 Self::refresh_with_token(&target, token, pin).map_err(SessionOpError::from_boxed);
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    return; // selection changed mid-refresh; drop the session + PIN
+                    // Selection changed mid-refresh; drop the session + PIN.
+                    if app.security_keys.session_device == for_device {
+                        app.security_keys.session = None;
+                        app.security_keys.session_device = None;
+                    }
+                    return;
                 }
                 match result {
                     Ok(fresh) => {
