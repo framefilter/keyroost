@@ -13,7 +13,8 @@ pub struct Entry {
     pub key: KeyParts,
     /// The certificate (DER) whose public key matches, if any.
     pub certificate: Option<Vec<u8>>,
-    /// The key's friendly name, else the certificate's, else its subject CN.
+    /// The certificate's friendly name, else its subject CN, else the key's
+    /// friendly name.
     pub label: Option<String>,
 }
 
@@ -85,9 +86,13 @@ pub(crate) fn pair(keys: Vec<KeyIn>, certs: Vec<CertIn>) -> Contents {
             }
             certs.get(i)
         });
-        let label = non_empty(&key.friendly_name)
-            .or_else(|| cert.and_then(|c| non_empty(&c.friendly_name)))
-            .or_else(|| cert.and_then(|c| common_name(&c.der)));
+        // The certificate's names first: Windows names the key bag after
+        // its key container ("te-<guid>"), which means nothing to a person,
+        // and other tools give both bags the same name anyway.
+        let label = cert
+            .and_then(|c| non_empty(&c.friendly_name))
+            .or_else(|| cert.and_then(|c| common_name(&c.der)))
+            .or_else(|| non_empty(&key.friendly_name));
         entries.push(Entry {
             key: key.parts,
             certificate: cert.map(|c| c.der.clone()),
@@ -192,6 +197,21 @@ mod tests {
             PublicKey::Ecc { point } => point,
             PublicKey::Rsa { .. } => Vec::new(),
         }
+    }
+
+    #[test]
+    fn label_prefers_the_certificate_over_a_key_container_name() {
+        let mut key = ed_key();
+        key.friendly_name = Some("te-0b6f8e2c-5d1a-4f3e-9c7b-2a1d4e6f8a9b".into());
+        let mut named = cert(KeyAlg::Ed25519, ed_point(), 1);
+        named.friendly_name = Some("Work VPN".into());
+        let c = pair(vec![key], vec![named]);
+        assert_eq!(c.entries[0].label.as_deref(), Some("Work VPN"));
+        // With no certificate, the key's own name is all there is.
+        let mut key = ed_key();
+        key.friendly_name = Some("only-key".into());
+        let c = pair(vec![key], Vec::new());
+        assert_eq!(c.entries[0].label.as_deref(), Some("only-key"));
     }
 
     #[test]
