@@ -7903,7 +7903,7 @@ fn fido_reset_after_replug(
     // Exactly one touch prompt: this step's name when there is one (factory
     // reset), else `fido_reset_at`'s own generic one (standalone `fido reset`).
     if let Some(name) = step_name {
-        eprintln!("{name}  touch the key now\u{2026}");
+        crate::prompt::touch(&format!("{name}  touch the key now\u{2026}"));
     }
     fido_reset_at(&path, needs_generic_touch_prompt(step_name))
 }
@@ -8168,6 +8168,11 @@ fn reset_one_card_applet(
         match step {
             ResetStep::Oath => {
                 let mut s = keyroost_transport::OathSession::open_traced(&reader()?, debug)?;
+                // Some keys (Nitrokey 3) ask for a touch to reset, as `oath reset` says.
+                crate::prompt::touch(&format!(
+                    "{}  touch the key if it blinks\u{2026}",
+                    step.label()
+                ));
                 s.factory_reset()?;
             }
             ResetStep::OpenPgp => {
@@ -8188,6 +8193,22 @@ fn reset_one_card_applet(
         Ok(()) => StepOutcome::Wiped,
         Err(e) => StepOutcome::Failed(sanitize_terminal(&e.to_string())),
     }
+}
+
+/// Whether the account `name` needs a touch to compute: the listing says so
+/// (Nitrokey's secrets app lists the property), or the card's CALCULATE ALL
+/// left it out for a touch (YubiKey).
+fn oath_needs_touch(
+    listing: &keyroost_oath::Listing,
+    all: Option<&keyroost_oath::CalculateAll>,
+    name: &str,
+) -> bool {
+    listing.touch_required.iter().any(|n| n == name)
+        || all.is_some_and(|all| {
+            all.entries.iter().any(|e| {
+                e.name == name && matches!(e.result, keyroost_oath::CalculateAllResult::Touch)
+            })
+        })
 }
 
 fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -8242,20 +8263,28 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let mut session = open_oath(&mut Secrets::real(), access, debug)?;
             // Dispatch on the stored credential type: HOTP uses the card's own
             // counter (empty challenge), TOTP a time counter.
-            let is_hotp = session
-                .list()?
+            let listing = session.list()?;
+            let is_hotp = listing
                 .credentials
                 .iter()
                 .find(|c| c.name == *name)
                 .map(|c| matches!(c.oath_type, keyroost_oath::OathType::Hotp))
                 .unwrap_or(false);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+            // CALCULATE ALL never computes an HOTP code, so it can't advance
+            // the counter; here it only says whether the account needs a touch.
+            let all = (!is_hotp)
+                .then(|| session.calculate_all(now).ok())
+                .flatten();
+            if oath_needs_touch(&listing, all.as_ref(), name) {
+                crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
+            }
             let code = if is_hotp {
                 session.calculate_hotp(name)?
             } else {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|e| e.to_string())?
-                    .as_secs();
                 session.calculate_totp(name, now, oath_code_period(*period, name))?
             };
             if json_output() {
@@ -8316,7 +8345,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             };
             // Some keys (Nitrokey 3) ask for a touch to save a touch account.
             if *touch {
-                eprintln!("Saving \u{2014} touch the key if it blinks\u{2026}");
+                crate::prompt::touch("Saving \u{2014} touch the key if it blinks\u{2026}");
             }
             session.put(&params)?;
             println!(
@@ -8355,6 +8384,16 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session =
                 open_oath_unlocked(&reader, password.as_deref().map(String::as_str), debug)?;
+            // Some keys (Nitrokey 3) ask for a touch to delete a touch account.
+            let listing = session.list()?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+            let all = session.calculate_all(now).ok();
+            if oath_needs_touch(&listing, all.as_ref(), name) {
+                crate::prompt::touch("Deleting \u{2014} touch the key if it blinks\u{2026}");
+            }
             session.delete(name)?;
             println!("Deleted OATH credential {:?}.", name);
         }
@@ -8391,7 +8430,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let name = crate::target::reader_of(&dev)?;
             let mut session = keyroost_transport::OathSession::open_traced(&name, debug)?;
             // Some keys (Nitrokey 3) ask for a touch to reset.
-            eprintln!("Resetting \u{2014} touch the key if it blinks\u{2026}");
+            crate::prompt::touch("Resetting \u{2014} touch the key if it blinks\u{2026}");
             session.factory_reset()?;
             println!("OATH applet reset: all credentials wiped, access password cleared.");
         }
@@ -8535,9 +8574,27 @@ fn open_otp_on(
     };
     session.set_debug(debug);
     session.set_button_prompt(Box::new(|| {
-        eprintln!("touch your key to continue\u{2026}");
+        crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
     }));
     Ok(session)
+}
+
+/// Open a USB FIDO connection on which the key's own "waiting for a touch"
+/// signal (CTAPHID KEEPALIVE, user presence needed) prints a touch prompt,
+/// for whatever command is sent on it ([`crate::prompt::touch_signal`]).
+fn open_ctap_hid(
+    path: &std::path::Path,
+) -> Result<
+    (keyroost_ctap::CtapHidDevice, keyroost_ctap::InitResponse),
+    keyroost_ctap::hid::HidTransportError,
+> {
+    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(path)?;
+    dev.set_keepalive_hook(Box::new(|status| {
+        if status == keyroost_ctap::hid::KEEPALIVE_STATUS_UPNEEDED {
+            crate::prompt::touch_signal();
+        }
+    }));
+    Ok((dev, init))
 }
 
 /// One prompt for the one touch an OTP erase needs (`otp reset` and the
@@ -8545,12 +8602,11 @@ fn open_otp_on(
 /// prompt waits for that; a reader gives no such sign, so there it comes up
 /// front.
 fn arm_otp_erase_prompt(session: &mut keyroost_transport::Token2OtpSession) {
+    const ERASE: &str = "touch your key to confirm the erase\u{2026}";
     if session.is_pcsc() {
-        eprintln!("touch your key to confirm the erase\u{2026}");
+        crate::prompt::touch(ERASE);
     } else {
-        session.set_button_prompt(Box::new(|| {
-            eprintln!("touch your key to confirm the erase\u{2026}");
-        }));
+        session.set_button_prompt(Box::new(|| crate::prompt::touch(ERASE)));
     }
 }
 
@@ -8800,7 +8856,7 @@ fn run_otp(
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
-            eprintln!("Touch the fingerprint sensor to unlock OTP codes\u{2026}");
+            crate::prompt::touch("Touch the fingerprint sensor to unlock OTP codes\u{2026}");
             session.verify_fingerprint()?;
             let entries = session.enumerate(now)?;
             print_otp_entries(&entries)?;
@@ -8819,7 +8875,9 @@ fn run_otp(
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
             if session.fp_is_enabled().unwrap_or(false) {
-                eprintln!("Touch the fingerprint sensor (or wait to fall back to PIN)\u{2026}");
+                crate::prompt::touch(
+                    "Touch the fingerprint sensor (or wait to fall back to PIN)\u{2026}",
+                );
             }
             let method = session.unlock_fp_or_pin(pin.as_deref().map(|p| p.as_str()), true)?;
             eprintln!(
@@ -8842,7 +8900,7 @@ fn run_otp(
             if session.is_pcsc() {
                 let listed = session.enumerate(now).unwrap_or_default();
                 if otp_entry_wants_touch(&listed, app, account) {
-                    eprintln!("touch your key to continue\u{2026}");
+                    crate::prompt::touch("touch your key to continue\u{2026}");
                 }
             }
             let entry = session.read_entry(now, app, account)?;
@@ -9556,7 +9614,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
-            output::status(&format!(
+            crate::prompt::touch(&format!(
                 "Generating {} key — touch the key if it blinks…",
                 slot.label()
             ));
@@ -9639,7 +9697,10 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // RSA-signs it); ECDSA/EdDSA slots want the bare digest.
             let attrs = session.algorithm_attributes(keyroost_openpgp::KeyCrt::Sign)?;
             let input = openpgp_sign_input("signature", &attrs, *hash, &data)?;
-            eprintln!("Signing ({}) — touch the key if it blinks…", hash.label());
+            crate::prompt::touch(&format!(
+                "Signing ({}) — touch the key if it blinks…",
+                hash.label()
+            ));
             let sig = session.sign(&input)?;
             match out {
                 Some(path) => {
@@ -9676,11 +9737,11 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // (including empty attributes) is refused rather than guessed.
             let (plain, noun) = match attrs.first() {
                 Some(0x12) => {
-                    eprintln!("Deriving shared secret — touch the key if it blinks…");
+                    crate::prompt::touch("Deriving shared secret — touch the key if it blinks…");
                     (session.decrypt_ecdh(&cryptogram)?, "shared-secret")
                 }
                 Some(0x01) => {
-                    eprintln!("Decrypting — touch the key if it blinks…");
+                    crate::prompt::touch("Decrypting — touch the key if it blinks…");
                     (session.decrypt(&cryptogram)?, "plaintext")
                 }
                 _ => {
@@ -10655,7 +10716,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         let (alg, key) = load_pubkey_material(path)?;
                         s.remember_pubkey(slot.to_slot(), alg, key);
                     }
-                    eprintln!("Signing the request on the card (touch if it blinks)\u{2026}");
+                    crate::prompt::touch(
+                        "Signing the request on the card (touch if it blinks)\u{2026}",
+                    );
                     let ku = resolve_key_usage(
                         &key_usage.key_usage,
                         slot.to_slot(),
@@ -10767,7 +10830,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         let (alg, key) = load_pubkey_material(path)?;
                         s.remember_pubkey(slot.to_slot(), alg, key);
                     }
-                    eprintln!("Signing the certificate on the card (touch if it blinks)\u{2026}");
+                    crate::prompt::touch(
+                        "Signing the certificate on the card (touch if it blinks)\u{2026}",
+                    );
                     let now = unix_now();
                     let choice = compression.choice();
                     let ku = resolve_key_usage(
@@ -12627,7 +12692,7 @@ fn plan_key_label(
         .as_deref()
         .filter(|_| dev.caps.has(keyroost_resolve::Caps::FIDO2))
         .ok_or(NO_KEY_NAME_STORAGE)?;
-    let (mut h, init) = keyroost_ctap::CtapHidDevice::open(path)?;
+    let (mut h, init) = open_ctap_hid(path)?;
     if !init.supports_cbor() {
         return Err(NO_KEY_NAME_STORAGE.into());
     }
@@ -12669,7 +12734,7 @@ fn apply_key_label(
         src,
     )?;
     let path = crate::target::hid_path_of(dev)?;
-    let (mut h, _) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    let (mut h, _) = open_ctap_hid(&path)?;
     let info = keyroost_ctap::get_info(&mut h)?;
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut h,
@@ -13477,8 +13542,7 @@ fn run_fido_always_uv(
     // Read the state first (no PIN needed), so a key already in the
     // wanted state is never asked for its PIN.
     let current = {
-        let (mut hid, init) =
-            keyroost_ctap::CtapHidDevice::open(&crate::target::hid_path_of(&dev)?)?;
+        let (mut hid, init) = open_ctap_hid(&crate::target::hid_path_of(&dev)?)?;
         if !init.supports_cbor() {
             return Err("device is U2F-only; CTAP2 authenticatorConfig not supported".into());
         }
@@ -13648,7 +13712,7 @@ fn enumerate_ssh_credentials(
     pin: &str,
 ) -> Result<SshCredEnumeration, Box<dyn std::error::Error>> {
     let path = crate::target::fido_path(path)?;
-    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    let (mut dev, init) = open_ctap_hid(&path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 credential management not supported".into());
     }
@@ -13821,7 +13885,7 @@ fn open_and_read_large_blobs(
     Box<dyn std::error::Error>,
 > {
     let path = crate::target::fido_path(path)?;
-    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    let (mut dev, init) = open_ctap_hid(&path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 large blobs not supported".into());
     }
@@ -14548,7 +14612,7 @@ fn run_fido_info(
     path: &std::path::Path,
     reader: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(path)?;
+    let (mut dev, init) = open_ctap_hid(path)?;
     let firmware = fido_firmware(&init, reader);
     let json = json_output();
     let mut caps = Vec::new();
@@ -14710,9 +14774,12 @@ fn fido_reset_at(
     path: &std::path::Path,
     announce_touch: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut dev, _init) = keyroost_ctap::CtapHidDevice::open(path)?;
+    let (mut dev, _init) = open_ctap_hid(path)?;
     if announce_touch {
-        eprintln!("Resetting {} — touch the key now…", path.display());
+        crate::prompt::touch(&format!(
+            "Resetting {} — touch the key now…",
+            path.display()
+        ));
     }
     // Names read from keys before or during the write are stale.
     keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::reset(&mut dev))?;
@@ -14753,7 +14820,7 @@ fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::E
 
 fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
     let path = crate::target::fido_path(path)?;
-    let (mut dev, _) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    let (mut dev, _) = open_ctap_hid(&path)?;
     let n = keyroost_ctap::client_pin::get_pin_retries(&mut dev)?;
     if json_output() {
         emit_json(&json_out::FidoPinRetriesJson { pin_retries: n })?;
@@ -14768,7 +14835,7 @@ fn run_fido_pin_set(
     new_pin: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = crate::target::fido_path(path)?;
-    let (mut dev, _) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    let (mut dev, _) = open_ctap_hid(&path)?;
     keyroost_ctap::client_pin::set_pin(&mut dev, new_pin)?;
     println!("PIN set.");
     Ok(())
@@ -14780,7 +14847,7 @@ fn run_fido_pin_change(
     new_pin: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = crate::target::fido_path(path)?;
-    let (mut dev, _) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    let (mut dev, _) = open_ctap_hid(&path)?;
     keyroost_ctap::client_pin::change_pin(&mut dev, old_pin, new_pin)?;
     println!("PIN changed.");
     Ok(())
@@ -14952,7 +15019,7 @@ fn run_fido_fingerprint_enroll(
                 ));
             }
         }
-        output::status("Touch the sensor now\u{2026}");
+        crate::prompt::touch("Touch the sensor now\u{2026}");
         let (template_id, mut status) = bio.enroll_begin(None)?;
         output::status(&format!(
             "  {}",
@@ -14960,7 +15027,7 @@ fn run_fido_fingerprint_enroll(
         ));
         // Capture until the device says no samples remain.
         while status.remaining_samples > 0 {
-            output::status(&format!(
+            crate::prompt::touch(&format!(
                 "  {} more sample(s) needed \u{2014} touch the sensor again\u{2026}",
                 status.remaining_samples
             ));
@@ -15022,7 +15089,7 @@ where
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
     let path = crate::target::fido_path(path)?;
-    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    let (mut dev, init) = open_ctap_hid(&path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 credential management not supported".into());
     }
@@ -15051,7 +15118,7 @@ where
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
     let path = crate::target::fido_path(path)?;
-    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    let (mut dev, init) = open_ctap_hid(&path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 bio enrollment not supported".into());
     }
@@ -15095,7 +15162,7 @@ where
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
     let path = crate::target::fido_path(path)?;
-    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    let (mut dev, init) = open_ctap_hid(&path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 authenticatorConfig not supported".into());
     }
@@ -15741,6 +15808,44 @@ mod otp_capability_tests {
 mod cli_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn an_oath_account_needs_a_touch_when_the_listing_or_calculate_all_says_so() {
+        use keyroost_oath::{
+            CalculateAll, CalculateAllEntry, CalculateAllResult, Listing, OtpCode,
+        };
+        let listing = |touch: &[&str]| Listing {
+            credentials: Vec::new(),
+            skipped: 0,
+            touch_required: touch.iter().map(|n| n.to_string()).collect(),
+        };
+        let entry = |name: &str, result| CalculateAllEntry {
+            name: name.into(),
+            result,
+        };
+        let all = CalculateAll {
+            entries: vec![
+                entry("yk-touch", CalculateAllResult::Touch),
+                entry(
+                    "yk-plain",
+                    CalculateAllResult::Code(OtpCode {
+                        digits: 6,
+                        code: "123456".into(),
+                    }),
+                ),
+                entry("yk-hotp", CalculateAllResult::Hotp),
+            ],
+            skipped: 0,
+        };
+        // Nitrokey's secrets app: the listing names its touch accounts.
+        assert!(oath_needs_touch(&listing(&["nk-touch"]), None, "nk-touch"));
+        assert!(!oath_needs_touch(&listing(&["nk-touch"]), None, "nk-plain"));
+        // YubiKey: CALCULATE ALL leaves a touch account out with TOUCH.
+        assert!(oath_needs_touch(&listing(&[]), Some(&all), "yk-touch"));
+        assert!(!oath_needs_touch(&listing(&[]), Some(&all), "yk-plain"));
+        assert!(!oath_needs_touch(&listing(&[]), Some(&all), "yk-hotp"));
+        assert!(!oath_needs_touch(&listing(&[]), None, "yk-touch"));
+    }
 
     #[test]
     fn a_required_pin_change_names_the_command_that_makes_it() {

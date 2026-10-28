@@ -275,7 +275,7 @@ fn write_key_name(
         apply_label_plan, plan_label_change, random_nonce, read_label, DeviceLabel, LabelState,
         WRITER_KEYROOST,
     };
-    let (mut dev, init) = CtapHidDevice::open(path).map_err(|e| e.to_string())?;
+    let (mut dev, init) = open_ctap_hid(path).map_err(|e| e.to_string())?;
     if !init.supports_cbor() {
         return Err(KEY_NAME_NO_STORAGE.into());
     }
@@ -371,7 +371,7 @@ fn record_key_name(
 fn open_fido(target: &FidoTarget) -> Result<OpenFido, String> {
     match target {
         FidoTarget::Hid(path) => {
-            let (dev, init) = CtapHidDevice::open(path).map_err(|e| e.to_string())?;
+            let (dev, init) = open_ctap_hid(path).map_err(|e| e.to_string())?;
             let cbor = init.supports_cbor();
             Ok((Box::new(dev), cbor, Some(init)))
         }
@@ -2577,6 +2577,7 @@ fn run_card_reset_step(
                     }
                     (None, None) => return Err("no transport for the OTP applet".to_string()),
                 };
+                signal_otp_touch(&mut s);
                 s.erase_all().map_err(|e| e.to_string())?;
             }
             ResetStep::Fido => {}
@@ -2590,11 +2591,12 @@ fn run_card_reset_step(
 }
 
 /// The status line while the factory reset's card sweep runs. The OTP erase
-/// waits for a touch on the key, and the sweep is one job with one label, so
-/// the label asks for the touch up front, as the OATH reset's does.
+/// waits for a touch on the key, and some keys (Nitrokey 3) ask for one to
+/// reset OATH; the sweep is one job with one label, so the label asks for the
+/// touch up front, as the OATH reset's does.
 fn factory_reset_busy_label(card_steps: &[keyroost_resolve::ResetStep]) -> &'static str {
     use keyroost_resolve::ResetStep;
-    if card_steps.contains(&ResetStep::Token2Otp) {
+    if card_steps.contains(&ResetStep::Token2Otp) || card_steps.contains(&ResetStep::Oath) {
         "Factory-resetting key \u{2014} touch the key if it blinks\u{2026}"
     } else {
         "Factory-resetting key\u{2026}"
@@ -2681,11 +2683,51 @@ fn fido_unread_line(u2f_only: bool, read_failed: bool) -> &'static str {
     }
 }
 
-/// Whether a job's status text asks for a touch on the key. Every job that
-/// waits for one says so in its label, so the label decides when
-/// [`App::touch_banner`] shows.
+/// Whether a job's status text asks for a touch on the key: a job that knows
+/// it needs (or may need) one says so in its label.
 fn job_waits_for_touch(label: &str) -> bool {
     label.to_lowercase().contains("touch")
+}
+
+/// Set from the worker when the key reports over USB that it is waiting for
+/// a touch (CTAPHID KEEPALIVE, user presence needed; the Token2 OTP button
+/// wait). Cleared when a job starts and when the last one ends.
+static KEY_WANTS_TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the touch banner says while a job runs, or `None` for no banner: the
+/// job's own label when it asks for a touch, else a plain prompt once the key
+/// itself reports it is waiting for one.
+fn touch_prompt(label: Option<&str>, busy: bool, key_wants_touch: bool) -> Option<String> {
+    if !busy {
+        return None;
+    }
+    match label {
+        Some(label) if job_waits_for_touch(label) => Some(label.to_owned()),
+        _ if key_wants_touch => Some("Touch your key to continue\u{2026}".to_owned()),
+        _ => None,
+    }
+}
+
+/// [`CtapHidDevice::open`] with the key's "waiting for a touch" signal wired
+/// to the touch banner ([`KEY_WANTS_TOUCH`]), for every command sent on it.
+fn open_ctap_hid(
+    path: &std::path::Path,
+) -> Result<(CtapHidDevice, keyroost_ctap::InitResponse), keyroost_ctap::hid::HidTransportError> {
+    let (mut dev, init) = CtapHidDevice::open(path)?;
+    dev.set_keepalive_hook(Box::new(|status| {
+        if status == keyroost_ctap::hid::KEEPALIVE_STATUS_UPNEEDED {
+            KEY_WANTS_TOUCH.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }));
+    Ok((dev, init))
+}
+
+/// The Token2 OTP session's button wait, wired to the touch banner the same
+/// way (HID only; a reader gives no such sign).
+fn signal_otp_touch(session: &mut keyroost_transport::Token2OtpSession) {
+    session.set_button_prompt(Box::new(|| {
+        KEY_WANTS_TOUCH.store(true, std::sync::atomic::Ordering::Relaxed);
+    }));
 }
 
 /// The reset dialogs' note, before anything is confirmed, for a key with no
@@ -5022,6 +5064,7 @@ impl App {
             Some(worker) => {
                 self.busy_jobs += 1;
                 self.busy_label = Some(label.into());
+                KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 if worker.job_tx.send(Box::new(job)).is_err() {
                     // Worker died; undo the bookkeeping so the UI doesn't hang.
                     self.busy_jobs -= 1;
@@ -5062,6 +5105,7 @@ impl App {
             self.busy_jobs = self.busy_jobs.saturating_sub(1);
             if self.busy_jobs == 0 {
                 self.busy_label = None;
+                KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             apply(self);
         }
@@ -5741,7 +5785,7 @@ impl App {
             return;
         }
         let for_device = self.selected_device.clone();
-        self.spawn_job("Unlocking\u{2026} (enter PIN / touch)", move || {
+        self.spawn_job("Unlocking\u{2026}", move || {
             let result = Self::open_and_unlock(&target, &pin);
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
@@ -6229,126 +6273,130 @@ impl App {
         self.security_keys.fp_progress = Some(progress.clone());
 
         let for_device = self.selected_device.clone();
-        self.spawn_job("Enrolling fingerprint\u{2026}", move || {
-            use keyroost_ctap::bio_enroll::sample_status_message;
-            let result = (|| -> Result<Vec<keyroost_ctap::Enrollment>, SessionOpError> {
-                let (mut dev, cbor, _init) = open_fido(&target).map_err(SessionOpError::msg)?;
-                if !cbor {
-                    return Err(SessionOpError::msg("device is U2F-only"));
-                }
-                // Wire the cooperative-cancel flag into the transport so a
-                // capture blocked waiting for a touch aborts promptly (at the
-                // next KEEPALIVE) when the user clicks Cancel.
-                dev.set_cancel_flag(cancel_flag.clone());
-                let info = keyroost_ctap::get_info(&mut dev).map_err(SessionOpError::from_ctap)?;
-                let cmd_code = if info.option("bioEnroll").is_some() {
-                    keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT
-                } else {
-                    keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT_PREVIEW
-                };
-                // Fresh bio token per enroll, derived from the session PIN.
-                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
-                    &mut dev,
-                    &pin,
-                    &info,
-                    keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
-                )
-                .map_err(SessionOpError::from_ctap)?;
-                let mut bio =
-                    keyroost_ctap::bio_enroll::BioEnrollment::new(&mut dev, token, cmd_code);
-
-                // Learn how many samples the sensor wants, for the progress bar.
-                let total = bio
-                    .sensor_info()
-                    .map(|i| i.max_capture_samples)
-                    .unwrap_or(0);
-
-                let (template_id, mut status) =
-                    bio.enroll_begin(None).map_err(SessionOpError::from_ctap)?;
-                // captured = total - remaining (clamped), so the bar advances
-                // even though the protocol reports "remaining".
-                let update = |p: &std::sync::Mutex<EnrollProgress>,
-                              total: u64,
-                              remaining: u64,
-                              msg: &str| {
-                    if let Ok(mut g) = p.lock() {
-                        g.total = total;
-                        g.captured = total.saturating_sub(remaining);
-                        g.last_message = msg.to_string();
+        self.spawn_job(
+            "Enrolling fingerprint \u{2014} touch the sensor\u{2026}",
+            move || {
+                use keyroost_ctap::bio_enroll::sample_status_message;
+                let result = (|| -> Result<Vec<keyroost_ctap::Enrollment>, SessionOpError> {
+                    let (mut dev, cbor, _init) = open_fido(&target).map_err(SessionOpError::msg)?;
+                    if !cbor {
+                        return Err(SessionOpError::msg("device is U2F-only"));
                     }
-                };
-                update(
-                    &progress,
-                    total.max(status.remaining_samples + 1),
-                    status.remaining_samples,
-                    sample_status_message(status.last_sample_status),
-                );
+                    // Wire the cooperative-cancel flag into the transport so a
+                    // capture blocked waiting for a touch aborts promptly (at the
+                    // next KEEPALIVE) when the user clicks Cancel.
+                    dev.set_cancel_flag(cancel_flag.clone());
+                    let info =
+                        keyroost_ctap::get_info(&mut dev).map_err(SessionOpError::from_ctap)?;
+                    let cmd_code = if info.option("bioEnroll").is_some() {
+                        keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT
+                    } else {
+                        keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT_PREVIEW
+                    };
+                    // Fresh bio token per enroll, derived from the session PIN.
+                    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+                        &mut dev,
+                        &pin,
+                        &info,
+                        keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
+                    )
+                    .map_err(SessionOpError::from_ctap)?;
+                    let mut bio =
+                        keyroost_ctap::bio_enroll::BioEnrollment::new(&mut dev, token, cmd_code);
 
-                while status.remaining_samples > 0 {
-                    // The capture below blocks waiting for a touch, but the
-                    // transport checks the cancel flag on every KEEPALIVE, so a
-                    // cancel returns the "cancelled" error promptly. Map that to
-                    // a device-side cancel + a clean exit.
-                    match bio.enroll_capture_next(&template_id, None) {
-                        Ok(s) => status = s,
-                        Err(e) if e.to_string().contains("cancelled") => {
-                            // Clear the flag first, otherwise the cancel command
-                            // itself would be cancelled at its first KEEPALIVE.
-                            cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                            let _ = bio.cancel_enrollment();
-                            return Err(SessionOpError::msg("cancelled"));
+                    // Learn how many samples the sensor wants, for the progress bar.
+                    let total = bio
+                        .sensor_info()
+                        .map(|i| i.max_capture_samples)
+                        .unwrap_or(0);
+
+                    let (template_id, mut status) =
+                        bio.enroll_begin(None).map_err(SessionOpError::from_ctap)?;
+                    // captured = total - remaining (clamped), so the bar advances
+                    // even though the protocol reports "remaining".
+                    let update = |p: &std::sync::Mutex<EnrollProgress>,
+                                  total: u64,
+                                  remaining: u64,
+                                  msg: &str| {
+                        if let Ok(mut g) = p.lock() {
+                            g.total = total;
+                            g.captured = total.saturating_sub(remaining);
+                            g.last_message = msg.to_string();
                         }
-                        Err(e) => return Err(SessionOpError::from_ctap(e)),
-                    }
-                    let total = total.max(status.remaining_samples + 1);
+                    };
                     update(
                         &progress,
-                        total,
+                        total.max(status.remaining_samples + 1),
                         status.remaining_samples,
                         sample_status_message(status.last_sample_status),
                     );
-                }
 
-                if let Some(n) = &name {
-                    bio.set_friendly_name(&template_id, n)
-                        .map_err(SessionOpError::from_ctap)?;
-                }
-                bio.enumerate().map_err(SessionOpError::from_ctap)
-            })();
-
-            // Mark the shared cell done (success or failure) for the UI.
-            if let Ok(mut g) = progress.lock() {
-                g.done = Some(result.as_ref().map(|_| ()).map_err(|e| e.message.clone()));
-                if result.is_ok() {
-                    g.last_message = "Fingerprint enrolled.".into();
-                    g.captured = g.total;
-                }
-            }
-
-            Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    return; // selection changed mid-enroll; the progress cell
-                            // was already dropped + cancelled on selection change
-                }
-                match result {
-                    Ok(list) => {
-                        app.security_keys.fingerprints = Some(list);
-                        app.security_keys.fp_new_name.clear();
-                        app.security_keys.error = None;
+                    while status.remaining_samples > 0 {
+                        // The capture below blocks waiting for a touch, but the
+                        // transport checks the cancel flag on every KEEPALIVE, so a
+                        // cancel returns the "cancelled" error promptly. Map that to
+                        // a device-side cancel + a clean exit.
+                        match bio.enroll_capture_next(&template_id, None) {
+                            Ok(s) => status = s,
+                            Err(e) if e.to_string().contains("cancelled") => {
+                                // Clear the flag first, otherwise the cancel command
+                                // itself would be cancelled at its first KEEPALIVE.
+                                cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                                let _ = bio.cancel_enrollment();
+                                return Err(SessionOpError::msg("cancelled"));
+                            }
+                            Err(e) => return Err(SessionOpError::from_ctap(e)),
+                        }
+                        let total = total.max(status.remaining_samples + 1);
+                        update(
+                            &progress,
+                            total,
+                            status.remaining_samples,
+                            sample_status_message(status.last_sample_status),
+                        );
                     }
-                    Err(e) if e.message == "cancelled" => {
-                        // User cancelled — dismiss the wizard without an error
-                        // banner, and refresh the list so it reflects reality.
-                        app.security_keys.fp_progress = None;
-                        app.security_keys.error = None;
-                        app.refresh_fingerprints();
+
+                    if let Some(n) = &name {
+                        bio.set_friendly_name(&template_id, n)
+                            .map_err(SessionOpError::from_ctap)?;
                     }
-                    Err(e) => app.fail_session_op(&e, "enroll failed"),
+                    bio.enumerate().map_err(SessionOpError::from_ctap)
+                })();
+
+                // Mark the shared cell done (success or failure) for the UI.
+                if let Ok(mut g) = progress.lock() {
+                    g.done = Some(result.as_ref().map(|_| ()).map_err(|e| e.message.clone()));
+                    if result.is_ok() {
+                        g.last_message = "Fingerprint enrolled.".into();
+                        g.captured = g.total;
+                    }
                 }
-                // Leave fp_progress in place briefly so the UI shows the final
-                // "enrolled" state; it's cleared on the next user action.
-            })
-        });
+
+                Box::new(move |app: &mut App| {
+                    if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                        return; // selection changed mid-enroll; the progress cell
+                                // was already dropped + cancelled on selection change
+                    }
+                    match result {
+                        Ok(list) => {
+                            app.security_keys.fingerprints = Some(list);
+                            app.security_keys.fp_new_name.clear();
+                            app.security_keys.error = None;
+                        }
+                        Err(e) if e.message == "cancelled" => {
+                            // User cancelled — dismiss the wizard without an error
+                            // banner, and refresh the list so it reflects reality.
+                            app.security_keys.fp_progress = None;
+                            app.security_keys.error = None;
+                            app.refresh_fingerprints();
+                        }
+                        Err(e) => app.fail_session_op(&e, "enroll failed"),
+                    }
+                    // Leave fp_progress in place briefly so the UI shows the final
+                    // "enrolled" state; it's cleared on the next user action.
+                })
+            },
+        );
     }
 
     /// Delete one fingerprint by template id, then refresh the list.
@@ -6896,7 +6944,7 @@ impl App {
                 // moment to accept opens; retry briefly before giving up.
                 let mut dev = None;
                 for attempt in 0..10 {
-                    match CtapHidDevice::open(&path) {
+                    match open_ctap_hid(&path) {
                         Ok((d, _)) => {
                             dev = Some(d);
                             break;
@@ -8455,12 +8503,13 @@ impl App {
     /// gray and the first thing a narrow window cuts off, and a touch nobody
     /// was told about times out (#218).
     fn touch_banner(&self, ctx: &egui::Context, p: &Palette) {
-        let Some(label) = self.busy_label.as_deref() else {
+        let Some(label) = touch_prompt(
+            self.busy_label.as_deref(),
+            self.busy(),
+            KEY_WANTS_TOUCH.load(std::sync::atomic::Ordering::Relaxed),
+        ) else {
             return;
         };
-        if !self.busy() || !job_waits_for_touch(label) {
-            return;
-        }
         egui::Area::new(egui::Id::new("touch_banner"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
@@ -15841,7 +15890,12 @@ impl App {
                             // A job waiting for a touch says so in the
                             // banner over the content (`touch_banner`), so
                             // the bar shows nothing for it.
-                            let touch_wait = busy_label.as_deref().is_some_and(job_waits_for_touch);
+                            let touch_wait = touch_prompt(
+                                busy_label.as_deref(),
+                                busy,
+                                KEY_WANTS_TOUCH.load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                            .is_some();
                             if busy && !touch_wait {
                                 ui.add_space(12.0);
                                 ui.spinner();
@@ -26981,6 +27035,8 @@ mod tests {
                 .contains("touch the key")
         );
         assert!(!factory_reset_busy_label(&[ResetStep::OpenPgp, ResetStep::Piv]).contains("touch"));
+        // Some keys (Nitrokey 3) ask for a touch to reset OATH.
+        assert!(factory_reset_busy_label(&[ResetStep::Oath]).contains("touch the key"));
     }
 
     #[test]
@@ -28339,6 +28395,28 @@ mod tests {
         ));
         assert!(!job_waits_for_touch("Reading OATH codes\u{2026}"));
         assert!(!job_waits_for_touch("Resetting card\u{2026}"));
+    }
+
+    /// The banner shows for a job that asks for a touch, and for any job once
+    /// the key itself reports it is waiting for one; never while idle.
+    #[test]
+    fn the_touch_banner_follows_the_label_or_the_key() {
+        let asks = "Resetting OATH applet \u{2014} touch the key if it blinks\u{2026}";
+        assert_eq!(touch_prompt(Some(asks), true, false).as_deref(), Some(asks));
+        assert_eq!(
+            touch_prompt(Some("Refreshing credentials\u{2026}"), true, false),
+            None
+        );
+        assert_eq!(
+            touch_prompt(Some("Refreshing credentials\u{2026}"), true, true).as_deref(),
+            Some("Touch your key to continue\u{2026}")
+        );
+        assert_eq!(
+            touch_prompt(Some(asks), false, true),
+            None,
+            "no job, no banner"
+        );
+        assert_eq!(touch_prompt(None, false, false), None);
     }
 
     #[test]
