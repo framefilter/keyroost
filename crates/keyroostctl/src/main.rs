@@ -8397,6 +8397,11 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             if needs_touch {
                 crate::prompt::touch("Deleting \u{2014} touch the key if it blinks\u{2026}");
             }
+            // The touch check sent commands since the unlock; an applet that
+            // keeps its unlock for one command only (a password-protected
+            // Solo 2) would refuse the delete. Unlock again, with the same
+            // password; without one this sends nothing.
+            session.reauthenticate()?;
             session.delete(name)?;
             println!("Deleted OATH credential {:?}.", name);
         }
