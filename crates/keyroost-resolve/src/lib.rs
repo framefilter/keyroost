@@ -19,6 +19,7 @@ use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey};
 use keyroost_transport::YubiKeyCcid;
 
 pub mod device;
+pub mod firmware;
 pub mod identity;
 pub mod names;
 pub mod select;
