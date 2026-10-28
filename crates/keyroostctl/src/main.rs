@@ -13133,7 +13133,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             let dev = crate::target::select_fido_any(reader.as_deref(), path.as_deref())?;
             match fido_route(&dev, reader.is_some())? {
                 FidoRoute::Card { reader } => run_fido_info_reader(&reader)?,
-                FidoRoute::Hid { path } => run_fido_info(&path)?,
+                FidoRoute::Hid { path } => run_fido_info(&path, dev.reader.as_deref())?,
             }
             Ok(())
         }
@@ -14425,8 +14425,27 @@ fn run_fido_info_reader(reader: &str) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn run_fido_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+/// The firmware version for `fido info`: CTAPHID INIT's, or, when INIT says
+/// 0.0.0 (a Nitrokey 3 does), what the key's admin application reports over
+/// its smart-card `reader`, as the app's header shows.
+fn fido_firmware(init: &keyroost_ctap::InitResponse, reader: Option<&str>) -> String {
+    let (major, minor, build) = (init.device_major, init.device_minor, init.device_build);
+    if (major, minor, build) == (0, 0, 0) {
+        if let Some(v) = reader.and_then(|r| {
+            keyroost_transport::identity::trussed_admin_firmware(r, crate::target::debug_on())
+        }) {
+            return v;
+        }
+    }
+    format!("{major}.{minor}.{build}")
+}
+
+fn run_fido_info(
+    path: &std::path::Path,
+    reader: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(path)?;
+    let firmware = fido_firmware(&init, reader);
     let json = json_output();
     let mut caps = Vec::new();
     if init.supports_wink() {
@@ -14450,13 +14469,7 @@ fn run_fido_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
                         init.channel_id, init.protocol_version
                     ),
                 ),
-                (
-                    "Firmware",
-                    format!(
-                        "{}.{}.{}",
-                        init.device_major, init.device_minor, init.device_build
-                    ),
-                ),
+                ("Firmware", firmware.clone()),
                 (
                     "Caps",
                     format!("{} (raw 0x{:02X})", caps.join("+"), init.capabilities),
@@ -14471,10 +14484,7 @@ fn run_fido_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
                 device: path.display().to_string(),
                 channel_id: init.channel_id,
                 ctaphid_protocol_version: init.protocol_version,
-                firmware: format!(
-                    "{}.{}.{}",
-                    init.device_major, init.device_minor, init.device_build
-                ),
+                firmware: firmware.clone(),
                 hid_caps: caps,
                 hid_caps_raw: init.capabilities,
                 ctap2: None,
@@ -14493,10 +14503,7 @@ fn run_fido_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
             device: path.display().to_string(),
             channel_id: init.channel_id,
             ctaphid_protocol_version: init.protocol_version,
-            firmware: format!(
-                "{}.{}.{}",
-                init.device_major, init.device_minor, init.device_build
-            ),
+            firmware,
             hid_caps: caps,
             hid_caps_raw: init.capabilities,
             ctap2: Some(ctap2_json(&info)),
