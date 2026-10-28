@@ -2785,6 +2785,17 @@ fn edit_state_needs_scrub(state: &egui::text_edit::TextEditState) -> bool {
     undoer.has_undo(&probe) || undoer.has_redo(&probe) || undoer.is_in_flux()
 }
 
+/// Drop keyboard focus from whatever widget holds it, so a secret field
+/// left focused gets its undo history scrubbed by [`guard_secret_field`] on
+/// the next draw (the idle lock asks for this).
+fn surrender_text_focus(ctx: &egui::Context) {
+    ctx.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+}
+
 /// Draw-time guard for a secret field: while it isn't holding keyboard focus,
 /// purge its undo history (see [`clear_edit_undo`]). Call immediately after
 /// adding any `.password(true)` field, passing its [`egui::Response`].
@@ -5893,11 +5904,25 @@ impl App {
     fn holds_unlocked_secrets(&mut self) -> bool {
         self.security_keys.session.is_some()
             || self.typed_secrets().iter().any(|s| !s.is_empty())
+            || self.holds_opened_secrets()
             || self.oath.unlocked_password.is_some()
             || self.oath.creds.iter().any(|r| r.code.is_some())
             || self.otp.pin.is_some()
             || self.otp.rows.iter().any(|r| r.code.is_some())
             || !self.otp.touch_codes.is_empty()
+    }
+
+    /// Whether a dialog holds what a typed password opened: the entries of a
+    /// file read for import (seeds, decrypted or not), an OpenPGP key set
+    /// made or read from a backup, or the key from a .p12 file.
+    fn holds_opened_secrets(&self) -> bool {
+        self.import_flow
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.file.is_some())
+            || self.openpgp.created.is_some()
+            || self.openpgp.restore_loaded.is_some()
+            || self.piv.key_import.contents.is_some()
     }
 
     /// Every field holding a secret typed into a masked box and not yet sent
@@ -6028,6 +6053,21 @@ impl App {
             // Replacing the form wipes its PINs (ChangePinDialog's Drop).
             self.security_keys.change_pin = ChangePinDialog::default();
             self.security_keys.error = Some(idle_locked_msg());
+        }
+        // What a typed password opened: the dialog holding it closes, as its
+        // own Close would, dropping it with its typed secrets. The import
+        // dialog goes on its next frame, which also scrubs its boxes; the
+        // OpenPGP one says where the backup files are.
+        if let Some(d) = self.import_flow.dialog.as_mut() {
+            if d.file.is_some() {
+                d.close();
+            }
+        }
+        if self.openpgp.created.is_some() || self.openpgp.restore_loaded.is_some() {
+            self.openpgp_cred_modal_close();
+        }
+        if self.piv.key_import.contents.is_some() {
+            self.piv_cred_modal_close();
         }
         // Every other typed secret: the boxes empty, their forms stay open.
         for secret in self.typed_secrets() {
@@ -15154,11 +15194,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(next);
         }
         if std::mem::take(&mut self.drop_text_focus) {
-            ctx.memory_mut(|m| {
-                if let Some(id) = m.focused() {
-                    m.surrender_focus(id);
-                }
-            });
+            surrender_text_focus(ctx);
         }
 
         self.top_bar(root_ui, &p);
@@ -28880,6 +28916,74 @@ mod tests {
             !after.undoer().has_undo(&empty),
             "undo history (and its plaintext) must be gone after clear_edit_undo"
         );
+    }
+
+    /// A secret box left focused keeps its undo history (the guard skips a
+    /// focused box); the idle lock's focus drop lets the guard scrub it on
+    /// the next frame. Real frames, as the app draws them.
+    #[test]
+    fn dropping_focus_scrubs_a_focused_secret_box() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("idle-focus-test");
+        let mut buf = String::new();
+        let frame = |buf: &mut String, focus: bool| {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let resp = ui.add(egui::TextEdit::singleline(&mut *buf).password(true).id(id));
+                if focus {
+                    resp.request_focus();
+                }
+                guard_secret_field(ui.ctx(), &resp);
+            });
+        };
+        frame(&mut buf, true);
+        // Typing, as egui records it: an undo point holding the plaintext.
+        let empty = (egui::text::CCursorRange::default(), String::new());
+        let secret = (egui::text::CCursorRange::default(), "1234-pin".to_string());
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        let mut undoer = state.undoer();
+        undoer.feed_state(0.0, &empty);
+        undoer.feed_state(1.0, &secret);
+        undoer.feed_state(2.0, &secret);
+        state.set_undoer(undoer);
+        egui::TextEdit::store_state(&ctx, id, state);
+        buf.push_str("1234-pin");
+
+        frame(&mut buf, false);
+        let held = egui::TextEdit::load_state(&ctx, id).unwrap();
+        assert!(
+            edit_state_needs_scrub(&held),
+            "still focused: the guard leaves the history alone"
+        );
+
+        // The idle lock: the buffer is wiped and focus dropped.
+        wipe(&mut buf);
+        surrender_text_focus(&ctx);
+        frame(&mut buf, false);
+        let after = egui::TextEdit::load_state(&ctx, id).unwrap();
+        assert!(!edit_state_needs_scrub(&after), "the history is scrubbed");
+    }
+
+    /// What a typed password opened counts as held, and the idle lock closes
+    /// the dialog holding it: here a file read for import.
+    #[test]
+    fn idle_lock_closes_an_import_dialog_holding_a_read_file() {
+        let mut app = App::default();
+        let mut dialog = import_flow::ImportDialog::default();
+        dialog.open = true;
+        dialog.file = Some(std::sync::Arc::new(keyroost_import::ImportFile {
+            format: keyroost_import::Format::Aegis,
+            items: Vec::new(),
+            batch: None,
+        }));
+        app.import_flow.dialog = Some(dialog);
+        assert!(app.holds_unlocked_secrets());
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+        let d = app.import_flow.dialog.as_ref().unwrap();
+        assert!(!d.open, "closed; its next frame removes it");
+        assert!(d.file.is_none());
+        assert!(!app.holds_unlocked_secrets());
     }
 
     /// The scrub-needed check behind `guard_secret_field`: empty history is

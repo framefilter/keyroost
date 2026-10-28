@@ -1246,11 +1246,12 @@ impl App {
                             .font(theme::f_reg(12.0))
                             .color(p.txt2),
                     );
-                    ui.add(
+                    let resp = ui.add(
                         egui::TextEdit::singleline(&mut dlg.current)
                             .password(true)
                             .desired_width(220.0),
                     );
+                    crate::guard_secret_field(ui.ctx(), &resp);
                     ui.add_space(6.0);
                 }
                 if matches!(kind, PinDialogKind::Set | PinDialogKind::Change) {
@@ -1259,22 +1260,24 @@ impl App {
                             .font(theme::f_reg(12.0))
                             .color(p.txt2),
                     );
-                    ui.add(
+                    let resp = ui.add(
                         egui::TextEdit::singleline(&mut dlg.new)
                             .password(true)
                             .desired_width(220.0),
                     );
+                    crate::guard_secret_field(ui.ctx(), &resp);
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new("Confirm new PIN")
                             .font(theme::f_reg(12.0))
                             .color(p.txt2),
                     );
-                    ui.add(
+                    let resp = ui.add(
                         egui::TextEdit::singleline(&mut dlg.confirm)
                             .password(true)
                             .desired_width(220.0),
                     );
+                    crate::guard_secret_field(ui.ctx(), &resp);
                 }
             }
             ui.add_space(6.0);
@@ -1785,6 +1788,7 @@ impl App {
                         .hint_text("OTP PIN")
                         .desired_width(220.0),
                 );
+                crate::guard_secret_field(ui.ctx(), &resp);
                 let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
