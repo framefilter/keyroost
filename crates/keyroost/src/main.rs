@@ -69,6 +69,11 @@ fn idle_locked_msg() -> String {
 }
 
 /// Shown where the idle lock only hid codes that need no unlock to show again.
+/// What a dialog the idle lock closed says.
+fn idle_closed_msg() -> String {
+    format!("Closed after {} of inactivity.", idle_lock_span())
+}
+
 fn idle_hidden_msg() -> String {
     format!("Codes hidden after {} of inactivity.", idle_lock_span())
 }
@@ -1310,6 +1315,16 @@ fn load_failure(e: TransportError, backup: &std::path::Path) -> LoadFailure {
 }
 
 /// The create dialog closed after the three files were written.
+/// [`canceled_after_write`] when the idle lock closed the dialog.
+fn idle_closed_after_write(backup: &std::path::Path) -> String {
+    format!(
+        "Closed after {} of inactivity; the card was not changed. The new keys are \
+         saved at {} (delete those three files if you don't want them).",
+        idle_lock_span(),
+        backup.display()
+    )
+}
+
 fn canceled_after_write(backup: &std::path::Path) -> String {
     format!(
         "Canceled; the card was not changed. The new keys are saved at {} (delete those \
@@ -2785,15 +2800,15 @@ fn edit_state_needs_scrub(state: &egui::text_edit::TextEditState) -> bool {
     undoer.has_undo(&probe) || undoer.has_redo(&probe) || undoer.is_in_flux()
 }
 
-/// Drop keyboard focus from whatever widget holds it, so a secret field
-/// left focused gets its undo history scrubbed by [`guard_secret_field`] on
-/// the next draw (the idle lock asks for this).
+/// Drop keyboard focus from whatever widget holds it, scrubbing that
+/// widget's undo history first (the idle lock asks for this): a secret box
+/// left focused may never be drawn again, when the lock closed its dialog,
+/// so [`guard_secret_field`] can't be relied on to scrub it.
 fn surrender_text_focus(ctx: &egui::Context) {
-    ctx.memory_mut(|m| {
-        if let Some(id) = m.focused() {
-            m.surrender_focus(id);
-        }
-    });
+    if let Some(id) = ctx.memory(|m| m.focused()) {
+        clear_edit_undo(ctx, id);
+        ctx.memory_mut(|m| m.surrender_focus(id));
+    }
 }
 
 /// Draw-time guard for a secret field: while it isn't holding keyboard focus,
@@ -6061,13 +6076,28 @@ impl App {
         if let Some(d) = self.import_flow.dialog.as_mut() {
             if d.file.is_some() {
                 d.close();
+                // Shown instead, which also holds the queue until it's read.
+                self.import_flow.notice = Some(import_flow::FileNotice {
+                    file_name: d.file_name.clone(),
+                    text: format!("{} Open the file again to continue.", idle_closed_msg()),
+                });
             }
         }
-        if self.openpgp.created.is_some() || self.openpgp.restore_loaded.is_some() {
+        if let Some(c) = self.openpgp.created.clone() {
             self.openpgp_cred_modal_close();
+            // Closed by the lock, not canceled; a load that may have written
+            // to the card keeps its own error.
+            if self.openpgp.notice.is_some() {
+                self.openpgp.notice = Some(idle_closed_after_write(&c.paths.secret));
+            }
+        } else if self.openpgp.restore_loaded.is_some() {
+            self.openpgp_cred_modal_close();
+            self.openpgp.error = None;
+            self.openpgp.notice = Some(idle_closed_msg());
         }
         if self.piv.key_import.contents.is_some() {
             self.piv_cred_modal_close();
+            self.piv.notice = Some(idle_closed_msg());
         }
         // Every other typed secret: the boxes empty, their forms stay open.
         for secret in self.typed_secrets() {
@@ -28919,8 +28949,8 @@ mod tests {
     }
 
     /// A secret box left focused keeps its undo history (the guard skips a
-    /// focused box); the idle lock's focus drop lets the guard scrub it on
-    /// the next frame. Real frames, as the app draws them.
+    /// focused box); the idle lock's focus drop scrubs it even when the box
+    /// is never drawn again. Real frames, as the app draws them.
     #[test]
     fn dropping_focus_scrubs_a_focused_secret_box() {
         let ctx = egui::Context::default();
@@ -28955,12 +28985,14 @@ mod tests {
             "still focused: the guard leaves the history alone"
         );
 
-        // The idle lock: the buffer is wiped and focus dropped.
+        // The idle lock: the buffer is wiped and focus dropped. The box
+        // isn't drawn again (the lock may have closed its dialog).
         wipe(&mut buf);
         surrender_text_focus(&ctx);
-        frame(&mut buf, false);
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
         let after = egui::TextEdit::load_state(&ctx, id).unwrap();
         assert!(!edit_state_needs_scrub(&after), "the history is scrubbed");
+        assert!(ctx.memory(|m| m.focused()).is_none());
     }
 
     /// What a typed password opened counts as held, and the idle lock closes
@@ -28983,7 +29015,10 @@ mod tests {
         let d = app.import_flow.dialog.as_ref().unwrap();
         assert!(!d.open, "closed; its next frame removes it");
         assert!(d.file.is_none());
+        assert!(!d.preview_wanted, "no key read for a closed dialog");
         assert!(!app.holds_unlocked_secrets());
+        let notice = app.import_flow.notice.as_ref().expect("says why");
+        assert!(notice.text.starts_with(&idle_closed_msg()));
     }
 
     /// The scrub-needed check behind `guard_secret_field`: empty history is

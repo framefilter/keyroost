@@ -544,6 +544,8 @@ impl ImportDialog {
     /// the key holds and the report.
     pub fn close(&mut self) {
         self.open = false;
+        // A preview still waiting for the worker never starts for a closed dialog.
+        self.preview_wanted = false;
         wipe(&mut self.file_password);
         wipe(&mut self.dest_secret);
         self.file = None;
