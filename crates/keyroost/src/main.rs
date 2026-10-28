@@ -4321,6 +4321,9 @@ struct App {
     /// drives the inactivity lock (see [`IDLE_LOCK_AFTER`]). `None` until the
     /// first frame.
     last_activity: Option<std::time::Instant>,
+    /// Set by the idle lock: the next frame drops keyboard focus, so a
+    /// secret box left focused gets its undo history scrubbed too.
+    drop_text_focus: bool,
     /// True once the first automatic device scan has been kicked off.
     scanned: bool,
     /// Sidebar filter text (filters the visible device list by vendor/model).
@@ -5883,16 +5886,85 @@ impl App {
     }
 
     /// Whether the app holds anything [`Self::idle_lock`] would clear: an
-    /// unlocked FIDO session (with its PIN), a PIN draft in the change-PIN
-    /// form, a retained OATH password or OTP PIN, or displayed OATH / OTP codes.
-    fn holds_unlocked_secrets(&self) -> bool {
+    /// unlocked FIDO session (with its PIN), a typed secret not yet sent to a
+    /// key ([`Self::typed_secrets`]), a retained OATH password or OTP PIN, or
+    /// displayed OATH / OTP codes. `&mut` only because the typed-secret list
+    /// is one list, shared with the wipe.
+    fn holds_unlocked_secrets(&mut self) -> bool {
         self.security_keys.session.is_some()
-            || self.security_keys.change_pin.has_pin_input()
+            || self.typed_secrets().iter().any(|s| !s.is_empty())
             || self.oath.unlocked_password.is_some()
             || self.oath.creds.iter().any(|r| r.code.is_some())
             || self.otp.pin.is_some()
             || self.otp.rows.iter().any(|r| r.code.is_some())
             || !self.otp.touch_codes.is_empty()
+    }
+
+    /// Every field holding a secret typed into a masked box and not yet sent
+    /// to a key: PINs, PUKs, passwords, passphrases, management keys and
+    /// seeds, in every pane and dialog. The idle lock wipes them all, so a
+    /// form left half-filled doesn't keep its secret.
+    ///
+    /// Left out on purpose: the Molto2 customer key. Empty there means the
+    /// factory default key, so wiping it would quietly switch the next
+    /// sign-in to the default key.
+    fn typed_secrets(&mut self) -> Vec<&mut String> {
+        let sk = &mut self.security_keys;
+        let mut out: Vec<&mut String> = vec![
+            &mut sk.pin_input,
+            &mut sk.change_pin.old,
+            &mut sk.change_pin.new,
+            &mut sk.change_pin.confirm,
+        ];
+        if let Some(d) = sk.advanced.as_mut() {
+            out.push(&mut d.pin_input);
+        }
+        out.push(&mut self.rename_pin);
+        out.push(&mut self.reset_mgmt_auth_input);
+        out.push(&mut self.oath.password_input);
+        out.push(&mut self.oath.add.secret);
+        let otp = &mut self.otp;
+        out.push(&mut otp.pin_input);
+        out.push(&mut otp.add.secret);
+        out.push(&mut otp.button_hotp.secret);
+        if let Some(d) = otp.pin_dialog.as_mut() {
+            out.extend([&mut d.current, &mut d.new, &mut d.confirm]);
+        }
+        let pgp = &mut self.openpgp;
+        out.extend([
+            &mut pgp.admin_pin,
+            &mut pgp.user_pin_old,
+            &mut pgp.user_pin_new,
+            &mut pgp.admin_pin_old,
+            &mut pgp.admin_pin_new,
+            &mut pgp.unblock_new,
+            &mut pgp.passphrase,
+            &mut pgp.create.pass,
+            &mut pgp.create.pass_repeat,
+            &mut pgp.expiry.user_pin,
+        ]);
+        let piv = &mut self.piv;
+        out.extend([
+            &mut piv.mgmt_key_input,
+            &mut piv.new_mgmt_key_input,
+            &mut piv.pin_old,
+            &mut piv.pin_new,
+            &mut piv.pin_confirm,
+            &mut piv.puk_old,
+            &mut piv.puk_new,
+            &mut piv.puk_confirm,
+            &mut piv.unblock_puk,
+            &mut piv.unblock_new_pin,
+            &mut piv.retries_pin_auth,
+            &mut piv.sign_pin,
+            &mut piv.key_import.password,
+        ]);
+        out.push(&mut *self.prog_seed_input);
+        out.push(&mut self.draft.secret_base32);
+        if let Some(d) = self.import_flow.dialog.as_mut() {
+            out.extend([&mut d.file_password, &mut d.dest_secret]);
+        }
+        out
     }
 
     /// The inactivity check, run once per frame. `user_input` is whether this
@@ -5942,10 +6014,11 @@ impl App {
 
     /// Lock what [`Self::holds_unlocked_secrets`] reports, after
     /// [`IDLE_LOCK_AFTER`] without input: the FIDO session through the same
-    /// path as the Lock button, PIN drafts in the change-PIN form, the
-    /// retained OATH password and OTP PIN (a protected applet goes back to
-    /// its unlock prompt, as after a rejected password), and every displayed
-    /// code. Local only — no device I/O.
+    /// path as the Lock button, every typed secret ([`Self::typed_secrets`];
+    /// the change-PIN form also closes), the retained OATH password and OTP
+    /// PIN (a protected applet goes back to its unlock prompt, as after a
+    /// rejected password), and every displayed code. Local only — no device
+    /// I/O.
     fn idle_lock(&mut self) {
         if self.security_keys.session.is_some() {
             self.lock_session();
@@ -5956,6 +6029,14 @@ impl App {
             self.security_keys.change_pin = ChangePinDialog::default();
             self.security_keys.error = Some(idle_locked_msg());
         }
+        // Every other typed secret: the boxes empty, their forms stay open.
+        for secret in self.typed_secrets() {
+            wipe(secret);
+        }
+        // A box that still has keyboard focus keeps egui's undo history,
+        // which holds the typed text; dropping the focus lets
+        // guard_secret_field scrub it on the next frame.
+        self.drop_text_focus = true;
 
         let oath_codes = self.oath.creds.iter().any(|r| r.code.is_some());
         for row in &mut self.oath.creds {
@@ -15066,11 +15147,18 @@ impl eframe::App for App {
         }
 
         // Inactivity lock: after IDLE_LOCK_AFTER without input, drop the
-        // unlocked FIDO session, retained OATH password / OTP PIN and shown
-        // codes. The timer wakes the frame loop even when nothing else draws.
+        // unlocked FIDO session, retained OATH password / OTP PIN, shown
+        // codes and typed secrets. The timer wakes the frame loop even when nothing else draws.
         let user_input = ctx.input(|i| i.events.iter().any(is_user_activity));
         if let Some(next) = self.idle_lock_tick(std::time::Instant::now(), user_input) {
             ctx.request_repaint_after(next);
+        }
+        if std::mem::take(&mut self.drop_text_focus) {
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
         }
 
         self.top_bar(root_ui, &p);
@@ -31787,6 +31875,51 @@ mod tests {
             assert!(app.security_keys.change_pin.confirm.is_empty(), "{case}");
             assert_eq!(app.security_keys.error, Some(idle_locked_msg()), "{case}");
             assert!(!app.holds_unlocked_secrets(), "{case}");
+        }
+    }
+
+    /// A secret typed into any pane and left there starts the idle clock and
+    /// is wiped when it runs out; the Molto2 customer key, where empty means
+    /// the default key, is kept.
+    #[test]
+    fn idle_lock_wipes_typed_secrets_in_every_pane() {
+        let mut app = App::default();
+        app.security_keys.pin_input = "fido-pin".into();
+        app.oath.password_input = "oath-password".into();
+        app.otp.pin_input = "otp-pin".into();
+        app.openpgp.passphrase = "backup-passphrase".into();
+        app.piv.puk_new = "87654321".into();
+        app.piv.key_import.password = "p12-password".into();
+        app.customer_key_input = "custom-key".into();
+        assert!(app.holds_unlocked_secrets());
+
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+
+        assert!(app.typed_secrets().iter().all(|s| s.is_empty()));
+        assert!(!app.holds_unlocked_secrets());
+        assert!(app.drop_text_focus, "a focused secret box gives up focus");
+        assert_eq!(app.customer_key_input, "custom-key");
+    }
+
+    /// One typed character anywhere is enough to start the clock.
+    #[test]
+    fn every_typed_secret_starts_the_idle_clock() {
+        // With every optional dialog open, so their boxes are listed too.
+        let with_dialogs = || {
+            let mut app = App::default();
+            app.security_keys.advanced = Some(AdvancedDialog::default());
+            app.otp.pin_dialog = Some(otp_pane::PinDialog::default());
+            app.import_flow.dialog = Some(import_flow::ImportDialog::default());
+            app
+        };
+        let count = with_dialogs().typed_secrets().len();
+        for i in 0..count {
+            let mut app = with_dialogs();
+            assert!(!app.holds_unlocked_secrets());
+            *app.typed_secrets()[i] = "x".into();
+            assert!(app.holds_unlocked_secrets(), "secret #{i}");
         }
     }
 
