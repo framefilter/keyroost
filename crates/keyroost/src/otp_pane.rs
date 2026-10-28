@@ -1445,15 +1445,20 @@ impl App {
             self.load_otp_entries();
         }
 
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("On-device OTP")
-                    .font(theme::f_sb(14.5))
-                    .color(p.txt),
-            );
-            ui.add_space(6.0);
-            self.help_dot(ui, p, "otp");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        // The buttons move to a line of their own under the title when the
+        // window is too narrow for both.
+        self.adaptive_row(
+            ui,
+            |app, ui| {
+                ui.label(
+                    egui::RichText::new("On-device OTP")
+                        .font(theme::f_sb(14.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                app.help_dot(ui, p, "otp");
+            },
+            |app, ui| {
                 // Secondary actions live in an overflow menu so the header row
                 // doesn't crowd: HID-HOTP configure, the interface toggle, and the
                 // transport selector. Rendered first so that, in this
@@ -1488,7 +1493,7 @@ impl App {
                             OtpTransportSel::Ccid,
                         ] {
                             if ui
-                                .selectable_label(self.otp.transport == sel, sel.label())
+                                .selectable_label(app.otp.transport == sel, sel.label())
                                 .clicked()
                             {
                                 new_transport = Some(sel);
@@ -1498,10 +1503,10 @@ impl App {
 
                         // Configure HID-HOTP — disabled (with reason) when the
                         // keyboard interface is off or unsupported.
-                        let touch_blocked = self.otp.touch_hotp_ok == Some(false);
+                        let touch_blocked = app.otp.touch_hotp_ok == Some(false);
                         ui.add_enabled_ui(!touch_blocked, |ui| {
                             let r = ui.selectable_label(false, "Configure HID-HOTP\u{2026}");
-                            let r = match self.otp.touch_hotp_why {
+                            let r = match app.otp.touch_hotp_why {
                                 Some(why) if touch_blocked => r.on_disabled_hover_text(why),
                                 _ => r,
                             };
@@ -1511,7 +1516,7 @@ impl App {
                         });
 
                         // Enable/Disable the keyboard-HID interface.
-                        if let Some(iface) = self.otp.iface {
+                        if let Some(iface) = app.otp.iface {
                             let (label, target) = if iface.keyboard {
                                 ("Disable HID-HOTP", false)
                             } else {
@@ -1528,15 +1533,15 @@ impl App {
                             // model that doesn't have the HOTP-on-touch feature,
                             // so block it (the interface toggle only makes sense
                             // for keys that actually support it).
-                            let unsupported = target && self.otp.hotp_supported == Some(false);
+                            let unsupported = target && app.otp.hotp_supported == Some(false);
                             let blocked = would_underflow || unsupported;
                             ui.add_enabled_ui(!blocked, |ui| {
                                 let r = ui.selectable_label(false, label);
                                 let r = if unsupported {
                                     r.on_disabled_hover_text(
                                         "this key was supplied without the HOTP-on-touch \
-                                         function; keys aren't upgradable after purchase, so \
-                                         it can't be enabled here",
+                                     function; keys aren't upgradable after purchase, so \
+                                     it can't be enabled here",
                                     )
                                 } else if would_underflow {
                                     r.on_disabled_hover_text(
@@ -1558,7 +1563,7 @@ impl App {
                                 .font(theme::f_reg(11.0))
                                 .color(p.txt3),
                         );
-                        match self.otp.pin_set {
+                        match app.otp.pin_set {
                             Some(false) => {
                                 if ui.selectable_label(false, "Set PIN\u{2026}").clicked() {
                                     pin_dialog_open = Some(PinDialogKind::Set);
@@ -1572,7 +1577,7 @@ impl App {
                                     pin_dialog_open = Some(PinDialogKind::Remove);
                                 }
                                 // Lock is only meaningful once unlocked this session.
-                                ui.add_enabled_ui(self.otp.pin.is_some(), |ui| {
+                                ui.add_enabled_ui(app.otp.pin.is_some(), |ui| {
                                     if ui.selectable_label(false, "Lock now").clicked() {
                                         pin_lock = true;
                                     }
@@ -1589,7 +1594,7 @@ impl App {
                         // set, since enabling/disabling it authenticates with the
                         // PIN). Requires an enrolled fingerprint on the key; the
                         // device rejects enabling otherwise, surfaced as an error.
-                        if self.otp.pin_set == Some(true) {
+                        if app.otp.pin_set == Some(true) {
                             ui.separator();
                             ui.label(
                                 egui::RichText::new("Fingerprint")
@@ -1598,7 +1603,7 @@ impl App {
                             );
                             // Some(false) -> offer Enable; Some(true) -> offer
                             // Disable; None (unknown) -> no toggle item.
-                            let toggle = match self.otp.fp_enabled {
+                            let toggle = match app.otp.fp_enabled {
                                 Some(false) => Some((true, "Enable fingerprint unlock\u{2026}")),
                                 Some(true) => Some((false, "Disable fingerprint unlock\u{2026}")),
                                 None => None,
@@ -1613,38 +1618,38 @@ impl App {
 
                 // Apply menu selections after the closure.
                 if let Some(sel) = new_transport {
-                    self.otp.transport = sel;
-                    self.otp.active = None;
-                    self.otp.serial = None;
-                    self.load_otp_entries();
+                    app.otp.transport = sel;
+                    app.otp.active = None;
+                    app.otp.serial = None;
+                    app.load_otp_entries();
                 }
                 if open_touch {
                     let mut dlg = ButtonHotpDialog::default();
                     dlg.open = true;
-                    if let Some(st) = self.otp.button_hotp_status {
+                    if let Some(st) = app.otp.button_hotp_status {
                         dlg.send_enter = st.send_enter;
                         dlg.long_touch = st.long_touch;
                         dlg.numpad = st.numpad;
                     }
-                    self.otp.button_hotp = dlg;
+                    app.otp.button_hotp = dlg;
                     // A reopened dialog must default to masked, regardless of a
                     // reveal toggle left set from a prior entry.
-                    self.secret_reveal.insert("otp-buttonhotp-secret", false);
+                    app.secret_reveal.insert("otp-buttonhotp-secret", false);
                 }
                 if let Some(target) = kbd_target {
-                    self.otp.kbd_confirm = Some(KbdToggle {
+                    app.otp.kbd_confirm = Some(KbdToggle {
                         enable: target,
                         typed: String::new(),
                     });
                 }
                 if let Some(kind) = pin_dialog_open {
-                    self.otp.pin_dialog = Some(PinDialog::for_kind(kind));
+                    app.otp.pin_dialog = Some(PinDialog::for_kind(kind));
                 }
                 if pin_lock {
-                    self.lock_otp_pin();
+                    app.lock_otp_pin();
                 }
                 if let Some(enable) = fp_toggle {
-                    self.set_otp_fp_protection(enable);
+                    app.set_otp_fp_protection(enable);
                 }
 
                 // Primary actions, to the left of the overflow menu (added after
@@ -1653,7 +1658,7 @@ impl App {
                 // no on-device OTP function — there is nothing to add it to.
                 // Refresh stays, so the read can be retried.
                 ui.add_space(6.0);
-                if self.otp.totp_supported != Some(false)
+                if app.otp.totp_supported != Some(false)
                     && theme::button(ui, p, BtnKind::Primary, "+ Add entry").clicked()
                 {
                     // OtpAddDialog has a Drop impl (wipes the typed seed), so
@@ -1661,17 +1666,17 @@ impl App {
                     // then flip `open`.
                     let mut dlg = OtpAddDialog::default();
                     dlg.open = true;
-                    self.otp.add = dlg;
+                    app.otp.add = dlg;
                     // A reopened dialog must default to masked, regardless of a
                     // reveal toggle left set from a prior entry.
-                    self.secret_reveal.insert("otp-add-secret", false);
+                    app.secret_reveal.insert("otp-add-secret", false);
                 }
                 ui.add_space(6.0);
-                if self.otp.totp_supported != Some(false)
+                if app.otp.totp_supported != Some(false)
                     && theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked()
                 {
-                    if let Some(id) = self.selected_device.clone() {
-                        self.import_pick_file(crate::import_flow::Origin::View(
+                    if let Some(id) = app.selected_device.clone() {
+                        app.import_pick_file(crate::import_flow::Origin::View(
                             crate::import_flow::DestKey {
                                 device: id,
                                 store: crate::import_flow::StoreKind::Token2Otp,
@@ -1679,8 +1684,8 @@ impl App {
                         ));
                     }
                 }
-            });
-        });
+            },
+        );
         // Transport + serial on their own line, so neither collides with the
         // controls on the header row.
         if self.otp.active.is_some() || self.otp.serial.is_some() {
@@ -1980,6 +1985,9 @@ impl App {
                 .num_columns(2)
                 .spacing([10.0, 8.0])
                 .show(ui, |ui| {
+                    // A narrow window must not break a label mid-word
+                    // ("Accou/nt"); the fields take the squeeze instead.
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     ui.label("Issuer / app");
                     ui.text_edit_singleline(&mut self.otp.add.app_name);
                     ui.end_row();
@@ -1995,7 +2003,10 @@ impl App {
                             .get("otp-add-secret")
                             .copied()
                             .unwrap_or(false);
-                        crate::secret_edit(ui, p, &mut self.otp.add.secret, &mut rev, "", 260.0);
+                        // Narrower in a narrow window (the eye button takes ~34 px),
+                        // so the field stays inside the card.
+                        let w = (ui.available_width() - 34.0).clamp(80.0, 260.0);
+                        crate::secret_edit(ui, p, &mut self.otp.add.secret, &mut rev, "", w);
                         self.secret_reveal.insert("otp-add-secret", rev);
                     }
                     ui.end_row();
@@ -2127,6 +2138,8 @@ impl App {
                 .num_columns(2)
                 .spacing([10.0, 8.0])
                 .show(ui, |ui| {
+                    // As in the add-entry form: labels never break mid-word.
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     let configured = matches!(
                         self.otp.button_hotp_status,
                         Some(st) if st.configured
@@ -2147,13 +2160,14 @@ impl App {
                             .get("otp-buttonhotp-secret")
                             .copied()
                             .unwrap_or(false);
+                        let w = (ui.available_width() - 34.0).clamp(80.0, 260.0);
                         crate::secret_edit(
                             ui,
                             p,
                             &mut self.otp.button_hotp.secret,
                             &mut rev,
                             bh_hint,
-                            260.0,
+                            w,
                         );
                         self.secret_reveal.insert("otp-buttonhotp-secret", rev);
                     }
