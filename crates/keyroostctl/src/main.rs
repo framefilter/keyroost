@@ -13501,14 +13501,13 @@ enum AlwaysUvStep {
 }
 
 /// What `fido config always-uv enable|disable` must do, from the `alwaysUv` option the
-/// key reports. A key that doesn't report it can't be brought to a known
-/// state, so nothing is sent.
+/// key reports. A key that doesn't report it doesn't support Always UV, so
+/// nothing is sent.
 fn always_uv_step(current: Option<bool>, want_on: bool) -> Result<AlwaysUvStep, String> {
     match current {
         None => Err(
-            "this key doesn't report its \"always require user verification\" \
-                     setting (alwaysUv), so keyroost can't set it to a known state; \
-                     nothing was changed"
+            "this key does not support \"always require user verification\" \
+                     (alwaysUv); nothing was changed"
                 .into(),
         ),
         Some(on) if on == want_on => Ok(AlwaysUvStep::AlreadySet),
@@ -16438,6 +16437,7 @@ mod cli_tests {
         );
         for want in [true, false] {
             let e = always_uv_step(None, want).unwrap_err();
+            assert!(e.contains("does not support"), "{e}");
             assert!(e.contains("nothing was changed"), "{e}");
         }
     }

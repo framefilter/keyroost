@@ -54,6 +54,7 @@ const PARAM_FORCE_CHANGE_PIN: u64 = 0x03;
 pub struct Configurator<'a, T: CtapTransport> {
     dev: &'a mut T,
     token: PinUvAuthToken,
+    always_uv_supported: bool,
 }
 
 impl<'a, T: CtapTransport> Configurator<'a, T> {
@@ -69,7 +70,11 @@ impl<'a, T: CtapTransport> Configurator<'a, T> {
                 "authenticator does not support authenticatorConfig",
             ));
         }
-        Ok(Self { dev, token })
+        Ok(Self {
+            dev,
+            token,
+            always_uv_supported: info.option("alwaysUv").is_some(),
+        })
     }
 
     /// Enable enterprise attestation (sub-command 0x01). Typically one-way:
@@ -81,8 +86,14 @@ impl<'a, T: CtapTransport> Configurator<'a, T> {
     /// Toggle "always require user verification" (sub-command 0x02). Flips the
     /// current state: if `alwaysUv` is on it turns off, and vice versa. Inspect
     /// the `alwaysUv` option from `getInfo` first if you need a specific target
-    /// state. Whether the setting survives a reset is vendor-specific.
+    /// state. Whether the setting survives a reset is vendor-specific. A key
+    /// that does not report `alwaysUv` does not support this sub-command.
     pub fn toggle_always_uv(&mut self) -> Result<(), CtapError> {
+        if !self.always_uv_supported {
+            return Err(CtapError::InvalidResponseShape(
+                "authenticator does not support toggleAlwaysUV",
+            ));
+        }
         self.dispatch(SUB_TOGGLE_ALWAYS_UV, None)
     }
 
@@ -249,5 +260,60 @@ mod tests {
         assert_eq!(expected.len(), 32);
         // Re-deriving from the same input must match (determinism).
         assert_eq!(expected, token.authenticate(&cfg_input));
+    }
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        calls: usize,
+    }
+
+    impl CtapTransport for RecordingTransport {
+        fn transact(&mut self, _cmd: u8, _payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            self.calls += 1;
+            Ok(vec![0])
+        }
+    }
+
+    fn config_info(always_uv: Option<bool>) -> AuthenticatorInfo {
+        let mut options = vec![("authnrCfg".into(), true)];
+        if let Some(enabled) = always_uv {
+            options.push(("alwaysUv".into(), enabled));
+        }
+        AuthenticatorInfo {
+            options,
+            ..Default::default()
+        }
+    }
+
+    fn configurator<'a>(
+        dev: &'a mut RecordingTransport,
+        always_uv: Option<bool>,
+    ) -> Configurator<'a, RecordingTransport> {
+        let token = PinUvAuthToken {
+            protocol: 1,
+            token: vec![0x42; 16],
+        };
+        Configurator::new(dev, token, &config_info(always_uv)).unwrap()
+    }
+
+    #[test]
+    fn toggle_always_uv_requires_advertised_support() {
+        let mut dev = RecordingTransport::default();
+        let mut cfg = configurator(&mut dev, None);
+        let error = cfg.toggle_always_uv().unwrap_err();
+        assert!(matches!(error, CtapError::InvalidResponseShape(_)));
+        drop(cfg);
+        assert_eq!(dev.calls, 0);
+    }
+
+    #[test]
+    fn toggle_always_uv_allows_reported_on_or_off() {
+        for enabled in [false, true] {
+            let mut dev = RecordingTransport::default();
+            let mut cfg = configurator(&mut dev, Some(enabled));
+            cfg.toggle_always_uv().unwrap();
+            drop(cfg);
+            assert_eq!(dev.calls, 1);
+        }
     }
 }
