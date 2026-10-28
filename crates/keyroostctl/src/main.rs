@@ -9770,6 +9770,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |session| -> Result<(), Box<dyn std::error::Error>> {
                     let status = session.status()?;
+                    let retired = read_retired_slots(session);
 
                     if json_output() {
                         emit_json(&json_out::PivStatusJson {
@@ -9790,6 +9791,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             slots: status
                                 .slots
                                 .iter()
+                                .chain(&retired.in_use)
                                 .map(|s| json_out::PivSlotJson {
                                     slot: json_out::piv_slot_token(s.slot),
                                     slot_name: s.slot.label(),
@@ -9878,7 +9880,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         None => println!("CHUID:       (unavailable)"),
                     }
                     println!("Slots:");
-                    for s in &status.slots {
+                    for s in status.slots.iter().chain(&retired.in_use) {
                         println!(
                             "  {:<26} {}",
                             s.slot.label(),
@@ -9890,6 +9892,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 s.key,
                             )
                         );
+                    }
+                    // Said only when every retired slot answered: a key
+                    // without them answers none, and then nothing is said.
+                    if retired.in_use.is_empty() && retired.all_read {
+                        println!("  {:<26} all empty", "retired keys (82\u{2013}95)");
                     }
                     Ok(())
                 },
@@ -11389,6 +11396,36 @@ fn piv_metadata_quirky(
     use keyroost_piv::compat::PivQuirk;
     quirks.contains(&PivQuirk::InsF7MetadataAlgorithmInvalid)
         || quirks.contains(&PivQuirk::InsF7MetadataPinTouchPolicyInvalid)
+}
+
+/// What `piv info` read of the twenty retired slots (82–95).
+struct RetiredSlots {
+    /// The retired slots holding a key or a certificate, in slot order.
+    in_use: Vec<keyroost_transport::PivSlotStatus>,
+    /// Whether every retired slot answered.
+    all_read: bool,
+}
+
+/// Read the retired slots for `piv info`, which lists only the ones in use,
+/// as `ykman piv info` does: twenty empty rows would bury the four standard
+/// slots on a key that, like most, has never used them.
+fn read_retired_slots(session: &mut keyroost_transport::PivSession) -> RetiredSlots {
+    let mut in_use = Vec::new();
+    let mut all_read = true;
+    for slot in keyroost_piv::Slot::retired_all() {
+        match session.slot_status(slot) {
+            Ok(st) if piv_slot_in_use(st.cert_present, st.key) => in_use.push(st),
+            Ok(_) => {}
+            Err(_) => all_read = false,
+        }
+    }
+    RetiredSlots { in_use, all_read }
+}
+
+/// Whether a slot holds anything: a certificate (readable or not) or a key
+/// the card says is there.
+fn piv_slot_in_use(cert_present: bool, key: keyroost_transport::SlotKeyPresence) -> bool {
+    cert_present || key == keyroost_transport::SlotKeyPresence::Present
 }
 
 /// The `piv info` words for one slot. A slot without a certificate reads
@@ -23765,6 +23802,18 @@ mod cli_tests {
         let v = serde_json::to_value(slot(None)).expect("serialize");
         assert!(v["cert_unreadable"].is_null(), "{v}");
         assert!(v.as_object().unwrap().contains_key("cert_unreadable"));
+    }
+
+    #[test]
+    fn piv_slot_in_use_needs_a_certificate_or_a_known_key() {
+        use keyroost_transport::SlotKeyPresence as K;
+        assert!(piv_slot_in_use(false, K::Present));
+        assert!(piv_slot_in_use(true, K::NoKey));
+        assert!(piv_slot_in_use(true, K::Unknown));
+        assert!(!piv_slot_in_use(false, K::NoKey));
+        // A card that can't say whether a key is there lists no row for an
+        // empty-looking retired slot, as `ykman piv info` doesn't either.
+        assert!(!piv_slot_in_use(false, K::Unknown));
     }
 
     #[test]
