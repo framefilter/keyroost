@@ -350,7 +350,7 @@ impl core::fmt::Display for Note {
                 "This key doesn't report how many codes it holds; writing stops if it fills up.",
             ),
             Note::Solo2Hotp => f.write_str(
-                "Solo 2 firmware 2.3.x computes HOTP codes over a 4-byte counter \
+                "Solo 2 firmware 2.964 (its latest release) computes HOTP codes over a 4-byte counter \
                  (the HOTP standard uses 8 bytes), so its HOTP codes don't match \
                  what services expect. TOTP codes work normally.",
             ),

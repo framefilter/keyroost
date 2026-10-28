@@ -13301,7 +13301,11 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
                 FidoRoute::Hid { path } => run_fido_info(
                     &path,
                     dev.reader.as_deref(),
-                    Some(dev.serial.as_str()).filter(|s| !s.is_empty()),
+                    // The USB side's serial when the row joined a card's.
+                    dev.hid_serial
+                        .as_deref()
+                        .or(Some(dev.serial.as_str()))
+                        .filter(|s| !s.is_empty()),
                 )?,
             }
             Ok(())

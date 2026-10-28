@@ -54,9 +54,11 @@ pub fn key_firmware(
         return Some(v);
     }
     if vendor_id == TOKEN2_VID {
-        // The row's serial when the scan read one; read it over USB only
-        // when there's none (an unlisted prefix stays unlisted).
-        let release = match serial.filter(|s| s.len() >= 5) {
+        // The row's serial when the scan read it in the FIDO form (the long
+        // decimal serial; a card applet's short serial is a different
+        // number); otherwise read it over USB. An unlisted prefix stays
+        // unlisted rather than read again.
+        let release = match serial.filter(|s| token2_fido_serial(s)) {
             Some(serial) => token2_release(serial),
             None => token2_release_hid(path, debug),
         };
@@ -153,6 +155,12 @@ pub fn token2_release(serial: &str) -> Option<&'static str> {
         .map(|(_, release)| *release)
 }
 
+/// Whether `serial` is a Token2 serial in the FIDO form (the long decimal
+/// serial, which carries the prefix), not a card applet's short one.
+fn token2_fido_serial(serial: &str) -> bool {
+    serial.len() >= 10 && serial.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// The release of the Token2 key at HID `path`, from its serial number read
 /// over USB (the §6.10 serial request, read-only, the one device scans
 /// send). `None` when the key doesn't answer or isn't in Token2's table.
@@ -197,6 +205,15 @@ mod tests {
         // Token2 and all-zero bytes don't state it.
         assert_eq!(init_firmware(0x349e, 0x0024, (2, 1, 2)), None);
         assert_eq!(init_firmware(0x20a0, 0x42b2, (0, 0, 0)), None);
+    }
+
+    #[test]
+    fn only_a_long_decimal_serial_is_trusted_for_the_release() {
+        assert!(token2_fido_serial("65103012345678"));
+        // An OpenPGP applet's 8-digit serial is a different number.
+        assert!(!token2_fido_serial("65103012"));
+        assert!(!token2_fido_serial("6510a012345678"));
+        assert!(!token2_fido_serial(""));
     }
 
     #[test]

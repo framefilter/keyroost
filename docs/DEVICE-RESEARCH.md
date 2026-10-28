@@ -149,7 +149,7 @@ two encodings whose relation no real key has confirmed are never equated.
 | Solo 2 | USB `iSerialNumber` (the device UUID); fallback: admin UUID over CTAPHID (vendor command `0xE2`) | SELECT the admin applet `A0000008470000 0001`, then `00 62 00 00` → 16-byte UUID | lowercase hex UUID |
 | Token2 | GET_INFO serial request (§6.10 of Token2's public OTP-on-FIDO protocol document) over HID, reply `D1 len …` | the same request after selecting the FIDO applet; if that fails, the OTP applet's reply, which is plain ASCII decimal | the FIDO-format reply with the FIDO-format reply only; the OTP-applet form only with itself |
 
-**Evidence.** YubiKey 5 (fw 5.7) and Solo 2 (fw 2.3.x) were matched by
+**Evidence.** YubiKey 5 (fw 5.7) and Solo 2 (fw 2.964) were matched by
 identity alone on hardware: with USB-position matching switched off in a test
 build, the device list came out identical to the USB-position result. The two
 CTAPHID vendor commands were confirmed read-only on the same keys (YubiKey

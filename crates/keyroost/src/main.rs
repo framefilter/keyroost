@@ -5714,7 +5714,7 @@ impl App {
         // The serial the scan read, if any: a Token2's names its firmware.
         let serial = self
             .selected_device()
-            .map(|d| d.serial.clone())
+            .map(|d| d.hid_serial.clone().unwrap_or_else(|| d.serial.clone()))
             .filter(|s| !s.is_empty());
         // Tag the job with the device it reads — if the user switches devices
         // while it's in flight, the result must not be painted into the new
