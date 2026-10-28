@@ -55,6 +55,8 @@ pub struct Configurator<'a, T: CtapTransport> {
     dev: &'a mut T,
     token: PinUvAuthToken,
     always_uv_supported: bool,
+    ep_supported: bool,
+    min_pin_supported: bool,
 }
 
 impl<'a, T: CtapTransport> Configurator<'a, T> {
@@ -72,12 +74,19 @@ impl<'a, T: CtapTransport> Configurator<'a, T> {
             dev,
             token,
             always_uv_supported: info.option("alwaysUv").is_some(),
+            // Present at all (on or off) means the key supports it.
+            ep_supported: info.option("ep").is_some(),
+            min_pin_supported: info.option("setMinPINLength") == Some(true),
         })
     }
 
     /// Enable enterprise attestation (sub-command 0x01). Typically one-way:
-    /// disabling again requires a reset. No effect if already enabled.
+    /// disabling again requires a reset. No effect if already enabled. A key
+    /// that does not report `ep` does not support this sub-command.
     pub fn enable_enterprise_attestation(&mut self) -> Result<(), CtapError> {
+        if !self.ep_supported {
+            return Err(CtapError::Unsupported("enableEnterpriseAttestation"));
+        }
         self.dispatch(SUB_ENABLE_ENTERPRISE_ATTESTATION, None)
     }
 
@@ -105,12 +114,17 @@ impl<'a, T: CtapTransport> Configurator<'a, T> {
     ///   authenticator sets this implicitly.
     ///
     /// At least one of the three should be meaningful, or the call is a no-op.
+    /// A key whose `setMinPINLength` option isn't `true` does not support this
+    /// sub-command (nor, so, [`Self::force_pin_change`]).
     pub fn set_min_pin_length(
         &mut self,
         new_min: Option<u32>,
         rp_ids: &[String],
         force_change: bool,
     ) -> Result<(), CtapError> {
+        if !self.min_pin_supported {
+            return Err(CtapError::Unsupported("setMinPINLength"));
+        }
         let mut entries: Vec<(Value, Value)> = Vec::with_capacity(3);
         if let Some(n) = new_min {
             entries.push((Value::UInt(PARAM_NEW_MIN_PIN_LENGTH), Value::UInt(n as u64)));
@@ -290,6 +304,59 @@ mod tests {
             token: vec![0x42; 16],
         };
         Configurator::new(dev, token, &config_info(always_uv)).unwrap()
+    }
+
+    #[test]
+    fn enterprise_attestation_and_min_pin_require_advertised_support() {
+        let token = || PinUvAuthToken {
+            protocol: 1,
+            token: vec![0x42; 16],
+        };
+        let info = |options: &[(&str, bool)]| AuthenticatorInfo {
+            options: std::iter::once(("authnrCfg".to_string(), true))
+                .chain(options.iter().map(|(k, v)| (k.to_string(), *v)))
+                .collect(),
+            ..Default::default()
+        };
+
+        // Not offered: refused, nothing sent.
+        let mut dev = RecordingTransport::default();
+        let mut cfg = Configurator::new(&mut dev, token(), &info(&[])).unwrap();
+        assert!(matches!(
+            cfg.enable_enterprise_attestation().unwrap_err(),
+            CtapError::Unsupported("enableEnterpriseAttestation")
+        ));
+        assert!(matches!(
+            cfg.set_min_pin_length(Some(6), &[], false).unwrap_err(),
+            CtapError::Unsupported("setMinPINLength")
+        ));
+        assert!(matches!(
+            cfg.force_pin_change().unwrap_err(),
+            CtapError::Unsupported("setMinPINLength")
+        ));
+        drop(cfg);
+        assert_eq!(dev.calls, 0);
+
+        // `setMinPINLength: false` is not support either.
+        let mut dev = RecordingTransport::default();
+        let mut cfg =
+            Configurator::new(&mut dev, token(), &info(&[("setMinPINLength", false)])).unwrap();
+        assert!(cfg.force_pin_change().is_err());
+        drop(cfg);
+        assert_eq!(dev.calls, 0);
+
+        // Offered (ep present, even off): one request each.
+        let mut dev = RecordingTransport::default();
+        let mut cfg = Configurator::new(
+            &mut dev,
+            token(),
+            &info(&[("ep", false), ("setMinPINLength", true)]),
+        )
+        .unwrap();
+        cfg.enable_enterprise_attestation().unwrap();
+        cfg.set_min_pin_length(Some(6), &[], false).unwrap();
+        drop(cfg);
+        assert_eq!(dev.calls, 2);
     }
 
     #[test]
