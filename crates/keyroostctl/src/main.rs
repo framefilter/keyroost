@@ -8788,6 +8788,15 @@ fn run_otp(
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
+            // Over USB the key says when it waits for its button, and the
+            // session's prompt shows then. A reader gives no such sign, so
+            // there an entry saved with --touch gets the prompt up front.
+            if session.is_pcsc() {
+                let listed = session.enumerate(now).unwrap_or_default();
+                if otp_entry_wants_touch(&listed, app, account) {
+                    eprintln!("touch your key to continue\u{2026}");
+                }
+            }
             let entry = session.read_entry(now, app, account)?;
             match entry.code {
                 Some(code) => {
@@ -9197,6 +9206,15 @@ fn run_otp(
         }
     }
     Ok(())
+}
+
+/// Whether the `(app, account)` entry in `listed` was saved with --touch.
+/// An entry that isn't listed (or a listing that failed, passed as empty)
+/// gets no prompt.
+fn otp_entry_wants_touch(listed: &[keyroost_token2otp::Entry], app: &str, account: &str) -> bool {
+    listed
+        .iter()
+        .any(|e| e.app_name == app && e.account_name == account && e.button_required)
 }
 
 /// `otp list` output for every --unlock mode: JSON `{"accounts": [...]}`
@@ -16113,6 +16131,27 @@ mod cli_tests {
                 assert!(!h.contains("hidraw"), "{path}: --{:?}", a.get_long());
             }
         }
+    }
+
+    #[test]
+    fn otp_code_prompts_up_front_only_for_a_listed_touch_entry() {
+        let entry = |app: &str, account: &str, touch| keyroost_token2otp::Entry {
+            otp_type: keyroost_token2otp::OtpType::Totp,
+            algorithm: keyroost_token2otp::Algorithm::Sha1,
+            timestep: 30,
+            code_length: 6,
+            button_required: touch,
+            app_name: app.into(),
+            account_name: account.into(),
+            code: None,
+        };
+        let listed = [entry("kr", "touch", true), entry("kr", "plain", false)];
+        assert!(otp_entry_wants_touch(&listed, "kr", "touch"));
+        assert!(!otp_entry_wants_touch(&listed, "kr", "plain"));
+        // Same account under another app is a different entry.
+        assert!(!otp_entry_wants_touch(&listed, "", "touch"));
+        // A failed listing (empty) never prompts.
+        assert!(!otp_entry_wants_touch(&[], "kr", "touch"));
     }
 
     #[test]
