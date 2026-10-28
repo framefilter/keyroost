@@ -29588,8 +29588,8 @@ mod tests {
     /// double-report into the pane-level `oath.error` while the modal owns the op.
     #[test]
     fn a_touch_read_late_in_a_window_gets_the_next_windows_code() {
-        let start = 1_000_020 - 1_000_020 % 30;
-        // At :05 the code is for this window, valid until :30.
+        let start = 33_334 * 30; // the start of a 30 s window
+                                 // At :05 the code is for this window, valid until :30.
         assert_eq!(
             oath_touch_read_window(start + 5, 30),
             (start + 15, start + 30)
@@ -29603,8 +29603,8 @@ mod tests {
 
     #[test]
     fn a_read_ahead_code_counts_down_to_its_own_window_end() {
-        let start = 1_000_020 - 1_000_020 % 30;
-        // A listed code follows the current window.
+        let start = 33_334 * 30; // the start of a 30 s window
+                                 // A listed code follows the current window.
         assert_eq!(oath_code_left(start + 25, 30, None).0, 5);
         // A touch code read at :25 for the next window has 35 s left; the
         // ring is full until it is under one period.
@@ -29616,7 +29616,7 @@ mod tests {
 
     #[test]
     fn a_touch_code_outlives_the_refresh_until_its_window_ends() {
-        let start = 1_000_020 - 1_000_020 % 30;
+        let start = 33_334 * 30; // the start of a 30 s window
         let touched = || {
             let mut r = OathRow::new("kr-touch".into(), Some("123456".into()), false);
             r.touch = true;
