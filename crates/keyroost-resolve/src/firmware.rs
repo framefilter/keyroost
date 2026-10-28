@@ -48,7 +48,8 @@ pub fn is_token2(vendor_id: u16) -> bool {
 /// a PIN+ key's serial number and the firmware release they identify. From
 /// <https://www.token2.com/site/page/pin-firmware-feature-support-matrix-openpgp-fido2-otp-and-piv-across-releases>
 /// (updated 2026-10-14). The one range of whole serials that table lists
-/// (a custom access card) is left out.
+/// (a custom access card) is left out. `packaging/check-token2-prefixes.py`
+/// compares this with the page; the release playbook runs it in pre-flight.
 const TOKEN2_PREFIXES: &[(&str, &str)] = &[
     ("96105", "R2"),
     ("96104", "R2"),

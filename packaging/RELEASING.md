@@ -15,6 +15,14 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       pinned-inputs check).
 - [ ] `cargo audit` green (the audit workflow runs on pushes; check the last
       run) and the deps-outdated report reviewed.
+- [ ] **Token2 serial prefixes current:**
+      `python3 packaging/check-token2-prefixes.py`
+      keyroost names a Token2 PIN+ key's firmware release ("R3.4") from its
+      serial prefix, using a copy of Token2's published table; a model Token2
+      added since shows no firmware. Exit 1 lists the rows to add or change
+      in `TOKEN2_PREFIXES` (`crates/keyroost-resolve/src/firmware.rs`): land
+      that before the version bump, not during the cut. Exit 2 means the
+      page or its table couldn't be read; check the page by hand.
 - [ ] **Semver check against the published crates** — with every library
       crate on crates.io (19 as of 0.14.0), Cargo treats 0.7.x -> 0.7.y as compatible, so an
       accidental API break in a patch release ships silently and breaks
