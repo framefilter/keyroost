@@ -513,6 +513,12 @@ pub struct ImportDialog {
     pub molto_armed_on: Option<Option<DeviceId>>,
 }
 
+impl crate::TypedSecrets for ImportDialog {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        vec![&mut self.file_password, &mut self.dest_secret]
+    }
+}
+
 impl Drop for ImportDialog {
     fn drop(&mut self) {
         self.close();

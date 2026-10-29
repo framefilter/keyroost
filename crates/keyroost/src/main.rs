@@ -580,12 +580,25 @@ struct AdvancedDialog {
     device: Option<DeviceId>,
 }
 
+impl TypedSecrets for AdvancedDialog {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            action: _,
+            pin_input,
+            min_pin_input: _,
+            force_change: _,
+            device: _,
+        } = self;
+        vec![pin_input]
+    }
+}
+
 impl Drop for AdvancedDialog {
     /// Scrub the typed PIN when the dialog is torn down (e.g. on success, the
     /// dialog is replaced with `None`), matching the wipe-on-drop discipline of
     /// the other secret-bearing dialogs (ChangePinDialog, PivState).
     fn drop(&mut self) {
-        wipe(&mut self.pin_input);
+        self.wipe_typed();
     }
 }
 
@@ -832,14 +845,43 @@ impl ChangePinDialog {
     }
 }
 
+impl TypedSecrets for ChangePinDialog {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            open: _,
+            old,
+            new,
+            confirm,
+        } = self;
+        vec![old, new, confirm]
+    }
+}
+
 impl Drop for ChangePinDialog {
     /// Zeroize the typed PINs whenever the dialog is dropped — including the
     /// `= ChangePinDialog::default()` resets on cancel/success — so a typed
     /// (or mistyped) PIN doesn't linger in the buffer after the form closes.
     fn drop(&mut self) {
-        wipe(&mut self.old);
-        wipe(&mut self.new);
-        wipe(&mut self.confirm);
+        self.wipe_typed();
+    }
+}
+
+impl TypedSecrets for SecurityKeysState {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let mut out = vec![&mut self.pin_input];
+        out.extend(self.change_pin.secrets_mut());
+        if let Some(d) = self.advanced.as_mut() {
+            out.extend(d.secrets_mut());
+        }
+        out
+    }
+}
+
+impl TypedSecrets for OathState {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let mut out = vec![&mut self.password_input];
+        out.extend(self.add.secrets_mut());
+        out
     }
 }
 
@@ -1050,9 +1092,24 @@ impl OathAddDialog {
 }
 
 // The form is replaced wholesale after submit; wipe the typed seed on drop.
+impl TypedSecrets for OathAddDialog {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            open: _,
+            name: _,
+            secret,
+            totp: _,
+            require_touch: _,
+            busy: _,
+            result: _,
+        } = self;
+        vec![secret]
+    }
+}
+
 impl Drop for OathAddDialog {
     fn drop(&mut self) {
-        wipe(&mut self.secret);
+        self.wipe_typed();
     }
 }
 
@@ -1146,16 +1203,7 @@ impl OpenPgpState {
     /// Zeroize every PIN entry field. Called when the selection changes (a PIN
     /// typed for one card must not ride along to another) and on drop.
     fn wipe_secrets(&mut self) {
-        wipe(&mut self.admin_pin);
-        wipe(&mut self.user_pin_old);
-        wipe(&mut self.user_pin_new);
-        wipe(&mut self.admin_pin_old);
-        wipe(&mut self.admin_pin_new);
-        wipe(&mut self.unblock_new);
-        wipe(&mut self.passphrase);
-        wipe(&mut self.create.pass);
-        wipe(&mut self.create.pass_repeat);
-        wipe(&mut self.expiry.user_pin);
+        self.wipe_typed();
         self.created = None;
         self.created_failure = None;
         self.restore_loaded = None;
@@ -1166,6 +1214,23 @@ impl OpenPgpState {
 /// Replacing the pane's state (a device switch, a factory reset) drops the
 /// old one: its PINs and passphrases are wiped then too, not only when a
 /// dialog closes. (No struct-update construction past this point.)
+impl TypedSecrets for OpenPgpState {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let mut out = vec![
+            &mut self.admin_pin,
+            &mut self.user_pin_old,
+            &mut self.user_pin_new,
+            &mut self.admin_pin_old,
+            &mut self.admin_pin_new,
+            &mut self.unblock_new,
+            &mut self.passphrase,
+        ];
+        out.extend(self.create.secrets_mut());
+        out.extend(self.expiry.secrets_mut());
+        out
+    }
+}
+
 impl Drop for OpenPgpState {
     fn drop(&mut self) {
         self.wipe_secrets();
@@ -1201,10 +1266,24 @@ impl Default for CreateForm {
     }
 }
 
+impl TypedSecrets for CreateForm {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            name: _,
+            email: _,
+            key_type: _,
+            expiry: _,
+            pass,
+            pass_repeat,
+            save_path: _,
+        } = self;
+        vec![pass, pass_repeat]
+    }
+}
+
 impl Drop for CreateForm {
     fn drop(&mut self) {
-        wipe(&mut self.pass);
-        wipe(&mut self.pass_repeat);
+        self.wipe_typed();
     }
 }
 
@@ -1399,9 +1478,24 @@ impl Default for ExpiryForm {
     }
 }
 
+impl TypedSecrets for ExpiryForm {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            public_path: _,
+            cert: _,
+            expiry: _,
+            with_backup: _,
+            backup_path: _,
+            user_pin,
+            current: _,
+        } = self;
+        vec![user_pin]
+    }
+}
+
 impl Drop for ExpiryForm {
     fn drop(&mut self) {
-        wipe(&mut self.user_pin);
+        self.wipe_typed();
     }
 }
 
@@ -1645,6 +1739,24 @@ fn openpgp_cred_mismatch(pgp: &OpenPgpState, kind: OpenPgpCredKind) -> Option<&'
 fn wipe(s: &mut String) {
     use zeroize::Zeroize;
     s.zeroize();
+}
+
+/// A form or pane state that holds secrets typed or pasted into it: PINs,
+/// PUKs, passwords, passphrases, management keys, seeds. `secrets_mut` is the
+/// one list of those fields. The state's own wipe (on drop, on close) and the
+/// idle lock ([`App::typed_secrets`]) both use it, so a field can't be wiped
+/// in one place and missed in the other. A small form names every field
+/// there, secret or not, so a field added to it doesn't compile until
+/// someone says which it is.
+trait TypedSecrets {
+    fn secrets_mut(&mut self) -> Vec<&mut String>;
+
+    /// Zeroize every field [`Self::secrets_mut`] lists.
+    fn wipe_typed(&mut self) {
+        for s in self.secrets_mut() {
+            wipe(s);
+        }
+    }
 }
 
 /// The firmware to show for the key at `target`, as the vendor states it
@@ -3291,9 +3403,24 @@ struct PivKeyImport {
     chain_out: String,
 }
 
+impl TypedSecrets for PivKeyImport {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            path: _,
+            password,
+            opening: _,
+            contents: _,
+            open_error: _,
+            entry: _,
+            chain_out: _,
+        } = self;
+        vec![password]
+    }
+}
+
 impl Drop for PivKeyImport {
     fn drop(&mut self) {
-        wipe(&mut self.password);
+        self.wipe_typed();
     }
 }
 
@@ -3582,21 +3709,31 @@ impl PivState {
 // The pane is replaced wholesale on device switch (`self.piv =
 // PivState::default()`); wiping on drop means the discarded fields don't
 // leave PINs/keys in freed memory.
+impl TypedSecrets for PivState {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let mut out = vec![
+            &mut self.mgmt_key_input,
+            &mut self.new_mgmt_key_input,
+            &mut self.pin_old,
+            &mut self.pin_new,
+            &mut self.pin_confirm,
+            &mut self.puk_old,
+            &mut self.puk_new,
+            &mut self.puk_confirm,
+            &mut self.unblock_puk,
+            &mut self.unblock_new_pin,
+            &mut self.retries_pin_auth,
+            &mut self.sign_pin,
+        ];
+        out.extend(self.key_import.secrets_mut());
+        out
+    }
+}
+
 impl Drop for PivState {
     fn drop(&mut self) {
-        wipe(&mut self.mgmt_key_input);
+        self.wipe_typed();
         self.mgmt_auth_mode = PivMgmtAuthMode::default();
-        wipe(&mut self.pin_old);
-        wipe(&mut self.pin_new);
-        wipe(&mut self.pin_confirm);
-        wipe(&mut self.puk_old);
-        wipe(&mut self.puk_new);
-        wipe(&mut self.puk_confirm);
-        wipe(&mut self.unblock_puk);
-        wipe(&mut self.unblock_new_pin);
-        wipe(&mut self.retries_pin_auth);
-        wipe(&mut self.new_mgmt_key_input);
-        wipe(&mut self.sign_pin);
     }
 }
 
@@ -5027,6 +5164,20 @@ struct Draft {
     display_timeout: TimeoutChoice,
 }
 
+impl TypedSecrets for Draft {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            title: _,
+            secret_base32,
+            algorithm: _,
+            digits: _,
+            time_step: _,
+            display_timeout: _,
+        } = self;
+        vec![secret_base32]
+    }
+}
+
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum AlgoChoice {
     #[default]
@@ -5101,6 +5252,15 @@ struct ImportDialog {
     uri: String,
 }
 
+impl TypedSecrets for ImportDialog {
+    /// The pasted otpauth:// URI carries the seed, though its box isn't
+    /// masked.
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self { open: _, uri } = self;
+        vec![uri]
+    }
+}
+
 impl ImportDialog {
     /// Settle the dialog's open state after its window was drawn this frame.
     /// `window_open` is the copy egui's `[X]` close wrote to; `cancel_clicked` is the
@@ -5116,7 +5276,7 @@ impl ImportDialog {
     /// Close the dialog and wipe the pasted URI, which carries the seed.
     fn close(&mut self) {
         self.open = false;
-        wipe(&mut self.uri);
+        self.wipe_typed();
     }
 }
 
@@ -6189,69 +6349,30 @@ impl App {
             || self.piv.key_import.contents.is_some()
     }
 
-    /// Every field holding a secret typed into a masked box and not yet sent
-    /// to a key: PINs, PUKs, passwords, passphrases, management keys and
-    /// seeds, in every pane and dialog. The idle lock wipes them all, so a
-    /// form left half-filled doesn't keep its secret.
+    /// Every field holding a secret typed or pasted and not yet sent to a
+    /// key: PINs, PUKs, passwords, passphrases, management keys, seeds and
+    /// otpauth:// URIs, in every pane and dialog, from each state's
+    /// [`TypedSecrets`] list. The idle lock wipes them all, so a form left
+    /// half-filled doesn't keep its secret.
     ///
     /// Left out on purpose: the Molto2 customer key. Empty there means the
     /// factory default key, so wiping it would quietly switch the next
     /// sign-in to the default key.
     fn typed_secrets(&mut self) -> Vec<&mut String> {
-        let sk = &mut self.security_keys;
-        let mut out: Vec<&mut String> = vec![
-            &mut sk.pin_input,
-            &mut sk.change_pin.old,
-            &mut sk.change_pin.new,
-            &mut sk.change_pin.confirm,
-        ];
-        if let Some(d) = sk.advanced.as_mut() {
-            out.push(&mut d.pin_input);
-        }
+        // Each state's own list (TypedSecrets), the one its wipe uses too;
+        // only the few boxes kept on `App` itself are named here.
+        let mut out = self.security_keys.secrets_mut();
         out.push(&mut self.rename_pin);
         out.push(&mut self.reset_mgmt_auth_input);
-        out.push(&mut self.oath.password_input);
-        out.push(&mut self.oath.add.secret);
-        let otp = &mut self.otp;
-        out.push(&mut otp.pin_input);
-        out.push(&mut otp.add.secret);
-        out.push(&mut otp.button_hotp.secret);
-        if let Some(d) = otp.pin_dialog.as_mut() {
-            out.extend([&mut d.current, &mut d.new, &mut d.confirm]);
-        }
-        let pgp = &mut self.openpgp;
-        out.extend([
-            &mut pgp.admin_pin,
-            &mut pgp.user_pin_old,
-            &mut pgp.user_pin_new,
-            &mut pgp.admin_pin_old,
-            &mut pgp.admin_pin_new,
-            &mut pgp.unblock_new,
-            &mut pgp.passphrase,
-            &mut pgp.create.pass,
-            &mut pgp.create.pass_repeat,
-            &mut pgp.expiry.user_pin,
-        ]);
-        let piv = &mut self.piv;
-        out.extend([
-            &mut piv.mgmt_key_input,
-            &mut piv.new_mgmt_key_input,
-            &mut piv.pin_old,
-            &mut piv.pin_new,
-            &mut piv.pin_confirm,
-            &mut piv.puk_old,
-            &mut piv.puk_new,
-            &mut piv.puk_confirm,
-            &mut piv.unblock_puk,
-            &mut piv.unblock_new_pin,
-            &mut piv.retries_pin_auth,
-            &mut piv.sign_pin,
-            &mut piv.key_import.password,
-        ]);
+        out.extend(self.oath.secrets_mut());
+        out.extend(self.otp.secrets_mut());
+        out.extend(self.openpgp.secrets_mut());
+        out.extend(self.piv.secrets_mut());
         out.push(&mut *self.prog_seed_input);
-        out.push(&mut self.draft.secret_base32);
+        out.extend(self.draft.secrets_mut());
+        out.extend(self.import_dialog.secrets_mut());
         if let Some(d) = self.import_flow.dialog.as_mut() {
-            out.extend([&mut d.file_password, &mut d.dest_secret]);
+            out.extend(d.secrets_mut());
         }
         out
     }
@@ -32831,6 +32952,9 @@ mod tests {
         app.openpgp.passphrase = "backup-passphrase".into();
         app.piv.puk_new = "87654321".into();
         app.piv.key_import.password = "p12-password".into();
+        // A pasted otpauth:// URI carries the seed, though its box isn't
+        // masked.
+        app.import_dialog.uri = "otpauth://totp/x?secret=JBSWY3DP".into();
         app.customer_key_input = "custom-key".into();
         assert!(app.holds_unlocked_secrets());
 
@@ -32839,6 +32963,7 @@ mod tests {
         app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
 
         assert!(app.typed_secrets().iter().all(|s| s.is_empty()));
+        assert!(app.import_dialog.uri.is_empty());
         assert!(!app.holds_unlocked_secrets());
         assert!(app.drop_text_focus, "a focused secret box gives up focus");
         assert_eq!(app.customer_key_input, "custom-key");
