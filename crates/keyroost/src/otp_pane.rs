@@ -456,6 +456,13 @@ impl App {
         self.otp.info = Some(msg);
     }
 
+    /// The OTP list read's failure: shown in the pane, and logged once in
+    /// the background, since the tab reads again on its own every 30 seconds.
+    fn otp_read_failed(&mut self, err: String) {
+        self.log_bg_once(Severity::Err, format!("OTP: {err}"));
+        self.otp.error = Some(err);
+    }
+
     /// An OTP job's failure: shown in the pane and written to the activity
     /// log.
     fn otp_failed(&mut self, err: String) {
@@ -766,7 +773,7 @@ impl App {
                                 app.otp.pin = None;
                                 app.otp.pin_required = true;
                             }
-                            app.otp_failed(e.to_string());
+                            app.otp_read_failed(e.to_string());
                             app.otp.loaded = true;
                         }
                     }
@@ -838,6 +845,7 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
+                    app.log_moved_on(for_device.as_ref(), "adding an OTP entry", &result);
                     return;
                 }
                 match result {
@@ -897,6 +905,7 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
+                    app.log_moved_on(for_device.as_ref(), "setting touch HOTP", &result);
                     return;
                 }
                 match result {
@@ -960,6 +969,7 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
+                    app.log_moved_on(for_device.as_ref(), "updating interfaces", &result);
                     return;
                 }
                 match result {
@@ -995,6 +1005,7 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
+                    app.log_moved_on(for_device.as_ref(), "clearing touch HOTP", &result);
                     return;
                 }
                 match result {
@@ -1034,6 +1045,7 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
+                    app.log_moved_on(for_device.as_ref(), "deleting an OTP entry", &result);
                     return;
                 }
                 match result {
@@ -1090,6 +1102,7 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
+                    app.log_moved_on(for_device.as_ref(), "locking the OTP PIN", &result);
                     return;
                 }
                 app.otp.pin = None;
@@ -1132,6 +1145,11 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
+                    app.log_moved_on(
+                        for_device.as_ref(),
+                        "updating fingerprint protection",
+                        &result,
+                    );
                     return;
                 }
                 match result {
@@ -1204,6 +1222,7 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
+                    app.log_moved_on(for_device.as_ref(), "updating the OTP PIN", &result);
                     return;
                 }
                 match result {
@@ -1405,6 +1424,7 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
+                    app.log_moved_on(for_device.as_ref(), "updating touch HOTP options", &result);
                     return;
                 }
                 match result {
@@ -1442,6 +1462,7 @@ impl App {
                 })();
                 Box::new(move |app: &mut App| {
                     if app.selected_device != for_device {
+                        app.log_moved_on(for_device.as_ref(), "erasing all OTP entries", &result);
                         return;
                     }
                     match result {

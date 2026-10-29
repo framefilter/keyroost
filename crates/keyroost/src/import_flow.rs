@@ -1006,7 +1006,8 @@ impl App {
                 })
             }
         };
-        let queued = self.spawn_job("Reading the key\u{2026}", move || {
+        let on = dest.device.clone();
+        let queued = self.spawn_job_on(Some(&on), "Reading the key\u{2026}", move || {
             let preview = job();
             Box::new(move |app: &mut App| app.import_set_preview(id, &dest, preview))
         });
