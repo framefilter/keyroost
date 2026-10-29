@@ -223,6 +223,7 @@ pub fn ccid_applet_read(
     if keyroost_proto::is_molto2_reader(reader) {
         return None;
     }
+    let shown = keyroost_proto::trace::reader_name(reader);
     let ctx = crate::establish_context().ok()?;
     let name = std::ffi::CString::new(reader).ok()?;
     let card = match ctx.connect(&name, ShareMode::Shared, Protocols::ANY) {
@@ -232,7 +233,7 @@ pub fn ccid_applet_read(
                 format_line(
                     Dir::Note,
                     "identity",
-                    &format!("{reader} connect failed: {e}"),
+                    &format!("{shown} connect failed: {e}"),
                 )
             });
             return None;
@@ -240,21 +241,21 @@ pub fn ccid_applet_read(
     };
     let out = (|| -> Option<Vec<u8>> {
         trace::line(debug, || {
-            format_line(Dir::Sent, "identity", &format!("{reader} {}", hex(select)))
+            format_line(Dir::Sent, "identity", &format!("{shown} {}", hex(select)))
         });
         let (_, s1, s2) = crate::transmit_apdu(&card, select).ok()?;
         trace::line(debug, || {
             format_line(
                 Dir::Received,
                 "identity",
-                &format!("{reader} {s1:02X}{s2:02X}"),
+                &format!("{shown} {s1:02X}{s2:02X}"),
             )
         });
         if select_must_succeed && !((s1 == 0x90 && s2 == 0x00) || s1 == 0x61) {
             return None;
         }
         trace::line(debug, || {
-            format_line(Dir::Sent, "identity", &format!("{reader} {}", hex(command)))
+            format_line(Dir::Sent, "identity", &format!("{shown} {}", hex(command)))
         });
         let (data, sw) =
             crate::exchange_apdu(&card, command, 0x61, || vec![0x00, 0xC0, 0x00, 0x00, 0x00])
@@ -263,7 +264,7 @@ pub fn ccid_applet_read(
             format_line(
                 Dir::Received,
                 "identity",
-                &format!("{reader} {} {sw:04X}", hex(&data)),
+                &format!("{shown} {} {sw:04X}", hex(&data)),
             )
         });
         (sw == 0x9000).then_some(data)

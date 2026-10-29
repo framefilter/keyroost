@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey, UsbSmartCard};
 use keyroost_keyring::Keyring;
-use keyroost_proto::trace::{emit, format_line, Dir};
+use keyroost_proto::trace::{emit, format_line, reader_name, Dir};
 use keyroost_transport::identity::InitAnswer;
 use keyroost_transport::{ReaderProbe, YubiKeyCcid};
 
@@ -837,7 +837,7 @@ pub fn correlate_with(
     for (hid, b) in hids.iter().zip(&bound) {
         emit(opts.trace, || {
             let to = match b {
-                Some((r, step)) => format!("'{r}' by {}", step.label()),
+                Some((r, step)) => format!("'{}' by {}", reader_name(r), step.label()),
                 None => "no reader".to_string(),
             };
             format_line(

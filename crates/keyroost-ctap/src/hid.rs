@@ -764,8 +764,8 @@ fn ctap_line(dir: Dir, cmd: u8, len: usize, payload: &str) -> String {
 /// what this line shows (the request itself, or its response). `label` names
 /// the transport.
 pub fn trace_message(dir: Dir, label: &str, request: &[u8], body: &[u8]) {
-    let sensitive = exchange_is_sensitive(CTAPHID_CBOR, request);
     emit(ctap_trace_enabled(), || {
+        let sensitive = exchange_is_sensitive(CTAPHID_CBOR, request);
         format_line(
             dir,
             label,

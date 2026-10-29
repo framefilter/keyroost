@@ -214,7 +214,9 @@ impl CtapPcscDevice {
                 &keyroost_proto::codec::hex_encode(&apdu),
             )
         });
-        let (data, sw1, sw2) = self.exchange_full(&apdu)?;
+        let (data, sw1, sw2) = self.exchange_full(&apdu).inspect_err(|e| {
+            trace_line(|| format_line(Dir::Note, "ctap reader select", &e.to_string()));
+        })?;
         trace_line(|| {
             format_line(
                 Dir::Received,
