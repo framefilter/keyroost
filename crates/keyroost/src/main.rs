@@ -885,6 +885,14 @@ impl TypedSecrets for OathState {
     }
 }
 
+/// Replacing the pane's state (a device switch, an applet reset) drops the
+/// old one: a typed password is wiped then too.
+impl Drop for OathState {
+    fn drop(&mut self) {
+        self.wipe_typed();
+    }
+}
+
 /// State for the OATH (TOTP) pane. The applet is driven over PC/SC, so a
 /// "reader name" identifies the key rather than a hidraw path.
 #[derive(Default)]
@@ -1091,7 +1099,6 @@ impl OathAddDialog {
     }
 }
 
-// The form is replaced wholesale after submit; wipe the typed seed on drop.
 impl TypedSecrets for OathAddDialog {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
         let Self {
@@ -1107,6 +1114,7 @@ impl TypedSecrets for OathAddDialog {
     }
 }
 
+// The form is replaced wholesale after submit; wipe the typed seed on drop.
 impl Drop for OathAddDialog {
     fn drop(&mut self) {
         self.wipe_typed();
@@ -1211,9 +1219,6 @@ impl OpenPgpState {
     }
 }
 
-/// Replacing the pane's state (a device switch, a factory reset) drops the
-/// old one: its PINs and passphrases are wiped then too, not only when a
-/// dialog closes. (No struct-update construction past this point.)
 impl TypedSecrets for OpenPgpState {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
         let mut out = vec![
@@ -1231,6 +1236,9 @@ impl TypedSecrets for OpenPgpState {
     }
 }
 
+/// Replacing the pane's state (a device switch, a factory reset) drops the
+/// old one: its PINs and passphrases are wiped then too, not only when a
+/// dialog closes. (No struct-update construction past this point.)
 impl Drop for OpenPgpState {
     fn drop(&mut self) {
         self.wipe_secrets();
@@ -3718,9 +3726,6 @@ impl PivState {
     }
 }
 
-// The pane is replaced wholesale on device switch (`self.piv =
-// PivState::default()`); wiping on drop means the discarded fields don't
-// leave PINs/keys in freed memory.
 impl TypedSecrets for PivState {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
         let mut out = vec![
@@ -3742,6 +3747,9 @@ impl TypedSecrets for PivState {
     }
 }
 
+// The pane is replaced wholesale on device switch (`self.piv =
+// PivState::default()`); wiping on drop means the discarded fields don't
+// leave PINs/keys in freed memory.
 impl Drop for PivState {
     fn drop(&mut self) {
         self.wipe_typed();
@@ -5176,6 +5184,12 @@ struct Draft {
     display_timeout: TimeoutChoice,
 }
 
+impl Drop for Draft {
+    fn drop(&mut self) {
+        self.wipe_typed();
+    }
+}
+
 impl TypedSecrets for Draft {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
         let Self {
@@ -5262,6 +5276,12 @@ impl TimeoutChoice {
 struct ImportDialog {
     open: bool,
     uri: String,
+}
+
+impl Drop for ImportDialog {
+    fn drop(&mut self) {
+        self.wipe_typed();
+    }
 }
 
 impl TypedSecrets for ImportDialog {
@@ -27080,12 +27100,16 @@ impl App {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.label("Paste an otpauth:// URI:");
-                    ui.add(
+                    let uri_box = ui.add(
                         egui::TextEdit::multiline(&mut self.import_dialog.uri)
                             .desired_rows(3)
                             .desired_width(420.0)
                             .font(egui::TextStyle::Monospace),
                     );
+                    // The URI carries the seed: like a masked box, its undo
+                    // history is scrubbed once it loses focus, so a wiped
+                    // box can't hand the seed back on Ctrl+Z.
+                    guard_secret_field(ui.ctx(), &uri_box);
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui.button("Parse & populate fields").clicked() {

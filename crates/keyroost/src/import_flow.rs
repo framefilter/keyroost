@@ -552,8 +552,7 @@ impl ImportDialog {
         self.open = false;
         // A preview still waiting for the worker never starts for a closed dialog.
         self.preview_wanted = false;
-        wipe(&mut self.file_password);
-        wipe(&mut self.dest_secret);
+        crate::TypedSecrets::wipe_typed(self);
         self.file = None;
         self.existing = None;
         self.report = None;

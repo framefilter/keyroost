@@ -175,7 +175,6 @@ impl Default for OtpAddDialog {
     }
 }
 
-// Wipe the typed seed on drop (the form is replaced wholesale after submit).
 impl TypedSecrets for OtpAddDialog {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
         let Self {
@@ -193,6 +192,7 @@ impl TypedSecrets for OtpAddDialog {
     }
 }
 
+// Wipe the typed seed on drop (the form is replaced wholesale after submit).
 impl Drop for OtpAddDialog {
     fn drop(&mut self) {
         self.wipe_typed();
