@@ -2775,11 +2775,11 @@ fn without_home(text: &str) -> String {
     }
 }
 
-/// `text` with every whole-path occurrence of `home` replaced by `~`: only
-/// where a path starts (the text's start, a space, a quote or a bracket) and
-/// the next character ends that path part, so a home of `/home/al` leaves
-/// `/home/alice` alone and a home of `/root` leaves `/srv/root/x` alone. A
-/// home of `/` (or empty) changes nothing.
+/// `text` with every whole-path occurrence of `home` replaced by `~`: where
+/// the character before it doesn't continue a path name and the next one
+/// ends that path part, so a home of `/home/al` leaves `/home/alice` alone
+/// and a home of `/root` leaves `/srv/root/x` alone. A home of `/` (or
+/// empty) changes nothing.
 fn with_home_as_tilde(text: &str, home: &str) -> String {
     let home = home.trim_end_matches(['/', '\\']);
     if home.is_empty() {
@@ -2789,8 +2789,16 @@ fn with_home_as_tilde(text: &str, home: &str) -> String {
     let mut rest = text;
     while let Some(at) = rest.find(home) {
         let after = &rest[at + home.len()..];
-        let prev = rest[..at].chars().last().or_else(|| out.chars().last());
-        let starts = prev.is_none_or(|c| matches!(c, ' ' | '"' | '\'' | '(' | '=' | '\n'));
+        // Fails closed: the home starts a path unless the character before
+        // it continues a path name (a letter, digit, `.`, `-`, `_` or a
+        // separator), so a delimiter nobody listed can't leak the folder.
+        // A separator that ends a `file://` or `\\?\` prefix starts one.
+        let lead = &rest[..at];
+        let prev = lead.chars().last().or_else(|| out.chars().last());
+        let continues = |c: char| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '\\');
+        let starts = prev.is_none_or(|c| !continues(c))
+            || lead.ends_with("file://")
+            || lead.ends_with(r"\\?\");
         let ends = after
             .chars()
             .next()
@@ -29980,6 +29988,25 @@ mod tests {
         );
         assert_eq!(with_home_as_tilde("/etc/x", "/"), "/etc/x");
         assert_eq!(with_home_as_tilde("/srv/root/x", "/root"), "/srv/root/x");
+        // Fails closed: anything before the home that doesn't continue a
+        // path name starts one, so these are all shortened.
+        for (text, want) in [
+            ("`/home/al/x`", "`~/x`"),
+            ("[/home/al/x]", "[~/x]"),
+            ("<{/home/al/x}>", "<{~/x}>"),
+            ("a\t/home/al/x", "a\t~/x"),
+            ("k:/home/al/x", "k:~/x"),
+            ("file:///home/al/x", "file://~/x"),
+        ] {
+            assert_eq!(with_home_as_tilde(text, "/home/al"), want, "{text}");
+        }
+        assert_eq!(
+            with_home_as_tilde(r"\\?\C:\Users\al\x.asc", r"C:\Users\al"),
+            r"\\?\~\x.asc"
+        );
+        // A home that is the tail of a longer name stays.
+        assert_eq!(with_home_as_tilde("x/home/al/y", "/home/al"), "x/home/al/y");
+        assert_eq!(with_home_as_tilde("my_/home/al", "/home/al"), "my_/home/al");
         assert_eq!(
             with_home_as_tilde("from \"/root/a\" and (/root/b)", "/root"),
             "from \"~/a\" and (~/b)"
