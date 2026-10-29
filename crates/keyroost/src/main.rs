@@ -2887,9 +2887,11 @@ fn without_home(text: &str) -> String {
     }
 }
 
-/// `text` with every whole-path occurrence of `home` replaced by `~`: only
-/// where the next character ends that path part, so a home of `/home/al`
-/// leaves `/home/alice` alone. A home of `/` (or empty) changes nothing.
+/// `text` with every whole-path occurrence of `home` replaced by `~`: where
+/// the character before it doesn't continue a path name and the next one
+/// ends that path part, so a home of `/home/al` leaves `/home/alice` alone
+/// and a home of `/root` leaves `/srv/root/x` alone. A home of `/` (or
+/// empty) changes nothing.
 fn with_home_as_tilde(text: &str, home: &str) -> String {
     let home = home.trim_end_matches(['/', '\\']);
     if home.is_empty() {
@@ -2899,12 +2901,22 @@ fn with_home_as_tilde(text: &str, home: &str) -> String {
     let mut rest = text;
     while let Some(at) = rest.find(home) {
         let after = &rest[at + home.len()..];
-        let whole = after
+        // Fails closed: the home starts a path unless the character before
+        // it continues a path name (a letter, digit, `.`, `-`, `_` or a
+        // separator), so a delimiter nobody listed can't leak the folder.
+        // A separator that ends a `file://` or `\\?\` prefix starts one.
+        let lead = &rest[..at];
+        let prev = lead.chars().last().or_else(|| out.chars().last());
+        let continues = |c: char| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '\\');
+        let starts = prev.is_none_or(|c| !continues(c))
+            || lead.ends_with("file://")
+            || lead.ends_with(r"\\?\");
+        let ends = after
             .chars()
             .next()
             .is_none_or(|c| matches!(c, '/' | '\\' | ' ' | '"' | '\'' | ')' | ',' | ';' | ':'));
         out.push_str(&rest[..at]);
-        out.push_str(if whole { "~" } else { home });
+        out.push_str(if starts && ends { "~" } else { home });
         rest = after;
     }
     out.push_str(rest);
@@ -5584,9 +5596,14 @@ impl App {
             None => text.into(),
         };
         let text = without_home(&text);
+        // Against the newest line of the same severity, so the automatic
+        // trace line a traced refresh adds in between doesn't defeat it.
+        let same = std::mem::discriminant(&severity);
         if self
             .log
-            .last()
+            .iter()
+            .rev()
+            .find(|l| std::mem::discriminant(&l.severity) == same)
             .is_some_and(|l| l.text == text && matches!(l.kind, LogKind::Background))
         {
             return;
@@ -6537,13 +6554,6 @@ impl App {
         self.clipboard_clear_at = Some((text, now_secs_f64() + 45.0));
     }
 
-    /// Resolve a failed unlocked-session operation. When the underlying CTAP
-    /// error is a PIN / PIN-auth failure (`0x31` / `0x33` / `0x34`) the key has
-    /// invalidated the in-flight session, so we drop it and ask the user to
-    /// unlock again. Any other failure keeps the existing behavior: surface the
-    /// caller's contextual message. Auto-lock applies ONLY to operations that
-    /// already hold a session — `try_unlock`'s own wrong-PIN handling is left
-    /// untouched.
     /// A change to the key's large-blob storage that worked: the tab's
     /// status line, and an activity-log line (counts only, never a note).
     fn storage_done(&mut self, status: String) {
@@ -6560,6 +6570,13 @@ impl App {
         self.security_keys.lb_status = Some(status);
     }
 
+    /// Resolve a failed unlocked-session operation. When the underlying CTAP
+    /// error is a PIN / PIN-auth failure (`0x31` / `0x33` / `0x34`) the key has
+    /// invalidated the in-flight session, so we drop it and ask the user to
+    /// unlock again. Any other failure keeps the existing behavior: surface the
+    /// caller's contextual message. Auto-lock applies ONLY to operations that
+    /// already hold a session — `try_unlock`'s own wrong-PIN handling is left
+    /// untouched.
     fn fail_session_op(&mut self, err: &SessionOpError, context: &str) {
         self.log(Severity::Err, format!("FIDO2: {context}: {err}"));
         if err.relock {
@@ -6866,7 +6883,11 @@ impl App {
 
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    app.log_moved_on(for_device.as_ref(), "enrolling a fingerprint", &result);
+                    // Selecting another key cancels an enrollment on purpose;
+                    // that isn't a failure worth a line.
+                    if !matches!(&result, Err(e) if e.message == "cancelled") {
+                        app.log_moved_on(for_device.as_ref(), "enrolling a fingerprint", &result);
+                    }
                     return; // selection changed mid-enroll; the progress cell
                             // was already dropped + cancelled on selection change
                 }
@@ -7109,21 +7130,28 @@ impl App {
         let for_device = self.selected_device.clone();
         self.spawn_job("Deleting credential\u{2026}", move || {
             // Delete, then re-list in the same job so the UI updates atomically.
-            let result = Self::try_delete(&target, token, &cred_id)
+            // `deleted`: the passkey is gone, whatever the re-list says.
+            let deleted = Self::try_delete(&target, token, &cred_id);
+            let wrote = deleted.is_ok();
+            let result = deleted
                 .and_then(|()| Self::refresh_with_token(&target, token_refresh, pin_refresh))
                 .map_err(SessionOpError::from_boxed);
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    app.log_moved_on(for_device.as_ref(), "deleting a passkey", &result);
+                    let outcome = if wrote { Ok(()) } else { result.map(|_| ()) };
+                    app.log_moved_on(for_device.as_ref(), "deleting a passkey", &outcome);
                     return; // selection changed mid-delete; drop the refresh
+                }
+                if wrote {
+                    app.log(Severity::Ok, "Passkey deleted");
                 }
                 match result {
                     Ok(fresh) => {
-                        app.log(Severity::Ok, "Passkey deleted");
                         app.security_keys.session = Some(fresh);
                         app.security_keys.session_device = for_device.clone();
                         app.security_keys.error = None;
                     }
+                    Err(e) if wrote => app.fail_session_op(&e, "passkey list not read again"),
                     Err(e) => app.fail_session_op(&e, "delete failed"),
                 }
             })
@@ -7188,7 +7216,13 @@ impl App {
                             Some(&keyroost_ctap::ssh_cert::default_cert_filename(&rp_id)),
                         );
                     }
-                    Err(e) => app.security_keys.ssh_cert_status = Some(e),
+                    Err(e) => {
+                        app.log(
+                            Severity::Err,
+                            format!("FIDO2: SSH certificate not read: {e}"),
+                        );
+                        app.security_keys.ssh_cert_status = Some(e);
+                    }
                 }
             })
         });
@@ -7401,7 +7435,8 @@ impl App {
                      \u{2014} its passkeys and PIN are still on it: {e}"
                 ),
             };
-            app.log(Severity::Warn, note);
+            // Global: `log` would put the newly selected key's name on it.
+            app.log_global(Severity::Warn, LogKind::User, note);
             return;
         }
         match result {
@@ -7416,6 +7451,8 @@ impl App {
                 if resolve_fido_reset_row(&mut app.factory_reset_report, outcome.clone()) {
                     let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
                     app.log(severity, line);
+                } else {
+                    app.log(Severity::Ok, "FIDO2 reset: passkeys and PIN wiped");
                 }
                 // Re-read info so the PIN status reflects the wipe.
                 app.fetch_selected_info();
@@ -7440,6 +7477,8 @@ impl App {
                 if resolve_fido_reset_row(&mut app.factory_reset_report, outcome.clone()) {
                     let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
                     app.log(severity, line);
+                } else {
+                    app.log(Severity::Err, format!("FIDO2: {msg}"));
                 }
                 app.security_keys.error = Some(msg);
             }
@@ -7661,8 +7700,16 @@ impl App {
             "Reading code\u{2026}"
         };
         self.spawn_job(label, move || {
-            let result = (|| -> Result<(String, Option<u64>), TransportError> {
+            // `Ok(None)`: the account is no longer on the key (deleted
+            // elsewhere since the list was read), so nothing was asked.
+            let result = (|| -> Result<Option<(String, Option<u64>)>, TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
+                if session.list().is_ok_and(|l| l.lacks(&cred)) {
+                    return Ok(None);
+                }
+                // The check was a command since the unlock; an applet that
+                // keeps its unlock for one command only needs it again.
+                session.reauthenticate()?;
                 match totp_period {
                     Some(period) => {
                         let now = SystemTime::now()
@@ -7671,9 +7718,9 @@ impl App {
                             .unwrap_or(0);
                         let (at, until) = oath_touch_read_window(now, u64::from(period));
                         let code = session.calculate_totp(&cred, at, period)?.code;
-                        Ok((code, Some(until)))
+                        Ok(Some((code, Some(until))))
                     }
-                    None => Ok((session.calculate_hotp(&cred)?.code, None)),
+                    None => Ok(Some((session.calculate_hotp(&cred)?.code, None))),
                 }
             })();
             Box::new(move |app: &mut App| {
@@ -7684,7 +7731,7 @@ impl App {
                 // apply_oath_rows).
                 wipe(&mut app.oath.password_input);
                 match result {
-                    Ok((code, valid_until)) => {
+                    Ok(Some((code, valid_until))) => {
                         // This password worked (or none was needed): retain it,
                         // like a successful listing does.
                         app.oath.unlocked_password = Some(password);
@@ -7692,6 +7739,16 @@ impl App {
                             row.code = Some(code);
                             row.valid_until = valid_until;
                         }
+                    }
+                    Ok(None) => {
+                        app.oath.unlocked_password = Some(password);
+                        app.log(
+                            Severity::Warn,
+                            "Authenticator account was no longer on the key",
+                        );
+                        // Re-list first: it clears the pane's error as it starts.
+                        app.load_oath_creds();
+                        app.oath.error = Some("That account is no longer on the key.".into());
                     }
                     Err(e) => {
                         if let Some(line) = oath_failure_line(&e, !password.is_empty()) {
@@ -7811,6 +7868,9 @@ impl App {
             return;
         };
         let password = oath_effective_password(&self.oath);
+        // A password typed into the unlock box: a failure is the user's
+        // attempt (a full line), not an automatic refresh's.
+        let typed = !self.oath.password_input.is_empty();
         let for_device = self.selected_device.clone();
         let touch = self.oath_touch_names();
         self.spawn_job("Reading OATH codes\u{2026}", move || {
@@ -7828,7 +7888,11 @@ impl App {
                         // An automatic read: logged once, in the background.
                         Err(e) => {
                             if let Some(line) = oath_failure_line(e, !password.is_empty()) {
-                                app.log_bg_once(Severity::Err, line);
+                                if typed {
+                                    app.log(Severity::Err, line);
+                                } else {
+                                    app.log_bg_once(Severity::Err, line);
+                                }
                             }
                         }
                     }
@@ -7922,7 +7986,11 @@ impl App {
             Box::new(move |app: &mut App| {
                 let what = "adding an Authenticator account";
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    let outcome = if wrote { Ok(()) } else { result.map(|_| ()) };
+                    let outcome = match (&refused, wrote) {
+                        (_, true) => Ok(()),
+                        (Some(why), false) => Err(why.clone()),
+                        (None, false) => result.map(|_| ()).map_err(|e| e.to_string()),
+                    };
                     app.log_moved_on(for_device.as_ref(), what, &outcome);
                     return;
                 }
@@ -7977,16 +8045,18 @@ impl App {
                 // An account deleted elsewhere since this list was read isn't
                 // sent: key families answer a missing name differently (a
                 // YubiKey refuses it, a Solo 2 reports success).
+                // An applet that keeps its unlock for one command only (a
+                // password-protected Solo 2) needs it again after each
+                // command here: the check, the delete, the re-list.
                 if session.list().is_ok_and(|l| l.lacks(&cred_name)) {
                     gone = true;
+                    session.reauthenticate()?;
                     return Self::oath_list_rows(&mut session, &touch);
                 }
-                // The listing was a command since the unlock; an applet that
-                // keeps its unlock for one command only (a password-protected
-                // Solo 2) would refuse the delete. Unlock again first.
                 session.reauthenticate()?;
                 session.delete(&cred_name)?;
                 wrote = true;
+                session.reauthenticate()?;
                 Self::oath_list_rows(&mut session, &touch)
             })();
             Box::new(move |app: &mut App| {
@@ -8347,6 +8417,9 @@ impl App {
         };
         let for_device = dev.id;
         self.spawn_job("Checking PIV reset support\u{2026}", move || {
+            // Why the check failed, for the log (the dialog then says it
+            // couldn't tell).
+            let mut check_failed: Option<String> = None;
             let (preview, needs_reset_mgmt_auth, default_mgmt_key, reset_long_running) =
                 keyroost_transport::PivSession::with_transaction(&reader, |s| {
                     // One fingerprint serves all four checks — see
@@ -8362,15 +8435,19 @@ impl App {
                             .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning),
                     ))
                 })
-                .unwrap_or((
-                    FactoryResetPivPreview::CheckFailed,
-                    false,
-                    None,
-                    false,
-                ));
+                .unwrap_or_else(|e| {
+                    check_failed = Some(e.to_string());
+                    (FactoryResetPivPreview::CheckFailed, false, None, false)
+                });
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(Some(&for_device), app.selected_device.as_ref()) {
                     return;
+                }
+                if let Some(e) = check_failed {
+                    app.log(
+                        Severity::Warn,
+                        format!("PIV: couldn't check reset support: {e}"),
+                    );
                 }
                 app.factory_reset_confirm = Some(FactoryResetConfirmState {
                     for_device,
@@ -9448,11 +9525,14 @@ impl App {
     /// Re-read status after a write and store it, surfacing `notice` on success.
     /// `keys_changed`: the write replaced or wiped keys, so what was read about
     /// key presence no longer holds; other writes (name, URL, PINs) keep it.
+    /// `wrote`: the change itself went through, so a failure can only be
+    /// the status re-read after it; the change is still logged as done.
     fn apply_openpgp_write(
         app: &mut App,
         result: Result<keyroost_transport::OpenPgpStatus, TransportError>,
         notice: String,
         keys_changed: bool,
+        wrote: bool,
     ) {
         match result {
             Ok(status) => {
@@ -9463,6 +9543,17 @@ impl App {
                 app.openpgp.loaded = true;
                 app.openpgp.error = None;
                 app.openpgp_done(notice);
+                wipe(&mut app.openpgp.admin_pin);
+            }
+            Err(e) if wrote => {
+                let done = notice.trim_end_matches('.');
+                app.log(Severity::Ok, done.to_string());
+                app.log(
+                    Severity::Err,
+                    format!("OpenPGP: the card couldn't be read again: {e}"),
+                );
+                app.openpgp.error =
+                    Some(format!("{done}, but the card couldn't be read again: {e}"));
                 wipe(&mut app.openpgp.admin_pin);
             }
             Err(e) => {
@@ -9523,13 +9614,16 @@ impl App {
         let value = self.openpgp.name_input.clone();
         self.openpgp.notice = None;
         self.spawn_job("Setting cardholder name…", move || {
+            // The change was made, whatever the status re-read after it says.
+            let mut wrote = false;
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
                 let mut s = Self::openpgp_open_admin(&name, &pin)?;
                 s.set_cardholder_name(value.as_bytes())?;
+                wrote = true;
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                Self::apply_openpgp_write(app, result, "Cardholder name set.".into(), false)
+                Self::apply_openpgp_write(app, result, "Cardholder name set.".into(), false, wrote)
             })
         });
     }
@@ -9543,13 +9637,16 @@ impl App {
         let value = self.openpgp.url_input.clone();
         self.openpgp.notice = None;
         self.spawn_job("Setting public-key URL…", move || {
+            // The change was made, whatever the status re-read after it says.
+            let mut wrote = false;
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
                 let mut s = Self::openpgp_open_admin(&name, &pin)?;
                 s.set_url(value.as_bytes())?;
+                wrote = true;
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                Self::apply_openpgp_write(app, result, "Public-key URL set.".into(), false)
+                Self::apply_openpgp_write(app, result, "Public-key URL set.".into(), false, wrote)
             })
         });
     }
@@ -9717,10 +9814,15 @@ impl App {
     /// Settle one step of a multi-step OpenPGP dialog (create, restore) that
     /// moves to its next stage rather than finishing: `busy` clears, and an
     /// error stays in the dialog for a retry.
+    /// A dialog step's job that failed: shown in the dialog, and logged.
+    /// (A form hint before anything runs goes to [`Self::openpgp_modal_step`]
+    /// alone.)
+    fn openpgp_step_failed(app: &mut App, err: String) {
+        app.log(Severity::Err, format!("OpenPGP: {err}"));
+        Self::openpgp_modal_step(app, Some(err));
+    }
+
     fn openpgp_modal_step(app: &mut App, err: Option<String>) {
-        if let Some(e) = &err {
-            app.log(Severity::Err, format!("OpenPGP: {e}"));
-        }
         if let Some(m) = app.openpgp.cred_modal.as_mut() {
             m.busy = false;
             m.result = err.map(Err);
@@ -9800,7 +9902,7 @@ impl App {
                         app.openpgp.created = Some(std::sync::Arc::new(created));
                         Self::openpgp_modal_step(app, None);
                     }
-                    Err(e) => Self::openpgp_modal_step(app, Some(e)),
+                    Err(e) => Self::openpgp_step_failed(app, e),
                 }
             })
         })
@@ -9875,7 +9977,7 @@ impl App {
                                 .is_some_and(|prev| prev.card_touched);
                             let msg = f.message.clone();
                             app.openpgp.created_failure = Some(f);
-                            Self::openpgp_modal_step(app, Some(msg));
+                            Self::openpgp_step_failed(app, msg);
                         }
                     }
                 })
@@ -9938,7 +10040,7 @@ impl App {
                         app.openpgp.restore_loaded = Some(std::sync::Arc::new(loaded));
                         Self::openpgp_modal_step(app, None);
                     }
-                    Err(e) => Self::openpgp_modal_step(app, Some(e)),
+                    Err(e) => Self::openpgp_step_failed(app, e),
                 }
             })
         })
@@ -9997,7 +10099,7 @@ impl App {
                                 m.result = Some(Ok(()));
                             }
                         }
-                        Err(e) => Self::openpgp_modal_step(app, Some(sentence(e))),
+                        Err(e) => Self::openpgp_step_failed(app, sentence(e)),
                     }
                 })
             },
@@ -10037,7 +10139,7 @@ impl App {
                         f.cert = Some(cert);
                         Self::openpgp_modal_step(app, None);
                     }
-                    Err(e) => Self::openpgp_modal_step(app, Some(e)),
+                    Err(e) => Self::openpgp_step_failed(app, e),
                 }
             })
         })
@@ -10175,7 +10277,7 @@ impl App {
                             m.result = Some(Ok(()));
                         }
                     }
-                    Err(e) => Self::openpgp_modal_step(app, Some(e)),
+                    Err(e) => Self::openpgp_step_failed(app, e),
                 }
             })
         })
@@ -10191,9 +10293,12 @@ impl App {
         self.openpgp.notice = None;
         let for_device = self.selected_device.clone();
         self.spawn_job("Resetting OpenPGP applet…", move || {
+            // The change was made, whatever the status re-read after it says.
+            let mut wrote = false;
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
                 let mut s = keyroost_transport::OpenPgpSession::open(&name)?;
                 s.factory_reset()?;
+                wrote = true;
                 s.status()
             })();
             Box::new(move |app: &mut App| {
@@ -10206,6 +10311,7 @@ impl App {
                     result,
                     "OpenPGP applet reset; keys wiped, PINs back to defaults.".into(),
                     true,
+                    wrote,
                 )
             })
         })
@@ -10221,15 +10327,24 @@ impl App {
         let new = zeroize::Zeroizing::new(self.openpgp.user_pin_new.clone());
         self.openpgp.notice = None;
         self.spawn_job("Changing user PIN\u{2026}", move || {
+            // The change was made, whatever the status re-read after it says.
+            let mut wrote = false;
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
                 let mut s = keyroost_transport::OpenPgpSession::open(&name)?;
                 s.change_user_pin(old.as_bytes(), new.as_bytes())?;
+                wrote = true;
                 s.status()
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.openpgp.user_pin_old);
                 wipe(&mut app.openpgp.user_pin_new);
-                Self::apply_openpgp_write(app, result, "User PIN (PW1) changed.".into(), false);
+                Self::apply_openpgp_write(
+                    app,
+                    result,
+                    "User PIN (PW1) changed.".into(),
+                    false,
+                    wrote,
+                );
             })
         });
     }
@@ -10243,15 +10358,24 @@ impl App {
         let new = zeroize::Zeroizing::new(self.openpgp.admin_pin_new.clone());
         self.openpgp.notice = None;
         self.spawn_job("Changing admin PIN\u{2026}", move || {
+            // The change was made, whatever the status re-read after it says.
+            let mut wrote = false;
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
                 let mut s = keyroost_transport::OpenPgpSession::open(&name)?;
                 s.change_admin_pin(old.as_bytes(), new.as_bytes())?;
+                wrote = true;
                 s.status()
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.openpgp.admin_pin_old);
                 wipe(&mut app.openpgp.admin_pin_new);
-                Self::apply_openpgp_write(app, result, "Admin PIN (PW3) changed.".into(), false);
+                Self::apply_openpgp_write(
+                    app,
+                    result,
+                    "Admin PIN (PW3) changed.".into(),
+                    false,
+                    wrote,
+                );
             })
         });
     }
@@ -10266,14 +10390,23 @@ impl App {
         let new = zeroize::Zeroizing::new(self.openpgp.unblock_new.clone());
         self.openpgp.notice = None;
         self.spawn_job("Unblocking user PIN\u{2026}", move || {
+            // The change was made, whatever the status re-read after it says.
+            let mut wrote = false;
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
                 let mut s = keyroost_transport::OpenPgpSession::open(&name)?;
                 s.reset_retry_counter(admin.as_bytes(), new.as_bytes())?;
+                wrote = true;
                 s.status()
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.openpgp.unblock_new);
-                Self::apply_openpgp_write(app, result, "User PIN (PW1) unblocked.".into(), false);
+                Self::apply_openpgp_write(
+                    app,
+                    result,
+                    "User PIN (PW1) unblocked.".into(),
+                    false,
+                    wrote,
+                );
             })
         });
     }
@@ -19838,6 +19971,7 @@ impl App {
                 ));
             }
             Err(e) => {
+                self.log_bg_once(Severity::Err, format!("Storage: load failed: {e}"));
                 self.security_keys.lb_status = Some(format!("Load failed: {e}"));
             }
         }
@@ -29994,6 +30128,30 @@ mod tests {
             r"~\x.asc"
         );
         assert_eq!(with_home_as_tilde("/etc/x", "/"), "/etc/x");
+        assert_eq!(with_home_as_tilde("/srv/root/x", "/root"), "/srv/root/x");
+        // Fails closed: anything before the home that doesn't continue a
+        // path name starts one, so these are all shortened.
+        for (text, want) in [
+            ("`/home/al/x`", "`~/x`"),
+            ("[/home/al/x]", "[~/x]"),
+            ("<{/home/al/x}>", "<{~/x}>"),
+            ("a\t/home/al/x", "a\t~/x"),
+            ("k:/home/al/x", "k:~/x"),
+            ("file:///home/al/x", "file://~/x"),
+        ] {
+            assert_eq!(with_home_as_tilde(text, "/home/al"), want, "{text}");
+        }
+        assert_eq!(
+            with_home_as_tilde(r"\\?\C:\Users\al\x.asc", r"C:\Users\al"),
+            r"\\?\~\x.asc"
+        );
+        // A home that is the tail of a longer name stays.
+        assert_eq!(with_home_as_tilde("x/home/al/y", "/home/al"), "x/home/al/y");
+        assert_eq!(with_home_as_tilde("my_/home/al", "/home/al"), "my_/home/al");
+        assert_eq!(
+            with_home_as_tilde("from \"/root/a\" and (/root/b)", "/root"),
+            "from \"~/a\" and (~/b)"
+        );
     }
 
     /// With no worker (the default), a job runs inline so headless tests and any
@@ -31268,6 +31426,67 @@ mod tests {
                 "Authenticator: reader gone"
             ]
         );
+    }
+
+    /// A FIDO2 reset run on its own (not a factory reset's last step) writes
+    /// a line, success or failure.
+    #[test]
+    fn a_standalone_fido2_reset_is_logged() {
+        let a: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(a.clone()),
+            ..Default::default()
+        };
+        App::apply_reset_path_outcome(&mut app, Some(&a), Ok(()));
+        App::apply_reset_path_outcome(&mut app, Some(&a), Err("no touch".into()));
+        let lines: Vec<(&str, bool)> = app
+            .log
+            .iter()
+            .map(|l| (l.text.as_str(), matches!(l.severity, Severity::Err)))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("FIDO2 reset: passkeys and PIN wiped", false),
+                ("FIDO2: reset failed: no touch", true)
+            ]
+        );
+    }
+
+    /// An OpenPGP change that went through but whose status re-read failed
+    /// is logged as made, plus the failed re-read; one that failed is just
+    /// a failure.
+    #[test]
+    fn an_openpgp_change_logs_as_made_when_only_the_reread_failed() {
+        let mut app = App::default();
+        App::apply_openpgp_write(
+            &mut app,
+            Err(TransportError::OathCredentialTooLong),
+            "User PIN (PW1) changed.".into(),
+            false,
+            true,
+        );
+        assert_eq!(app.log[0].text, "User PIN (PW1) changed");
+        assert!(matches!(app.log[0].severity, Severity::Ok));
+        assert!(app.log[1]
+            .text
+            .starts_with("OpenPGP: the card couldn't be read again"));
+        assert!(app
+            .openpgp
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("User PIN (PW1) changed, but")));
+
+        let mut app = App::default();
+        App::apply_openpgp_write(
+            &mut app,
+            Err(TransportError::OathCredentialTooLong),
+            "User PIN (PW1) changed.".into(),
+            false,
+            false,
+        );
+        assert_eq!(app.log.len(), 1);
+        assert!(matches!(app.log[0].severity, Severity::Err));
     }
 
     /// A change that finishes after another key was selected still gets a
