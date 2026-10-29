@@ -18,47 +18,18 @@
 //!   can still be traced. This works because the GUI's blocking device jobs
 //!   run to completion on one dedicated worker thread before their result
 //!   crosses back to the UI thread (see `keyroost`'s `Worker`), so "recorded
-//!   between begin and take" exactly matches "what this one job did".
+//!   between begin and take" exactly matches "what this one job did". The
+//!   capture itself lives in [`keyroost_proto::trace`], so CTAP traffic
+//!   (`keyroost-ctap`, over USB or a reader) lands in the same one.
 
-use std::cell::RefCell;
-
-thread_local! {
-    static TRACE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
-}
-
-/// Start capturing trace lines recorded on this thread. Pairs with [`take`].
-/// A capture left open by a panicking job is harmless: the next `begin`
-/// simply discards it.
-pub fn begin() {
-    TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
-}
-
-/// Stop capturing and return everything recorded since [`begin`]. `None` if
-/// no capture is active on this thread.
-pub fn take() -> Option<Vec<String>> {
-    TRACE.with(|t| t.borrow_mut().take())
-}
-
-fn capturing() -> bool {
-    TRACE.with(|t| t.borrow().is_some())
-}
+pub use keyroost_proto::trace::{begin, take};
 
 /// Record one `--debug` trace line. `debug` is the session's own flag: when
 /// on, the line prints to stderr immediately, same as always. Independently,
-/// if this thread has an active capture, the line is also appended there.
+/// if this thread has an active capture, the line is also appended there
+/// (see [`keyroost_proto::trace::emit`], which every transport shares).
 /// `line` is built lazily so the common case — a non-`--debug` CLI run with
 /// no GUI capture active — never allocates or formats anything.
 pub(crate) fn line(debug: bool, f: impl FnOnce() -> String) {
-    if !debug && !capturing() {
-        return;
-    }
-    let s = f();
-    if debug {
-        eprintln!("{s}");
-    }
-    TRACE.with(|t| {
-        if let Some(buf) = t.borrow_mut().as_mut() {
-            buf.push(s);
-        }
-    });
+    keyroost_proto::trace::emit(debug, f);
 }

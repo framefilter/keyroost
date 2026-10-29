@@ -384,16 +384,13 @@ impl OpenPgpSession {
         if let Some(alg) = alg {
             let current = self.algorithm_attributes(crt)?;
             if needs_attribute_write(&current, alg) {
-                if self.debug {
-                    eprintln!(
-                        "{}",
-                        format_line(
-                            Dir::Note,
-                            "openpgp generate",
-                            &format!("setting {crt:?} slot algorithm to {}", alg.label()),
-                        )
-                    );
-                }
+                trace::line(self.debug, || {
+                    format_line(
+                        Dir::Note,
+                        "openpgp generate",
+                        &format!("setting {crt:?} slot algorithm to {}", alg.label()),
+                    )
+                });
                 self.set_algorithm(crt, alg)?;
             }
         }
@@ -737,31 +734,27 @@ impl OpenPgpSession {
     ) -> Result<Option<pgp::AlgorithmInformation>, TransportError> {
         let (bytes, sw) = self.transmit_full(&pgp::get_algorithm_information())?;
         if sw != pgp::SW_OK {
-            if self.debug {
-                eprintln!(
-                    "{}",
-                    format_line(
-                        Dir::Note,
-                        "openpgp",
-                        &format!(
-                            "card has no Algorithm Information object (SW={sw:04X}); \
+            trace::line(self.debug, || {
+                format_line(
+                    Dir::Note,
+                    "openpgp",
+                    &format!(
+                        "card has no Algorithm Information object (SW={sw:04X}); \
                              offering every algorithm"
-                        ),
-                    )
-                );
-            }
+                    ),
+                )
+            });
             return Ok(None);
         }
         let parsed = pgp::parse_algorithm_information(&bytes).ok();
-        if parsed.is_none() && self.debug {
-            eprintln!(
-                "{}",
+        if parsed.is_none() {
+            trace::line(self.debug, || {
                 format_line(
                     Dir::Note,
                     "openpgp",
                     "Algorithm Information object did not parse; offering every algorithm",
                 )
-            );
+            });
         }
         Ok(parsed)
     }

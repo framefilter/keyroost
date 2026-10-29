@@ -12,7 +12,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use keyroost_hid::{HidDevice, UsbDeviceKey};
-use keyroost_proto::trace::{format_line, Dir};
+use keyroost_proto::trace::{emit, format_line, Dir};
 use keyroost_transport::ReaderProbe;
 
 pub use keyroost_transport::identity::KeyAnswer;
@@ -434,20 +434,17 @@ fn read_identities_with(
 ) -> Identities {
     let hid = hid_identities_from(cache, plan, hids, |v, h| {
         let id = registry[v].read_hid(h, debug);
-        if debug {
+        emit(debug, || {
             let shown = match &id {
                 KeyAnswer::Reply(id) => id.to_string(),
                 KeyAnswer::Declined | KeyAnswer::NoAnswer => "no answer".to_string(),
             };
-            eprintln!(
-                "{}",
-                format_line(
-                    Dir::Note,
-                    "identity",
-                    &format!("{} {}: {shown}", registry[v].vendor(), h.path.display()),
-                )
-            );
-        }
+            format_line(
+                Dir::Note,
+                "identity",
+                &format!("{} {}: {shown}", registry[v].vendor(), h.path.display()),
+            )
+        });
         id
     });
     let mut ids = Identities {
@@ -459,19 +456,16 @@ fn read_identities_with(
             continue;
         };
         let id = registry[*v].read_ccid(p, debug);
-        if debug {
+        emit(debug, || {
             let shown = id
                 .as_ref()
                 .map_or_else(|| "no answer".to_string(), ToString::to_string);
-            eprintln!(
-                "{}",
-                format_line(
-                    Dir::Note,
-                    "identity",
-                    &format!("{} '{name}': {shown}", registry[*v].vendor()),
-                )
-            );
-        }
+            format_line(
+                Dir::Note,
+                "identity",
+                &format!("{} '{name}': {shown}", registry[*v].vendor()),
+            )
+        });
         if let Some(id) = id {
             ids.reader.insert(name.clone(), id);
         }

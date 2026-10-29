@@ -254,19 +254,20 @@ fn first_time(lines: &[String; 2]) -> bool {
 }
 
 /// The key for a node whose raw chain is `chain` (`None` when the lookup
-/// failed), printing the trace lines to stderr when `trace` is set (once per
-/// process for an identical lookup and result).
+/// failed), printing the trace lines to stderr when `trace` is set and
+/// adding them to an open activity-log capture (once per process for an
+/// identical lookup and result).
 #[must_use]
 pub fn win_node_from_chain(
     subject: &str,
     chain: Option<&[String]>,
     trace: bool,
 ) -> Option<UsbDeviceKey> {
-    if trace {
+    if trace || keyroost_proto::trace::capturing() {
         let lines = devtree_trace_lines(subject, chain);
         if first_time(&lines) {
             for line in lines {
-                eprintln!("{line}");
+                keyroost_proto::trace::emit(trace, || line);
             }
         }
     }

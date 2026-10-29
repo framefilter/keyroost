@@ -25,7 +25,7 @@ use keyroost_proto::commands::{
     self, derive_sm4_key, sw_auth_failed, sw_completed, sw_ok, Command, ProfileConfig,
     ProfilePublicData, PublicDataError,
 };
-use keyroost_proto::trace::{format_line, Dir};
+use keyroost_proto::trace::{abbreviate, format_line, Dir};
 use pcsc::{
     Attribute, Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State,
     PNP_NOTIFICATION,
@@ -1277,9 +1277,11 @@ fn probe_trace_on() -> bool {
         || std::env::var_os("KEYROOST_PROBE_DEBUG").is_some()
 }
 
-/// One reader-probe trace line on stderr, in the shared trace grammar.
+/// One reader-probe trace line in the shared trace grammar: on stderr under
+/// the probe trace switch, and into the activity log's capture when one is
+/// open.
 fn probe_note(body: &str) {
-    eprintln!("{}", format_line(Dir::Note, "probe", body));
+    keyroost_proto::trace::emit(probe_trace_on(), || format_line(Dir::Note, "probe", body));
 }
 
 /// Probe every connected PC/SC reader in a single pass: one context, the reader
@@ -1360,7 +1362,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             usb_device: tree_key,
             usb_product,
         };
-        let trace = probe_trace_on();
+        let trace = probe_trace_on() || keyroost_proto::trace::capturing();
         if trace {
             probe_note(&format!("reader seen: {}", probe.reader_name));
         }
@@ -1444,7 +1446,10 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                             probe.is_prog = true;
                             probe.prog_serial = Some(parsed.serial);
                             if trace {
-                                probe_note(&format!("prog token -> {:?}", probe.prog_serial));
+                                probe_note(&format!(
+                                    "prog token -> {:?}",
+                                    probe.prog_serial.as_deref().map(abbreviate)
+                                ));
                             }
                         }
                     }
@@ -1483,7 +1488,10 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                         if !hex.is_empty() {
                             probe.serial = Some(hex);
                             if trace {
-                                probe_note(&format!("token2 full serial -> {:?}", probe.serial));
+                                probe_note(&format!(
+                                    "token2 full serial -> {:?}",
+                                    probe.serial.as_deref().map(abbreviate)
+                                ));
                             }
                         }
                     } else if trace {
@@ -1522,7 +1530,10 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                         probe.serial =
                             Some(sn.iter().map(|b| format!("{b:02x}")).collect::<String>());
                         if trace {
-                            probe_note(&format!("openpgp serial (aid) -> {:?}", probe.serial));
+                            probe_note(&format!(
+                                "openpgp serial (aid) -> {:?}",
+                                probe.serial.as_deref().map(abbreviate)
+                            ));
                         }
                     }
                 }

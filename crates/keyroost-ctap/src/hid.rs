@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use keyroost_proto::trace::{format_line, Dir};
+use keyroost_proto::trace::{emit, format_line, Dir};
 
 /// Broadcast channel ID used for the initial `CTAPHID_INIT` request.
 pub const CTAPHID_BROADCAST_CID: u32 = 0xFFFF_FFFF;
@@ -463,54 +463,45 @@ impl CtapHidDevice {
         let started = Instant::now();
         let mut attempt: u32 = 1;
         loop {
-            if ctap_trace_enabled() {
-                eprintln!(
-                    "{}",
-                    ctap_line(
-                        Dir::Sent,
-                        cmd,
-                        payload.len(),
-                        &trace_payload(payload, sensitive)
-                    )
-                );
-            }
+            emit(ctap_trace_enabled(), || {
+                ctap_line(
+                    Dir::Sent,
+                    cmd,
+                    payload.len(),
+                    &trace_payload(payload, sensitive),
+                )
+            });
             let outcome = self
                 .send(self.channel_id, cmd, payload)
                 .and_then(|()| self.recv(self.channel_id, cmd));
             match outcome {
                 Ok(resp) => {
-                    if ctap_trace_enabled() {
-                        eprintln!(
-                            "{}",
-                            ctap_line(
-                                Dir::Received,
-                                cmd,
-                                resp.len(),
-                                &trace_payload(&resp, sensitive)
-                            )
-                        );
-                    }
+                    emit(ctap_trace_enabled(), || {
+                        ctap_line(
+                            Dir::Received,
+                            cmd,
+                            resp.len(),
+                            &trace_payload(&resp, sensitive),
+                        )
+                    });
                     return Ok(resp);
                 }
                 Err(HidTransportError::DeviceError(code)) => {
                     let Some(delay) = busy_retry_delay(code, attempt, started.elapsed()) else {
                         return Err(HidTransportError::DeviceError(code));
                     };
-                    if ctap_trace_enabled() {
-                        // Framing metadata only — no payload, so this line
-                        // can't leak what the redacted trace withheld.
-                        eprintln!(
-                            "{}",
-                            format_line(
-                                Dir::Note,
-                                &format!("ctaphid {}", ctap_cmd_name(cmd)),
-                                &format!(
-                                    "busy (error 0x{code:02x}), retry {attempt} in {}ms",
-                                    delay.as_millis()
-                                ),
-                            )
-                        );
-                    }
+                    // Framing metadata only — no payload, so this line can't
+                    // leak what the redacted trace withheld.
+                    emit(ctap_trace_enabled(), || {
+                        format_line(
+                            Dir::Note,
+                            &format!("ctaphid {}", ctap_cmd_name(cmd)),
+                            &format!(
+                                "busy (error 0x{code:02x}), retry {attempt} in {}ms",
+                                delay.as_millis()
+                            ),
+                        )
+                    });
                     self.sleep_between_attempts(delay)?;
                     attempt += 1;
                 }
@@ -543,23 +534,18 @@ impl CtapHidDevice {
 
     fn do_init(&mut self) -> Result<InitResponse, HidTransportError> {
         let nonce = generate_nonce();
-        if ctap_trace_enabled() {
-            let body = hexline(&nonce);
-            eprintln!("{}", ctap_line(Dir::Sent, CTAPHID_INIT, nonce.len(), &body));
-        }
+        emit(ctap_trace_enabled(), || {
+            ctap_line(Dir::Sent, CTAPHID_INIT, nonce.len(), &hexline(&nonce))
+        });
         self.send(CTAPHID_BROADCAST_CID, CTAPHID_INIT, &nonce)?;
         // One deadline for the whole exchange, so answers meant for others
         // can't keep it open.
         let deadline = Instant::now() + self.timeout;
         loop {
             let resp = self.recv_by(CTAPHID_BROADCAST_CID, CTAPHID_INIT, deadline)?;
-            if ctap_trace_enabled() {
-                let body = hexline(&resp);
-                eprintln!(
-                    "{}",
-                    ctap_line(Dir::Received, CTAPHID_INIT, resp.len(), &body)
-                );
-            }
+            emit(ctap_trace_enabled(), || {
+                ctap_line(Dir::Received, CTAPHID_INIT, resp.len(), &hexline(&resp))
+            });
             if resp.len() < 17 {
                 return Err(HidTransportError::InitResponseTooShort);
             }
@@ -769,6 +755,30 @@ fn ctap_line(dir: Dir, cmd: u8, len: usize, payload: &str) -> String {
         &format!("ctaphid {}", ctap_cmd_name(cmd)),
         &format!("len={len} {payload}"),
     )
+}
+
+/// Trace one CTAP2 message carried by another transport (a smart-card
+/// reader), in the same grammar and with the same redaction as CTAP-HID, under
+/// the same switch ([`set_trace`] / `KEYROOST_CTAP_DEBUG`) and into the same
+/// capture. `request` decides whether the exchange is sensitive; `body` is
+/// what this line shows (the request itself, or its response). `label` names
+/// the transport.
+pub fn trace_message(dir: Dir, label: &str, request: &[u8], body: &[u8]) {
+    let sensitive = exchange_is_sensitive(CTAPHID_CBOR, request);
+    emit(ctap_trace_enabled(), || {
+        format_line(
+            dir,
+            label,
+            &format!("len={} {}", body.len(), trace_payload(body, sensitive)),
+        )
+    });
+}
+
+/// Emit any other line under the CTAP trace switch (for another transport's
+/// framing, such as a reader's applet selection). The caller keeps secrets
+/// out of `line`.
+pub fn trace_line(line: impl FnOnce() -> String) {
+    emit(ctap_trace_enabled(), line);
 }
 
 /// True when a CTAPHID CBOR exchange carries personal data or PIN material
@@ -1493,6 +1503,28 @@ mod tests {
         );
         assert_eq!(ctap_cmd_name(CTAPHID_INIT), "init");
         assert_eq!(ctap_cmd_name(0x55), "0x55");
+    }
+
+    /// A CTAP2 message carried by another transport is traced into the
+    /// capture with the CTAP-HID redaction: a bio-enrollment name stays
+    /// hidden, in the request and in its response; getInfo shows its bytes.
+    #[test]
+    fn trace_message_redacts_like_ctaphid_into_the_capture() {
+        let mut name = vec![0x09];
+        name.extend_from_slice(b"\xa1\x02mAlice Example");
+        keyroost_proto::trace::begin();
+        trace_message(Dir::Sent, "ctap reader", &name, &name);
+        trace_message(Dir::Received, "ctap reader", &name, b"\x00Alice");
+        trace_message(Dir::Sent, "ctap reader", &[0x04], &[0x04]);
+        let lines = keyroost_proto::trace::take().unwrap();
+        assert_eq!(lines.len(), 3);
+        for l in &lines[..2] {
+            assert!(l.contains("<redacted: personal-data payload>"), "{l}");
+            assert!(!l.contains(&hexline(b"Alice")), "{l}");
+        }
+        assert!(lines[0].starts_with("> ctap reader"));
+        assert!(lines[1].starts_with("< ctap reader"));
+        assert!(lines[2].ends_with("len=1 04"), "{}", lines[2]);
     }
 
     #[test]

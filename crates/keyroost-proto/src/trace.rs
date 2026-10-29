@@ -1,5 +1,56 @@
 //! The one `--debug` trace line format shared by every keyroost crate. Not a
 //! stable contract: the text may change between releases.
+//!
+//! Also the one place a trace line goes once built ([`emit`]): to stderr when
+//! the caller's own `--debug` switch is on, and into this thread's capture
+//! when a front end opened one with [`begin`]. The GUI's activity log opens a
+//! capture around each device job (they run to completion on one worker
+//! thread) and collects it with [`take`], so every transport — smart-card
+//! applets, CTAP over USB and over a reader — lands in the same log.
+
+use std::cell::RefCell;
+
+thread_local! {
+    static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+/// Start capturing trace lines emitted on this thread. Pairs with [`take`].
+/// A capture left open by a panicking job is harmless: the next `begin`
+/// simply discards it.
+pub fn begin() {
+    CAPTURE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop capturing and return everything emitted since [`begin`]. `None` if
+/// no capture is active on this thread.
+pub fn take() -> Option<Vec<String>> {
+    CAPTURE.with(|t| t.borrow_mut().take())
+}
+
+/// True while a capture is open on this thread.
+#[must_use]
+pub fn capturing() -> bool {
+    CAPTURE.with(|t| t.borrow().is_some())
+}
+
+/// Emit one trace line: printed to stderr when `print` (the caller's
+/// `--debug` switch), and appended to this thread's capture when one is
+/// open. Built lazily, so the common case — no `--debug`, no capture — never
+/// formats anything.
+pub fn emit(print: bool, line: impl FnOnce() -> String) {
+    if !print && !capturing() {
+        return;
+    }
+    let s = line();
+    if print {
+        eprintln!("{s}");
+    }
+    CAPTURE.with(|t| {
+        if let Some(buf) = t.borrow_mut().as_mut() {
+            buf.push(s);
+        }
+    });
+}
 
 /// Width the label column is padded to (longer labels push the body right).
 pub const LABEL_WIDTH: usize = 20;
@@ -57,7 +108,27 @@ pub fn format_line(dir: Dir, label: &str, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{abbreviate, format_line, Dir, LABEL_WIDTH};
+    use super::{abbreviate, begin, emit, format_line, take, Dir, LABEL_WIDTH};
+
+    /// A capture collects every line emitted on this thread between `begin`
+    /// and `take`, printed or not; with no capture and nothing to print, the
+    /// line is never built.
+    #[test]
+    fn a_capture_collects_what_this_thread_emits() {
+        assert_eq!(take(), None);
+        emit(false, || unreachable!("built with no capture and no print"));
+        begin();
+        emit(false, || "> a".to_string());
+        emit(false, || "< b".to_string());
+        assert_eq!(take(), Some(vec!["> a".to_string(), "< b".to_string()]));
+        assert_eq!(take(), None);
+        // Another thread's lines stay out of this thread's capture.
+        begin();
+        std::thread::spawn(|| emit(false, || "elsewhere".to_string()))
+            .join()
+            .unwrap();
+        assert_eq!(take(), Some(Vec::new()));
+    }
 
     #[test]
     fn abbreviate_keeps_two_each_end_plus_length() {

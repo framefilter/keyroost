@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey, UsbSmartCard};
 use keyroost_keyring::Keyring;
-use keyroost_proto::trace::{format_line, Dir};
+use keyroost_proto::trace::{emit, format_line, Dir};
 use keyroost_transport::identity::InitAnswer;
 use keyroost_transport::{ReaderProbe, YubiKeyCcid};
 
@@ -834,27 +834,18 @@ pub fn correlate_with(
     // --- 3. Merge FIDO HID nodes into their physical key. Reader ownership is
     // settled up front by strength of evidence, not enumeration order.
     let bound = bind_readers(&hids, probes, &yk_readers, ids, opts);
-    if opts.trace {
-        for (hid, b) in hids.iter().zip(&bound) {
-            match b {
-                Some((r, step)) => eprintln!(
-                    "{}",
-                    format_line(
-                        Dir::Note,
-                        "match",
-                        &format!("{} -> '{r}' by {}", hid.path.display(), step.label()),
-                    )
-                ),
-                None => eprintln!(
-                    "{}",
-                    format_line(
-                        Dir::Note,
-                        "match",
-                        &format!("{} -> no reader", hid.path.display()),
-                    )
-                ),
-            }
-        }
+    for (hid, b) in hids.iter().zip(&bound) {
+        emit(opts.trace, || {
+            let to = match b {
+                Some((r, step)) => format!("'{r}' by {}", step.label()),
+                None => "no reader".to_string(),
+            };
+            format_line(
+                Dir::Note,
+                "match",
+                &format!("{} -> {to}", hid.path.display()),
+            )
+        });
     }
     for (i, hid) in hids.iter().enumerate() {
         let serial = serials.get(i).cloned().flatten().unwrap_or_default();
@@ -1145,17 +1136,19 @@ pub fn take_scan_warnings() -> Vec<String> {
 pub fn load_keyring_for_scan(debug: bool) -> (Keyring, bool) {
     match Keyring::load_default() {
         Ok(k) => {
-            if let (true, Some(r)) = (debug, k.load_report()) {
-                let line = format!(
-                    "converted keys.json to version 2: {}; {}",
-                    plural(r.converted, "record", "records"),
-                    if r.persisted {
-                        "saved"
-                    } else {
-                        "not saved yet (the old file is kept; the next save retries)"
-                    }
-                );
-                eprintln!("{}", format_line(Dir::Note, "names", &line));
+            if let Some(r) = k.load_report() {
+                emit(debug, || {
+                    let line = format!(
+                        "converted keys.json to version 2: {}; {}",
+                        plural(r.converted, "record", "records"),
+                        if r.persisted {
+                            "saved"
+                        } else {
+                            "not saved yet (the old file is kept; the next save retries)"
+                        }
+                    );
+                    format_line(Dir::Note, "names", &line)
+                });
             }
             (k, true)
         }
@@ -1271,16 +1264,13 @@ fn read_key_labels(devices: &[Device], debug: bool) -> HashMap<DeviceId, KeyLabe
             )
         };
         let label = read().unwrap_or_else(|e| {
-            if debug {
-                eprintln!(
-                    "{}",
-                    format_line(
-                        Dir::Note,
-                        "names",
-                        &format!("{}: name not read: {e}", path.display()),
-                    )
-                );
-            }
+            emit(debug, || {
+                format_line(
+                    Dir::Note,
+                    "names",
+                    &format!("{}: name not read: {e}", path.display()),
+                )
+            });
             KeyLabel::ReadFailed
         });
         if let Ok(mut c) = LABEL_CACHE.lock() {
@@ -1429,7 +1419,7 @@ pub fn name_from_keys(devices: &mut [Device], keyring: &Keyring, may_save: bool,
             warn_once(w);
         }
     }
-    if debug {
+    emit(debug, || {
         let mut line = format!(
             "read {} ({} with a name on the key); recorded {}",
             plural(learned.read, "key", "keys"),
@@ -1442,8 +1432,8 @@ pub fn name_from_keys(devices: &mut [Device], keyring: &Keyring, may_save: bool,
                 plural(learned.dropped, "stale name", "stale names")
             ));
         }
-        eprintln!("{}", format_line(Dir::Note, "names", &line));
-    }
+        format_line(Dir::Note, "names", &line)
+    });
 }
 
 /// [`name_from_keys`] over rows from a scan that skipped name reads

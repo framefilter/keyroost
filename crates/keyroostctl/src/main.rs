@@ -54,9 +54,9 @@ const PATH_HELP: &str = "USB HID device path of the key, instead of --device";
     after_help = "Guide with examples: https://framefilter.github.io/keyroost/cli.html"
 )]
 struct Cli {
-    /// Print every message sent to and received from the key to stderr (APDUs,
-    /// and FIDO CTAP over USB; not FIDO through a smart-card reader). The
-    /// format is for people and may change between releases.
+    /// Print every message sent to and received from the key to stderr
+    /// (smart-card APDUs, and FIDO CTAP over USB or through a smart-card
+    /// reader). The format is for people and may change between releases.
     #[arg(long, global = true, help_heading = "Global options")]
     debug: bool,
     /// Target a key by friendly name, serial, or `list` number (prefix name:,

@@ -33,7 +33,9 @@
 //! transport.
 
 use keyroost_ctap::cmd::CtapError;
+use keyroost_ctap::hid::{trace_line, trace_message};
 use keyroost_ctap::transport::CtapTransport;
+use keyroost_proto::trace::{format_line, Dir};
 use pcsc::{Card, Protocols, ShareMode};
 
 /// FIDO applet AID — `A0 00 00 06 47 2F 00 01`.
@@ -49,6 +51,9 @@ const CLA_CHAIN: u8 = 0x10;
 const GET_RESPONSE_CLA: u8 = 0x00;
 const GET_RESPONSE_INS: u8 = 0xC0;
 
+/// The `--debug` / activity-log label for CTAP through a reader (CTAP over
+/// USB shows as `ctaphid`).
+const TRACE_LABEL: &str = "ctap reader";
 /// Largest data field in a short-form command APDU.
 const MAX_SHORT_DATA: usize = 255;
 
@@ -202,7 +207,24 @@ impl CtapPcscDevice {
         let mut apdu = vec![0x00, 0xA4, 0x04, 0x00, FIDO_AID.len() as u8];
         apdu.extend_from_slice(&FIDO_AID);
         apdu.push(0x00); // Le
+        trace_line(|| {
+            format_line(
+                Dir::Sent,
+                "ctap reader select",
+                &keyroost_proto::codec::hex_encode(&apdu),
+            )
+        });
         let (data, sw1, sw2) = self.exchange_full(&apdu)?;
+        trace_line(|| {
+            format_line(
+                Dir::Received,
+                "ctap reader select",
+                &format!(
+                    "{} {sw1:02x}{sw2:02x}",
+                    keyroost_proto::codec::hex_encode(&data)
+                ),
+            )
+        });
         if (sw1, sw2) != (0x90, 0x00) {
             return Err(CtapError::Transport(format!(
                 "FIDO applet not present on this card (SELECT -> {sw1:02X}{sw2:02X})"
@@ -361,7 +383,19 @@ impl CtapTransport for CtapPcscDevice {
                 "CTAP command 0x{cmd:02X} is not supported over a smart-card reader"
             )));
         }
-        self.send_ctap_message(payload)
+        // The whole message and its reassembled answer, redacted as over USB
+        // (chaining and GET RESPONSE are framing, not traced).
+        trace_message(Dir::Sent, TRACE_LABEL, payload, payload);
+        match self.send_ctap_message(payload) {
+            Ok(resp) => {
+                trace_message(Dir::Received, TRACE_LABEL, payload, &resp);
+                Ok(resp)
+            }
+            Err(e) => {
+                trace_line(|| format_line(Dir::Note, TRACE_LABEL, &e.to_string()));
+                Err(e)
+            }
+        }
     }
 }
 
