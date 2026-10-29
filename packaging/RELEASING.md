@@ -199,10 +199,11 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
 - [ ] Two workflows start on the tag: `release.yml` (platform archives +
       GitHub Release) and `linux-bundles.yml` (AppImage + flatpak).
       release.yml has no approval gate. linux-bundles.yml gates the
-      AppImage and Flatpak build jobs behind `release-publish`, then
-      `flatpak-publish` once the Flatpak build finishes. **Approve those
-      gates promptly** — the bundle attach steps wait for the Release that
-      release.yml creates.
+      AppImage and Flatpak build jobs behind `release-publish`, then asks
+      for `release-publish` once more for the "Flatpak (attach bundle +
+      publish to keyroost-flatpak)" job once the Flatpak build finishes.
+      **Approve those gates promptly** — the bundle attach steps wait for
+      the Release that release.yml creates.
       The retry window is 10 minutes (v0.7.6 lost the old 2-minute window
       by 16 seconds); if it still expires, re-run the failed job once the
       Release exists — attach is idempotent (`--clobber`).
@@ -249,10 +250,12 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
 
 ## 5. Signed Windows build (out-of-band, Token2)
 
-- [ ] Ask Token2 to sign the **current** release's Windows build (never an
-      older version — it would predate shipped fixes). They deliver into
-      issue #77 as `signed_keyroost-vX.Y.Z-*.zip` attachments; macOS may
-      arrive separately from Windows, so check for both.
+- [ ] Token2 watches the releases and signs each new one's Windows build
+      on their own; nothing needs asking. Watch issue #77 for the delivery,
+      `signed_keyroost-vX.Y.Z-*.zip` attachments; macOS may arrive
+      separately from Windows, so check for both. Only ever attach a signed
+      build of the **current** release (an older one would predate shipped
+      fixes).
 - [ ] **The winget-pkgs fork sync now runs in CI** (`Sync the winget-pkgs
       fork`, non-fatal). wingetcreate submits its PR from that fork and
       cannot fast-forward it itself: `WINGET_TOKEN` is a classic PAT with

@@ -175,6 +175,15 @@ that doesn't answer is shown as two entries, not guessed at.
 
 ---
 
+## YubiKey NEO: no FIDO firmware version over the smart-card interface
+
+Yubico's old NEO Manager lists a version query for the NEO's U2F applet:
+SELECT `A0000006472F0001`, then `00 42 00 00`. Tried on a real NEO over its
+smart-card interface (2026-10): the SELECT answers `U2F_V2` with `9000`, and
+the version query answers `6D00` (instruction not supported). keyroost
+therefore doesn't use that query, and shows no FIDO firmware version for a
+NEO from it.
+
 # Thread B — Capabilities & day-to-day security uses
 
 **Goal of this thread:** for each device, build an accurate picture of what it

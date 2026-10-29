@@ -200,6 +200,9 @@ keyroostctl otp info                   # interface states &amp; slot status
 keyroostctl otp import -i export.json  # add every code in an authenticator export
 keyroostctl otp button set --digits 6                    # provision HID-HOTP (asks for the base32 seed, hidden)
 keyroostctl otp interface --fido --ccid --keyboard        # enable interfaces (re-plug after)</code></pre>
+    <p class="kr-muted">Some keys answer <code>otp info</code> with a short configuration
+      block, which doesn't include the on-device OTP and HOTP-on-touch details; keyroost
+      then shows those three rows as <em>unknown</em> rather than guessing.</p>
     <p class="kr-muted">Every <code>otp</code> subcommand accepts
       <code>--transport auto|hid|ccid</code> (default <code>auto</code>: over USB first —
       through the key's FIDO interface, using Token2's documented vendor command, then

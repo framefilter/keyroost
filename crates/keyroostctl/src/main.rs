@@ -13554,7 +13554,9 @@ fn always_uv_pre_pin_step(
 ) -> Result<AlwaysUvStep, Box<dyn std::error::Error>> {
     let step = always_uv_step(info.option("alwaysUv"), want_on)?;
     if step == AlwaysUvStep::Change && info.option("authnrCfg") != Some(true) {
-        return Err("this authenticator does not advertise authenticatorConfig support".into());
+        return Err(
+            "this key does not support authenticatorConfig (authnrCfg); nothing was changed".into(),
+        );
     }
     Ok(step)
 }
@@ -15213,7 +15215,7 @@ where
     } else if has_preview {
         keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT_PREVIEW
     } else {
-        return Err("this authenticator does not advertise fingerprint enrollment".into());
+        return Err("this key does not support fingerprint enrollment".into());
     };
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
@@ -15246,7 +15248,9 @@ where
     }
     let info = keyroost_ctap::get_info(&mut dev)?;
     if info.option("authnrCfg") != Some(true) {
-        return Err("this authenticator does not advertise authenticatorConfig support".into());
+        return Err(
+            "this key does not support authenticatorConfig (authnrCfg); nothing was changed".into(),
+        );
     }
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,

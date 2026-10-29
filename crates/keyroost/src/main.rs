@@ -2736,6 +2736,18 @@ fn job_waits_for_touch(label: &str) -> bool {
 /// when a job starts and when the last one ends.
 static KEY_WANTS_TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A job's busy label as an activity-log line: up to the ellipsis, dash or
+/// parenthesis that starts its "touch the key" hint, so "Reading OATH
+/// codes…" logs as "Reading OATH codes".
+fn job_log_text(label: &str) -> String {
+    let end = ["\u{2026}", " \u{2014} ", " ("]
+        .iter()
+        .filter_map(|cut| label.find(cut))
+        .min()
+        .unwrap_or(label.len());
+    label[..end].trim().to_string()
+}
+
 /// The busy label for deleting an Authenticator account: it asks for a touch
 /// when the applet wants one for every delete (a Nitrokey 3) or the account
 /// requires one.
@@ -5137,10 +5149,30 @@ impl App {
         if self.busy() {
             return false;
         }
+        let label: String = label.into();
+        // While "APDU trace" is on, a job whose result writes no log line (a
+        // read, a refresh) still shows its traffic: one background line named
+        // after the job, under the key it ran on, not whichever key is
+        // selected by the time it finishes.
+        let unclaimed = job_log_text(&label);
+        let ran_on = self.selected_device().map(|d| d.title().into_owned());
+        let job = move || -> ApplyFn {
+            let apply = job();
+            Box::new(move |app: &mut App| {
+                apply(app);
+                if app.pending_trace.as_ref().is_some_and(|t| !t.is_empty()) {
+                    let text = match &ran_on {
+                        Some(key) => format!("{key}: {unclaimed}"),
+                        None => unclaimed,
+                    };
+                    app.log_global(Severity::Info, LogKind::Background, text);
+                }
+            })
+        };
         match &self.worker {
             Some(worker) => {
                 self.busy_jobs += 1;
-                self.busy_label = Some(label.into());
+                self.busy_label = Some(label);
                 KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 if worker.job_tx.send(Box::new(job)).is_err() {
                     // Worker died; undo the bookkeeping so the UI doesn't hang.
@@ -7371,9 +7403,13 @@ impl App {
                     Err(TransportError::OathPasswordRejected) => {
                         app.oath.unlocked_password = None;
                         app.oath.locked = true;
+                        app.log(Severity::Err, "Authenticator: wrong password");
                         app.oath.error = Some("wrong OATH password".into());
                     }
-                    Err(e) => app.oath.error = Some(e.to_string()),
+                    Err(e) => {
+                        app.log(Severity::Err, format!("Authenticator: {e}"));
+                        app.oath.error = Some(e.to_string());
+                    }
                 }
             })
         });
@@ -7444,6 +7480,7 @@ impl App {
             Err(TransportError::OathPasswordRejected) => {
                 app.oath.unlocked_password = None;
                 app.oath.locked = true;
+                app.log(Severity::Err, "Authenticator: wrong password");
                 // The add modal already shows this; don't double-report when it
                 // is the one that failed.
                 if !modal_busy {
@@ -7451,6 +7488,7 @@ impl App {
                 }
             }
             Err(e) => {
+                app.log(Severity::Err, format!("Authenticator: {e}"));
                 // A transport error says nothing about the password; keep any
                 // retained copy so a transient failure doesn't force a retype.
                 if !modal_busy {
@@ -7583,6 +7621,9 @@ impl App {
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     if result.is_ok() {
                         app.oath.delete_asks_touch = asks;
+                        if refused.is_none() {
+                            app.log(Severity::Ok, "Authenticator account added");
+                        }
                     }
                     Self::apply_oath_rows(app, result, password);
                     if let Some(why) = refused.filter(|_| app.oath.add.open) {
@@ -7619,6 +7660,7 @@ impl App {
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     if result.is_ok() {
                         app.oath.delete_asks_touch = asks;
+                        app.log(Severity::Ok, "Authenticator account deleted");
                     }
                     Self::apply_oath_rows(app, result, password);
                 }
@@ -7885,12 +7927,16 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
+                        app.log(Severity::Ok, "Authenticator reset");
                         // Fresh state: the applet is now empty and unprotected;
                         // clearing oath_tried lets the pane re-list on its own.
                         app.oath = OathState::default();
                         app.oath_tried = false;
                     }
-                    Err(e) => app.oath.error = Some(format!("reset failed: {e}")),
+                    Err(e) => {
+                        app.log(Severity::Err, format!("Authenticator reset failed: {e}"));
+                        app.oath.error = Some(format!("reset failed: {e}"));
+                    }
                 }
             })
         });
@@ -17084,7 +17130,14 @@ impl App {
                 // flip it, and the very next device operation's trace
                 // shows up under its log entry.
                 let mut trace_on = app.apdu_trace.load(std::sync::atomic::Ordering::Relaxed);
-                if ui.checkbox(&mut trace_on, "APDU trace").changed() {
+                if ui
+                    .checkbox(&mut trace_on, "APDU trace")
+                    .on_hover_text(
+                        "Record the exact traffic with the key under each entry. \
+                         While it's on, every read and refresh gets an entry too.",
+                    )
+                    .changed()
+                {
                     app.apdu_trace
                         .store(trace_on, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -29470,6 +29523,63 @@ mod tests {
         );
     }
 
+    /// With "APDU trace" on, a job whose result writes no log line still gets
+    /// one, named after the job and carrying its trace; a job that logs claims
+    /// its own trace; with nothing captured there's no extra line.
+    #[test]
+    fn a_traced_job_that_logs_nothing_gets_a_line_of_its_own() {
+        // No worker: jobs run inline.
+        let mut app = App {
+            pending_trace: Some(vec!["> 00a4".into()]),
+            ..Default::default()
+        };
+        app.spawn_job("Reading OATH codes\u{2026}", || Box::new(|_: &mut App| {}));
+        let last = app.log.last().expect("a line for the trace");
+        assert_eq!(last.text, "Reading OATH codes");
+        assert!(matches!(last.kind, LogKind::Background));
+        assert_eq!(last.trace.as_deref(), Some(&["> 00a4".to_string()][..]));
+        assert!(app.pending_trace.is_none());
+
+        let n = app.log.len();
+        app.pending_trace = Some(vec!["> 00a4".into()]);
+        app.spawn_job("Deleting OTP entry\u{2026}", || {
+            Box::new(|app: &mut App| app.log(Severity::Ok, "OTP entry deleted"))
+        });
+        assert_eq!(app.log.len(), n + 1);
+        assert_eq!(app.log[n].text, "OTP entry deleted");
+        assert!(app.log[n].trace.is_some());
+
+        app.spawn_job("Scanning for devices\u{2026}", || {
+            Box::new(|_: &mut App| {})
+        });
+        assert_eq!(app.log.len(), n + 1);
+    }
+
+    /// The automatic line drops the busy label's ellipsis and touch hint.
+    #[test]
+    fn job_log_text_drops_the_ellipsis_and_touch_hints() {
+        assert_eq!(
+            job_log_text("Reading OATH codes\u{2026}"),
+            "Reading OATH codes"
+        );
+        assert_eq!(
+            job_log_text("Deleting credential \u{2014} touch the key if it blinks\u{2026}"),
+            "Deleting credential"
+        );
+        assert_eq!(
+            job_log_text("Generating key\u{2026} (touch the key if it blinks)"),
+            "Generating key"
+        );
+        assert_eq!(
+            job_log_text("Writing profile #3\u{2026}"),
+            "Writing profile #3"
+        );
+        assert_eq!(
+            job_log_text("Resetting key\u{2026} (touch now)"),
+            "Resetting key"
+        );
+    }
+
     /// With no worker (the default), a job runs inline so headless tests and any
     /// non-GUI use still apply results.
     #[test]
@@ -30703,6 +30813,36 @@ mod tests {
         // Shown only while its window lasts.
         assert_eq!(touched().code_at(start + 59), Some("123456"));
         assert_eq!(touched().code_at(start + 60), None);
+    }
+
+    /// An Authenticator listing that fails writes an activity-log line, in
+    /// the modal and the pane alike; one that succeeds writes none (a read).
+    #[test]
+    fn a_failed_authenticator_listing_is_logged() {
+        let mut app = App::default();
+        App::apply_oath_rows(
+            &mut app,
+            Ok((vec![OathRow::new("x".into(), None, false)], 0)),
+            zeroize::Zeroizing::new(String::new()),
+        );
+        assert!(app.log.is_empty());
+        App::apply_oath_rows(
+            &mut app,
+            Err(TransportError::OathPasswordRejected),
+            zeroize::Zeroizing::new(String::new()),
+        );
+        app.oath.add = OathAddDialog::opened();
+        app.oath.add.busy = true;
+        App::apply_oath_rows(
+            &mut app,
+            Err(TransportError::OathCredentialTooLong),
+            zeroize::Zeroizing::new(String::new()),
+        );
+        let lines: Vec<&str> = app.log.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "Authenticator: wrong password");
+        assert!(lines[1].starts_with("Authenticator: OATH credential name"));
+        assert!(app.log.iter().all(|l| matches!(l.severity, Severity::Err)));
     }
 
     #[test]

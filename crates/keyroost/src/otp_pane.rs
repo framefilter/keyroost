@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use keyroost_transport::{OtpTransportError, Token2OtpSession};
 
 use crate::ui::theme::{self, BtnKind, Palette};
-use crate::{wipe, App};
+use crate::{wipe, App, Severity};
 
 /// Which transport the OTP pane should use. Mirrors the CLI `--transport` flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -449,6 +449,20 @@ pub(crate) fn totp_capability(info: Option<&keyroost_token2otp::DeviceInfo>) -> 
 }
 
 impl App {
+    /// An OTP job's success: shown in the pane and written to the activity
+    /// log.
+    fn otp_done(&mut self, msg: String) {
+        self.log(Severity::Ok, msg.trim_end_matches('.').to_string());
+        self.otp.info = Some(msg);
+    }
+
+    /// An OTP job's failure: shown in the pane and written to the activity
+    /// log.
+    fn otp_failed(&mut self, err: String) {
+        self.log(Severity::Err, format!("OTP: {err}"));
+        self.otp.error = Some(err);
+    }
+
     /// Resolve the OTP endpoint for the current selection + transport choice.
     /// `Err` when nothing is selected or the selection can't satisfy the pick.
     fn otp_target(&self) -> Result<OtpTarget, String> {
@@ -509,7 +523,7 @@ impl App {
                     // Touch failed / wrong finger: keep the prompt up with the
                     // message; the user can retry the sensor or type the PIN.
                     Err(e) => {
-                        app.otp.error = Some(e.to_string());
+                        app.otp_failed(e.to_string());
                         app.otp.pin_required = true;
                         app.otp.loaded = true;
                     }
@@ -752,7 +766,7 @@ impl App {
                                 app.otp.pin = None;
                                 app.otp.pin_required = true;
                             }
-                            app.otp.error = Some(e.to_string());
+                            app.otp_failed(e.to_string());
                             app.otp.loaded = true;
                         }
                     }
@@ -829,10 +843,10 @@ impl App {
                 match result {
                     Ok(()) => {
                         app.otp.add = OtpAddDialog::default();
-                        app.otp.info = Some("OTP entry added.".into());
+                        app.otp_done("OTP entry added.".into());
                         app.load_otp_entries();
                     }
-                    Err(e) => app.otp.error = Some(e.to_string()),
+                    Err(e) => app.otp_failed(e.to_string()),
                 }
             })
         });
@@ -888,12 +902,12 @@ impl App {
                 match result {
                     Ok(()) => {
                         app.otp.button_hotp = ButtonHotpDialog::default();
-                        app.otp.info = Some("Touch HOTP configured.".into());
+                        app.otp_done("Touch HOTP configured.".into());
                         // Re-read the config so the "seed configured" status and
                         // the settings-only editor reflect the new slot.
                         app.load_otp_entries();
                     }
-                    Err(e) => app.otp.error = Some(e.to_string()),
+                    Err(e) => app.otp_failed(e.to_string()),
                 }
             })
         });
@@ -950,14 +964,14 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
-                        app.otp.info = Some(
+                        app.otp_done(
                             "Interface updated. Re-plug the key for the change to take effect."
                                 .into(),
                         );
                         // Reflect the change locally; a refresh re-reads from hardware.
                         app.otp.iface = Some(next);
                     }
-                    Err(e) => app.otp.error = Some(e),
+                    Err(e) => app.otp_failed(e),
                 }
             })
         });
@@ -985,10 +999,10 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
-                        app.otp.info = Some("Touch HOTP cleared.".into());
+                        app.otp_done("Touch HOTP cleared.".into());
                         app.load_otp_entries();
                     }
-                    Err(e) => app.otp.error = Some(e.to_string()),
+                    Err(e) => app.otp_failed(e.to_string()),
                 }
             })
         });
@@ -1024,10 +1038,10 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
-                        app.otp.info = Some("OTP entry deleted.".into());
+                        app.otp_done("OTP entry deleted.".into());
                         app.load_otp_entries();
                     }
-                    Err(e) => app.otp.error = Some(e.to_string()),
+                    Err(e) => app.otp_failed(e.to_string()),
                 }
             })
         });
@@ -1082,8 +1096,8 @@ impl App {
                 app.otp.pin_required = true;
                 app.otp.rows.clear();
                 match result {
-                    Ok(()) => app.otp.info = Some("OTP PIN locked.".into()),
-                    Err(e) => app.otp.error = Some(e.to_string()),
+                    Ok(()) => app.otp_done("OTP PIN locked.".into()),
+                    Err(e) => app.otp_failed(e.to_string()),
                 }
             })
         });
@@ -1123,13 +1137,13 @@ impl App {
                 match result {
                     Ok(()) => {
                         app.otp.fp_enabled = Some(enable);
-                        app.otp.info = Some(if enable {
+                        app.otp_done(if enable {
                             "Fingerprint unlock enabled.".into()
                         } else {
                             "Fingerprint unlock disabled.".into()
                         });
                     }
-                    Err(e) => app.otp.error = Some(e.to_string()),
+                    Err(e) => app.otp_failed(e.to_string()),
                 }
             })
         });
@@ -1199,23 +1213,23 @@ impl App {
                             PinDialogKind::Set => {
                                 app.otp.pin = new_pin.clone();
                                 app.otp.pin_set = Some(true);
-                                app.otp.info = Some("OTP PIN set.".into());
+                                app.otp_done("OTP PIN set.".into());
                             }
                             PinDialogKind::Change => {
                                 app.otp.pin = new_pin.clone();
                                 app.otp.pin_set = Some(true);
-                                app.otp.info = Some("OTP PIN changed.".into());
+                                app.otp_done("OTP PIN changed.".into());
                             }
                             PinDialogKind::Remove => {
                                 app.otp.pin = None;
                                 app.otp.pin_set = Some(false);
                                 app.otp.pin_required = false;
-                                app.otp.info = Some("OTP PIN removed.".into());
+                                app.otp_done("OTP PIN removed.".into());
                             }
                         }
                         app.load_otp_entries();
                     }
-                    Err(e) => app.otp.error = Some(e.to_string()),
+                    Err(e) => app.otp_failed(e.to_string()),
                 }
             })
         });
@@ -1357,9 +1371,9 @@ impl App {
                         app.otp.touch_codes.insert(key, code);
                     }
                     Ok(None) => {
-                        app.otp.error = Some("the key did not return a code".into());
+                        app.otp_failed("the key did not return a code".into());
                     }
-                    Err(e) => app.otp.error = Some(e),
+                    Err(e) => app.otp_failed(e),
                 }
             })
         });
@@ -1395,14 +1409,14 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
-                        app.otp.info = Some("Touch HOTP options updated.".into());
+                        app.otp_done("Touch HOTP options updated.".into());
                         if let Some(st) = app.otp.button_hotp_status.as_mut() {
                             st.send_enter = send_enter;
                             st.long_touch = long_touch;
                             st.numpad = numpad;
                         }
                     }
-                    Err(e) => app.otp.error = Some(e),
+                    Err(e) => app.otp_failed(e),
                 }
             })
         });
@@ -1432,10 +1446,10 @@ impl App {
                     }
                     match result {
                         Ok(()) => {
-                            app.otp.info = Some("All OTP entries erased.".into());
+                            app.otp_done("All OTP entries erased.".into());
                             app.load_otp_entries();
                         }
-                        Err(e) => app.otp.error = Some(e.to_string()),
+                        Err(e) => app.otp_failed(e.to_string()),
                     }
                 })
             },
@@ -2436,6 +2450,32 @@ mod tests {
     fn auto_falls_back_to_reader_when_no_hid() {
         let t = otp_target_for(OtpTransportSel::Auto, None, Some("Acme CCID 00"));
         assert_eq!(t, Ok(OtpTarget::Reader("Acme CCID 00".into())));
+    }
+
+    /// An OTP job's outcome shows in the pane and in the activity log; a
+    /// failure is logged as one.
+    #[test]
+    fn otp_results_are_logged() {
+        let mut app = App::default();
+        app.otp_done("OTP entry deleted.".into());
+        assert_eq!(app.otp.info.as_deref(), Some("OTP entry deleted."));
+        app.otp_failed("the key did not return a code".into());
+        assert_eq!(
+            app.otp.error.as_deref(),
+            Some("the key did not return a code")
+        );
+        let texts: Vec<(&str, bool)> = app
+            .log
+            .iter()
+            .map(|l| (l.text.as_str(), matches!(l.severity, Severity::Err)))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("OTP entry deleted", false),
+                ("OTP: the key did not return a code", true)
+            ]
+        );
     }
 
     #[test]

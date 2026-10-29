@@ -388,12 +388,13 @@ unset PIV_MGMT PIV_PIN   # clear the secrets when you're done</code></pre>
       reads the negotiated protocol and chains large commands from the start on T=0 links, so
       this no longer happens.</p>
     <p class="kr-muted">The desktop app's <strong>activity log</strong> (opened from the top
-      bar, and detachable into its own window) lists every action, distinguishing what you
-      triggered from background reads. Turn on its <strong>APDU trace</strong> checkbox before
-      an operation to have it also record the exact commands and responses exchanged with the
-      card — the same detail <code>--debug</code> prints on the CLI — with
-      <strong>Clear</strong> to empty the log and <strong>Copy</strong> to take a trace
-      elsewhere.</p>
+      bar, and detachable into its own window) lists every change and every error, in every
+      tab, distinguishing what you triggered from background reads. Turn on its
+      <strong>APDU trace</strong> checkbox before an operation to have it also record the
+      exact commands and responses exchanged with the key — the same detail
+      <code>--debug</code> prints on the CLI — and, while it's on, to give every read and
+      refresh an entry of its own. <strong>Clear</strong> empties the log and
+      <strong>Copy</strong> takes a trace elsewhere, for example into a bug report.</p>
   </section>
 
   <section class="kr-section kr-res-section">
