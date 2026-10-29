@@ -7848,9 +7848,22 @@ impl App {
             let mut asks = false;
             // The account was deleted, whatever the re-list after it says.
             let mut wrote = false;
+            // The account was no longer on the key, so nothing was sent.
+            let mut gone = false;
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
                 asks = session.asks_touch_to_delete();
+                // An account deleted elsewhere since this list was read isn't
+                // sent: key families answer a missing name differently (a
+                // YubiKey refuses it, a Solo 2 reports success).
+                if session.list().is_ok_and(|l| l.lacks(&cred_name)) {
+                    gone = true;
+                    return Self::oath_list_rows(&mut session, &touch);
+                }
+                // The listing was a command since the unlock; an applet that
+                // keeps its unlock for one command only (a password-protected
+                // Solo 2) would refuse the delete. Unlock again first.
+                session.reauthenticate()?;
                 session.delete(&cred_name)?;
                 wrote = true;
                 Self::oath_list_rows(&mut session, &touch)
@@ -7864,6 +7877,12 @@ impl App {
                 }
                 if wrote {
                     app.log(Severity::Ok, "Authenticator account deleted");
+                }
+                if gone {
+                    app.log(
+                        Severity::Warn,
+                        "Authenticator account was no longer on the key; nothing was deleted",
+                    );
                 }
                 match &result {
                     Ok(_) => app.oath.delete_asks_touch = asks,

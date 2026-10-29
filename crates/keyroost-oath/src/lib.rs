@@ -870,6 +870,20 @@ pub struct Listing {
     pub touch_required: Vec<String>,
 }
 
+impl Listing {
+    /// True when `name` is known not to be on the card: the listing is
+    /// complete (it skipped nothing it couldn't decode) and has no credential
+    /// by that name. A partial listing can't say, so this is `false` and the
+    /// card answers for itself. Checked before anything that names an
+    /// account is sent, so every applet gives the same answer: a YubiKey
+    /// refuses a missing name with `6984`, while a Solo 2 reports success for
+    /// a delete of one.
+    #[must_use]
+    pub fn lacks(&self, name: &str) -> bool {
+        self.skipped == 0 && !self.credentials.iter().any(|c| c.name == name)
+    }
+}
+
 /// Parse a `LIST` response into credential entries.
 ///
 /// The response is a sequence of `NAME_LIST` (`0x72`) TLVs; each value is
@@ -1704,6 +1718,24 @@ mod tests {
         let info3 = parse_select(&buf3).unwrap();
         assert!(!info3.password_required());
         assert!(info3.challenge.is_none());
+    }
+
+    /// An account is missing only by a complete listing; a listing that
+    /// skipped entries it couldn't decode can't say, so the card answers.
+    #[test]
+    fn a_complete_listing_says_which_names_it_lacks() {
+        let listing = |skipped| Listing {
+            credentials: vec![CredentialInfo {
+                name: "GitHub:alice".into(),
+                oath_type: OathType::Totp,
+                algorithm: Algorithm::Sha1,
+            }],
+            skipped,
+            touch_required: Vec::new(),
+        };
+        assert!(!listing(0).lacks("GitHub:alice"));
+        assert!(listing(0).lacks("GitHub:bob"));
+        assert!(!listing(1).lacks("GitHub:bob"));
     }
 
     #[test]
