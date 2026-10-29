@@ -8287,14 +8287,21 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| e.to_string())?
                 .as_secs();
+            // An applet that keeps its unlock for one command only (a
+            // password-protected Solo 2) needs it again before each command
+            // after the listing; without a password this sends nothing.
             // CALCULATE ALL never computes an HOTP code, so it can't advance
             // the counter; here it only says whether the account needs a touch.
-            let all = (!is_hotp)
-                .then(|| session.calculate_all(now).ok())
-                .flatten();
+            let all = if is_hotp {
+                None
+            } else {
+                session.reauthenticate()?;
+                session.calculate_all(now).ok()
+            };
             if oath_needs_touch(&listing, all.as_ref(), name) {
                 crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
             }
+            session.reauthenticate()?;
             let code = if is_hotp {
                 session.calculate_hotp(name)?
             } else {

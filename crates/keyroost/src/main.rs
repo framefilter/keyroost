@@ -7579,8 +7579,16 @@ impl App {
             "Reading code\u{2026}"
         };
         self.spawn_job(label, move || {
-            let result = (|| -> Result<(String, Option<u64>), TransportError> {
+            // `Ok(None)`: the account is no longer on the key (deleted
+            // elsewhere since the list was read), so nothing was asked.
+            let result = (|| -> Result<Option<(String, Option<u64>)>, TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
+                if session.list().is_ok_and(|l| l.lacks(&cred)) {
+                    return Ok(None);
+                }
+                // The check was a command since the unlock; an applet that
+                // keeps its unlock for one command only needs it again.
+                session.reauthenticate()?;
                 match totp_period {
                     Some(period) => {
                         let now = SystemTime::now()
@@ -7589,9 +7597,9 @@ impl App {
                             .unwrap_or(0);
                         let (at, until) = oath_touch_read_window(now, u64::from(period));
                         let code = session.calculate_totp(&cred, at, period)?.code;
-                        Ok((code, Some(until)))
+                        Ok(Some((code, Some(until))))
                     }
-                    None => Ok((session.calculate_hotp(&cred)?.code, None)),
+                    None => Ok(Some((session.calculate_hotp(&cred)?.code, None))),
                 }
             })();
             Box::new(move |app: &mut App| {
@@ -7602,7 +7610,7 @@ impl App {
                 // apply_oath_rows).
                 wipe(&mut app.oath.password_input);
                 match result {
-                    Ok((code, valid_until)) => {
+                    Ok(Some((code, valid_until))) => {
                         // This password worked (or none was needed): retain it,
                         // like a successful listing does.
                         app.oath.unlocked_password = Some(password);
@@ -7610,6 +7618,16 @@ impl App {
                             row.code = Some(code);
                             row.valid_until = valid_until;
                         }
+                    }
+                    Ok(None) => {
+                        app.oath.unlocked_password = Some(password);
+                        app.log(
+                            Severity::Warn,
+                            "Authenticator account was no longer on the key",
+                        );
+                        // Re-list first: it clears the pane's error as it starts.
+                        app.load_oath_creds();
+                        app.oath.error = Some("That account is no longer on the key.".into());
                     }
                     Err(e) => {
                         if let Some(line) = oath_failure_line(&e, !password.is_empty()) {
@@ -7906,16 +7924,18 @@ impl App {
                 // An account deleted elsewhere since this list was read isn't
                 // sent: key families answer a missing name differently (a
                 // YubiKey refuses it, a Solo 2 reports success).
+                // An applet that keeps its unlock for one command only (a
+                // password-protected Solo 2) needs it again after each
+                // command here: the check, the delete, the re-list.
                 if session.list().is_ok_and(|l| l.lacks(&cred_name)) {
                     gone = true;
+                    session.reauthenticate()?;
                     return Self::oath_list_rows(&mut session, &touch);
                 }
-                // The listing was a command since the unlock; an applet that
-                // keeps its unlock for one command only (a password-protected
-                // Solo 2) would refuse the delete. Unlock again first.
                 session.reauthenticate()?;
                 session.delete(&cred_name)?;
                 wrote = true;
+                session.reauthenticate()?;
                 Self::oath_list_rows(&mut session, &touch)
             })();
             Box::new(move |app: &mut App| {
