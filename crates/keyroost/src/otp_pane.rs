@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use keyroost_transport::{OtpTransportError, Token2OtpSession};
 
 use crate::ui::theme::{self, BtnKind, Palette};
-use crate::{wipe, App, Severity};
+use crate::{wipe, App, Severity, TypedSecrets};
 
 /// Which transport the OTP pane should use. Mirrors the CLI `--transport` flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -175,10 +175,27 @@ impl Default for OtpAddDialog {
     }
 }
 
+impl TypedSecrets for OtpAddDialog {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            open: _,
+            app_name: _,
+            account_name: _,
+            secret,
+            totp: _,
+            sha256: _,
+            digits: _,
+            period: _,
+            require_touch: _,
+        } = self;
+        vec![secret]
+    }
+}
+
 // Wipe the typed seed on drop (the form is replaced wholesale after submit).
 impl Drop for OtpAddDialog {
     fn drop(&mut self) {
-        wipe(&mut self.secret);
+        self.wipe_typed();
     }
 }
 
@@ -211,9 +228,23 @@ impl Default for ButtonHotpDialog {
     }
 }
 
+impl TypedSecrets for ButtonHotpDialog {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            open: _,
+            secret,
+            digits: _,
+            send_enter: _,
+            long_touch: _,
+            numpad: _,
+        } = self;
+        vec![secret]
+    }
+}
+
 impl Drop for ButtonHotpDialog {
     fn drop(&mut self) {
-        wipe(&mut self.secret);
+        self.wipe_typed();
     }
 }
 
@@ -281,12 +312,22 @@ pub struct PinDialog {
     pub confirm: String,
 }
 
+impl TypedSecrets for PinDialog {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            kind_set: _,
+            kind_remove: _,
+            current,
+            new,
+            confirm,
+        } = self;
+        vec![current, new, confirm]
+    }
+}
+
 impl Drop for PinDialog {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.current.zeroize();
-        self.new.zeroize();
-        self.confirm.zeroize();
+        self.wipe_typed();
     }
 }
 
@@ -401,6 +442,18 @@ pub struct OtpState {
     pub button_hotp_status: Option<ButtonHotpStatus>,
 }
 
+impl TypedSecrets for OtpState {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let mut out = vec![&mut self.pin_input];
+        out.extend(self.add.secrets_mut());
+        out.extend(self.button_hotp.secrets_mut());
+        if let Some(d) = self.pin_dialog.as_mut() {
+            out.extend(d.secrets_mut());
+        }
+        out
+    }
+}
+
 impl Drop for OtpState {
     /// Scrub the PIN entry buffer when the pane state is torn down — which is
     /// what a device switch does (`self.otp = OtpState::default()`), so a PIN
@@ -408,7 +461,7 @@ impl Drop for OtpState {
     /// The `pin` field is `Zeroizing` and wipes itself; `pin_input` is a plain
     /// `String` because egui edits it in place, so it needs this.
     fn drop(&mut self) {
-        wipe(&mut self.pin_input);
+        self.wipe_typed();
     }
 }
 

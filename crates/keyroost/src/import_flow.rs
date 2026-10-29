@@ -513,6 +513,12 @@ pub struct ImportDialog {
     pub molto_armed_on: Option<Option<DeviceId>>,
 }
 
+impl crate::TypedSecrets for ImportDialog {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        vec![&mut self.file_password, &mut self.dest_secret]
+    }
+}
+
 impl Drop for ImportDialog {
     fn drop(&mut self) {
         self.close();
@@ -546,8 +552,7 @@ impl ImportDialog {
         self.open = false;
         // A preview still waiting for the worker never starts for a closed dialog.
         self.preview_wanted = false;
-        wipe(&mut self.file_password);
-        wipe(&mut self.dest_secret);
+        crate::TypedSecrets::wipe_typed(self);
         self.file = None;
         self.existing = None;
         self.report = None;

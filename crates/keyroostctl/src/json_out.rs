@@ -230,12 +230,15 @@ pub(crate) struct PivStatusJson {
     /// (The plain-text `piv info` output does apply that fallback —
     /// see `run_piv`.)
     pub applet_name: String,
-    /// The applet's own firmware version, dotted (same formatting as
+    /// The key's own firmware version, dotted (same formatting as
     /// `version`), when a specific fingerprint's probe discovered one —
     /// currently `Trussed::Nitrokey` (Trussed's admin application) only.
     /// Not necessarily equal to `version`, which is the PIV applet's own
     /// version. `None` when no such probe applies or it found nothing
-    /// parseable.
+    /// parseable. Named like `fido --json info`'s `firmware`.
+    pub firmware: Option<String>,
+    /// Retired name for `firmware`, same value; kept so scripts written
+    /// before 0.16 still read it.
     pub version_firmware: Option<String>,
 }
 
@@ -953,6 +956,7 @@ mod tests {
             ("slots", "array"),
             ("applet_fingerprint", "string"),
             ("applet_name", "string"),
+            ("firmware", "string|null"),
             ("version_firmware", "string|null"),
         ];
         for some in [true, false] {
@@ -971,6 +975,7 @@ mod tests {
                 slots: vec![],
                 applet_fingerprint: "YubiKey".into(),
                 applet_name: String::new(),
+                firmware: some.then(|| "1.0.0".to_string()),
                 version_firmware: some.then(|| "1.0.0".to_string()),
             });
             assert_shape(&v, &shape);

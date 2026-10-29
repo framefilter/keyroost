@@ -9906,6 +9906,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let retired = read_retired_slots(session);
 
                     if json_output() {
+                        let firmware = status
+                            .version_firmware
+                            .as_deref()
+                            .map(keyroost_piv::format_version_bytes);
                         emit_json(&json_out::PivStatusJson {
                             version: status
                                 .version
@@ -9937,10 +9941,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 .collect(),
                             applet_fingerprint: status.applet_fingerprint.to_string(),
                             applet_name: status.applet_name.clone(),
-                            version_firmware: status
-                                .version_firmware
-                                .as_deref()
-                                .map(keyroost_piv::format_version_bytes),
+                            version_firmware: firmware.clone(),
+                            firmware,
                         })?;
                         return Ok(());
                     }
@@ -23979,6 +23981,7 @@ mod cli_tests {
             }],
             applet_fingerprint: "YubiKey".into(),
             applet_name: "YubiKey".into(),
+            firmware: Some("3.35.0".into()),
             version_firmware: Some("3.35.0".into()),
         };
         assert_json_has_keys(
@@ -23992,6 +23995,7 @@ mod cli_tests {
                 "slots",
                 "applet_fingerprint",
                 "applet_name",
+                "firmware",
                 "version_firmware",
             ],
         );

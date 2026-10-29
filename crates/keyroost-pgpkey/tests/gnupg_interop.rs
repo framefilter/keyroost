@@ -40,7 +40,53 @@ impl Home {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir(&p).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The agent's own log, printed if a step fails (see `Home::ok`).
+        std::fs::write(
+            p.join("gpg-agent.conf"),
+            format!(
+                "log-file {}\ndebug-level basic\n",
+                p.join("agent.log").display()
+            ),
+        )
+        .unwrap();
         Home(p)
+    }
+
+    /// [`ok`], plus what's needed to understand a failure that doesn't
+    /// reproduce: the gpg version, the agent's log, and the exported key set
+    /// when this home has one (`sec.asc`; a throwaway key under the test's
+    /// own passphrase), so the failing key can be replayed.
+    fn ok(&self, o: &Output, what: &str) -> String {
+        if !o.status.success() {
+            let version = Command::new("gpg")
+                .arg("--version")
+                .output()
+                .map(|v| {
+                    String::from_utf8_lossy(&v.stdout)
+                        .lines()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default();
+            let log = std::fs::read_to_string(self.file("agent.log")).unwrap_or_default();
+            let tail: Vec<&str> = log
+                .lines()
+                .rev()
+                .take(80)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let key = std::fs::read_to_string(self.file("sec.asc")).unwrap_or_default();
+            panic!(
+                "{what} failed:\n{}\n{}\n--- {version}\n--- agent log (tail):\n{}\n--- key set:\n{key}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr),
+                tail.join("\n"),
+            );
+        }
+        String::from_utf8_lossy(&o.stdout).into_owned()
     }
 
     fn file(&self, name: &str) -> PathBuf {
@@ -190,11 +236,11 @@ fn our_export_works_in_gpg(t: KeyType) {
     let home = Home::new(t.cli_name());
     let h = &home.0;
     let sec = home.write("sec.asc", out.secret.as_bytes());
-    ok(&gpg(h, &["--import", &sec], Some(PASS)), "import");
+    home.ok(&gpg(h, &["--import", &sec], Some(PASS)), "import");
     let fprs: Vec<String> = set.parts.iter().map(|p| hex(&p.fingerprint())).collect();
 
     // Every self-signature and binding verifies in gpg.
-    let o = ok(
+    let o = home.ok(
         &gpg(h, &["--with-colons", "--check-sigs", &fprs[0]], None),
         "check-sigs",
     );
@@ -205,7 +251,7 @@ fn our_export_works_in_gpg(t: KeyType) {
     }
 
     // Usages and expiry as written.
-    let o = ok(
+    let o = home.ok(
         &gpg(h, &["--with-colons", "--list-secret-keys", &fprs[0]], None),
         "list-secret-keys",
     );
@@ -227,7 +273,7 @@ fn our_export_works_in_gpg(t: KeyType) {
     let sig = home.file("data.sig");
     let sig = sig.to_str().unwrap();
     let signer = format!("{}!", fprs[0]);
-    ok(
+    home.ok(
         &gpg(
             h,
             &["--local-user", &signer, "-o", sig, "--detach-sign", &data],
@@ -235,7 +281,7 @@ fn our_export_works_in_gpg(t: KeyType) {
         ),
         "detach-sign",
     );
-    let o = ok(
+    let o = home.ok(
         &gpg(h, &["--status-fd", "1", "--verify", sig, &data], None),
         "verify",
     );
@@ -269,11 +315,11 @@ fn our_export_works_in_gpg(t: KeyType) {
         eprintln!("this gpg can't encrypt to secp256k1; skipping encrypt/decrypt");
         return;
     }
-    let o = ok(&enc, "encrypt");
+    let o = home.ok(&enc, "encrypt");
     assert!(o.contains("END_ENCRYPTION"), "{t:?}: {o}");
     let plain = home.file("plain.txt");
     let plain_s = plain.to_str().unwrap();
-    let o = ok(
+    let o = home.ok(
         &gpg(
             h,
             &["--yes", "--status-fd", "1", "-o", plain_s, "--decrypt", msg],
