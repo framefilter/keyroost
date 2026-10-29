@@ -1021,6 +1021,12 @@ impl App {
 
     /// Apply a preview to the dialog it was read for.
     fn import_set_preview(&mut self, id: u64, dest: &DestKey, preview: Preview) {
+        let name = self
+            .import_device(&dest.device)
+            .map(|d| d.title().into_owned())
+            .unwrap_or_default();
+        // A read that failed, logged once the dialog is updated.
+        let mut failed: Option<String> = None;
         let Some(d) = self.import_flow.dialog.as_mut() else {
             return;
         };
@@ -1049,8 +1055,16 @@ impl App {
             }
             Preview::Failed(e) => {
                 d.existing = None;
+                failed = Some(e.clone());
                 d.dest_error = Some(e);
             }
+        }
+        if let Some(e) = failed {
+            self.log_global(
+                Severity::Err,
+                LogKind::Background,
+                format!("{name}: import: couldn't read the key: {e}"),
+            );
         }
     }
 
@@ -1175,6 +1189,8 @@ impl App {
         } else {
             format!("Adding codes to {}\u{2026}", dev.title())
         };
+        // The trace line names the destination, which may not be the selected key.
+        let on = dest.device.clone();
         let queued = match dest.store {
             StoreKind::Molto2 => {
                 if !self.authenticated {
@@ -1188,7 +1204,7 @@ impl App {
                     self.import_add_refused("The Molto2 isn't ready yet; try again in a moment.");
                     return;
                 };
-                self.spawn_job(label, move || {
+                self.spawn_job_on(Some(&on), label, move || {
                     let mut on_progress = on_progress;
                     let report = {
                         let mut store =
@@ -1225,7 +1241,7 @@ impl App {
                 };
                 let pw = oath_pw;
                 let vendor = dev.vendor.clone();
-                self.spawn_job(label, move || {
+                self.spawn_job_on(Some(&on), label, move || {
                     let mut on_progress = on_progress;
                     let added = (|| {
                         let mut s = match keyroost_transport::OathSession::open(&reader) {
@@ -1281,7 +1297,7 @@ impl App {
                     }
                 };
                 let pin = otp_pin;
-                self.spawn_job(label, move || {
+                self.spawn_job_on(Some(&on), label, move || {
                     let mut on_progress = on_progress;
                     let added = (|| {
                         let mut s = match target.open() {
@@ -1348,6 +1364,27 @@ impl App {
                     StoreKind::Molto2 => {}
                 }
             }
+        }
+        // The other outcomes wrote nothing; the log says so as well as the
+        // dialog.
+        let nothing = match &added {
+            Added::Done(..) => None,
+            Added::Changed(..) => Some((
+                Severity::Warn,
+                "the codes on the key changed; nothing was written".to_string(),
+            )),
+            Added::Locked => Some((
+                Severity::Warn,
+                "the key is locked; nothing was written".to_string(),
+            )),
+            Added::Refused(e) => Some((
+                Severity::Err,
+                format!("the key didn't accept that; nothing was written: {e}"),
+            )),
+            Added::Failed(e) => Some((Severity::Err, format!("nothing was written: {e}"))),
+        };
+        if let Some((sev, what)) = nothing {
+            self.log_global(sev, LogKind::User, format!("{name}: import: {what}"));
         }
         let Some(d) = self.import_flow.dialog.as_mut() else {
             return;

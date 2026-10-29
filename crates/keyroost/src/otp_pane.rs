@@ -352,6 +352,9 @@ pub struct OtpState {
     /// Set when the last read reported the key is PIN-protected and no valid PIN
     /// has been entered yet — drives the unlock prompt instead of the list.
     pub pin_required: bool,
+    /// A PIN was just submitted, so the next listing's failure is the user's
+    /// attempt (a full log line), not an automatic refresh's.
+    pub pin_submitted: bool,
     /// The verified PIN for the current selection, reused across refreshes so the
     /// user isn't re-prompted every reload. Cleared when the device changes.
     pub pin: Option<zeroize::Zeroizing<String>>,
@@ -576,6 +579,7 @@ impl App {
         // thread and is dropped there, so a plain clone would leave the PIN in
         // that thread's heap with nothing left to wipe it.
         let pin: Option<zeroize::Zeroizing<String>> = self.otp.pin.clone();
+        let submitted = std::mem::take(&mut self.otp.pin_submitted);
         self.spawn_job("Reading OTP entries\u{2026}", move || {
             let result =
                 (|| -> Result<OtpLoad, OtpTransportError> {
@@ -773,7 +777,11 @@ impl App {
                                 app.otp.pin = None;
                                 app.otp.pin_required = true;
                             }
-                            app.otp_read_failed(e.to_string());
+                            if submitted {
+                                app.otp_failed(e.to_string());
+                            } else {
+                                app.otp_read_failed(e.to_string());
+                            }
                             app.otp.loaded = true;
                         }
                     }
@@ -1859,6 +1867,7 @@ impl App {
                 wipe(&mut self.otp.pin_input);
                 self.otp.pin_required = false;
                 self.otp.error = None;
+                self.otp.pin_submitted = true;
                 self.load_otp_entries();
             }
             return;
