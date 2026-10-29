@@ -11,7 +11,8 @@
 #      against.
 #   2. Start: the AppImage must start and keep running for START_SECONDS
 #      (default 15) under a virtual display in a bare Ubuntu 22.04 container
-#      that has graphics drivers but no libpcsclite, no libxkbcommon and no
+#      that has what every X11 desktop has (graphics drivers, the standard X
+#      client libraries) but no libpcsclite, no libxkbcommon and no
 #      smart-card service. A missing library or a crash at start fails it.
 #      Skipped, with a notice, when no `docker` is available (local runs).
 #
@@ -58,11 +59,14 @@ docker run --rm -e START_SECONDS="${start_seconds}" -v "${root}:/app:ro" "${imag
   set -e
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  # A display and software OpenGL, nothing else: no libpcsclite, no
-  # libxkbcommon, no pcscd. What the AppImage needs beyond this it must
-  # bring itself.
+  # What every X11 desktop has (a display, software OpenGL, the standard X
+  # client libraries the window layer loads at runtime) and nothing else:
+  # no libpcsclite, no libxkbcommon, no pcscd. What the AppImage needs
+  # beyond this it must bring itself (it bundles libxkbcommon(-x11)).
   apt-get install -y -qq --no-install-recommends \
-    xvfb xauth libgl1 libegl1 libgl1-mesa-dri libegl-mesa0 >/dev/null
+    xvfb xauth libgl1 libegl1 libgl1-mesa-dri libegl-mesa0 \
+    libx11-6 libx11-xcb1 libxcb1 libxcursor1 libxi6 libxrender1 libxrandr2 \
+    >/dev/null
   for p in libpcsclite1 libxkbcommon0 pcscd; do
     if dpkg -s "$p" >/dev/null 2>&1; then
       echo "::warning::$p came in with the display packages; the start test is less strict"
