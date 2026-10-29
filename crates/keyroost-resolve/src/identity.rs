@@ -463,7 +463,11 @@ fn read_identities_with(
             format_line(
                 Dir::Note,
                 "identity",
-                &format!("{} '{name}': {shown}", registry[*v].vendor()),
+                &format!(
+                    "{} '{}': {shown}",
+                    registry[*v].vendor(),
+                    keyroost_proto::trace::reader_name(name)
+                ),
             )
         });
         if let Some(id) = id {

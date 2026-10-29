@@ -93,6 +93,30 @@ pub fn abbreviate(value: &str) -> String {
     format!("{head}\u{2026}{tail} (len {})", chars.len())
 }
 
+/// A smart-card reader's name for a trace. Some systems put the device's USB
+/// serial in parentheses in the name ("Solo 2 [CCID/ICCD Interface]
+/// (07A9…) 01 00"); that part is shortened like [`abbreviate`]. A short
+/// parenthesized product ID ("Security Key(0024)") and names without one come
+/// back unchanged.
+#[must_use]
+pub fn reader_name(name: &str) -> String {
+    let (Some(open), Some(close)) = (name.find('('), name.rfind(')')) else {
+        return name.to_string();
+    };
+    let Some(inner) = name.get(open + 1..close) else {
+        return name.to_string();
+    };
+    if inner.len() <= 4 || !inner.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return name.to_string();
+    }
+    format!(
+        "{}({}){}",
+        &name[..open],
+        abbreviate(inner),
+        &name[close + 1..]
+    )
+}
+
 /// `"> label                body"`, with no trailing whitespace.
 #[must_use]
 pub fn format_line(dir: Dir, label: &str, body: &str) -> String {
@@ -108,7 +132,26 @@ pub fn format_line(dir: Dir, label: &str, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{abbreviate, begin, emit, format_line, take, Dir, LABEL_WIDTH};
+    use super::{abbreviate, begin, emit, format_line, reader_name, take, Dir, LABEL_WIDTH};
+
+    /// A serial some systems put in a reader's name is shortened; a short
+    /// parenthesized product ID and names without one stay as they are.
+    #[test]
+    fn reader_name_shortens_a_serial_in_parentheses() {
+        assert_eq!(
+            reader_name("SoloKeys Solo 2 [CCID/ICCD Interface] (07A9568FBE31AD5D) 01 00"),
+            "SoloKeys Solo 2 [CCID/ICCD Interface] (07\u{2026}5D (len 16)) 01 00"
+        );
+        assert_eq!(
+            reader_name("TOKEN2 FIDO2 Security Key(0024) 0"),
+            "TOKEN2 FIDO2 Security Key(0024) 0"
+        );
+        assert_eq!(
+            reader_name("Yubico YubiKey OTP+FIDO+CCID 00 00"),
+            "Yubico YubiKey OTP+FIDO+CCID 00 00"
+        );
+        assert_eq!(reader_name("odd (with spaces) 00"), "odd (with spaces) 00");
+    }
 
     /// A capture collects every line emitted on this thread between `begin`
     /// and `take`, printed or not; with no capture and nothing to print, the

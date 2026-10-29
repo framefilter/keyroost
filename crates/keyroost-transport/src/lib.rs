@@ -1364,7 +1364,10 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         };
         let trace = probe_trace_on() || keyroost_proto::trace::capturing();
         if trace {
-            probe_note(&format!("reader seen: {}", probe.reader_name));
+            probe_note(&format!(
+                "reader seen: {}",
+                keyroost_proto::trace::reader_name(&probe.reader_name)
+            ));
         }
         if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
             // Windows reports no bus/address here; its evidence is the device
