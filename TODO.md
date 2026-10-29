@@ -65,11 +65,6 @@ Being worked on right now — check with whoever holds it before starting.
   states, a cue on long ops. Keep it tasteful — over-animation reads as cheap.
   Research what feels alive vs. annoying before building.
 
-- **Firmware version has three JSON names.** `firmware` (`fido info`, the
-  vendor-stated string since 0.15), `ctap2.firmware_version` (`fido info`, the
-  raw CTAP2 number) and `version_firmware` (`piv info`); pick one name with
-  retired aliases. A decision for later. (S)
-
 - **Research: restoring missing OpenPGP fingerprints** from the user's public
   key file. Investigate only; may be a hornet's nest (key-generation times,
   which key matches, writing to the card). (research)
