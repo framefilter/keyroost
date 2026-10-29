@@ -680,7 +680,10 @@ process — run it from the test branch BEFORE tagging):
 
 No tag input → both bundles build and land as workflow artifacts; nothing is
 attached or published. Approve the release-publish gate; a probe cannot
-publish.
+publish. The AppImage job also checks portability
+(`packaging/appimage/check-appimage-portability.sh`): no bundled file may need
+a glibc newer than the build image's (2.35), and the AppImage must start in a
+bare Ubuntu 22.04 container without libpcsclite, libxkbcommon or pcscd.
 
 **Republish into an existing release** (e.g. the #80 AppStream fix, where the
 flatpak needed to move without a version bump):
@@ -696,6 +699,9 @@ semantics:
   adds a fresh provenance attestation alongside the original);
 * the OSTree push commits only when the tree actually changed;
 * drop `flatpak_only` to also rebuild/replace the AppImage assets;
+* for the AppImage alone, pass `-f appimage_only=true` instead: the Flatpak
+  jobs skip, so nothing about the Flatpak is rebuilt or republished (no
+  gate to reject by hand);
 * the release-publish environment approval is required every time — a
   republish replaces published bytes, so the maintainer approves personally.
 

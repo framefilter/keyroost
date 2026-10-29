@@ -29,20 +29,6 @@ Being worked on right now — check with whoever holds it before starting.
 
 **Later:**
 
-- **AppImage-only republish.** Add an `appimage_only` input to
-  `linux-bundles.yml`, mirroring `flatpak_only`. Republishing just the
-  AppImage today rebuilds the Flatpak too and relies on rejecting its publish
-  gate by hand; rejecting the wrong gate would double-publish the Flatpak.
-  (A full split into separate AppImage and Flatpak workflows is only worth it
-  if AppImage-specific work keeps growing.) (S)
-
-- **AppImage portability check in CI.** Fail the AppImage job when the
-  binary needs a glibc newer than the build image's (2.35 on Ubuntu 22.04,
-  via `objdump -T`), or when the AppImage doesn't start in a stripped-down
-  environment (no libpcsclite, no libxkbcommon, no pcscd socket), so
-  AppImageHub-style failures (AppImage/appimage.github.io#9258) show up on
-  the packaging probe, not after a release. (S–M)
-
 - **Duplicate keys on Windows with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — device-tree pairing shipped in v0.14.0; awaiting a Windows run with two Token2 PIN+ keys.**
   On Windows, keyroost pairs a key's two halves from where both sit in the
   device tree. Identity matching (v0.13.0) remains the fallback there and

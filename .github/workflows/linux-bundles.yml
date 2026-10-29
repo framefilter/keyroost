@@ -33,7 +33,9 @@ name: Linux bundles (AppImage + Flatpak)
 #     the OSTree push no-ops when the tree is already current. A version guard
 #     fails the run if the ref's workspace version doesn't match the tag.
 #     `flatpak_only: true` skips the AppImage job (e.g. the #80 AppStream
-#     republish, where only the flatpak needed to move).
+#     republish, where only the flatpak needed to move); `appimage_only: true`
+#     skips the Flatpak jobs the same way, so an AppImage-only republish never
+#     rebuilds or republishes the Flatpak. Setting both builds nothing.
 # Every run still passes the release-publish environment approval.
 #
 # ONE-TIME MAINTAINER SETUP required before this produces working bundles:
@@ -74,6 +76,11 @@ on:
         default: ''
       flatpak_only:
         description: Skip the AppImage job (flatpak-only republish, e.g. #80)
+        type: boolean
+        required: false
+        default: false
+      appimage_only:
+        description: Skip the Flatpak jobs (AppImage-only republish)
         type: boolean
         required: false
         default: false
@@ -254,6 +261,16 @@ jobs:
           echo "zsync=${zsync}" >> "$GITHUB_OUTPUT"
           echo "zsync ${zsync:-<none>}"
 
+      # Would it run on an older or stripped-down Linux? No bundled file may
+      # need a glibc newer than this build image's, and the AppImage must
+      # start in a bare Ubuntu 22.04 with no libpcsclite, libxkbcommon or
+      # pcscd. A catalog test or a user would otherwise find out after the
+      # release (AppImage/appimage.github.io#9258).
+      - name: Check AppImage portability
+        env:
+          IMG: ${{ steps.find.outputs.path }}
+        run: bash packaging/appimage/check-appimage-portability.sh "${IMG}"
+
       # Guard: nothing is attested or uploaded unless the signature verifies
       # against the COMMITTED public key alone, the update information is
       # intact, and the .zsync describes the signed bytes. No secrets here.
@@ -318,6 +335,9 @@ jobs:
   # ===========================================================================
   flatpak:
     name: Flatpak (OSTree repo + bundle)
+    # Skippable for AppImage-only republishes; push (tag) runs always include
+    # it. Its publish job needs it, so that skips too.
+    if: github.event_name == 'push' || !inputs.appimage_only
     environment: release-publish
     runs-on: ubuntu-latest
     # The official flatpak-builder action expects to run inside the freedesktop
