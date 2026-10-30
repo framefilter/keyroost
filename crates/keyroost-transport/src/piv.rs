@@ -4957,10 +4957,11 @@ impl<'tx> PivSession<'tx> {
             return resolved;
         }
         // GET METADATA writes `policy_cache` directly whenever its reply
-        // carries a policy tag — check again after it. A key this session
-        // already knows (generated here, or remembered from a file) says
-        // nothing about its policy, so the card is asked even then.
-        if self.state.pubkey_cache.get(key_ref).is_some() {
+        // carries a policy tag — check again after it. A key the cache holds
+        // without a policy may be one this session generated or was given
+        // (`remember_pubkey`), which says nothing about its policy, so the
+        // card is asked then. A cached empty slot was already asked.
+        if matches!(self.state.pubkey_cache.get(key_ref), Some(Some(_))) {
             let _ = self.resolve_slot_from_device(slot);
         } else {
             self.cached_slot_key(slot);
