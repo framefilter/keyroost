@@ -643,9 +643,10 @@ fn random_iv() -> [u8; 16] {
 /// the whole cycle over USB (set, verify, wrong PIN, read and write under
 /// the PIN, change, clear). These tests fix what keyroost sends, so a later
 /// change to the ladder or to any data field has to be a deliberate, argued
-/// one rather than a silent re-framing. Each builder is checked by taking the device's
-/// side — deriving the same keys, decrypting what was sent, and comparing the
-/// recovered plaintext against the exact bytes the protocol calls for.
+/// one rather than a silent re-framing. Each builder is checked by taking the
+/// device's side — deriving the same keys, decrypting what was sent, and
+/// comparing the recovered plaintext against the exact bytes the protocol
+/// calls for.
 #[cfg(test)]
 mod pin_crypto_tests {
     use super::*;

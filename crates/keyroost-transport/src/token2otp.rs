@@ -725,11 +725,23 @@ impl CtapOtpTransport {
                         t.finish(&flag, resp).ok()
                     }) =>
                 {
+                    if sw != t2::sw::OK {
+                        note(format!(
+                            "probe answered sw={sw:#06x}; the PIN-flag read shows an OTP PIN, keeping this channel"
+                        ));
+                    }
                     t.dev.set_timeout(Duration::from_secs(20));
                     return Ok(t);
                 }
                 Ok((_, sw)) => {
-                    note(format!("probe answered sw={sw:#06x}; trying report frames"));
+                    let flag_read = if sw == t2::sw::FUNCTION_NOT_SUPPORTED {
+                        " (the PIN-flag read shows no OTP PIN)"
+                    } else {
+                        ""
+                    };
+                    note(format!(
+                        "probe answered sw={sw:#06x}{flag_read}; trying report frames"
+                    ));
                     true
                 }
                 // A reply too short to carry a status word isn't an answer.
@@ -2349,9 +2361,9 @@ mod ctap_reply_tests {
     #[test]
     fn a_pin_protected_key_still_answers_the_probe() {
         use super::probe_answered;
-        // Flag reply: AlgId, Retry, PinLen, MaxRetry, FpEnable.
-        let pin_set = || Some((vec![0x01, 8, 6, 8, 0], 0x9000));
-        let no_pin = || Some((vec![0x01, 8, 0, 8, 0], 0x9000));
+        // The Lc=04 flag reply: AlgId, Retry, PinLen, MaxRetry.
+        let pin_set = || Some((vec![0x07, 100, 6, 100], 0x9000));
+        let no_pin = || Some((vec![0x00, 0, 0, 0], 0x9000));
         assert!(probe_answered(0x9000, || panic!("no flag read on 9000")));
         assert!(probe_answered(0x6A81, pin_set));
         assert!(
@@ -2362,6 +2374,10 @@ mod ctap_reply_tests {
         assert!(!probe_answered(0x6A81, no_pin));
         assert!(!probe_answered(0x6A81, || Some((vec![], 0x6D00))));
         assert!(!probe_answered(0x6A81, || None));
+        assert!(
+            !probe_answered(0x6A81, || Some((vec![0x07, 100], 0x9000))),
+            "a flag reply too short to parse"
+        );
         // Any other refusal declines without asking.
         assert!(!probe_answered(0x6D00, || panic!("no flag read on 6D00")));
     }
