@@ -8168,11 +8168,14 @@ fn reset_one_card_applet(
         match step {
             ResetStep::Oath => {
                 let mut s = keyroost_transport::OathSession::open_traced(&reader()?, debug)?;
-                // Some keys (Nitrokey 3) ask for a touch to reset, as `oath reset` says.
-                crate::prompt::touch(&format!(
-                    "{}  touch the key if it blinks\u{2026}",
-                    step.label()
-                ));
+                // A Nitrokey 3 asks for a touch to reset, as `oath reset` says;
+                // a YubiKey doesn't.
+                if s.asks_touch_to_reset() {
+                    crate::prompt::touch(&format!(
+                        "{}  touch the key if it blinks\u{2026}",
+                        step.label()
+                    ));
+                }
                 s.factory_reset()?;
             }
             ResetStep::OpenPgp => {

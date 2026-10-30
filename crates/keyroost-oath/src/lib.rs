@@ -590,9 +590,11 @@ impl SelectInfo {
 
     /// True when the applet asks for a touch to reset: Nitrokey's secrets
     /// app ("Reset: always confirm with touch button", `fn reset` in
-    /// Nitrokey/trussed-secrets-app), also on current Solo 2 firmware. A
-    /// YubiKey, and the original oath-authenticator on older Solo 2 firmware,
-    /// reset without one.
+    /// Nitrokey/trussed-secrets-app; seen on a Nitrokey 3). A YubiKey resets
+    /// without one (seen on a 5.7). The original oath-authenticator a Solo 2
+    /// 2.x runs has no presence check in its `reset`, and SoloKeys' current
+    /// firmware source builds in the secrets app instead; neither Solo 2
+    /// case is tested on hardware.
     #[must_use]
     pub fn asks_touch_to_reset(&self) -> bool {
         self.serial.is_some()

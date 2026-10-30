@@ -449,6 +449,18 @@ struct KeyDetails {
     firmware: Option<String>,
 }
 
+impl KeyDetails {
+    /// Take what `newer` says, keeping what it leaves unsaid.
+    fn merge(&mut self, newer: &KeyDetails) {
+        if newer.model.is_some() {
+            self.model.clone_from(&newer.model);
+        }
+        if newer.firmware.is_some() {
+            self.firmware.clone_from(&newer.firmware);
+        }
+    }
+}
+
 #[derive(Default)]
 struct SecurityKeysState {
     /// CTAP info for the selected device, fetched lazily after selection.
@@ -2705,12 +2717,16 @@ fn run_card_reset_step(
                 let name = reader.ok_or("no PC/SC reader for the OATH applet")?;
                 let mut s =
                     keyroost_transport::OathSession::open(name).map_err(|e| e.to_string())?;
-                // A Nitrokey 3 asks for a touch here; raise the banner then.
+                // A Nitrokey 3 asks for a touch here; raise the banner then,
+                // and lower it after, whatever the outcome: the sweep's later
+                // steps (OpenPGP, PIV) run in the same job and need none.
                 KEY_WANTS_TOUCH.store(
                     s.asks_touch_to_reset(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                s.factory_reset().map_err(|e| e.to_string())?;
+                let reset = s.factory_reset();
+                KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
+                reset.map_err(|e| e.to_string())?;
             }
             ResetStep::OpenPgp => {
                 let name = reader.ok_or("no PC/SC reader for the OpenPGP applet")?;
@@ -5642,15 +5658,20 @@ impl App {
     /// lines such as the device-scan count, which every refresh repeats.
     fn log_global_bg_once(&mut self, severity: Severity, text: impl Into<String>) {
         let text = without_home(&text.into());
-        // Against the newest line of the same severity, so the automatic
-        // trace line a traced refresh adds in between doesn't defeat it.
+        // A line that would carry this job's APDU trace is never dropped:
+        // the traffic is new even when the words aren't, and dropping the
+        // line would only leave the trace to the job's automatic line.
+        let traced = self.pending_trace.as_ref().is_some_and(|t| !t.is_empty());
+        // Against the newest line of the same severity, so a user action of
+        // another severity in between doesn't defeat it.
         let same = std::mem::discriminant(&severity);
-        if self
-            .log
-            .iter()
-            .rev()
-            .find(|l| std::mem::discriminant(&l.severity) == same)
-            .is_some_and(|l| l.text == text && matches!(l.kind, LogKind::Background))
+        if !traced
+            && self
+                .log
+                .iter()
+                .rev()
+                .find(|l| std::mem::discriminant(&l.severity) == same)
+                .is_some_and(|l| l.text == text && matches!(l.kind, LogKind::Background))
         {
             return;
         }
@@ -6215,33 +6236,43 @@ impl App {
     /// after every scan, which rebuilds the rows from scratch, so a key read
     /// once keeps its name and firmware until it is unplugged.
     fn apply_key_details(&mut self) {
-        if let Some(id) = self.selected_device.clone() {
-            let fw = self.security_keys.firmware.clone();
-            let model = self
-                .security_keys
-                .info
-                .as_ref()
-                .and_then(|info| ui::aaguid::model_for_aaguid(&info.aaguid))
-                .map(str::to_string);
-            if fw.is_some() || model.is_some() {
-                let kept = self.key_details.entry(id).or_default();
-                if fw.is_some() {
-                    kept.firmware = fw;
-                }
-                if model.is_some() {
-                    kept.model = model;
-                }
+        // The selected key's details as just read: always shown on its row.
+        let live = self.selected_device.clone().map(|id| {
+            let details = KeyDetails {
+                firmware: self.security_keys.firmware.clone(),
+                model: self
+                    .security_keys
+                    .info
+                    .as_ref()
+                    .and_then(|info| ui::aaguid::model_for_aaguid(&info.aaguid))
+                    .map(str::to_string),
+            };
+            (id, details)
+        });
+        // Remembered past this selection only under a serial id: a path-based
+        // id ("hid:…", "reader:…") can come back on a different key after a
+        // swap, and would carry this key's name onto it.
+        if let Some((id, details)) = &live {
+            let said = details.model.is_some() || details.firmware.is_some();
+            if said && id.starts_with("serial:") {
+                let kept = self.key_details.entry(id.clone()).or_default();
+                kept.merge(details);
             }
         }
         for dev in &mut self.devices {
-            let Some(kept) = self.key_details.get(&dev.id) else {
-                continue;
-            };
-            if let Some(fw) = &kept.firmware {
-                dev.firmware = fw.clone();
-            }
-            if let Some(model) = &kept.model {
-                dev.model = model.clone();
+            let selected = live.as_ref().filter(|(id, _)| *id == dev.id);
+            for details in self
+                .key_details
+                .get(&dev.id)
+                .into_iter()
+                .chain(selected.map(|(_, d)| d))
+            {
+                if let Some(fw) = &details.firmware {
+                    dev.firmware = fw.clone();
+                }
+                if let Some(model) = &details.model {
+                    dev.model = model.clone();
+                }
             }
         }
     }
@@ -31539,6 +31570,13 @@ mod tests {
                 "device scan: 2 devices found"
             ]
         );
+        // With APDU trace on, each scan's line carries its traffic: kept.
+        app.pending_trace = Some(vec!["> select".into()]);
+        app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        let last = app.log.last().expect("logged");
+        assert_eq!(last.text, "device scan: 2 devices found");
+        assert!(last.trace.is_some());
+        assert_eq!(app.log.len(), 5);
     }
 
     /// A FIDO2 reset run on its own (not a factory reset's last step) writes
@@ -33743,6 +33781,27 @@ mod tests {
         app.devices = vec![other()];
         app.forget_unplugged_keys();
         assert!(app.key_details.is_empty());
+    }
+
+    /// A key known only by its USB path shows what was read while it is
+    /// selected, but isn't remembered: the path can return on another key.
+    #[test]
+    fn a_path_named_key_shows_its_details_but_isnt_remembered() {
+        let by_path = || sel_key("hid:/dev/hidraw9", "", None);
+        let mut app = App {
+            selected_device: Some("hid:/dev/hidraw9".into()),
+            devices: vec![by_path()],
+            ..Default::default()
+        };
+        app.security_keys.firmware = Some("2.964".into());
+        app.apply_key_details();
+        assert_eq!(app.devices[0].firmware, "2.964", "shown while selected");
+        assert!(app.key_details.is_empty(), "not remembered");
+        app.selected_device = None;
+        app.security_keys = SecurityKeysState::default();
+        app.devices = vec![by_path()];
+        app.apply_key_details();
+        assert_eq!(app.devices[0].firmware, "");
     }
 
     /// The selected key is unplugged: selection falls back to another key,

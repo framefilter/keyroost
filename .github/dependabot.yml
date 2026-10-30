@@ -68,7 +68,7 @@ updates:
         versions: ['>=0.12']
       # p256, p384, p521 and k256 moved to elliptic-curve 0.14 together
       # (#212); their 0.14.x patches are welcome. They share one
-      # `ToEncodedPoint` trait (from p256's re-export) in keyroost-pivtest and
+      # `ToSec1Point` trait (from p256's re-export) in keyroost-pivtest and
       # keyroost-pgpkey, so a next breaking release moves all four at once,
       # never one alone.
       - dependency-name: p256
