@@ -7777,7 +7777,9 @@ impl App {
                         if matches!(e, TransportError::OathPasswordRejected) {
                             app.oath.unlocked_password = None;
                             app.oath.locked = true;
-                            app.oath.error = Some("wrong OATH password".into());
+                            // With no password sent, the locked box says it all.
+                            app.oath.error =
+                                (!password.is_empty()).then(|| "wrong OATH password".into());
                         } else {
                             app.oath.error = Some(e.to_string());
                         }
@@ -7853,9 +7855,11 @@ impl App {
                 app.oath.unlocked_password = None;
                 app.oath.locked = true;
                 // The add modal already shows this; don't double-report when it
-                // is the one that failed.
+                // is the one that failed. A listing sent without a password
+                // (opening the tab on a protected key) was never "wrong": the
+                // locked box says the key wants one.
                 if !modal_busy {
-                    app.oath.error = Some("wrong OATH password".into());
+                    app.oath.error = (!password.is_empty()).then(|| "wrong OATH password".into());
                 }
             }
             Err(e) => {
@@ -31577,16 +31581,28 @@ mod tests {
         assert_eq!(app.oath.add.result, Some(Err("wrong OATH password".into())));
         assert!(app.oath.error.is_none());
 
-        // No modal open: the pane-level error path still works (unlock/refresh).
+        // No modal open: a typed password the key refused is reported in the
+        // pane (unlock/refresh).
+        let mut app = App::default();
+        App::apply_oath_rows(
+            &mut app,
+            Err(TransportError::OathPasswordRejected),
+            zeroize::Zeroizing::new("typed".to_string()),
+        );
+        assert!(!app.oath.add.open);
+        assert!(app.oath.locked);
+        assert_eq!(app.oath.error.as_deref(), Some("wrong OATH password"));
+
+        // Opening the tab on a protected key lists without a password: the
+        // key's refusal locks the pane but is no "wrong password".
         let mut app = App::default();
         App::apply_oath_rows(
             &mut app,
             Err(TransportError::OathPasswordRejected),
             zeroize::Zeroizing::new(String::new()),
         );
-        assert!(!app.oath.add.open);
         assert!(app.oath.locked);
-        assert_eq!(app.oath.error.as_deref(), Some("wrong OATH password"));
+        assert!(app.oath.error.is_none());
     }
 
     /// With "Use default management key" ticked, `piv_current_mgmt_key` ignores

@@ -29,19 +29,18 @@ Being worked on right now — check with whoever holds it before starting.
 
 **Later:**
 
-- **Duplicate keys on Windows with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — device-tree pairing shipped in v0.14.0; awaiting a Windows run with two Token2 PIN+ keys.**
-  On Windows, keyroost pairs a key's two halves from where both sit in the
-  device tree. Identity matching (v0.13.0) remains the fallback there and
-  the macOS path: where the OS reports no USB position, keyroost asks each side of a key
-  for the identity it reports (YubiKey serial, Solo 2 UUID, Token2 §6.10
-  serial) and joins the two halves when they match; a key that doesn't answer
-  stays two rows. Verified on Linux hardware with USB-position matching
-  switched off (YubiKey 5.7, Solo 2). Still open: the Windows run (two
-  Token2 PIN+ keys, as in the report) and whether Token2's FIDO-format and
-  OTP-applet serial encodings agree on a real key. Record in
-  `docs/DEVICE-RESEARCH.md` ("Identity matching across interfaces"). (S, then
-  close #51 if the test passes)
-
+- **Token2 serial in the key header on Windows ([#51](https://github.com/framefilter/keyroost/issues/51)).**
+  The duplicate rows are fixed: with v0.15.0, Token2 and the reporter each
+  saw one row per key (two PIN+ keys, Windows). Token2 then reported the
+  header showing the short 8-digit OpenPGP serial (`#0991…`) instead of the
+  number printed on the key. On Windows the merged row takes the card
+  side's serial, and the full-serial read there needs the FIDO applet to
+  answer over the reader. Next: a Windows `keyroostctl --debug list` on a
+  PIN+ (queued in the next Windows test round) to see what the probe gets,
+  then read the full serial another way when the FIDO applet doesn't
+  answer. On Linux this key's card side isn't visible at all (libccid has
+  no entry for 349e:0024), and the HID-only row shows no serial (`#—`)
+  although its firmware ("R3.4") is worked out from that serial.
 - **UI liveness — make "busy" visibly different from "frozen".** Card I/O stalls
   the visible UI for seconds (touch-required sign/decrypt/authenticate, on-card
   RSA keygen, the ~30s reset re-insert window, PC/SC enumeration) and a static
@@ -59,8 +58,12 @@ Being worked on right now — check with whoever holds it before starting.
   `install_broken_pipe_guard()` in `crates/keyroostctl/src/main.rs` plus its
   `tests/broken_pipe.rs` guard exist only because the clean fix — libstd
   resetting `SIGPIPE` to `SIG_DFL` — is nightly-only today
-  (`-Zon-broken-pipe=kill`; tracking issue rust-lang/rust#97889). Check
-  periodically; when it reaches stable, delete both and adopt the built-in.
+  (`-Zon-broken-pipe=kill`; tracking issue rust-lang/rust#97889). Checked
+  2026-10-29: still unstable, and the flag is to be replaced by an
+  attribute, `#[std::io::on_broken_pipe]` (tracking issue
+  rust-lang/rust#150588, implementation rust-lang/rust#150591, still open).
+  Check periodically; when it reaches stable, delete both and adopt the
+  built-in.
   (Same applies to the `keyroost` GUI binary if it ever grows piped stdout.)
 
 ---
@@ -120,12 +123,6 @@ plan's two-key manual steps were never executed):
 
 **Feature verification:**
 
-- **OATH applet reset:** on a password-PROTECTED test key, reset from the GUI
-  locked view and via `keyroostctl oath reset --yes`; confirm credentials are
-  wiped, the password is cleared, and the pane re-lists empty and unlocked.
-- **OATH password carry:** on a password-protected key, unlock + list, then
-  "Read code" on an HOTP credential — must succeed without retyping; switch
-  devices and confirm the retained password is dropped.
 - **SSH-cert export, interop proof:** on a YubiKey 5.7, store a cert with
   `fido2-token -S -b -n ssh:… cert.pub`, export it with `keyroostctl fido
   ssh export --rp <rp-id>` (and via the GUI), and confirm the output `-cert.pub` is
@@ -184,10 +181,16 @@ plan's two-key manual steps were never executed):
   Needs a way to get the token's serial during detection, without logging in
   with the customer key.
 
-- **Cache the Nix CI build** — the cross-build job
-  ([#144](https://github.com/framefilter/keyroost/pull/144)) starts cold every
-  run. Optional; speeds CI, changes nothing shipped.
-
+- **Speed up the Nix CI build** — the cross-build job
+  ([#144](https://github.com/framefilter/keyroost/pull/144)) is the slowest
+  in CI (10–19 minutes against 3–7). A plain cache of the Nix store won't
+  help much (checked 2026-10-29): the flake's source is the whole repo
+  (`src = ./.`), so any committed change rebuilds everything, and a cache
+  would only save the crate downloads. Each job also builds the dependency
+  tree twice (the app and the CLI are separate `buildRustPackage`s). A real
+  speedup means building the dependencies as their own cacheable step
+  (for example with crane), which adds a flake input and reshapes the
+  flake. Optional; changes nothing shipped.
 - **PC/SC: `dlopen` libpcsclite at runtime instead of hard-linking it** — the
   real fix for [#47](https://github.com/framefilter/keyroost/issues/47).
   Two payoffs: the *host's* libpcsclite is always used (the only client
