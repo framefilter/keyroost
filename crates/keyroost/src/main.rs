@@ -6254,7 +6254,8 @@ impl App {
         // swap, and would carry this key's name onto it.
         if let Some((id, details)) = &live {
             let said = details.model.is_some() || details.firmware.is_some();
-            if said && id.starts_with("serial:") {
+            // `serial:X#2` names a duplicate serial by scan order: not one key.
+            if said && id.starts_with("serial:") && !id.contains('#') {
                 let kept = self.key_details.entry(id.clone()).or_default();
                 kept.merge(details);
             }
