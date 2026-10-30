@@ -35,6 +35,28 @@ use zeroize::Zeroizing;
 /// serial number — but [`select`] addresses the applet with this 6-byte prefix.
 pub const AID_PREFIX: [u8; 6] = [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01];
 
+/// OpenPGP manufacturer ID assigned to Yubico.
+pub const MANUFACTURER_ID_YUBICO: u16 = 0x0006;
+
+/// OpenPGP manufacturer ID assigned to Nitrokey.
+pub const MANUFACTURER_ID_NITROKEY: u16 = 0x000F;
+
+/// Whether generating or importing a key (key generation, key import, a
+/// backup restore) may ask for a touch on a card from `manufacturer`, for a
+/// "touch the key if it blinks" hint. The card's touch setting (its User
+/// Interaction Flag, [`TAG_UIF_SIG`]) covers only using a key; `false` for a
+/// vendor known not to ask outside that: Yubico (a YubiKey 5.7 generated
+/// every key type without a touch) and Nitrokey (its `opcard` asks for
+/// presence only on PSO and INTERNAL AUTHENTICATE, per the touch setting).
+/// Any other vendor, or none, may ask.
+#[must_use]
+pub fn may_ask_touch_to_write(manufacturer: Option<u16>) -> bool {
+    !matches!(
+        manufacturer,
+        Some(MANUFACTURER_ID_YUBICO | MANUFACTURER_ID_NITROKEY)
+    )
+}
+
 /// OpenPGP manufacturer ID assigned to Token2 (bytes 8..10 of the AID). Its
 /// applets report the AID serial in BCD coding, so a caller that recognises
 /// this ID must BCD-decode the serial rather than read it as a plain integer.
@@ -50,6 +72,15 @@ pub fn aid_manufacturer_id(aid: &[u8]) -> Option<u16> {
         return None;
     }
     Some(u16::from_be_bytes([aid[8], aid[9]]))
+}
+
+/// Whether a User Interaction Flag reply ([`TAG_UIF_SIG`] and the other two)
+/// says using the key asks for a touch: `Some(false)` for `00` (off),
+/// `Some(true)` for any other setting (on, permanently on, cached), `None`
+/// for an empty reply.
+#[must_use]
+pub fn uif_asks_touch(reply: &[u8]) -> Option<bool> {
+    reply.first().map(|&setting| setting != 0x00)
 }
 
 /// Vendor display name for an OpenPGP manufacturer ID, using the registry
@@ -212,6 +243,14 @@ pub const TAG_PW_STATUS: u16 = 0x00C4;
 pub const TAG_FINGERPRINTS: u16 = 0x00C5;
 /// CA fingerprints — 60 bytes = 3×20.
 pub const TAG_CA_FINGERPRINTS: u16 = 0x00C6;
+/// User Interaction Flag (the touch setting) — signature key (OpenPGP card
+/// 3.3+, §4.4.3.6): byte 0 is 00 off, 01 on, 02 permanently on (YubiKey
+/// adds 03/04, "cached"), byte 1 the feature it uses (0x20, a button).
+pub const TAG_UIF_SIG: u16 = 0x00D6;
+/// User Interaction Flag — decryption key.
+pub const TAG_UIF_DEC: u16 = 0x00D7;
+/// User Interaction Flag — authentication key.
+pub const TAG_UIF_AUT: u16 = 0x00D8;
 /// Key generation timestamps.
 pub const TAG_GENERATION_TIMES: u16 = 0x00CD;
 /// Algorithm Information (`FA`, spec v3.4 §4.4.3.11): the algorithm-attribute
@@ -355,6 +394,17 @@ pub enum KeyCrt {
 }
 
 impl KeyCrt {
+    /// The tag of this key's User Interaction Flag (its touch setting):
+    /// [`TAG_UIF_SIG`], [`TAG_UIF_DEC`] or [`TAG_UIF_AUT`].
+    #[must_use]
+    pub const fn uif_tag(self) -> u16 {
+        match self {
+            KeyCrt::Sign => TAG_UIF_SIG,
+            KeyCrt::Decrypt => TAG_UIF_DEC,
+            KeyCrt::Auth => TAG_UIF_AUT,
+        }
+    }
+
     /// The CRT tag byte for this key slot.
     #[must_use]
     pub const fn tag(self) -> u8 {
@@ -3814,6 +3864,22 @@ mod tests {
 #[cfg(test)]
 mod manufacturer_tests {
     use super::*;
+
+    #[test]
+    fn touch_setting_and_vendor_rule() {
+        assert_eq!(uif_asks_touch(&[0x00, 0x20]), Some(false));
+        for on in [0x01, 0x02, 0x03, 0x04] {
+            assert_eq!(uif_asks_touch(&[on, 0x20]), Some(true));
+        }
+        assert_eq!(uif_asks_touch(&[]), None);
+        assert_eq!(KeyCrt::Sign.uif_tag(), 0x00D6);
+        assert_eq!(KeyCrt::Decrypt.uif_tag(), 0x00D7);
+        assert_eq!(KeyCrt::Auth.uif_tag(), 0x00D8);
+        assert!(!may_ask_touch_to_write(Some(0x0006)));
+        assert!(!may_ask_touch_to_write(Some(0x000F)));
+        assert!(may_ask_touch_to_write(Some(MANUFACTURER_ID_TOKEN2)));
+        assert!(may_ask_touch_to_write(None));
+    }
 
     #[test]
     fn aid_manufacturer_id_extracts_bytes_8_9() {

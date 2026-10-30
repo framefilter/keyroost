@@ -662,6 +662,21 @@ pub enum PivQuirk {
     /// still refuses to parse a multi-tag reply rather than guessing which
     /// tag is meant.
     HostChallengeResponsePermissiveTag,
+    /// Generating or importing a key never waits for a touch on this card:
+    /// its touch policy governs only the use of a slot's private key (sign,
+    /// decrypt, key agreement), and a key written with the default touch
+    /// policy never asks for one either. A front end's "touch the key if it
+    /// blinks" hint for key generation or import is then left out. YubiKey:
+    /// Yubico's PIV documentation ties the touch policy to private-key
+    /// operations and gives "never" as its default, and a YubiKey 5.7
+    /// generated every key type it supports without a touch.
+    NoTouchToGenerateOrImport,
+    /// This card never asks for a touch in PIV, for any operation: it has no
+    /// touch requirement at all. Nitrokey 3 firmware 1.9.1: Nitrokey's
+    /// published `piv-authenticator` source has no touch policy and no
+    /// user-presence check (the reason [`PivExtension::SlotTouchPolicy`] is
+    /// known unsupported there).
+    NeverAsksForTouch,
 }
 
 impl PivQuirk {
@@ -1350,18 +1365,25 @@ const YUBIKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 const YUBIKEY_APPLET_QUIRKS: &[VersionQuirks] = &[
     VersionQuirks {
         version: &[],
-        quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
+        quirks: &[
+            PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+            PivQuirk::NoTouchToGenerateOrImport,
+        ],
     },
     VersionQuirks {
         version: &[3],
         quirks: &[
             PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
             PivQuirk::SlotTouchPolicyCachedNotSupported,
+            PivQuirk::NoTouchToGenerateOrImport,
         ],
     },
     VersionQuirks {
         version: &[4, 3],
-        quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
+        quirks: &[
+            PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+            PivQuirk::NoTouchToGenerateOrImport,
+        ],
     },
 ];
 
@@ -3383,8 +3405,13 @@ const TRUSSED_NITROKEY_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
     quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
 }];
 
-/// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
-const TRUSSED_NITROKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+/// The Trussed-based Nitrokey's firmware-axis quirks: from firmware 1.9.1,
+/// the version the PIN/touch-policy verdict above rests on,
+/// [`PivQuirk::NeverAsksForTouch`].
+const TRUSSED_NITROKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
+    version: &[1, 9, 1],
+    quirks: &[PivQuirk::NeverAsksForTouch],
+}];
 
 /// `OpenFips201::Generic`'s cross-axis merge mode — see [`AxisMergeMode`]'s
 /// doc.
@@ -5395,6 +5422,29 @@ mod tests {
             ),
             BTreeSet::new()
         );
+    }
+
+    #[test]
+    fn touch_quirks_for_yubikey_and_nitrokey() {
+        for v in [&[2u8][..], &[3, 1], &[4, 3, 5], &[5, 7, 4]] {
+            assert!(
+                resolve_quirks(AppletFingerprint::YubiKey, Some(v), None)
+                    .contains(&PivQuirk::NoTouchToGenerateOrImport),
+                "YubiKey {v:?}"
+            );
+        }
+        let nk = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
+        assert!(resolve_quirks(nk, Some(&[6, 6, 6]), Some(&[1, 9, 1]))
+            .contains(&PivQuirk::NeverAsksForTouch));
+        assert!(!resolve_quirks(nk, Some(&[6, 6, 6]), Some(&[1, 8, 3]))
+            .contains(&PivQuirk::NeverAsksForTouch));
+        // Any other card keeps the hints.
+        assert!(!resolve_quirks(AppletFingerprint::IdPrime, None, None)
+            .iter()
+            .any(|q| matches!(
+                q,
+                PivQuirk::NoTouchToGenerateOrImport | PivQuirk::NeverAsksForTouch
+            )));
     }
 
     #[test]

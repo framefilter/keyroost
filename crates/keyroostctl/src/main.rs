@@ -9659,11 +9659,14 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let admin_pin = sec.read(&PGP_ADMIN_PIN, src)?;
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
+            let touch = session.may_ask_touch_to_write();
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
-            crate::prompt::touch(&format!(
-                "Generating {} key — touch the key if it blinks…",
-                slot.label()
-            ));
+            if touch {
+                crate::prompt::touch(&format!(
+                    "Generating {} key — touch the key if it blinks…",
+                    slot.label()
+                ));
+            }
             let key = session.generate_key(slot.to_crt(), algorithm.map(|a| a.to_alg()))?;
             let attrs = session.algorithm_attributes(slot.to_crt())?;
             print_openpgp_public_key(&format!("Generated {}", slot.label()), &attrs, &key);
@@ -9738,15 +9741,18 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let pin = sec.read(&PGP_SIGN_PIN, src)?;
             reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
+            let touch = session.may_ask_touch_to_use(keyroost_openpgp::KeyCrt::Sign);
             session.verify_pin(keyroost_openpgp::PW1_SIGN, pin.as_bytes())?;
             // RSA slots want a PKCS#1 v1.5 DigestInfo (the card EMSA-pads and
             // RSA-signs it); ECDSA/EdDSA slots want the bare digest.
             let attrs = session.algorithm_attributes(keyroost_openpgp::KeyCrt::Sign)?;
             let input = openpgp_sign_input("signature", &attrs, *hash, &data)?;
-            crate::prompt::touch(&format!(
-                "Signing ({}) — touch the key if it blinks…",
-                hash.label()
-            ));
+            if touch {
+                crate::prompt::touch(&format!(
+                    "Signing ({}) — touch the key if it blinks…",
+                    hash.label()
+                ));
+            }
             let sig = session.sign(&input)?;
             match out {
                 Some(path) => {
@@ -9774,6 +9780,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let pin = sec.read(&PGP_USER_PIN, src)?;
             reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
+            let touch = session.may_ask_touch_to_use(keyroost_openpgp::KeyCrt::Decrypt);
             // Decryption authorizes under PW1 in the "other"/decipher context
             // (ref 0x82), not the signing context (0x81).
             session.verify_pin(keyroost_openpgp::PW1_OTHER, pin.as_bytes())?;
@@ -9783,11 +9790,17 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // (including empty attributes) is refused rather than guessed.
             let (plain, noun) = match attrs.first() {
                 Some(0x12) => {
-                    crate::prompt::touch("Deriving shared secret — touch the key if it blinks…");
+                    if touch {
+                        crate::prompt::touch(
+                            "Deriving shared secret — touch the key if it blinks…",
+                        );
+                    }
                     (session.decrypt_ecdh(&cryptogram)?, "shared-secret")
                 }
                 Some(0x01) => {
-                    crate::prompt::touch("Decrypting — touch the key if it blinks…");
+                    if touch {
+                        crate::prompt::touch("Decrypting — touch the key if it blinks…");
+                    }
                     (session.decrypt(&cryptogram)?, "plaintext")
                 }
                 _ => {
@@ -9831,6 +9844,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let pin = sec.read(&PGP_USER_PIN, src)?;
             reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
+            let touch = session.may_ask_touch_to_use(keyroost_openpgp::KeyCrt::Auth);
             // INTERNAL AUTHENTICATE authorizes under PW1 in the "other" context
             // (ref 0x82) — the same context as decipher, not the signing context.
             session.verify_pin(keyroost_openpgp::PW1_OTHER, pin.as_bytes())?;
@@ -9838,10 +9852,12 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // the bare digest.
             let attrs = session.algorithm_attributes(keyroost_openpgp::KeyCrt::Auth)?;
             let input = openpgp_sign_input("authentication", &attrs, *hash, &data)?;
-            crate::prompt::touch(&format!(
-                "Authenticating ({}) — touch the key if it blinks…",
-                hash.label()
-            ));
+            if touch {
+                crate::prompt::touch(&format!(
+                    "Authenticating ({}) — touch the key if it blinks…",
+                    hash.label()
+                ));
+            }
             let sig = session.internal_authenticate(&input)?;
             match out {
                 Some(path) => {
@@ -10354,12 +10370,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     guard_piv_keygen(s, alg, *pin_policy, *touch_policy, *force)?;
+                    let touch = s.may_ask_touch_to_write();
                     authenticate_piv(s, &mgmt)?;
-                    crate::prompt::touch(&format!(
-                        "Generating {} in {} (touch the key if it blinks)\u{2026}",
-                        alg.label(),
-                        slot.to_slot().label()
-                    ));
+                    if touch {
+                        crate::prompt::touch(&format!(
+                            "Generating {} in {} (touch the key if it blinks)\u{2026}",
+                            alg.label(),
+                            slot.to_slot().label()
+                        ));
+                    }
                     let pubkey = s.generate_key(
                         slot.to_slot(),
                         alg,
@@ -10505,13 +10524,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     )
                     .map_err(|r| import_refusal_error(&r, &contents))?;
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
+                    let touch = s.may_ask_touch_to_import(touch_policy);
                     authenticate_piv(s, &mgmt)?;
                     let alg = plan.entry.key.alg();
-                    crate::prompt::touch(&format!(
-                        "Importing {} into {} (touch the key if it blinks)\u{2026}",
-                        alg.label(),
-                        piv_slot.label()
-                    ));
+                    if touch {
+                        crate::prompt::touch(&format!(
+                            "Importing {} into {} (touch the key if it blinks)\u{2026}",
+                            alg.label(),
+                            piv_slot.label()
+                        ));
+                    }
                     Ok((
                         alg,
                         keyroost_transport::piv_import::run_import(
@@ -10721,15 +10743,18 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         // Before the management key goes to the card, as
                         // `piv key generate` does.
                         guard_inline_keygen(s, keygen)?;
+                        let touch = s.may_ask_touch_to_write();
                         authenticate_piv(s, &mgmt)?;
-                        inline_generate_key(s, slot.to_slot(), keygen, pub_mode)?;
+                        inline_generate_key(s, slot.to_slot(), keygen, pub_mode, touch)?;
                     } else if let Some(path) = pubkey_in {
                         let (alg, key) = load_pubkey_material(path)?;
                         s.remember_pubkey(slot.to_slot(), alg, key);
                     }
-                    crate::prompt::touch(
-                        "Signing the request on the card (touch if it blinks)\u{2026}",
-                    );
+                    if s.may_ask_touch_to_use(slot.to_slot()) {
+                        crate::prompt::touch(
+                            "Signing the request on the card (touch if it blinks)\u{2026}",
+                        );
+                    }
                     let ku = resolve_key_usage(
                         &key_usage.key_usage,
                         slot.to_slot(),
@@ -10834,21 +10859,26 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
-                    if keygen.generate_key {
+                    let gen_touch = if keygen.generate_key {
                         // Before the management key goes to the card, as
                         // `piv key generate` does.
                         guard_inline_keygen(s, keygen)?;
-                    }
+                        s.may_ask_touch_to_write()
+                    } else {
+                        false
+                    };
                     authenticate_piv(s, &mgmt)?;
                     if keygen.generate_key {
-                        inline_generate_key(s, slot.to_slot(), keygen, pub_mode)?;
+                        inline_generate_key(s, slot.to_slot(), keygen, pub_mode, gen_touch)?;
                     } else if let Some(path) = pubkey_in {
                         let (alg, key) = load_pubkey_material(path)?;
                         s.remember_pubkey(slot.to_slot(), alg, key);
                     }
-                    crate::prompt::touch(
-                        "Signing the certificate on the card (touch if it blinks)\u{2026}",
-                    );
+                    if s.may_ask_touch_to_use(slot.to_slot()) {
+                        crate::prompt::touch(
+                            "Signing the certificate on the card (touch if it blinks)\u{2026}",
+                        );
+                    }
                     let now = unix_now();
                     let choice = compression.choice();
                     let ku = resolve_key_usage(
@@ -10955,12 +10985,17 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     // fails before any op, then before each later op for
                     // PIN-per-use slots (9c). The progress line prints after
                     // that first verify.
+                    // Before the PIN verify the test starts with.
+                    let touch = s.may_ask_touch_to_use(piv_slot);
                     let results = s.self_test_with_progress(
                         piv_slot,
                         alg,
                         &pubkey,
                         pin.as_ref().map(|p| p.as_bytes()),
                         || {
+                            if !touch {
+                                return;
+                            }
                             crate::prompt::touch(&format!(
                                 "\u{2192} Testing {} ({}) on the card (touch if it blinks)\u{2026}",
                                 piv_slot.label(),
@@ -12053,13 +12088,18 @@ fn inline_generate_key(
     slot: keyroost_piv::Slot,
     keygen: &InlineKeyGen,
     pub_mode: crate::prompt::OutMode,
+    touch: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let alg = keygen.algorithm.to_alg();
-    crate::prompt::touch(&format!(
-        "Generating {} in {} (touch the key if it blinks)\u{2026}",
-        alg.label(),
-        slot.label()
-    ));
+    // `touch`: [`keyroost_transport::PivSession::may_ask_touch_to_write`],
+    // asked by the caller before management-key authentication.
+    if touch {
+        crate::prompt::touch(&format!(
+            "Generating {} in {} (touch the key if it blinks)\u{2026}",
+            alg.label(),
+            slot.label()
+        ));
+    }
     let pubkey = s.generate_key(
         slot,
         alg,

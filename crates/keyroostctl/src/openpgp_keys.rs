@@ -354,11 +354,14 @@ fn create(
     let mut session = crate::target::reader_of(&dev)
         .and_then(|r| open_openpgp_at(&r, debug))
         .map_err(|e| saved(&e))?;
+    let touch = session.may_ask_touch_to_write();
     session
         .verify_pin(PW3_ADMIN, admin.as_bytes())
         .map_err(|e| saved(&e))?;
     drop(admin);
-    crate::prompt::touch("Putting the keys on the card — touch the key if it blinks…");
+    if touch {
+        crate::prompt::touch("Putting the keys on the card — touch the key if it blinks…");
+    }
     let fprs = keyroost_pgpkey::card::import_set(&mut session, &set).map_err(|e| saved(&e))?;
     drop(session);
 
@@ -452,9 +455,12 @@ fn restore(
     let admin = sec.read(&PGP_ADMIN_PIN, asrc)?;
     crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
     let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
+    let touch = session.may_ask_touch_to_write();
     session.verify_pin(PW3_ADMIN, admin.as_bytes())?;
     drop(admin);
-    crate::prompt::touch("Putting the keys on the card — touch the key if it blinks…");
+    if touch {
+        crate::prompt::touch("Putting the keys on the card — touch the key if it blinks…");
+    }
     let fprs = keyroost_pgpkey::card::import_loaded(&mut session, &loaded, &slots)?;
     drop(session);
 
@@ -517,12 +523,15 @@ fn import_rsa_file(
     let admin = sec.read(&PGP_ADMIN_PIN, asrc)?;
     crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
     let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
+    let touch = session.may_ask_touch_to_write();
     session.verify_pin(PW3_ADMIN, admin.as_bytes())?;
     drop(admin);
-    crate::prompt::touch(&format!(
-        "Importing {} key — touch the key if it blinks…",
-        slot.label()
-    ));
+    if touch {
+        crate::prompt::touch(&format!(
+            "Importing {} key — touch the key if it blinks…",
+            slot.label()
+        ));
+    }
     let parts = keyroost_transport::RsaPrivateKeyParts {
         e: &k.e,
         p: &k.p,
@@ -636,13 +645,17 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
             let pin = sec.read(spec, src)?;
             crate::reverify_if_prompted(&sec, Need::OpenPgp, reader)?;
             let mut session = open_openpgp_at(&name, debug)?;
+            // The new self-signatures come from the card's signature key.
+            let touch = session.may_ask_touch_to_use(keyroost_openpgp::KeyCrt::Sign);
             // The signer first checks the card holds this key, then verifies
             // the PIN before each signature: a wrong PIN fails at the first
             // one, before any file is written.
             let mut signer =
                 keyroost_pgpkey::card::CardSigner::new(&mut session, &cert, pin.as_bytes())
                     .map_err(plain)?;
-            crate::prompt::touch("Signing with the card — touch the key each time it blinks…");
+            if touch {
+                crate::prompt::touch("Signing with the card — touch the key each time it blinks…");
+            }
             let new_public = cert::change_expiry(&cert, &mut signer, cert.primary.fpr, *set, now)
                 .map_err(plain)?;
             drop(signer);

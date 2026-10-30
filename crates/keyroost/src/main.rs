@@ -2882,8 +2882,10 @@ fn job_waits_for_touch(label: &str) -> bool {
 
 /// Set from the worker when the key reports over USB that it is waiting for
 /// a touch (CTAPHID KEEPALIVE, user presence needed; the Token2 OTP button
-/// wait), or while an import's delete waits on one (a Nitrokey 3). Cleared
-/// when a job starts and when the last one ends.
+/// wait), while an import's delete waits on one (a Nitrokey 3), or before a
+/// smart-card step the card may ask a touch for (a PIV or OpenPGP key's
+/// touch setting, an OATH reset). Cleared when a job starts and when the
+/// last one ends.
 static KEY_WANTS_TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A job's busy label as an activity-log line: up to the ellipsis, dash or
@@ -9778,13 +9780,19 @@ impl App {
         let alg = self.openpgp.gen_alg.to_alg();
         let creation_time = unix_now();
         self.openpgp.notice = None;
-        self.spawn_job("Generating key… (touch the key if it blinks)", move || {
-            let result = (|| -> Result<(keyroost_transport::OpenPgpStatus, [u8; 20]), TransportError> {
-                let mut s = Self::openpgp_open_admin(&name, &pin)?;
-                let _ = s.generate_key(slot.to_crt(), alg)?;
-                let fpr = s.register_key(slot.to_crt(), creation_time)?;
-                Ok((s.status()?, fpr))
-            })();
+        // The job raises the touch banner when the card may ask for one.
+        self.spawn_job("Generating key\u{2026}", move || {
+            let result =
+                (|| -> Result<(keyroost_transport::OpenPgpStatus, [u8; 20]), TransportError> {
+                    let mut s = Self::openpgp_open_admin(&name, &pin)?;
+                    KEY_WANTS_TOUCH.store(
+                        s.may_ask_touch_to_write(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    let _ = s.generate_key(slot.to_crt(), alg)?;
+                    let fpr = s.register_key(slot.to_crt(), creation_time)?;
+                    Ok((s.status()?, fpr))
+                })();
             Box::new(move |app: &mut App| {
                 match result {
                     Ok((status, fpr)) => {
@@ -9825,76 +9833,89 @@ impl App {
         let path = std::path::PathBuf::from(self.openpgp.import_path.trim());
         self.openpgp.notice = None;
         let for_device = self.selected_device.clone();
-        self.spawn_job("Importing key from file\u{2026} (touch if it blinks)", move || {
+        // The job raises the touch banner when the card may ask for one.
+        self.spawn_job("Importing key from file\u{2026}", move || {
             // Whether the file read as OpenPGP, so a dialog opened before the
             // path changed still learns to ask for the passphrase.
             let mut file_is_openpgp = false;
-            let result = (|| -> Result<(keyroost_transport::OpenPgpStatus, String, [u8; 20]), String> {
-                let data = zeroize::Zeroizing::new(
-                    std::fs::read(&path)
-                        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?,
-                );
-                let crt = slot.to_crt();
-                file_is_openpgp = is_openpgp(&data);
-                if file_is_openpgp {
-                    let pass = (!pass.is_empty()).then(|| pass.as_bytes());
-                    let loaded = keyroost_pgpkey::read::open(&data, pass).map_err(|e| match e {
-                        keyroost_pgpkey::Error::NeedsPassphrase => {
-                            "This file is protected; enter its passphrase.".to_string()
-                        }
-                        e => pgp_plain(e),
-                    })?;
-                    drop(data);
-                    let Some(key) = loaded.keys.iter().find(|k| k.slot == Some(slot.to_slot()))
-                    else {
-                        return Err(format!(
-                            "{} has no key for the {} slot.",
-                            path.display(),
-                            slot.label()
-                        ));
-                    };
-                    let kind = key
-                        .key_type
-                        .map_or("OpenPGP", |t| t.card_alg(crt).label())
-                        .to_string();
-                    let mut s =
-                        Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
-                    let fprs =
-                        keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &[slot.to_slot()])
-                            .map_err(sentence)?;
-                    let status = s.status().map_err(|e| e.to_string())?;
-                    Ok((status, kind, fprs[0]))
-                } else {
-                    drop(data);
-                    let k = keyroost_rsakey::load_from_file(&path).map_err(|e| e.to_string())?;
-                    let alg = match k.n.len() {
-                        256 => keyroost_transport::OpenPgpKeyAlg::Rsa2048,
-                        384 => keyroost_transport::OpenPgpKeyAlg::Rsa3072,
-                        512 => keyroost_transport::OpenPgpKeyAlg::Rsa4096,
-                        n => return Err(format!("Unexpected RSA modulus of {n} bytes.")),
-                    };
-                    let mut s =
-                        Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
-                    let parts = keyroost_transport::RsaPrivateKeyParts {
-                        e: &k.e,
-                        p: &k.p,
-                        q: &k.q,
-                        u: &k.u,
-                        dp: &k.dp,
-                        dq: &k.dq,
-                        n: &k.n,
-                    };
-                    // Sets the slot to this key's size before the import, so a
-                    // 3072/4096-bit key lands in a slot that was 2048.
-                    s.import_any(crt, alg, &keyroost_transport::ImportKey::Rsa(parts))
+            let result =
+                (|| -> Result<(keyroost_transport::OpenPgpStatus, String, [u8; 20]), String> {
+                    let data = zeroize::Zeroizing::new(
+                        std::fs::read(&path)
+                            .map_err(|e| format!("Cannot read {}: {e}", path.display()))?,
+                    );
+                    let crt = slot.to_crt();
+                    file_is_openpgp = is_openpgp(&data);
+                    if file_is_openpgp {
+                        let pass = (!pass.is_empty()).then(|| pass.as_bytes());
+                        let loaded =
+                            keyroost_pgpkey::read::open(&data, pass).map_err(|e| match e {
+                                keyroost_pgpkey::Error::NeedsPassphrase => {
+                                    "This file is protected; enter its passphrase.".to_string()
+                                }
+                                e => pgp_plain(e),
+                            })?;
+                        drop(data);
+                        let Some(key) = loaded.keys.iter().find(|k| k.slot == Some(slot.to_slot()))
+                        else {
+                            return Err(format!(
+                                "{} has no key for the {} slot.",
+                                path.display(),
+                                slot.label()
+                            ));
+                        };
+                        let kind = key
+                            .key_type
+                            .map_or("OpenPGP", |t| t.card_alg(crt).label())
+                            .to_string();
+                        let mut s =
+                            Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
+                        KEY_WANTS_TOUCH.store(
+                            s.may_ask_touch_to_write(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        let fprs = keyroost_pgpkey::card::import_loaded(
+                            &mut s,
+                            &loaded,
+                            &[slot.to_slot()],
+                        )
                         .map_err(sentence)?;
-                    let fpr = s
-                        .register_key(crt, unix_now())
-                        .map_err(|e| e.to_string())?;
-                    let status = s.status().map_err(|e| e.to_string())?;
-                    Ok((status, alg.label().to_string(), fpr))
-                }
-            })();
+                        let status = s.status().map_err(|e| e.to_string())?;
+                        Ok((status, kind, fprs[0]))
+                    } else {
+                        drop(data);
+                        let k =
+                            keyroost_rsakey::load_from_file(&path).map_err(|e| e.to_string())?;
+                        let alg = match k.n.len() {
+                            256 => keyroost_transport::OpenPgpKeyAlg::Rsa2048,
+                            384 => keyroost_transport::OpenPgpKeyAlg::Rsa3072,
+                            512 => keyroost_transport::OpenPgpKeyAlg::Rsa4096,
+                            n => return Err(format!("Unexpected RSA modulus of {n} bytes.")),
+                        };
+                        let mut s =
+                            Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
+                        KEY_WANTS_TOUCH.store(
+                            s.may_ask_touch_to_write(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        let parts = keyroost_transport::RsaPrivateKeyParts {
+                            e: &k.e,
+                            p: &k.p,
+                            q: &k.q,
+                            u: &k.u,
+                            dp: &k.dp,
+                            dq: &k.dq,
+                            n: &k.n,
+                        };
+                        // Sets the slot to this key's size before the import, so a
+                        // 3072/4096-bit key lands in a slot that was 2048.
+                        s.import_any(crt, alg, &keyroost_transport::ImportKey::Rsa(parts))
+                            .map_err(sentence)?;
+                        let fpr = s.register_key(crt, unix_now()).map_err(|e| e.to_string())?;
+                        let status = s.status().map_err(|e| e.to_string())?;
+                        Ok((status, alg.label().to_string(), fpr))
+                    }
+                })();
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     app.log_moved_on(for_device.as_ref(), "importing a key from a file", &result);
@@ -10034,69 +10055,70 @@ impl App {
         let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
         let for_device = self.selected_device.clone();
         self.openpgp.notice = None;
-        self.spawn_job(
-            "Putting the keys on the card \u{2014} touch the key if it blinks\u{2026}",
-            move || {
-                let backup = created.paths.secret.clone();
-                // Opening the card and verifying the admin PIN write nothing;
-                // any failure from the import on may have left keys behind.
-                let result = (|| -> Result<keyroost_transport::OpenPgpStatus, LoadFailure> {
-                    let backup = &backup;
-                    let failed = |card_touched: bool| {
-                        move |e: TransportError| LoadFailure {
-                            card_touched,
-                            message: with_backup(e, backup),
-                        }
-                    };
-                    let mut s = Self::openpgp_open_admin(&name, &pin).map_err(failed(false))?;
-                    keyroost_pgpkey::card::import_set(&mut s, &created.set)
-                        .map_err(|e| load_failure(e, backup))?;
-                    s.status().map_err(failed(true))
-                })();
-                drop(created);
-                Box::new(move |app: &mut App| {
-                    if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                        app.log_moved_on(
-                            for_device.as_ref(),
-                            "putting new keys on the card",
-                            &result.as_ref().map(|_| ()).map_err(|f| f.message.clone()),
-                        );
-                        return;
+        self.spawn_job("Putting the keys on the card\u{2026}", move || {
+            let backup = created.paths.secret.clone();
+            // Opening the card and verifying the admin PIN write nothing;
+            // any failure from the import on may have left keys behind.
+            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, LoadFailure> {
+                let backup = &backup;
+                let failed = |card_touched: bool| {
+                    move |e: TransportError| LoadFailure {
+                        card_touched,
+                        message: with_backup(e, backup),
                     }
-                    wipe(&mut app.openpgp.admin_pin);
-                    match result {
-                        Ok(status) => {
-                            app.openpgp.created = None;
-                            app.openpgp.status = Some(status);
-                            app.openpgp.key_present = [None; 3];
-                            app.openpgp.loaded = true;
-                            app.openpgp.error = None;
-                            app.openpgp_done(format!(
-                                "Keys loaded. Backup saved to {}; keep it and the revocation \
+                };
+                let mut s = Self::openpgp_open_admin(&name, &pin).map_err(failed(false))?;
+                KEY_WANTS_TOUCH.store(
+                    s.may_ask_touch_to_write(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                keyroost_pgpkey::card::import_set(&mut s, &created.set)
+                    .map_err(|e| load_failure(e, backup))?;
+                s.status().map_err(failed(true))
+            })();
+            drop(created);
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    app.log_moved_on(
+                        for_device.as_ref(),
+                        "putting new keys on the card",
+                        &result.as_ref().map(|_| ()).map_err(|f| f.message.clone()),
+                    );
+                    return;
+                }
+                wipe(&mut app.openpgp.admin_pin);
+                match result {
+                    Ok(status) => {
+                        app.openpgp.created = None;
+                        app.openpgp.status = Some(status);
+                        app.openpgp.key_present = [None; 3];
+                        app.openpgp.loaded = true;
+                        app.openpgp.error = None;
+                        app.openpgp_done(format!(
+                            "Keys loaded. Backup saved to {}; keep it and the revocation \
                              certificate offline.",
-                                backup.display()
-                            ));
-                            if let Some(m) = app.openpgp.cred_modal.as_mut() {
-                                m.busy = false;
-                                m.result = Some(Ok(()));
-                            }
-                        }
-                        Err(mut f) => {
-                            // An earlier attempt that may have written keys
-                            // still counts after a later one that didn't.
-                            f.card_touched |= app
-                                .openpgp
-                                .created_failure
-                                .as_ref()
-                                .is_some_and(|prev| prev.card_touched);
-                            let msg = f.message.clone();
-                            app.openpgp.created_failure = Some(f);
-                            Self::openpgp_step_failed(app, msg);
+                            backup.display()
+                        ));
+                        if let Some(m) = app.openpgp.cred_modal.as_mut() {
+                            m.busy = false;
+                            m.result = Some(Ok(()));
                         }
                     }
-                })
-            },
-        )
+                    Err(mut f) => {
+                        // An earlier attempt that may have written keys
+                        // still counts after a later one that didn't.
+                        f.card_touched |= app
+                            .openpgp
+                            .created_failure
+                            .as_ref()
+                            .is_some_and(|prev| prev.card_touched);
+                        let msg = f.message.clone();
+                        app.openpgp.created_failure = Some(f);
+                        Self::openpgp_step_failed(app, msg);
+                    }
+                }
+            })
+        })
     }
 
     /// Restore a backup, step 1 (worker): read `restore_path` with the typed
@@ -10184,40 +10206,41 @@ impl App {
         let path = self.openpgp.restore_path.trim().to_string();
         let for_device = self.selected_device.clone();
         self.openpgp.notice = None;
-        self.spawn_job(
-            "Putting the keys on the card \u{2014} touch the key if it blinks\u{2026}",
-            move || {
-                let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
-                    let mut s = Self::openpgp_open_admin(&name, &pin)?;
-                    keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &slots)?;
-                    s.status()
-                })();
-                drop(loaded);
-                let what = pgp_slots_text(&slots);
-                Box::new(move |app: &mut App| {
-                    if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                        app.log_moved_on(for_device.as_ref(), "restoring a backup", &result);
-                        return;
-                    }
-                    wipe(&mut app.openpgp.admin_pin);
-                    match result {
-                        Ok(status) => {
-                            app.openpgp.restore_loaded = None;
-                            app.openpgp.status = Some(status);
-                            app.openpgp.key_present = [None; 3];
-                            app.openpgp.loaded = true;
-                            app.openpgp.error = None;
-                            app.openpgp_done(format!("Loaded {what} from {path}."));
-                            if let Some(m) = app.openpgp.cred_modal.as_mut() {
-                                m.busy = false;
-                                m.result = Some(Ok(()));
-                            }
+        self.spawn_job("Putting the keys on the card\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
+                let mut s = Self::openpgp_open_admin(&name, &pin)?;
+                KEY_WANTS_TOUCH.store(
+                    s.may_ask_touch_to_write(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &slots)?;
+                s.status()
+            })();
+            drop(loaded);
+            let what = pgp_slots_text(&slots);
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    app.log_moved_on(for_device.as_ref(), "restoring a backup", &result);
+                    return;
+                }
+                wipe(&mut app.openpgp.admin_pin);
+                match result {
+                    Ok(status) => {
+                        app.openpgp.restore_loaded = None;
+                        app.openpgp.status = Some(status);
+                        app.openpgp.key_present = [None; 3];
+                        app.openpgp.loaded = true;
+                        app.openpgp.error = None;
+                        app.openpgp_done(format!("Loaded {what} from {path}."));
+                        if let Some(m) = app.openpgp.cred_modal.as_mut() {
+                            m.busy = false;
+                            m.result = Some(Ok(()));
                         }
-                        Err(e) => Self::openpgp_step_failed(app, sentence(e)),
                     }
-                })
-            },
-        )
+                    Err(e) => Self::openpgp_step_failed(app, sentence(e)),
+                }
+            })
+        })
     }
 
     /// Change expiry date, step 1 (worker): read the public key file and
@@ -10298,7 +10321,7 @@ impl App {
             ),
             By::Card(_) => (
                 zeroize::Zeroizing::new(f.user_pin.clone()),
-                "Signing with the card \u{2014} touch the key each time it blinks\u{2026}",
+                "Signing with the card\u{2026}",
             ),
         };
         let for_device = self.selected_device.clone();
@@ -10354,6 +10377,12 @@ impl App {
                     By::Card(name) => {
                         let mut session = keyroost_transport::OpenPgpSession::open(name)
                             .map_err(|e| e.to_string())?;
+                        // The new self-signatures come from the card's
+                        // signature key: raise the touch banner if it may ask.
+                        KEY_WANTS_TOUCH.store(
+                            session.may_ask_touch_to_use(keyroost_transport::KeyCrt::Sign),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         // The signer first checks the card holds this key,
                         // then verifies the PIN before each signature: a
                         // wrong PIN fails at the first one, before any file
@@ -11850,11 +11879,16 @@ impl App {
         self.piv.notice = None;
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
-        self.spawn_piv_job("Generating key\u{2026} (touch if it blinks)", move || {
+        // The job raises the touch banner when the card may ask for one.
+        self.spawn_piv_job("Generating key\u{2026}", move || {
             let result = keyroost_transport::PivSession::with_cached_transaction(
                 &name,
                 cached_state,
                 |s| -> Result<_, TransportError> {
+                    KEY_WANTS_TOUCH.store(
+                        s.may_ask_touch_to_write(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     piv_authenticate(s, &mgmt)?;
                     let pubkey = s.generate_key(slot, alg, pin_policy, touch_policy)?;
                     let status = s.status()?;
@@ -12121,7 +12155,8 @@ impl App {
         self.piv.notice = None;
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
-        self.spawn_piv_job("Importing key\u{2026} (touch if it blinks)", move || {
+        // The job raises the touch banner when the card may ask for one.
+        self.spawn_piv_job("Importing key\u{2026}", move || {
             use keyroost_transport::piv_import;
             let result = keyroost_transport::PivSession::with_cached_transaction(
                 &name,
@@ -12140,6 +12175,10 @@ impl App {
                     ) {
                         Err(r) => Err(piv_import::ImportFailure::Refused(r)),
                         Ok(plan) => {
+                            KEY_WANTS_TOUCH.store(
+                                s.may_ask_touch_to_import(touch_policy),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             piv_authenticate(s, &mgmt)?;
                             piv_import::run_import(
                                 s,
@@ -12566,19 +12605,6 @@ impl App {
         )
     }
 
-    /// The selected slot's `(PIN policy, touch policy)` from the last
-    /// `status_detailed` read, or `None` when the card didn't report one.
-    fn piv_selected_slot_policy(
-        &self,
-    ) -> Option<(keyroost_piv::PinPolicy, keyroost_piv::TouchPolicy)> {
-        let sel = self.piv.selected_slot.to_slot();
-        self.piv
-            .slot_policies
-            .iter()
-            .find(|(s, _)| *s == sel)
-            .and_then(|(_, pol)| *pol)
-    }
-
     /// The selected slot's key algorithm (from the last `status_detailed`
     /// read) and whether it holds a certificate — the two facts the Test row
     /// gates its button on. A retired slot's come from the lazy retired read
@@ -12651,19 +12677,11 @@ impl App {
         };
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
-        let want_touch = matches!(
-            self.piv_selected_slot_policy().map(|(_, t)| t),
-            Some(keyroost_piv::TouchPolicy::Always | keyroost_piv::TouchPolicy::Cached)
-        );
         self.piv.notice = None;
-        let label = if want_touch {
-            "Running self-test\u{2026} \u{2014} touch the key"
-        } else {
-            "Running self-test\u{2026}"
-        };
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
-        self.spawn_piv_job(label, move || {
+        // The worker raises the touch banner when the slot may ask for one.
+        self.spawn_piv_job("Running self-test\u{2026}", move || {
             let outcome = run_piv_self_test(&name, slot, pin.as_bytes(), cached_state);
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.sign_pin);
@@ -12807,41 +12825,39 @@ impl App {
         // where the freshly-opened session otherwise has no other way to
         // learn it (see `load_piv_status`'s doc).
         let cached_state = self.piv_cached_piv_session_state();
-        self.spawn_piv_job(
-            "Creating self-signed certificate\u{2026} (touch if it blinks)",
-            move || {
-                let result = keyroost_transport::PivSession::with_cached_transaction(
-                    &name,
-                    cached_state,
-                    |s| {
-                        piv_authenticate(s, &mgmt)?;
-                        let now = unix_now();
-                        let (_, stored) = s.self_signed_certificate(
-                            slot,
-                            &subject,
-                            i64::from(now),
-                            keyroost_piv::add_calendar_period(u64::from(now), years, months, days),
-                            pin.as_bytes(),
-                            choice.to_compression(),
-                            key_usage,
-                        )?;
-                        let status = s.status()?;
-                        Ok((status, s.state(), stored))
-                    },
-                );
-                Box::new(move |app: &mut App| {
-                    wipe(&mut app.piv.sign_pin);
-                    wipe(&mut app.piv.mgmt_key_input);
-                    let result = app.store_and_unwrap_piv_cert_write(for_device, result);
-                    Self::apply_piv_cert_write(
-                        app,
-                        result,
-                        &format!("Self-signed certificate stored in {}", slot.label()),
-                        choice,
+        self.spawn_piv_job("Creating self-signed certificate\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    KEY_WANTS_TOUCH.store(
+                        s.may_ask_touch_to_use(slot),
+                        std::sync::atomic::Ordering::Relaxed,
                     );
-                })
-            },
-        );
+                    piv_authenticate(s, &mgmt)?;
+                    let now = unix_now();
+                    let (_, stored) = s.self_signed_certificate(
+                        slot,
+                        &subject,
+                        i64::from(now),
+                        keyroost_piv::add_calendar_period(u64::from(now), years, months, days),
+                        pin.as_bytes(),
+                        choice.to_compression(),
+                        key_usage,
+                    )?;
+                    let status = s.status()?;
+                    Ok((status, s.state(), stored))
+                });
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.piv.sign_pin);
+                wipe(&mut app.piv.mgmt_key_input);
+                let result = app.store_and_unwrap_piv_cert_write(for_device, result);
+                Self::apply_piv_cert_write(
+                    app,
+                    result,
+                    &format!("Self-signed certificate stored in {}", slot.label()),
+                    choice,
+                );
+            })
+        });
     }
 
     /// Sign a PKCS#10 certificate request on the card and save it as PEM.
@@ -12866,42 +12882,43 @@ impl App {
         // pubkey cache already knew, including a key generated earlier this
         // app run.
         let cached_state = self.piv_cached_piv_session_state();
-        self.spawn_piv_job(
-            "Signing certificate request\u{2026} (touch if it blinks)",
-            move || {
-                let result = keyroost_transport::PivSession::with_cached_transaction(
-                    &name,
-                    cached_state,
-                    |s| -> Result<_, TransportError> {
-                        let pem = s.generate_csr(slot, &subject, pin.as_bytes(), key_usage)?;
-                        std::fs::write(&path, pem.as_bytes()).map_err(|_| {
-                            TransportError::MalformedResponse("cannot write destination file")
-                        })?;
-                        Ok(s.state())
-                    },
-                );
-                Box::new(move |app: &mut App| {
-                    wipe(&mut app.piv.sign_pin);
-                    match result {
-                        Ok(state) => {
-                            app.store_piv_session_state(for_device, state);
-                            app.log(
-                                Severity::Ok,
-                                format!("certificate request signed for {}", slot.label()),
-                            );
-                            app.piv.error = None;
-                            app.piv.notice = Some("Certificate request signed and saved.".into());
-                        }
-                        Err(e) => {
-                            app.log(Severity::Err, e.to_string());
-                            app.piv.notice = None;
-                            app.piv.error = Some(e.to_string());
-                        }
+        self.spawn_piv_job("Signing certificate request\u{2026}", move || {
+            let result = keyroost_transport::PivSession::with_cached_transaction(
+                &name,
+                cached_state,
+                |s| -> Result<_, TransportError> {
+                    KEY_WANTS_TOUCH.store(
+                        s.may_ask_touch_to_use(slot),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    let pem = s.generate_csr(slot, &subject, pin.as_bytes(), key_usage)?;
+                    std::fs::write(&path, pem.as_bytes()).map_err(|_| {
+                        TransportError::MalformedResponse("cannot write destination file")
+                    })?;
+                    Ok(s.state())
+                },
+            );
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.piv.sign_pin);
+                match result {
+                    Ok(state) => {
+                        app.store_piv_session_state(for_device, state);
+                        app.log(
+                            Severity::Ok,
+                            format!("certificate request signed for {}", slot.label()),
+                        );
+                        app.piv.error = None;
+                        app.piv.notice = Some("Certificate request signed and saved.".into());
                     }
-                    Self::apply_piv_cred_result(app);
-                })
-            },
-        );
+                    Err(e) => {
+                        app.log(Severity::Err, e.to_string());
+                        app.piv.notice = None;
+                        app.piv.error = Some(e.to_string());
+                    }
+                }
+                Self::apply_piv_cred_result(app);
+            })
+        });
     }
 
     fn piv_export_cert(&mut self) {
@@ -14233,6 +14250,11 @@ fn run_piv_self_test(
                 return Err(format!("no self-test applies to a {} key", alg.label()));
             }
 
+            // Asked before the PIN verify the test starts with.
+            KEY_WANTS_TOUCH.store(
+                s.may_ask_touch_to_use(slot),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             // A wrong PIN fails the whole run before any op (one retry, not
             // one per op); PIN-per-use slots (9C) are re-verified per op.
             let results = s
@@ -22110,13 +22132,11 @@ impl App {
         let busy = self.piv.cred_modal.as_ref().is_some_and(|m| m.busy);
         let result = self.piv.cred_modal.as_ref().and_then(|m| m.result.clone());
         let detail = self.piv.cred_modal.as_ref().and_then(|m| m.detail.clone());
-        // The self-test spinner asks for a touch when the selected slot's
-        // touch policy needs one (mirrors the Generate-key spinner wording).
+        // The self-test spinner asks for a touch once the worker found the
+        // slot may ask for one (the same answer that raises the banner).
         let busy_text = if kind == PivCredKind::SelfTest
-            && matches!(
-                self.piv_selected_slot_policy().map(|(_, t)| t),
-                Some(keyroost_piv::TouchPolicy::Always | keyroost_piv::TouchPolicy::Cached)
-            ) {
+            && KEY_WANTS_TOUCH.load(std::sync::atomic::Ordering::Relaxed)
+        {
             format!("{} \u{2014} touch the key", kind.busy_label())
         } else {
             kind.busy_label().to_owned()
@@ -24389,7 +24409,7 @@ impl App {
             note(
                 ui,
                 "Generating OVERWRITES this key (clearable only by a full reset). \
-                 Prompts for the admin PIN; touch the key if it blinks.",
+                 Prompts for the admin PIN.",
             );
 
             ui.add_space(12.0);

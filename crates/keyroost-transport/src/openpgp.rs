@@ -690,6 +690,38 @@ impl OpenPgpSession {
         Ok(Vec::new()) // unreachable for a non-empty chunk list
     }
 
+    /// Whether using `crt`'s key (sign, decrypt, authenticate) may ask for a
+    /// touch, for a "touch the key if it blinks" hint: from the card's own
+    /// touch setting (its User Interaction Flag, OpenPGP card 3.3+). `false`
+    /// only when the card says it is off; a card that doesn't report it may.
+    /// Read before verifying a PIN.
+    pub fn may_ask_touch_to_use(&mut self, crt: pgp::KeyCrt) -> bool {
+        match self.transmit_full(&pgp::get_data(crt.uif_tag())) {
+            Ok((reply, 0x9000)) => pgp::uif_asks_touch(&reply).unwrap_or(true),
+            _ => true,
+        }
+    }
+
+    /// Whether generating or importing keys (or restoring a backup) may ask
+    /// for a touch on this card, for the same hint: by the AID's
+    /// manufacturer ([`pgp::may_ask_touch_to_write`]). A card whose AID
+    /// can't be read may.
+    pub fn may_ask_touch_to_write(&mut self) -> bool {
+        let manufacturer = self
+            .transmit_full(&pgp::get_data(pgp::TAG_AID))
+            .ok()
+            .filter(|(_, sw)| *sw == 0x9000)
+            .and_then(|(aid, _)| {
+                // The reply may be the raw AID or a `4F len …` wrapper.
+                let raw = match aid.as_slice() {
+                    [0x4F, _, rest @ ..] => rest.to_vec(),
+                    _ => aid,
+                };
+                pgp::aid_manufacturer_id(&raw)
+            });
+        pgp::may_ask_touch_to_write(manufacturer)
+    }
+
     /// Raw algorithm attributes (`C1`/`C2`/`C3`) of `crt`'s slot, from a fresh
     /// Application Related Data read. Read-only; no PIN.
     pub fn algorithm_attributes(&mut self, crt: pgp::KeyCrt) -> Result<Vec<u8>, TransportError> {

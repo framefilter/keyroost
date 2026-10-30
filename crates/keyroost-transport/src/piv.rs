@@ -4869,6 +4869,61 @@ impl<'tx> PivSession<'tx> {
         Ok(data)
     }
 
+    /// Whether using `slot`'s private key (sign, decrypt, key agreement,
+    /// the self-test) may ask for a touch, for a "touch the key if it
+    /// blinks" hint: `false` only when the card is known never to ask
+    /// ([`PivQuirk::NeverAsksForTouch`](keyroost_piv::compat::PivQuirk::NeverAsksForTouch))
+    /// or reports the slot's touch policy as never. Unknown counts as "may".
+    ///
+    /// Call it before verifying the PIN: it may read the slot's metadata,
+    /// and some cards take no command between a PIN verify and the
+    /// operation it authorizes.
+    pub fn may_ask_touch_to_use(&mut self, slot: Slot) -> bool {
+        if self
+            .quirks()
+            .contains(&keyroost_piv::compat::PivQuirk::NeverAsksForTouch)
+        {
+            return false;
+        }
+        !matches!(self.slot_policy(slot), Some((_, TouchPolicy::Never)))
+    }
+
+    /// Whether generating or importing a key may ask for a touch, for the
+    /// same hint: `false` only on a card known not to
+    /// ([`PivQuirk::NoTouchToGenerateOrImport`](keyroost_piv::compat::PivQuirk::NoTouchToGenerateOrImport),
+    /// [`PivQuirk::NeverAsksForTouch`](keyroost_piv::compat::PivQuirk::NeverAsksForTouch)).
+    /// Call it before management-key authentication; it reads only what the
+    /// session already knows about the card.
+    pub fn may_ask_touch_to_write(&mut self) -> bool {
+        use keyroost_piv::compat::PivQuirk;
+        let quirks = self.quirks();
+        !(quirks.contains(&PivQuirk::NoTouchToGenerateOrImport)
+            || quirks.contains(&PivQuirk::NeverAsksForTouch))
+    }
+
+    /// Whether a key import ([`crate::piv_import::run_import`]) may ask for
+    /// a touch: writing the key ([`Self::may_ask_touch_to_write`]) or the
+    /// self-test that follows it, which uses the new key under
+    /// `touch_policy`: "never" doesn't ask, "always"/"cached" may, and the
+    /// default may unless the card is known not to ask with it
+    /// ([`PivQuirk::NoTouchToGenerateOrImport`](keyroost_piv::compat::PivQuirk::NoTouchToGenerateOrImport)).
+    /// Call it before management-key authentication.
+    pub fn may_ask_touch_to_import(&mut self, touch_policy: TouchPolicy) -> bool {
+        let write = self.may_ask_touch_to_write();
+        if self
+            .quirks()
+            .contains(&keyroost_piv::compat::PivQuirk::NeverAsksForTouch)
+        {
+            return false;
+        }
+        write
+            || match touch_policy {
+                TouchPolicy::Never => false,
+                TouchPolicy::Default => write,
+                TouchPolicy::Always | TouchPolicy::Cached => true,
+            }
+    }
+
     /// Read `slot`'s PIN/touch policy for display:
     ///
     /// 1. `PolicyCache` — already resolved this lineage, by either of the
