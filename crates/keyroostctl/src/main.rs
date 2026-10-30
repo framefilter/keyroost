@@ -10713,6 +10713,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(mgmt) = &mgmt {
                         let mgmt = mgmt_key_bytes(mgmt, &PIV_MGMT_KEY, s)?;
+                        // Before the management key goes to the card, as
+                        // `piv key generate` does.
+                        guard_inline_keygen(s, keygen)?;
                         authenticate_piv(s, &mgmt)?;
                         inline_generate_key(s, slot.to_slot(), keygen, pub_mode)?;
                     } else if let Some(path) = pubkey_in {
@@ -10826,6 +10829,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
+                    if keygen.generate_key {
+                        // Before the management key goes to the card, as
+                        // `piv key generate` does.
+                        guard_inline_keygen(s, keygen)?;
+                    }
                     authenticate_piv(s, &mgmt)?;
                     if keygen.generate_key {
                         inline_generate_key(s, slot.to_slot(), keygen, pub_mode)?;
@@ -11986,6 +11994,21 @@ fn guard_piv_keygen(
     )
 }
 
+/// [`guard_piv_keygen`] for `--generate-key`'s choices. Callers run it
+/// before management-key authentication, as `piv key generate` does.
+fn guard_inline_keygen(
+    s: &mut keyroost_transport::PivSession<'_>,
+    keygen: &InlineKeyGen,
+) -> Result<(), Box<dyn std::error::Error>> {
+    guard_piv_keygen(
+        s,
+        keygen.algorithm.to_alg(),
+        keygen.pin_policy,
+        keygen.touch_policy,
+        keygen.force,
+    )
+}
+
 /// The `--generate-key` convenience shared by `piv cert request` / `piv
 /// cert generate`: generate a fresh key pair in `slot` on `s` (which must already
 /// be management-key authenticated), and, if asked, drop a PEM copy of its
@@ -11999,7 +12022,6 @@ fn inline_generate_key(
     pub_mode: crate::prompt::OutMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let alg = keygen.algorithm.to_alg();
-    guard_piv_keygen(s, alg, keygen.pin_policy, keygen.touch_policy, keygen.force)?;
     crate::prompt::touch(&format!(
         "Generating {} in {} (touch the key if it blinks)\u{2026}",
         alg.label(),
@@ -16658,6 +16680,37 @@ mod cli_tests {
             let cli = Cli::try_parse_from(["keyroostctl", "piv", "test", "--slot", slot]);
             assert!(cli.is_ok(), "--slot {slot}");
         }
+        let moved = Cli::try_parse_from([
+            "keyroostctl",
+            "piv",
+            "key",
+            "move",
+            "--from",
+            "8A",
+            "--to",
+            "9C",
+        ]);
+        assert!(moved.is_ok(), "key move takes capitals too");
+    }
+
+    /// `--force` belongs to `--generate-key`'s support checks.
+    #[test]
+    fn generate_key_force_needs_generate_key() {
+        let base = [
+            "keyroostctl",
+            "piv",
+            "cert",
+            "generate",
+            "-s",
+            "9a",
+            "--subject",
+            "CN=x",
+        ];
+        let with = |extra: &[&'static str]| {
+            Cli::try_parse_from(base.iter().copied().chain(extra.iter().copied()))
+        };
+        assert!(with(&["--force"]).is_err());
+        assert!(with(&["--generate-key", "--force"]).is_ok());
     }
 
     #[test]

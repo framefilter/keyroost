@@ -65,9 +65,10 @@ impl OpenPgpStatus {
     /// ID marks the card as Token2 ([`pgp::MANUFACTURER_ID_TOKEN2`]), the raw
     /// value is run through `crate::decode_bcd_serial` to recover the real
     /// serial; every other vendor's serial is a plain integer and passes
-    /// through untouched.
-    ///
-    /// See [`Self::full_serial`] for the serial to show.
+    /// through untouched. That is a number to compare, not one to show: a
+    /// YubiKey stores its serial there as BCD too (`0x37806840` for 37806840)
+    /// and a Nitrokey as its hex serial; [`Self::serial_text`] is the form to
+    /// show.
     #[must_use]
     pub fn serial(&self) -> Option<u32> {
         let raw = self
@@ -84,7 +85,8 @@ impl OpenPgpStatus {
         }
     }
 
-    /// The serial to show: [`Self::otp_applet_serial`] when present, else [`Self::serial`].
+    /// [`Self::otp_applet_serial`] when present, else [`Self::serial`], as a
+    /// number. To show a serial, use [`Self::serial_text`].
     #[must_use]
     pub fn full_serial(&self) -> Option<u128> {
         self.otp_applet_serial
