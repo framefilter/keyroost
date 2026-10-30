@@ -26,7 +26,7 @@ cbc = "0.1"
 aes = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 # Parsing the PKCS#8 payload into key parts.
 p256 = "0.14"
 p384 = "0.14"
