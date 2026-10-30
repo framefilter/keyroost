@@ -319,8 +319,10 @@ pub(crate) struct PivTestOpJson {
 #[derive(Serialize)]
 pub(crate) struct OpenpgpStatusJson {
     pub aid: String,
-    /// Decimal, as a string so a leading-zero or large serial survives any
-    /// JSON consumer exactly.
+    /// The serial as `openpgp info` shows it: a Token2 key's full serial,
+    /// else the AID's serial bytes as GnuPG prints them (a YubiKey's
+    /// decimal serial, a Nitrokey's hex one). A string, so leading zeros and
+    /// hex digits survive any JSON consumer exactly.
     pub serial: Option<String>,
     pub sig_algo: String,
     pub dec_algo: String,
