@@ -763,14 +763,21 @@ impl CtapOtpTransport {
 /// channel, given its status word `sw`. A key with an OTP PIN set refuses
 /// that command with `6A81` though the channel works, so a `6A81` is
 /// followed by the PIN-flag read (`ask_flag`, protocol §6.11): a PIN set,
-/// or a locked PIN (`6983`), is the applet answering. Any other refusal is
-/// the key declining the channel, as before.
+/// or a status word Token2 confirmed as a PIN state (`6982`, `6983`,
+/// `6985`, `63xx`, the ones [`Token2OtpSession::pin_status`] surfaces), is
+/// the applet answering. Any other refusal is the key declining the
+/// channel, as before. Used by both USB channels' probes.
 fn probe_answered(sw: u16, ask_flag: impl FnOnce() -> Option<(Vec<u8>, u16)>) -> bool {
     match sw {
         t2::sw::OK => true,
         t2::sw::FUNCTION_NOT_SUPPORTED => match ask_flag() {
             Some((data, t2::sw::OK)) => t2::PinFlag::parse(&data).is_ok_and(|f| f.is_set()),
-            Some((_, sw)) => sw == t2::sw::PIN_LOCKED,
+            Some((_, sw)) => {
+                matches!(
+                    sw,
+                    t2::sw::PIN_INVALID | t2::sw::PIN_LOCKED | t2::sw::PIN_CONDITIONS_NOT_SATISFIED
+                ) || sw & 0xFF00 == 0x6300
+            }
             None => false,
         },
         _ => false,
@@ -1239,10 +1246,19 @@ fn detect_failure_from(
 
 /// Confirm the OTP applet answers over HID using the read-only
 /// `GET_ECDH_PUBKEY` command (supported by every model, changes nothing). A
-/// non-`9000` status word or any transport error means HID isn't usable for the
-/// applet. Called only via [`probe_hid_owned`], which bounds it in time.
+/// key with an OTP PIN set refuses it with `6A81`, so that answer is
+/// followed by the PIN-flag read, as on the `0x41` channel
+/// ([`probe_answered`]). Any other non-`9000` status word or transport error
+/// means HID isn't usable for the applet. Called only via
+/// [`probe_hid_owned`], which bounds it in time.
 fn probe_hid(t: &mut HidOtpTransport) -> Result<(), OtpTransportError> {
     let (_data, sw) = t.transmit(&t2::get_ecdh_pubkey(), false)?;
+    if probe_answered(sw, || {
+        t.transmit(&t2::read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_BASE), false)
+            .ok()
+    }) {
+        return Ok(());
+    }
     OtpError::check(sw)?;
     Ok(())
 }
@@ -2366,10 +2382,10 @@ mod ctap_reply_tests {
         let no_pin = || Some((vec![0x00, 0, 0, 0], 0x9000));
         assert!(probe_answered(0x9000, || panic!("no flag read on 9000")));
         assert!(probe_answered(0x6A81, pin_set));
-        assert!(
-            probe_answered(0x6A81, || Some((vec![], 0x6983))),
-            "locked PIN"
-        );
+        // Status words Token2 confirmed as PIN states.
+        for sw in [0x6983, 0x6982, 0x6985, 0x63C5] {
+            assert!(probe_answered(0x6A81, || Some((vec![], sw))), "{sw:#06x}");
+        }
         // 6A81 with no PIN behind it, or no flag answer, still declines.
         assert!(!probe_answered(0x6A81, no_pin));
         assert!(!probe_answered(0x6A81, || Some((vec![], 0x6D00))));
