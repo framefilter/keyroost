@@ -11999,13 +11999,7 @@ fn inline_generate_key(
     pub_mode: crate::prompt::OutMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let alg = keygen.algorithm.to_alg();
-    guard_piv_keygen(
-        s,
-        alg,
-        keygen.pin_policy,
-        keygen.touch_policy,
-        keygen.force,
-    )?;
+    guard_piv_keygen(s, alg, keygen.pin_policy, keygen.touch_policy, keygen.force)?;
     crate::prompt::touch(&format!(
         "Generating {} in {} (touch the key if it blinks)\u{2026}",
         alg.label(),
