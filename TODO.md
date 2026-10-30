@@ -39,8 +39,8 @@ Being worked on right now — check with whoever holds it before starting.
   PIN+ (queued in the next Windows test round) to see what the probe gets,
   then read the full serial another way when the FIDO applet doesn't
   answer. On Linux this key's card side isn't visible at all (libccid has
-  no entry for 349e:0024), and the HID-only row shows no serial (`#—`)
-  although its firmware ("R3.4") is worked out from that serial.
+  no entry for 349e:0024); its USB-only row gets its serial from the §6.10
+  read since #236.
 - **UI liveness — make "busy" visibly different from "frozen".** Card I/O stalls
   the visible UI for seconds (touch-required sign/decrypt/authenticate, on-card
   RSA keygen, the ~30s reset re-insert window, PC/SC enumeration) and a static
