@@ -7810,7 +7810,11 @@ impl App {
         match &result {
             Ok(_) if modal_busy => app.oath.add.result = Some(Ok(())),
             Err(TransportError::OathPasswordRejected) if modal_busy => {
-                app.oath.add.result = Some(Err("wrong OATH password".into()));
+                app.oath.add.result = Some(Err(if password.is_empty() {
+                    "This key's Authenticator is password-protected: unlock it first".into()
+                } else {
+                    "wrong OATH password".into()
+                }));
             }
             Err(e) if modal_busy => app.oath.add.result = Some(Err(e.to_string())),
             _ => {}
@@ -23820,7 +23824,12 @@ impl App {
                     if submit
                         || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                     {
-                        self.load_oath_creds();
+                        // As the FIDO2 unlock card does: nothing to send.
+                        if self.oath.password_input.is_empty() {
+                            self.oath.error = Some("Password is empty".into());
+                        } else {
+                            self.load_oath_creds();
+                        }
                     }
                 });
             });
@@ -31575,11 +31584,27 @@ mod tests {
         App::apply_oath_rows(
             &mut app,
             Err(TransportError::OathPasswordRejected),
-            zeroize::Zeroizing::new(String::new()),
+            zeroize::Zeroizing::new("typed".to_string()),
         );
         assert!(!app.oath.add.busy);
         assert_eq!(app.oath.add.result, Some(Err("wrong OATH password".into())));
         assert!(app.oath.error.is_none());
+
+        // An add on a locked key sent no password: it asks for an unlock.
+        let mut app = App::default();
+        app.oath.add = OathAddDialog::opened();
+        app.oath.add.busy = true;
+        App::apply_oath_rows(
+            &mut app,
+            Err(TransportError::OathPasswordRejected),
+            zeroize::Zeroizing::new(String::new()),
+        );
+        assert_eq!(
+            app.oath.add.result,
+            Some(Err(
+                "This key's Authenticator is password-protected: unlock it first".into()
+            ))
+        );
 
         // No modal open: a typed password the key refused is reported in the
         // pane (unlock/refresh).

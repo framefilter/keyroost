@@ -181,7 +181,7 @@ plan's two-key manual steps were never executed):
   Needs a way to get the token's serial during detection, without logging in
   with the customer key.
 
-- **Speed up the Nix CI build** — the cross-build job
+- **Speed up the Nix CI build** — the Nix build job
   ([#144](https://github.com/framefilter/keyroost/pull/144)) is the slowest
   in CI (10–19 minutes against 3–7). A plain cache of the Nix store won't
   help much (checked 2026-10-29): the flake's source is the whole repo
