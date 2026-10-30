@@ -2882,11 +2882,25 @@ fn job_waits_for_touch(label: &str) -> bool {
 
 /// Set from the worker when the key reports over USB that it is waiting for
 /// a touch (CTAPHID KEEPALIVE, user presence needed; the Token2 OTP button
-/// wait), while an import's delete waits on one (a Nitrokey 3), or before a
-/// smart-card step the card may ask a touch for (a PIV or OpenPGP key's
-/// touch setting, an OATH reset). Cleared when a job starts and when the
-/// last one ends.
+/// wait), or while an import's delete waits on one (a Nitrokey 3). Cleared
+/// when a job starts and when the last one ends.
 static KEY_WANTS_TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set by a job around a smart-card step the card may ask a touch for (a PIV
+/// or OpenPGP key's touch setting allows one, or the card doesn't say): the
+/// banner then hedges, where [`KEY_WANTS_TOUCH`] is the key's own request.
+/// Cleared when a job starts and when the last one ends.
+static KEY_MAY_ASK_TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run `op` with the "touch the key if it blinks" banner up when `may_ask`,
+/// lowering it after whatever the outcome, so the job's later reads don't
+/// keep it.
+fn with_touch_hint<T>(may_ask: bool, op: impl FnOnce() -> T) -> T {
+    KEY_MAY_ASK_TOUCH.store(may_ask, std::sync::atomic::Ordering::Relaxed);
+    let out = op();
+    KEY_MAY_ASK_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
+    out
+}
 
 /// A job's busy label as an activity-log line: up to the ellipsis, dash or
 /// parenthesis that starts its "touch the key" hint, so "Reading OATH
@@ -2976,14 +2990,21 @@ fn oath_delete_label(applet_asks: bool, touch_account: bool) -> &'static str {
 
 /// What the touch banner says while a job runs, or `None` for no banner: the
 /// job's own label when it asks for a touch, else a plain prompt once the key
-/// itself reports it is waiting for one.
-fn touch_prompt(label: Option<&str>, busy: bool, key_wants_touch: bool) -> Option<String> {
+/// itself reports it is waiting for one, else a hedged one while the job
+/// runs a step the card may ask a touch for ([`KEY_MAY_ASK_TOUCH`]).
+fn touch_prompt(
+    label: Option<&str>,
+    busy: bool,
+    key_wants_touch: bool,
+    key_may_ask: bool,
+) -> Option<String> {
     if !busy {
         return None;
     }
     match label {
         Some(label) if job_waits_for_touch(label) => Some(label.to_owned()),
         _ if key_wants_touch => Some("Touch your key to continue\u{2026}".to_owned()),
+        _ if key_may_ask => Some("Touch the key if it blinks\u{2026}".to_owned()),
         _ => None,
     }
 }
@@ -5473,6 +5494,7 @@ impl App {
                 self.busy_jobs += 1;
                 self.busy_label = Some(label);
                 KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
+                KEY_MAY_ASK_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 if worker.job_tx.send(Box::new(job)).is_err() {
                     // Worker died; undo the bookkeeping so the UI doesn't hang.
                     self.busy_jobs -= 1;
@@ -5514,6 +5536,7 @@ impl App {
             if self.busy_jobs == 0 {
                 self.busy_label = None;
                 KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
+                KEY_MAY_ASK_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             apply(self);
         }
@@ -9316,6 +9339,7 @@ impl App {
             self.busy_label.as_deref(),
             self.busy(),
             KEY_WANTS_TOUCH.load(std::sync::atomic::Ordering::Relaxed),
+            KEY_MAY_ASK_TOUCH.load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 
@@ -9638,6 +9662,20 @@ impl App {
         Ok(session)
     }
 
+    /// [`Self::openpgp_open_admin`] for a key write (generate, import,
+    /// restore), with whether the write may ask for a touch: read before the
+    /// admin PIN verify, since some cards take no command between a verify
+    /// and what it authorizes.
+    fn openpgp_open_admin_for_write(
+        name: &str,
+        admin_pin: &str,
+    ) -> Result<(keyroost_transport::OpenPgpSession, bool), TransportError> {
+        let mut session = keyroost_transport::OpenPgpSession::open(name)?;
+        let touch = session.may_ask_touch_to_write();
+        session.verify_admin_pin(admin_pin.as_bytes())?;
+        Ok((session, touch))
+    }
+
     /// Re-read status after a write and store it, surfacing `notice` on success.
     /// `keys_changed`: the write replaced or wiped keys, so what was read about
     /// key presence no longer holds; other writes (name, URL, PINs) keep it.
@@ -9784,12 +9822,8 @@ impl App {
         self.spawn_job("Generating key\u{2026}", move || {
             let result =
                 (|| -> Result<(keyroost_transport::OpenPgpStatus, [u8; 20]), TransportError> {
-                    let mut s = Self::openpgp_open_admin(&name, &pin)?;
-                    KEY_WANTS_TOUCH.store(
-                        s.may_ask_touch_to_write(),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    let _ = s.generate_key(slot.to_crt(), alg)?;
+                    let (mut s, touch) = Self::openpgp_open_admin_for_write(&name, &pin)?;
+                    let _ = with_touch_hint(touch, || s.generate_key(slot.to_crt(), alg))?;
                     let fpr = s.register_key(slot.to_crt(), creation_time)?;
                     Ok((s.status()?, fpr))
                 })();
@@ -9868,17 +9902,11 @@ impl App {
                             .key_type
                             .map_or("OpenPGP", |t| t.card_alg(crt).label())
                             .to_string();
-                        let mut s =
-                            Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
-                        KEY_WANTS_TOUCH.store(
-                            s.may_ask_touch_to_write(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        let fprs = keyroost_pgpkey::card::import_loaded(
-                            &mut s,
-                            &loaded,
-                            &[slot.to_slot()],
-                        )
+                        let (mut s, touch) = Self::openpgp_open_admin_for_write(&name, &pin)
+                            .map_err(|e| e.to_string())?;
+                        let fprs = with_touch_hint(touch, || {
+                            keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &[slot.to_slot()])
+                        })
                         .map_err(sentence)?;
                         let status = s.status().map_err(|e| e.to_string())?;
                         Ok((status, kind, fprs[0]))
@@ -9892,12 +9920,8 @@ impl App {
                             512 => keyroost_transport::OpenPgpKeyAlg::Rsa4096,
                             n => return Err(format!("Unexpected RSA modulus of {n} bytes.")),
                         };
-                        let mut s =
-                            Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
-                        KEY_WANTS_TOUCH.store(
-                            s.may_ask_touch_to_write(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        let (mut s, touch) = Self::openpgp_open_admin_for_write(&name, &pin)
+                            .map_err(|e| e.to_string())?;
                         let parts = keyroost_transport::RsaPrivateKeyParts {
                             e: &k.e,
                             p: &k.p,
@@ -9909,8 +9933,10 @@ impl App {
                         };
                         // Sets the slot to this key's size before the import, so a
                         // 3072/4096-bit key lands in a slot that was 2048.
-                        s.import_any(crt, alg, &keyroost_transport::ImportKey::Rsa(parts))
-                            .map_err(sentence)?;
+                        with_touch_hint(touch, || {
+                            s.import_any(crt, alg, &keyroost_transport::ImportKey::Rsa(parts))
+                        })
+                        .map_err(sentence)?;
                         let fpr = s.register_key(crt, unix_now()).map_err(|e| e.to_string())?;
                         let status = s.status().map_err(|e| e.to_string())?;
                         Ok((status, alg.label().to_string(), fpr))
@@ -10067,13 +10093,12 @@ impl App {
                         message: with_backup(e, backup),
                     }
                 };
-                let mut s = Self::openpgp_open_admin(&name, &pin).map_err(failed(false))?;
-                KEY_WANTS_TOUCH.store(
-                    s.may_ask_touch_to_write(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                keyroost_pgpkey::card::import_set(&mut s, &created.set)
-                    .map_err(|e| load_failure(e, backup))?;
+                let (mut s, touch) =
+                    Self::openpgp_open_admin_for_write(&name, &pin).map_err(failed(false))?;
+                with_touch_hint(touch, || {
+                    keyroost_pgpkey::card::import_set(&mut s, &created.set)
+                })
+                .map_err(|e| load_failure(e, backup))?;
                 s.status().map_err(failed(true))
             })();
             drop(created);
@@ -10208,12 +10233,10 @@ impl App {
         self.openpgp.notice = None;
         self.spawn_job("Putting the keys on the card\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
-                let mut s = Self::openpgp_open_admin(&name, &pin)?;
-                KEY_WANTS_TOUCH.store(
-                    s.may_ask_touch_to_write(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &slots)?;
+                let (mut s, touch) = Self::openpgp_open_admin_for_write(&name, &pin)?;
+                with_touch_hint(touch, || {
+                    keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &slots)
+                })?;
                 s.status()
             })();
             drop(loaded);
@@ -10378,25 +10401,21 @@ impl App {
                         let mut session = keyroost_transport::OpenPgpSession::open(name)
                             .map_err(|e| e.to_string())?;
                         // The new self-signatures come from the card's
-                        // signature key: raise the touch banner if it may ask.
-                        KEY_WANTS_TOUCH.store(
-                            session.may_ask_touch_to_use(keyroost_transport::KeyCrt::Sign),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        // signature key; asked before the PIN verify.
+                        let touch = session.may_ask_touch_to_use(keyroost_transport::KeyCrt::Sign);
                         // The signer first checks the card holds this key,
                         // then verifies the PIN before each signature: a
                         // wrong PIN fails at the first one, before any file
                         // is written.
-                        let mut signer = keyroost_pgpkey::card::CardSigner::new(
-                            &mut session,
-                            &cert,
-                            secret.as_bytes(),
-                        )
-                        .map_err(pgp_plain)?;
-                        let new_public =
+                        let new_public = with_touch_hint(touch, || {
+                            let mut signer = keyroost_pgpkey::card::CardSigner::new(
+                                &mut session,
+                                &cert,
+                                secret.as_bytes(),
+                            )?;
                             cert::change_expiry(&cert, &mut signer, cert.primary.fpr, expiry, now)
-                                .map_err(pgp_plain)?;
-                        drop(signer);
+                        })
+                        .map_err(pgp_plain)?;
                         drop(session);
                         keyroost_pgpkey::files::replace(&[(&public, &new_public, false)])
                             .map_err(pgp_plain)
@@ -11885,12 +11904,11 @@ impl App {
                 &name,
                 cached_state,
                 |s| -> Result<_, TransportError> {
-                    KEY_WANTS_TOUCH.store(
-                        s.may_ask_touch_to_write(),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    let touch = s.may_ask_touch_to_write();
                     piv_authenticate(s, &mgmt)?;
-                    let pubkey = s.generate_key(slot, alg, pin_policy, touch_policy)?;
+                    let pubkey = with_touch_hint(touch, || {
+                        s.generate_key(slot, alg, pin_policy, touch_policy)
+                    })?;
                     let status = s.status()?;
                     Ok((pubkey, status, s.state()))
                 },
@@ -12175,17 +12193,16 @@ impl App {
                     ) {
                         Err(r) => Err(piv_import::ImportFailure::Refused(r)),
                         Ok(plan) => {
-                            KEY_WANTS_TOUCH.store(
-                                s.may_ask_touch_to_import(touch_policy),
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            let touch = s.may_ask_touch_to_import(touch_policy);
                             piv_authenticate(s, &mgmt)?;
-                            piv_import::run_import(
-                                s,
-                                &plan,
-                                compression.to_compression(),
-                                Some(pin.as_bytes()),
-                            )
+                            with_touch_hint(touch, || {
+                                piv_import::run_import(
+                                    s,
+                                    &plan,
+                                    compression.to_compression(),
+                                    Some(pin.as_bytes()),
+                                )
+                            })
                         }
                     };
                     // A failed re-read must not hide what the import did.
@@ -12828,21 +12845,20 @@ impl App {
         self.spawn_piv_job("Creating self-signed certificate\u{2026}", move || {
             let result =
                 keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
-                    KEY_WANTS_TOUCH.store(
-                        s.may_ask_touch_to_use(slot),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    let touch = s.may_ask_touch_to_use(slot);
                     piv_authenticate(s, &mgmt)?;
                     let now = unix_now();
-                    let (_, stored) = s.self_signed_certificate(
-                        slot,
-                        &subject,
-                        i64::from(now),
-                        keyroost_piv::add_calendar_period(u64::from(now), years, months, days),
-                        pin.as_bytes(),
-                        choice.to_compression(),
-                        key_usage,
-                    )?;
+                    let (_, stored) = with_touch_hint(touch, || {
+                        s.self_signed_certificate(
+                            slot,
+                            &subject,
+                            i64::from(now),
+                            keyroost_piv::add_calendar_period(u64::from(now), years, months, days),
+                            pin.as_bytes(),
+                            choice.to_compression(),
+                            key_usage,
+                        )
+                    })?;
                     let status = s.status()?;
                     Ok((status, s.state(), stored))
                 });
@@ -12887,11 +12903,10 @@ impl App {
                 &name,
                 cached_state,
                 |s| -> Result<_, TransportError> {
-                    KEY_WANTS_TOUCH.store(
-                        s.may_ask_touch_to_use(slot),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    let pem = s.generate_csr(slot, &subject, pin.as_bytes(), key_usage)?;
+                    let touch = s.may_ask_touch_to_use(slot);
+                    let pem = with_touch_hint(touch, || {
+                        s.generate_csr(slot, &subject, pin.as_bytes(), key_usage)
+                    })?;
                     std::fs::write(&path, pem.as_bytes()).map_err(|_| {
                         TransportError::MalformedResponse("cannot write destination file")
                     })?;
@@ -14251,15 +14266,13 @@ fn run_piv_self_test(
             }
 
             // Asked before the PIN verify the test starts with.
-            KEY_WANTS_TOUCH.store(
-                s.may_ask_touch_to_use(slot),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            let touch = s.may_ask_touch_to_use(slot);
             // A wrong PIN fails the whole run before any op (one retry, not
             // one per op); PIN-per-use slots (9C) are re-verified per op.
-            let results = s
-                .self_test(slot, alg, &pubkey, (!pin.is_empty()).then_some(pin))
-                .map_err(|e| e.to_string())?;
+            let results = with_touch_hint(touch, || {
+                s.self_test(slot, alg, &pubkey, (!pin.is_empty()).then_some(pin))
+            })
+            .map_err(|e| e.to_string())?;
             Ok(PivSelfTestRun {
                 results,
                 state: s.state(),
@@ -22135,9 +22148,9 @@ impl App {
         // The self-test spinner asks for a touch once the worker found the
         // slot may ask for one (the same answer that raises the banner).
         let busy_text = if kind == PivCredKind::SelfTest
-            && KEY_WANTS_TOUCH.load(std::sync::atomic::Ordering::Relaxed)
+            && KEY_MAY_ASK_TOUCH.load(std::sync::atomic::Ordering::Relaxed)
         {
-            format!("{} \u{2014} touch the key", kind.busy_label())
+            format!("{} \u{2014} touch the key if it blinks", kind.busy_label())
         } else {
             kind.busy_label().to_owned()
         };
@@ -29404,26 +29417,40 @@ mod tests {
         assert!(!job_waits_for_touch(oath_delete_label(false, false)));
     }
 
-    /// The banner shows for a job that asks for a touch, and for any job once
-    /// the key itself reports it is waiting for one; never while idle.
+    /// The banner shows for a job that asks for a touch, for any job once the
+    /// key itself reports it is waiting for one, and (hedged) while a job
+    /// runs a step the card may ask a touch for; never while idle.
     #[test]
     fn the_touch_banner_follows_the_label_or_the_key() {
         let asks = "Resetting OATH applet \u{2014} touch the key if it blinks\u{2026}";
-        assert_eq!(touch_prompt(Some(asks), true, false).as_deref(), Some(asks));
         assert_eq!(
-            touch_prompt(Some("Refreshing credentials\u{2026}"), true, false),
+            touch_prompt(Some(asks), true, false, false).as_deref(),
+            Some(asks)
+        );
+        assert_eq!(
+            touch_prompt(Some("Refreshing credentials\u{2026}"), true, false, false),
             None
         );
         assert_eq!(
-            touch_prompt(Some("Refreshing credentials\u{2026}"), true, true).as_deref(),
+            touch_prompt(Some("Refreshing credentials\u{2026}"), true, true, false).as_deref(),
+            Some("Touch your key to continue\u{2026}")
+        );
+        // A step the card may ask a touch for hedges; the key's own request
+        // doesn't.
+        assert_eq!(
+            touch_prompt(Some("Generating key\u{2026}"), true, false, true).as_deref(),
+            Some("Touch the key if it blinks\u{2026}")
+        );
+        assert_eq!(
+            touch_prompt(Some("Generating key\u{2026}"), true, true, true).as_deref(),
             Some("Touch your key to continue\u{2026}")
         );
         assert_eq!(
-            touch_prompt(Some(asks), false, true),
+            touch_prompt(Some(asks), false, true, true),
             None,
             "no job, no banner"
         );
-        assert_eq!(touch_prompt(None, false, false), None);
+        assert_eq!(touch_prompt(None, false, false, false), None);
     }
 
     #[test]

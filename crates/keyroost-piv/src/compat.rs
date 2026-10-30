@@ -675,7 +675,8 @@ pub enum PivQuirk {
     /// touch requirement at all. Nitrokey 3 firmware 1.9.1: Nitrokey's
     /// published `piv-authenticator` source has no touch policy and no
     /// user-presence check (the reason [`PivExtension::SlotTouchPolicy`] is
-    /// known unsupported there).
+    /// known unsupported there), and a Nitrokey 3 on it generated a key,
+    /// signed a certificate and passed the self-test without a touch.
     NeverAsksForTouch,
 }
 

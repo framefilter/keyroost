@@ -185,8 +185,9 @@ pub enum TransportError {
     /// A PIV PIN/PUK verification failed; `tries_remaining` is the count the
     /// card reported (`63 Cx`), or `None` when blocked / unknown.
     PivPinRejected { tries_remaining: Option<u8> },
-    /// A PIV write needed an authorization (management key or PIN) that hadn't
-    /// been satisfied (`SW 6982`).
+    /// A PIV operation needed an authorization (management key or PIN) that
+    /// hadn't been satisfied, or a touch the key didn't get in time
+    /// (`SW 6982`; a YubiKey answers a touch timeout this way).
     PivSecurityNotSatisfied,
     /// A supplied PIV management key was the wrong length for its algorithm.
     PivBadKeyLength,
@@ -487,7 +488,7 @@ impl fmt::Display for TransportError {
             } => write!(f, "PIV PIN/PUK rejected (may be blocked)"),
             TransportError::PivSecurityNotSatisfied => write!(
                 f,
-                "PIV operation needs a management-key auth or PIN that wasn't satisfied"
+                "PIV operation needs a management-key auth, PIN or touch that wasn't given"
             ),
             TransportError::PivBadKeyLength => {
                 write!(

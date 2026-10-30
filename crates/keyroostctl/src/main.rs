@@ -10867,6 +10867,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     } else {
                         false
                     };
+                    // The signing key's touch setting, before the management
+                    // key goes to the card; a key generated here is asked
+                    // about once it exists.
+                    let sign_touch =
+                        (!keygen.generate_key).then(|| s.may_ask_touch_to_use(slot.to_slot()));
                     authenticate_piv(s, &mgmt)?;
                     if keygen.generate_key {
                         inline_generate_key(s, slot.to_slot(), keygen, pub_mode, gen_touch)?;
@@ -10874,7 +10879,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         let (alg, key) = load_pubkey_material(path)?;
                         s.remember_pubkey(slot.to_slot(), alg, key);
                     }
-                    if s.may_ask_touch_to_use(slot.to_slot()) {
+                    if sign_touch.unwrap_or_else(|| s.may_ask_touch_to_use(slot.to_slot())) {
                         crate::prompt::touch(
                             "Signing the certificate on the card (touch if it blinks)\u{2026}",
                         );

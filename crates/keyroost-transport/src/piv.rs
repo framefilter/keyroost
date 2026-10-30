@@ -4892,8 +4892,9 @@ impl<'tx> PivSession<'tx> {
     /// same hint: `false` only on a card known not to
     /// ([`PivQuirk::NoTouchToGenerateOrImport`](keyroost_piv::compat::PivQuirk::NoTouchToGenerateOrImport),
     /// [`PivQuirk::NeverAsksForTouch`](keyroost_piv::compat::PivQuirk::NeverAsksForTouch)).
-    /// Call it before management-key authentication; it reads only what the
-    /// session already knows about the card.
+    /// Call it before management-key authentication: telling the card apart
+    /// may read its firmware version from another application on it (a
+    /// Nitrokey's admin app) the first time.
     pub fn may_ask_touch_to_write(&mut self) -> bool {
         use keyroost_piv::compat::PivQuirk;
         let quirks = self.quirks();
@@ -4955,11 +4956,15 @@ impl<'tx> PivSession<'tx> {
         if let Some(resolved) = self.state.policy_cache.get(key_ref) {
             return resolved;
         }
-        // `cached_slot_key` writes `policy_cache` directly whenever its own
-        // GET METADATA reply carries a policy tag — check again after it,
-        // rather than inspecting its return value, since that's the key
-        // material, not the policy.
-        self.cached_slot_key(slot);
+        // GET METADATA writes `policy_cache` directly whenever its reply
+        // carries a policy tag — check again after it. A key this session
+        // already knows (generated here, or remembered from a file) says
+        // nothing about its policy, so the card is asked even then.
+        if self.state.pubkey_cache.get(key_ref).is_some() {
+            let _ = self.resolve_slot_from_device(slot);
+        } else {
+            self.cached_slot_key(slot);
+        }
         if let Some(resolved) = self.state.policy_cache.get(key_ref) {
             return resolved;
         }
