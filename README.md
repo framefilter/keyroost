@@ -80,7 +80,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   standard allows (`--compress` / `--no-compress`).
   A read-only `test` runs every private-key operation a slot's key supports
   (decrypt for RSA, key-agree for the ECDH curves, sign for RSA / ECDSA /
-  Ed25519) and checks each result against the slot certificate's public key.
+  Ed25519) and checks each result against the slot certificate's public key,
+  or, for a slot without one, the key the card reports.
   keyroost identifies which PIV implementation a card runs (YubiKey, Token2,
   Nitrokey, Swissbit, HID Crescendo and others) and offers vendor extensions
   such as `piv key move` and `piv key delete` according to a built-in list of what each

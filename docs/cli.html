@@ -563,7 +563,7 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl piv cert delete</code></td><td>Delete a slot&#x27;s certificate; the slot&#x27;s private key is left in place. Needs the management key. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl piv chuid</code></td><td>Write a new CHUID (Card Holder Unique Identifier, the card&#x27;s identity record)</td></tr>
       <tr><td><code>keyroostctl piv chuid generate</code></td><td>Write a fresh, randomly-generated CHUID (Card Holder Unique Identifier). Needs the management key</td></tr>
-      <tr><td><code>keyroostctl piv test</code></td><td>Test a slot&#x27;s private key end to end against the slot certificate&#x27;s public key. Read-only — nothing on the card changes</td></tr>
+      <tr><td><code>keyroostctl piv test</code></td><td>Test a slot&#x27;s private key end to end against the slot certificate&#x27;s public key, or the key the card reports when there is no certificate. Read-only — nothing on the card changes</td></tr>
       <tr><td><code>keyroostctl piv reset</code></td><td>Reset the PIV application to factory defaults: wipe all keys, certificates and PINs. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
     </table></div>
     <h3 id="ref-molto">molto</h3>

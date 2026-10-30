@@ -156,7 +156,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "piv-test" => &Help {
             title: "Test the slot's key",
-            body: "Checks that the slot's private key actually works: keyroost builds a small fixed challenge from the slot certificate's public key, has the card run every operation the key type supports (decrypt for RSA; key-agree for ECDH curves; sign for RSA / ECDSA / Ed25519), and verifies each result against that same public key. It reports each operation's pass or fail. It needs the PIN unless the slot's PIN policy is \u{201c}never\u{201d}, and it changes nothing on the card.",
+            body: "Checks that the slot's private key actually works: keyroost builds a small fixed challenge from the slot certificate's public key, has the card run every operation the key type supports (decrypt for RSA; key-agree for ECDH curves; sign for RSA / ECDSA / Ed25519), and verifies each result against that same public key. A slot with no certificate (an X25519 key never has a self-signed one) is tested against the public key the card reports for it, and the result says no certificate was part of the test. It reports each operation's pass or fail. It needs the PIN unless the slot's PIN policy is \u{201c}never\u{201d}, and it changes nothing on the card.",
             slug: "/piv#test",
         },
         "piv-admin" => &Help {

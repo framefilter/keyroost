@@ -300,6 +300,10 @@ pub(crate) struct PivTestJson {
     /// Human name, e.g. `"authentication (9A)"`.
     pub slot_name: String,
     pub algorithm: String,
+    /// Whether the slot's certificate was part of the test: `false` when the
+    /// slot had none and the test ran against the public key the card
+    /// reports for it.
+    pub cert_tested: bool,
     /// `true` when no operation failed (skipped ops don't count).
     pub ok: bool,
     pub operations: Vec<PivTestOpJson>,
@@ -1004,6 +1008,7 @@ mod tests {
                 slot: piv_slot_token(slot),
                 slot_name: slot.label(),
                 algorithm: "ECCP256".into(),
+                cert_tested: true,
                 ok: detail.is_none(),
                 operations: vec![PivTestOpJson {
                     operation: "sign".into(),
@@ -1017,6 +1022,7 @@ mod tests {
                     ("slot", "string"),
                     ("slot_name", "string"),
                     ("algorithm", "string"),
+                    ("cert_tested", "bool"),
                     ("ok", "bool"),
                     ("operations", "array"),
                 ],

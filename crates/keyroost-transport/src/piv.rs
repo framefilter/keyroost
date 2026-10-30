@@ -5089,6 +5089,15 @@ impl<'tx> PivSession<'tx> {
             .map_err(TransportError::PivParse)
     }
 
+    /// `slot`'s algorithm and public key as the card reports them right now
+    /// (GET METADATA, YubiKey 5.3+), never from what this session cached or
+    /// was handed: for a self-test of a slot with no certificate, where the
+    /// key the test checks against must come from the card. `None` when the
+    /// card doesn't report one.
+    pub fn reported_slot_key(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
+        self.resolve_slot_from_device(slot).0
+    }
+
     /// The algorithm and public key of the key stored in `slot`, via
     /// `Self::confirmed_slot_key`: always re-confirmed live against GET
     /// METADATA first (firmware 5.3+, when the card actually names both

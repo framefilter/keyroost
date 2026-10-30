@@ -576,6 +576,12 @@ where
         .collect()
 }
 
+/// The line front ends show above a report when the slot had no
+/// certificate and the test ran against the public key the card reports for
+/// it: the key works, but no certificate was part of the test.
+pub const CARD_KEY_NOTE: &str = "No certificate in this slot: tested against the \
+public key the card reports for it, so no certificate was part of the test.";
+
 /// One human-readable line per operation:
 /// `<op>: passed`, `<op>: FAILED \u{2014} <reason>`, or
 /// `<op>: skipped \u{2014} not supported for <alg> keys`.
