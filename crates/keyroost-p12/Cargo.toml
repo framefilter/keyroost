@@ -20,7 +20,7 @@ keyroost-piv = { path = "../keyroost-piv", version = "0.15.0" }
 # MAC; modern ones use PBES2 (PBKDF2 + AES-CBC). `rc2` is the one crate here
 # that is new to the workspace tree; it is pinned to the `cipher 0.4` line the
 # other block-cipher crates already use.
-rc2 = "=0.8.1"
+rc2 = "=0.9.0"
 des = "0.8"
 cbc = "0.1"
 aes = "0.8"
