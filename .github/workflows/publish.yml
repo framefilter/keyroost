@@ -393,8 +393,8 @@ jobs:
           # Pinned + hash-checked for the same reason the actions above are
           # SHA-pinned: this executable runs with the winget PAT in env.
           # Hash is from wingetcreate.exe.txt on the same release.
-          $wcVersion = "v1.12.8.0"
-          $wcSha256 = "8bd738851b524885410112678e3771b341c5c716de60fbbecb88ab0a363ed85d"
+          $wcVersion = "v1.12.13.0"
+          $wcSha256 = "24042bd37915805615e6cf969ac57c6439124c3fe85823327f5f3fb24bd9ffea"
           curl.exe -fsSL -o wingetcreate.exe "https://github.com/microsoft/winget-create/releases/download/$wcVersion/wingetcreate.exe"
           $actual = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash.ToLower()
           if ($actual -ne $wcSha256) {

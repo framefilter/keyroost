@@ -56,30 +56,29 @@ updates:
         versions: ['>=0.5']
       - dependency-name: getrandom
         versions: ['>=0.3']
-      # aes-gcm 0.11, scrypt 0.12, and p256 0.14 are the same next-generation
-      # wave (aes 0.9 / cipher 0.5 / digest 0.11 / elliptic-curve 0.14): the
-      # comment above already names them as part of the coupled stack, but they
-      # had no entries of their own, so dependabot kept proposing them solo
-      # (aes-gcm 0.11 arrived with CI red across the board). Move them with the
-      # whole stack, not one crate at a time.
+      # aes-gcm 0.11 and scrypt 0.12 are the same next-generation wave (aes
+      # 0.9 / cipher 0.5 / digest 0.11): the comment above already names them
+      # as part of the coupled stack, but they had no entries of their own, so
+      # dependabot kept proposing them solo (aes-gcm 0.11 arrived with CI red
+      # across the board). Move them with the whole stack, not one crate at a
+      # time.
       - dependency-name: aes-gcm
         versions: ['>=0.11']
       - dependency-name: scrypt
         versions: ['>=0.12']
+      # p256, p384, p521 and k256 moved to elliptic-curve 0.14 together
+      # (#212); their 0.14.x patches are welcome. They share one
+      # `ToEncodedPoint` trait (from p256's re-export) in keyroost-pivtest and
+      # keyroost-pgpkey, so a next breaking release moves all four at once,
+      # never one alone.
       - dependency-name: p256
-        versions: ['>=0.14']
-      # p384 0.14 is the same elliptic-curve 0.14 wave as p256 0.14 above.
-      # keyroost-pivtest shares one `ToEncodedPoint` trait (from p256's
-      # re-export) across both curves, so p384 can only move to 0.14 when p256
-      # does — bumping it alone puts elliptic-curve 0.13 and 0.14 in the tree
-      # at once and fails to build. Move it with the p256 stack.
+        versions: ['>=0.15']
       - dependency-name: p384
-        versions: ['>=0.14']
-      # k256 (keyroost-pgpkey's secp256k1 keys) is the same elliptic-curve
-      # 0.13 generation and shares p256's re-exported `ToEncodedPoint` there,
-      # so it moves with the p256 stack too.
+        versions: ['>=0.15']
       - dependency-name: k256
-        versions: ['>=0.14']
+        versions: ['>=0.15']
+      - dependency-name: p521
+        versions: ['>=0.15']
       # The dalek crypto crates (keyroost-pivtest's Ed25519 / X25519 host-side
       # verification) are held at 2.x deliberately, not for a build conflict:
       # the 3.0 line pulls curve25519-dalek 5.0, a brand-new major, and gains

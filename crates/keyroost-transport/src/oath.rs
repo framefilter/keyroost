@@ -111,6 +111,12 @@ impl OathSession {
         self.select_info.asks_touch_to_delete()
     }
 
+    /// True when the applet asks for a touch to reset (Nitrokey's secrets
+    /// app); see [`keyroost_oath::SelectInfo::asks_touch_to_reset`].
+    pub fn asks_touch_to_reset(&self) -> bool {
+        self.select_info.asks_touch_to_reset()
+    }
+
     /// Authenticate against a password-protected applet (YubiKey OATH). Derives
     /// the access key from the password and the device id, answers the card's
     /// SELECT challenge with VALIDATE, and verifies the card's mutual-auth reply

@@ -442,6 +442,13 @@ impl std::fmt::Display for SessionOpError {
     }
 }
 
+/// What a key's own info said, remembered per key ([`App::key_details`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct KeyDetails {
+    model: Option<String>,
+    firmware: Option<String>,
+}
+
 #[derive(Default)]
 struct SecurityKeysState {
     /// CTAP info for the selected device, fetched lazily after selection.
@@ -455,8 +462,10 @@ struct SecurityKeysState {
     u2f_only: bool,
     /// User-facing error from the last enumeration / open / GetInfo call.
     error: Option<String>,
-    /// Live PIN entry field (cleared after submit).
-    pin_input: String,
+    /// Live PIN entry field (cleared after submit). Wipes itself when the
+    /// pane's state is replaced: the pane has no `Drop` (its tests build it
+    /// with struct update, which a `Drop` forbids).
+    pin_input: zeroize::Zeroizing<String>,
     /// Active unlocked session: token + cached resident credentials.
     session: Option<UnlockedSession>,
     /// The device `session` was unlocked on. Follow-on operations (reload,
@@ -868,7 +877,7 @@ impl Drop for ChangePinDialog {
 
 impl TypedSecrets for SecurityKeysState {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
-        let mut out = vec![&mut self.pin_input];
+        let mut out = vec![&mut *self.pin_input];
         out.extend(self.change_pin.secrets_mut());
         if let Some(d) = self.advanced.as_mut() {
             out.extend(d.secrets_mut());
@@ -2696,6 +2705,11 @@ fn run_card_reset_step(
                 let name = reader.ok_or("no PC/SC reader for the OATH applet")?;
                 let mut s =
                     keyroost_transport::OathSession::open(name).map_err(|e| e.to_string())?;
+                // A Nitrokey 3 asks for a touch here; raise the banner then.
+                KEY_WANTS_TOUCH.store(
+                    s.asks_touch_to_reset(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 s.factory_reset().map_err(|e| e.to_string())?;
             }
             ResetStep::OpenPgp => {
@@ -2752,12 +2766,12 @@ fn run_card_reset_step(
 }
 
 /// The status line while the factory reset's card sweep runs. The OTP erase
-/// waits for a touch on the key, and some keys (Nitrokey 3) ask for one to
-/// reset OATH; the sweep is one job with one label, so the label asks for the
-/// touch up front, as the OATH reset's does.
+/// always waits for a touch on the key, so the label asks for it up front. The
+/// OATH step asks for one only on some keys (Nitrokey 3); that step raises the
+/// touch banner itself once it knows.
 fn factory_reset_busy_label(card_steps: &[keyroost_resolve::ResetStep]) -> &'static str {
     use keyroost_resolve::ResetStep;
-    if card_steps.contains(&ResetStep::Token2Otp) || card_steps.contains(&ResetStep::Oath) {
+    if card_steps.contains(&ResetStep::Token2Otp) {
         "Factory-resetting key \u{2014} touch the key if it blinks\u{2026}"
     } else {
         "Factory-resetting key\u{2026}"
@@ -4704,6 +4718,12 @@ struct App {
     /// wherever a device disappears, so an unplugged key's cached identity
     /// doesn't linger indefinitely.
     piv_session_state: std::collections::HashMap<DeviceId, keyroost_transport::PivSessionState>,
+    /// What each key's own info said once it was read (the model its AAGUID
+    /// names, the firmware as its vendor states it), kept until the key is
+    /// unplugged: every scan rebuilds the rows from the USB names, and a key
+    /// read once keeps its official name rather than switching back when
+    /// another key is selected. Pruned like `piv_session_state`.
+    key_details: std::collections::HashMap<DeviceId, KeyDetails>,
     /// Keys the user chose to "ignore the compatibility table" for, this app
     /// run only (never persisted): features the table lists as unsupported
     /// become unverified — usable, with a warning — except RESET. Applied to
@@ -5615,7 +5635,13 @@ impl App {
             Some(d) => format!("{}: {}", d.title(), text.into()),
             None => text.into(),
         };
-        let text = without_home(&text);
+        self.log_global_bg_once(severity, text);
+    }
+
+    /// [`Self::log_bg_once`] without the selected-key prefix, for fleet-level
+    /// lines such as the device-scan count, which every refresh repeats.
+    fn log_global_bg_once(&mut self, severity: Severity, text: impl Into<String>) {
+        let text = without_home(&text.into());
         // Against the newest line of the same severity, so the automatic
         // trace line a traced refresh adds in between doesn't defeat it.
         let same = std::mem::discriminant(&severity);
@@ -6173,26 +6199,49 @@ impl App {
         });
     }
 
-    /// Put what the selected key's info says on its row: the firmware as its
-    /// vendor states it ("fw 5.7.4", [`key_firmware`]) and the model its AAGUID names
-    /// ("YubiKey" -> "YubiKey 5 Series with NFC"). Called when the info is
-    /// read and after every scan, which rebuilds the rows from scratch.
+    /// Drop what is remembered per key for keys no longer in `devices`: an
+    /// unplugged key's cached PIV identity, and its read name and firmware
+    /// (a key that comes back starts from its USB name until read again).
+    fn forget_unplugged_keys(&mut self) {
+        let present = |id: &DeviceId| self.devices.iter().any(|d| &d.id == id);
+        self.piv_session_state.retain(|id, _| present(id));
+        self.key_details.retain(|id, _| present(id));
+    }
+
+    /// Remember what the selected key's info says (the firmware as its
+    /// vendor states it, "fw 5.7.4", [`key_firmware`]; the model its AAGUID
+    /// names, "YubiKey" -> "YubiKey 5 Series with NFC") and put every
+    /// remembered key's details on its row. Called when the info is read and
+    /// after every scan, which rebuilds the rows from scratch, so a key read
+    /// once keeps its name and firmware until it is unplugged.
     fn apply_key_details(&mut self) {
-        let Some(id) = self.selected_device.clone() else {
-            return;
-        };
-        let fw = self.security_keys.firmware.clone();
-        let model = self
-            .security_keys
-            .info
-            .as_ref()
-            .and_then(|info| ui::aaguid::model_for_aaguid(&info.aaguid));
-        if let Some(dev) = self.devices.iter_mut().find(|d| d.id == id) {
-            if let Some(fw) = fw {
-                dev.firmware = fw;
+        if let Some(id) = self.selected_device.clone() {
+            let fw = self.security_keys.firmware.clone();
+            let model = self
+                .security_keys
+                .info
+                .as_ref()
+                .and_then(|info| ui::aaguid::model_for_aaguid(&info.aaguid))
+                .map(str::to_string);
+            if fw.is_some() || model.is_some() {
+                let kept = self.key_details.entry(id).or_default();
+                if fw.is_some() {
+                    kept.firmware = fw;
+                }
+                if model.is_some() {
+                    kept.model = model;
+                }
             }
-            if let Some(model) = model {
-                dev.model = model.to_string();
+        }
+        for dev in &mut self.devices {
+            let Some(kept) = self.key_details.get(&dev.id) else {
+                continue;
+            };
+            if let Some(fw) = &kept.firmware {
+                dev.firmware = fw.clone();
+            }
+            if let Some(model) = &kept.model {
+                dev.model = model.clone();
             }
         }
     }
@@ -6209,7 +6258,7 @@ impl App {
         let Some(target) = self.selected_fido_target() else {
             return;
         };
-        let pin = zeroize::Zeroizing::new(std::mem::take(&mut self.security_keys.pin_input));
+        let pin = std::mem::take(&mut self.security_keys.pin_input);
         if pin.is_empty() {
             self.security_keys.error = Some("PIN is empty".into());
             return;
@@ -8362,11 +8411,16 @@ impl App {
             return;
         };
         let for_device = self.selected_device.clone();
-        // Some keys (Nitrokey 3) ask for a touch to reset.
-        let label = "Resetting OATH applet \u{2014} touch the key if it blinks\u{2026}";
+        // A Nitrokey 3 asks for a touch to reset; the job raises the touch
+        // banner on such a key only, once the open says which it is.
+        let label = "Resetting OATH applet\u{2026}";
         self.spawn_job(label, move || {
             let result = (|| -> Result<(), TransportError> {
                 let mut session = keyroost_transport::OathSession::open(&reader)?;
+                KEY_WANTS_TOUCH.store(
+                    session.asks_touch_to_reset(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 session.factory_reset()
             })();
             Box::new(move |app: &mut App| {
@@ -10864,9 +10918,9 @@ impl App {
                     for w in keyroost_resolve::take_scan_warnings() {
                         app.log_global(Severity::Warn, LogKind::User, w);
                     }
-                    app.log_global(
+                    // Every refresh scans; the same count again isn't news.
+                    app.log_global_bg_once(
                         Severity::Info,
-                        LogKind::Background,
                         format!(
                             "device scan: {} device{} found",
                             devices.len(),
@@ -10880,8 +10934,8 @@ impl App {
                     );
                     app.devices = devices;
                     // A device that's genuinely gone shouldn't leave its
-                    // cached PIV identity/pubkey data sitting in memory
-                    // indefinitely. Prune here, against an actual fresh scan
+                    // cached PIV identity/pubkey data, or its read name and
+                    // firmware, sitting in memory indefinitely. Prune here, against an actual fresh scan
                     // result, rather than on every selection change (nothing
                     // about switching *which* still-present device is
                     // selected implies any device disappeared) or on a
@@ -10889,8 +10943,7 @@ impl App {
                     // actually went away, and wiping every entry over one
                     // pcscd hiccup would force a full re-fingerprint of
                     // everything on the next successful scan for no reason).
-                    app.piv_session_state
-                        .retain(|id, _| app.devices.iter().any(|d| &d.id == id));
+                    app.forget_unplugged_keys();
                     // A different selection reads its tabs afresh anyway.
                     let reread = std::mem::take(&mut app.reread_after_scan);
                     if changed {
@@ -19224,7 +19277,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let resp = ui.add_sized(
                         [220.0, 32.0],
-                        egui::TextEdit::singleline(&mut self.security_keys.pin_input)
+                        egui::TextEdit::singleline(&mut *self.security_keys.pin_input)
                             .vertical_align(egui::Align::Center)
                             .password(true)
                             .hint_text("Enter PIN to unlock this key"),
@@ -27886,8 +27939,9 @@ mod tests {
                 .contains("touch the key")
         );
         assert!(!factory_reset_busy_label(&[ResetStep::OpenPgp, ResetStep::Piv]).contains("touch"));
-        // Some keys (Nitrokey 3) ask for a touch to reset OATH.
-        assert!(factory_reset_busy_label(&[ResetStep::Oath]).contains("touch the key"));
+        // OATH asks for a touch only on some keys; that step raises the
+        // banner itself rather than every key's label asking.
+        assert!(!factory_reset_busy_label(&[ResetStep::Oath]).contains("touch"));
     }
 
     #[test]
@@ -31465,6 +31519,28 @@ mod tests {
         );
     }
 
+    /// Every refresh scans for devices: the same count twice in a row is one
+    /// line; a new count, or the same count after another line, is logged.
+    #[test]
+    fn a_repeated_device_scan_count_is_logged_once() {
+        let mut app = App::default();
+        app.log_global_bg_once(Severity::Info, "device scan: 3 devices found");
+        app.log_global_bg_once(Severity::Info, "device scan: 3 devices found");
+        app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        app.log(Severity::Info, "a: something the user did");
+        app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        let lines: Vec<&str> = app.log.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "device scan: 3 devices found",
+                "device scan: 2 devices found",
+                "a: something the user did",
+                "device scan: 2 devices found"
+            ]
+        );
+    }
+
     /// A FIDO2 reset run on its own (not a factory reset's last step) writes
     /// a line, success or failure.
     #[test]
@@ -33230,7 +33306,7 @@ mod tests {
     #[test]
     fn idle_lock_wipes_typed_secrets_in_every_pane() {
         let mut app = App::default();
-        app.security_keys.pin_input = "fido-pin".into();
+        app.security_keys.pin_input = zeroize::Zeroizing::new("fido-pin".into());
         app.oath.password_input = "oath-password".into();
         app.otp.pin_input = "otp-pin".into();
         app.openpgp.passphrase = "backup-passphrase".into();
@@ -33630,6 +33706,43 @@ mod tests {
         app.devices = vec![sel_key("serial:37806840", "37806840", None)];
         app.apply_key_details();
         check(&app);
+    }
+
+    /// A key whose info was read keeps its official name and firmware when
+    /// another key is selected and the rows are rebuilt; its details go
+    /// once it is unplugged.
+    #[test]
+    fn key_details_stay_with_their_key_until_it_is_unplugged() {
+        let yk = || sel_key("serial:37806840", "37806840", None);
+        let other = || sel_key("serial:B", "B", None);
+        let mut app = App {
+            selected_device: Some("serial:37806840".into()),
+            devices: vec![yk(), other()],
+            ..Default::default()
+        };
+        app.security_keys.firmware = Some("5.7.4".into());
+        app.security_keys.info = Some(AuthenticatorInfo {
+            aaguid: [
+                0xfa, 0x2b, 0x99, 0xdc, 0x9e, 0x39, 0x42, 0x57, 0x8f, 0x92, 0x4a, 0x30, 0xd2, 0x3c,
+                0x41, 0x18,
+            ],
+            ..Default::default()
+        });
+        app.apply_key_details();
+        // Another key is selected (its info not read yet) and a scan rebuilds
+        // every row from the USB names.
+        app.selected_device = Some("serial:B".into());
+        app.security_keys = SecurityKeysState::default();
+        app.devices = vec![yk(), other()];
+        app.apply_key_details();
+        assert_eq!(app.devices[0].model, "YubiKey 5 Series with NFC");
+        assert_eq!(app.devices[0].firmware, "5.7.4");
+        assert_eq!(app.devices[1].model, other().model, "B keeps its own");
+        // Unplugged: the next scan prunes it, so a key that comes back
+        // starts from its USB name again until it is read.
+        app.devices = vec![other()];
+        app.forget_unplugged_keys();
+        assert!(app.key_details.is_empty());
     }
 
     /// The selected key is unplugged: selection falls back to another key,

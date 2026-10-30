@@ -149,6 +149,12 @@ pub trait IdentityReader: Sync {
     /// answered without one; that answer is kept for the plug-in.
     fn read_hid(&self, h: &HidDevice, debug: bool) -> KeyAnswer<CanonicalId>;
     fn read_ccid(&self, p: &ReaderProbe, debug: bool) -> Option<CanonicalId>;
+    /// Whether to ask a HID node with no USB serial even when no reader could
+    /// pair with it: its answer is then the row's only serial. Off by
+    /// default; the reads exist for pairing, and each adds FIDO-side traffic.
+    fn names_unpaired_hid(&self) -> bool {
+        false
+    }
 }
 
 pub const SOLO2_VID: u16 = 0x1209;
@@ -230,6 +236,12 @@ pub struct Token2Identity;
 impl IdentityReader for Token2Identity {
     fn vendor(&self) -> &'static str {
         "Token2"
+    }
+    /// A Token2 key's USB interface reports no serial, so where nothing pairs
+    /// with it (on Linux, a PIN+ whose card side has no reader) the §6.10
+    /// answer is the only serial its row can show.
+    fn names_unpaired_hid(&self) -> bool {
+        true
     }
     fn claims_hid(&self, h: &HidDevice) -> bool {
         h.vendor_id == keyroost_proto::USB_VID
@@ -333,7 +345,8 @@ pub fn plan_identity_reads(
             .filter(|p| r.claims_reader(p))
             .collect();
         for h in &hs {
-            if ps.iter().any(|p| eligible(h, p))
+            let unpaired_row = r.names_unpaired_hid() && h.serial_number.is_none();
+            if (ps.iter().any(|p| eligible(h, p)) || unpaired_row)
                 && !plan.hid.iter().any(|(pv, x)| *pv == v && x == &h.path)
             {
                 plan.hid.push((v, h.path.clone()));
@@ -746,6 +759,27 @@ mod tests {
             vec![(0, "/dev/hidraw17".into()), (0, "/dev/hidraw18".into())]
         );
         assert_eq!(plan.ccid, vec![(0, YK0.to_string()), (0, YK1.to_string())]);
+    }
+
+    /// A Token2 key's USB side has no serial: with no reader to pair (Linux
+    /// without a reader for its card side), it is still asked, so its row
+    /// shows the serial. A YubiKey or Solo 2 in the same spot is not.
+    #[test]
+    fn an_unpaired_token2_is_asked_for_its_serial() {
+        let hids = [
+            hid(0x349E, 0x0024, "/dev/hidraw13", None, Some(9), Some(70)),
+            hid(0x1050, 0x0402, "/dev/hidraw20", None, Some(9), Some(60)),
+            hid(0x1209, 0xBEEE, "/dev/hidraw14", None, Some(9), Some(15)),
+        ];
+        let plan = plan_identity_reads(&hids, &[], IDENTITY_READERS);
+        assert_eq!(plan.hid, vec![(2, "/dev/hidraw13".into())]);
+        assert!(plan.ccid.is_empty());
+        // One that reports a USB serial needs no read.
+        let hids = [hid(0x349E, 0x0024, "/dev/hidraw13", Some("1"), None, None)];
+        assert_eq!(
+            plan_identity_reads(&hids, &[], IDENTITY_READERS),
+            IdentityPlan::default()
+        );
     }
 
     #[test]
