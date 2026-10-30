@@ -718,7 +718,13 @@ impl CtapOtpTransport {
         let probe = t2::get_ecdh_pubkey();
         let declined = match t.send(&probe, false) {
             Ok(resp) => match t.finish(&probe, resp) {
-                Ok((_, 0x9000)) => {
+                Ok((_, sw))
+                    if probe_answered(sw, || {
+                        let flag = t2::read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_BASE);
+                        let resp = t.send(&flag, false).ok()?;
+                        t.finish(&flag, resp).ok()
+                    }) =>
+                {
                     t.dev.set_timeout(Duration::from_secs(20));
                     return Ok(t);
                 }
@@ -738,6 +744,24 @@ impl CtapOtpTransport {
             }
         };
         Err(declined)
+    }
+}
+
+/// Whether the OTP applet answered the probe's `GET_ECDH_PUBKEY` over this
+/// channel, given its status word `sw`. A key with an OTP PIN set refuses
+/// that command with `6A81` though the channel works, so a `6A81` is
+/// followed by the PIN-flag read (`ask_flag`, protocol §6.11): a PIN set,
+/// or a locked PIN (`6983`), is the applet answering. Any other refusal is
+/// the key declining the channel, as before.
+fn probe_answered(sw: u16, ask_flag: impl FnOnce() -> Option<(Vec<u8>, u16)>) -> bool {
+    match sw {
+        t2::sw::OK => true,
+        t2::sw::FUNCTION_NOT_SUPPORTED => match ask_flag() {
+            Some((data, t2::sw::OK)) => t2::PinFlag::parse(&data).is_ok_and(|f| f.is_set()),
+            Some((_, sw)) => sw == t2::sw::PIN_LOCKED,
+            None => false,
+        },
+        _ => false,
     }
 }
 
@@ -2316,6 +2340,30 @@ mod ctap_reply_tests {
             KeyAnswer::Reply(vec![1])
         );
         assert_eq!(after_probe(false, KeyAnswer::Declined), KeyAnswer::Declined);
+    }
+
+    /// A PIN-protected key refuses the probe's `GET_ECDH_PUBKEY` with `6A81`
+    /// though command `0x41` works; its PIN-flag read on the same channel
+    /// tells the two apart. Before, a key with an OTP PIN set was unreachable
+    /// over USB, `otp pin clear` included.
+    #[test]
+    fn a_pin_protected_key_still_answers_the_probe() {
+        use super::probe_answered;
+        // Flag reply: AlgId, Retry, PinLen, MaxRetry, FpEnable.
+        let pin_set = || Some((vec![0x01, 8, 6, 8, 0], 0x9000));
+        let no_pin = || Some((vec![0x01, 8, 0, 8, 0], 0x9000));
+        assert!(probe_answered(0x9000, || panic!("no flag read on 9000")));
+        assert!(probe_answered(0x6A81, pin_set));
+        assert!(
+            probe_answered(0x6A81, || Some((vec![], 0x6983))),
+            "locked PIN"
+        );
+        // 6A81 with no PIN behind it, or no flag answer, still declines.
+        assert!(!probe_answered(0x6A81, no_pin));
+        assert!(!probe_answered(0x6A81, || Some((vec![], 0x6D00))));
+        assert!(!probe_answered(0x6A81, || None));
+        // Any other refusal declines without asking.
+        assert!(!probe_answered(0x6D00, || panic!("no flag read on 6D00")));
     }
 }
 

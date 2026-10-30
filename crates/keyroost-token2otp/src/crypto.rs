@@ -639,10 +639,11 @@ fn random_iv() -> [u8; 16] {
 
 /// The PIN session crypto, pinned byte-for-byte.
 ///
-/// No R3.4 key was available while this was written, so these tests are the
-/// only oracle the layout has: they fix what keyroost sends, so a later change
-/// to the ladder or to any data field has to be a deliberate, argued one rather
-/// than a silent re-framing. Each builder is checked by taking the device's
+/// This was written without an R3.4 key; a PIN+ Dual Ace R3.4 has since run
+/// the whole cycle over USB (set, verify, wrong PIN, read and write under
+/// the PIN, change, clear). These tests fix what keyroost sends, so a later
+/// change to the ladder or to any data field has to be a deliberate, argued
+/// one rather than a silent re-framing. Each builder is checked by taking the device's
 /// side — deriving the same keys, decrypting what was sent, and comparing the
 /// recovered plaintext against the exact bytes the protocol calls for.
 #[cfg(test)]
