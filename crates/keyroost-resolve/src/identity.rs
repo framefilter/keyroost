@@ -425,7 +425,20 @@ fn unique_per_plug_in(h: &HidDevice) -> bool {
 /// leave a key unmatched. An identity is kept only where
 /// [`unique_per_plug_in`]. Only the key's own answers are kept, never a
 /// failure to reach it, so a key that was briefly busy is asked again.
-type HidIdCache = Vec<((PlugIn, usize), Option<CanonicalId>)>;
+type HidIdCache = Vec<((PlugIn, usize), Cached)>;
+
+/// One cached HID identity outcome.
+#[derive(Clone, Debug)]
+enum Cached {
+    /// The key's answer, kept for the plug-in: not asked again.
+    Answer(Option<CanonicalId>),
+    /// The last identity a plug-in that isn't unique per plug-in (a Windows
+    /// device node) gave: it is asked again every scan, but a scan where it
+    /// doesn't answer (busy with a browser's sign-in, say) keeps this one,
+    /// so the key's row keeps its serial and id and the app's selection
+    /// doesn't jump away from it. Dropped with the plug-in.
+    Fallback(CanonicalId),
+}
 static HID_ID_CACHE: std::sync::Mutex<HidIdCache> = std::sync::Mutex::new(Vec::new());
 
 /// [`read_identities`], asking each HID interface at most once per plug-in
@@ -514,17 +527,27 @@ fn hid_identities_from(
             continue;
         };
         let key = (PlugIn::of(h), *v);
-        let id = match cache.iter().find(|(k, _)| *k == key) {
-            Some((_, id)) => id.clone(),
-            None => {
-                let id = match ask(*v, h) {
-                    KeyAnswer::Reply(id) => Some(id),
-                    KeyAnswer::Declined => None,
-                    KeyAnswer::NoAnswer => continue,
+        let entry = cache.iter().position(|(k, _)| *k == key);
+        let id = match entry.map(|i| cache[i].1.clone()) {
+            Some(Cached::Answer(id)) => id,
+            earlier => {
+                let fallback = match earlier {
+                    Some(Cached::Fallback(id)) => Some(id),
+                    _ => None,
                 };
-                if id.is_none() || unique_per_plug_in(h) {
-                    cache.push((key, id.clone()));
-                }
+                let (id, keep) = match ask(*v, h) {
+                    KeyAnswer::Reply(id) if unique_per_plug_in(h) => {
+                        (Some(id.clone()), Cached::Answer(Some(id)))
+                    }
+                    KeyAnswer::Reply(id) => (Some(id.clone()), Cached::Fallback(id)),
+                    KeyAnswer::Declined => (None, Cached::Answer(None)),
+                    KeyAnswer::NoAnswer => match fallback {
+                        Some(id) => (Some(id.clone()), Cached::Fallback(id)),
+                        None => continue,
+                    },
+                };
+                cache.retain(|(k, _)| *k != key);
+                cache.push((key, keep));
                 id
             }
         };
@@ -786,7 +809,10 @@ mod tests {
         );
         assert!(plan.ccid.is_empty());
         // One that reports a USB serial needs no read.
-        let hids = [hid(0x349E, 0x0024, "/dev/hidraw13", Some("1"), None, None)];
+        let hids = [
+            hid(0x349E, 0x0024, "/dev/hidraw13", Some("1"), None, None),
+            hid(0x1050, 0x0402, "/dev/hidraw20", Some("2"), None, None),
+        ];
         assert_eq!(
             plan_identity_reads(&hids, &[], IDENTITY_READERS),
             IdentityPlan::default()
@@ -1002,6 +1028,43 @@ mod tests {
             }
             assert_eq!(asked, vec![0, 1, 0], "{}", h.path.display());
         }
+    }
+
+    /// A Windows device node is asked every scan, but a scan where the key
+    /// doesn't answer keeps its last identity, so its row keeps its serial
+    /// and id; the identity goes with the plug-in.
+    #[test]
+    fn a_port_based_plug_in_keeps_its_last_identity_through_a_missed_answer() {
+        let mut win = hid(
+            0x1050,
+            0x0407,
+            r"\\?\HID#VID_1050&PID_0407&MI_01#7&1A2B3C4D&0&0000#{4d1e55b2}",
+            None,
+            None,
+            None,
+        );
+        win.usb_device = Some(UsbDeviceKey::win_node(r"USB\VID_1050&PID_0407\5&ABC&0&3"));
+        let hids = [win.clone()];
+        let plan = hid_plan(&[(0, win.path.to_str().unwrap())]);
+        let mut cache = HidIdCache::new();
+        let five = || yubico_from_serial_str("5").unwrap();
+        let mut asked = 0;
+        let mut scan = |cache: &mut HidIdCache, answer: KeyAnswer<CanonicalId>| {
+            asked += 1;
+            hid_identities_from(cache, &plan, &hids, |_, _| answer.clone())
+        };
+        assert_eq!(scan(&mut cache, KeyAnswer::Reply(five())).len(), 1);
+        let missed = scan(&mut cache, KeyAnswer::NoAnswer);
+        assert_eq!(missed.get(&win.path), Some(&five()), "kept through a miss");
+        assert_eq!(scan(&mut cache, KeyAnswer::Reply(five())).len(), 1);
+        assert_eq!(asked, 3, "asked every scan");
+        // Unplugged: the fallback goes with it.
+        hid_identities_from(&mut cache, &IdentityPlan::default(), &[], |_, _| {
+            panic!("nothing to ask")
+        });
+        assert!(cache.is_empty());
+        let after = hid_identities_from(&mut cache, &plan, &hids, |_, _| KeyAnswer::NoAnswer);
+        assert!(after.is_empty(), "a fresh plug-in has no fallback");
     }
 
     /// The key's own serial is part of its plug-in: a different key showing
