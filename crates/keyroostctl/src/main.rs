@@ -779,6 +779,10 @@ struct InlineKeyGen {
     /// session — just a spare copy to keep or hand to other tools.
     #[arg(long, value_name = "FILE", requires = "generate_key")]
     pubkey_out: Option<std::path::PathBuf>,
+    /// With `--generate-key`: run even if keyroost's list marks this key as
+    /// not supporting the chosen key type, PIN policy or touch policy.
+    #[arg(long, requires = "generate_key")]
+    force: bool,
 }
 
 /// Subcommands for the PIV smart-card applet. Secret material (PINs, PUK,
@@ -10344,47 +10348,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
-                    // Unlike PIN/touch policy, every algorithm choice is gated —
-                    // there's no "default" that's exempt: even the SP 800-73-4
-                    // standardized algorithms (RSA-1024/2048, ECC P-256/P-384) aren't
-                    // universally implemented, and RSA-3072/4096/Ed25519/X25519 are
-                    // vendor extensions with no standard obligation at all. See
-                    // `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm`.
-                    guard_piv_feature(
-                        s,
-                        keyroost_piv::compat::PivExtension::SlotKeyAlgorithm(alg),
-                        *force,
-                    )?;
-                    if !matches!(pin_policy, CliPinPolicy::Default) {
-                        guard_piv_feature(
-                            s,
-                            keyroost_piv::compat::PivExtension::SlotPinPolicy,
-                            *force,
-                        )?;
-                    }
-                    if !matches!(touch_policy, CliTouchPolicy::Default) {
-                        guard_piv_feature(
-                            s,
-                            keyroost_piv::compat::PivExtension::SlotTouchPolicy,
-                            *force,
-                        )?;
-                    }
-                    // Narrower than the two gates above: a device can support the
-                    // extension in general yet reject one specific value.
-                    guard_piv_policy_value(
-                        s,
-                        keyroost_piv::compat::PivQuirk::SlotPinPolicyOnceNotSupported,
-                        matches!(pin_policy, CliPinPolicy::Once),
-                        "PIN policy \"once\"",
-                        *force,
-                    )?;
-                    guard_piv_policy_value(
-                        s,
-                        keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported,
-                        matches!(touch_policy, CliTouchPolicy::Cached),
-                        "Touch policy \"cached\"",
-                        *force,
-                    )?;
+                    guard_piv_keygen(s, alg, *pin_policy, *touch_policy, *force)?;
                     authenticate_piv(s, &mgmt)?;
                     crate::prompt::touch(&format!(
                         "Generating {} in {} (touch the key if it blinks)\u{2026}",
@@ -11972,6 +11936,56 @@ fn guard_signable_alg(alg: keyroost_piv::KeyAlg) -> Result<(), Box<dyn std::erro
         })
 }
 
+/// The support checks before generating a key: the key type, and the PIN
+/// and touch policy when not `default`, against keyroost's list for this
+/// card. Shared by `piv key generate` and `--generate-key`, so both refuse
+/// the same things (and both take `--force`).
+fn guard_piv_keygen(
+    s: &mut keyroost_transport::PivSession<'_>,
+    alg: keyroost_piv::KeyAlg,
+    pin_policy: CliPinPolicy,
+    touch_policy: CliTouchPolicy,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Unlike PIN/touch policy, every algorithm choice is gated —
+    // there's no "default" that's exempt: even the SP 800-73-4
+    // standardized algorithms (RSA-1024/2048, ECC P-256/P-384) aren't
+    // universally implemented, and RSA-3072/4096/Ed25519/X25519 are
+    // vendor extensions with no standard obligation at all. See
+    // `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm`.
+    guard_piv_feature(
+        s,
+        keyroost_piv::compat::PivExtension::SlotKeyAlgorithm(alg),
+        force,
+    )?;
+    if !matches!(pin_policy, CliPinPolicy::Default) {
+        guard_piv_feature(s, keyroost_piv::compat::PivExtension::SlotPinPolicy, force)?;
+    }
+    if !matches!(touch_policy, CliTouchPolicy::Default) {
+        guard_piv_feature(
+            s,
+            keyroost_piv::compat::PivExtension::SlotTouchPolicy,
+            force,
+        )?;
+    }
+    // Narrower than the two gates above: a device can support the
+    // extension in general yet reject one specific value.
+    guard_piv_policy_value(
+        s,
+        keyroost_piv::compat::PivQuirk::SlotPinPolicyOnceNotSupported,
+        matches!(pin_policy, CliPinPolicy::Once),
+        "PIN policy \"once\"",
+        force,
+    )?;
+    guard_piv_policy_value(
+        s,
+        keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported,
+        matches!(touch_policy, CliTouchPolicy::Cached),
+        "Touch policy \"cached\"",
+        force,
+    )
+}
+
 /// The `--generate-key` convenience shared by `piv cert request` / `piv
 /// cert generate`: generate a fresh key pair in `slot` on `s` (which must already
 /// be management-key authenticated), and, if asked, drop a PEM copy of its
@@ -11985,6 +11999,13 @@ fn inline_generate_key(
     pub_mode: crate::prompt::OutMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let alg = keygen.algorithm.to_alg();
+    guard_piv_keygen(
+        s,
+        alg,
+        keygen.pin_policy,
+        keygen.touch_policy,
+        keygen.force,
+    )?;
     crate::prompt::touch(&format!(
         "Generating {} in {} (touch the key if it blinks)\u{2026}",
         alg.label(),
