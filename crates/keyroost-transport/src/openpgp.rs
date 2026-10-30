@@ -93,15 +93,18 @@ impl OpenPgpStatus {
 
     /// The serial as front ends show it: [`Self::otp_applet_serial`] (a
     /// Token2 key's full serial, as printed on the key) when present, else
-    /// [`Self::serial`] in decimal and hex (`19088743 (0x01234567)`). `None`
+    /// the AID's four serial bytes as eight hex digits, as GnuPG shows them.
+    /// That is the number the vendor gives the key: a YubiKey's and a Token2
+    /// key's serial are BCD there, so the digits are the decimal serial
+    /// (`37806840`); a Nitrokey's is its hex serial (`42682EF7`). `None`
     /// when the card reported neither.
     #[must_use]
     pub fn serial_text(&self) -> Option<String> {
-        match (self.otp_applet_serial, self.serial()) {
-            (Some(s), _) => Some(s.to_string()),
-            (None, Some(s)) => Some(format!("{s} (0x{s:08X})")),
-            (None, None) => None,
+        if let Some(s) = self.otp_applet_serial {
+            return Some(s.to_string());
         }
+        let b = self.aid.get(10..14)?;
+        Some(b.iter().map(|x| format!("{x:02X}")).collect())
     }
 
     /// Human label of the algorithm in `crt`'s slot (`RSA-2048`, `EdDSA
@@ -1674,13 +1677,13 @@ mod tests {
         let mut st = status_with(aid_with(0x0006, 1));
         st.otp_applet_serial = Some(1_000_000_123_456);
         assert_eq!(st.serial_text().as_deref(), Some("1000000123456"));
-        // Otherwise the AID serial, in decimal and hex.
-        assert_eq!(
-            status_with(aid_with(0x0006, 0x0123_4567))
-                .serial_text()
-                .as_deref(),
-            Some("19088743 (0x01234567)")
-        );
+        // Otherwise the AID's serial bytes as GnuPG shows them: a YubiKey's
+        // BCD bytes are its serial (a YubiKey 5.7, serial 37806840), a
+        // Nitrokey's its hex serial (a Nitrokey 3, 42682ef7).
+        let shown = |vendor, raw| status_with(aid_with(vendor, raw)).serial_text();
+        assert_eq!(shown(0x0006, 0x3780_6840).as_deref(), Some("37806840"));
+        assert_eq!(shown(0x000F, 0x4268_2EF7).as_deref(), Some("42682EF7"));
+        assert_eq!(shown(0x0006, 0x0123_4567).as_deref(), Some("01234567"));
         // Neither: nothing to show.
         assert_eq!(status_with(vec![]).serial_text(), None);
     }

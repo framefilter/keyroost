@@ -9515,7 +9515,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 };
                 emit_json(&json_out::OpenpgpStatusJson {
                     aid: hex_encode(&status.aid),
-                    serial: status.full_serial().map(|s| s.to_string()),
+                    serial: status.serial_text(),
                     sig_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Sign),
                     dec_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Decrypt),
                     aut_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Auth),
@@ -9534,10 +9534,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             }
 
             println!("AID:            {}", hex_encode(&status.aid));
-            // AID serial: shown in decimal and hex (Yubico prints it in hex;
-            // it equals the YubiKey's CCID/mgmt serial used for friendly
-            // names). A Token2 key's full serial from its OTP applet is shown
-            // as printed on the key.
+            // The serial as GnuPG shows it (a YubiKey's equals its serial
+            // elsewhere); a Token2 key's full serial from its OTP applet is
+            // shown as printed on the key.
             if let Some(serial) = status.serial_text() {
                 println!("Serial:         {serial}");
             }
@@ -9616,7 +9615,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let name = crate::target::reader_of(&dev)?;
             let mut session = open_openpgp_at(&name, debug)?;
             let status = session.status()?;
-            let ident = match status.full_serial() {
+            let ident = match status.serial_text() {
                 Some(serial) => format!("serial {}", serial),
                 None => format!("AID {}", hex_encode(&status.aid)),
             };
