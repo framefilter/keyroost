@@ -201,7 +201,8 @@ enum EcCurve {
 }
 
 /// Build the challenge for `op` against a slot holding `(alg, pubkey)`, where
-/// `pubkey` is the slot certificate's public key.
+/// `pubkey` is the slot certificate's public key, or the key the card
+/// reports for a slot with no certificate.
 ///
 /// # Errors
 /// [`TestError::Unsupported`] if `op` is not defined for `alg`;
@@ -537,7 +538,8 @@ impl Outcome {
 }
 
 /// Run every [`SelfTest`] against a slot holding `(alg, pubkey)` — `pubkey`
-/// being the slot certificate's public key — in `Decrypt` → `KeyAgree` →
+/// being the slot certificate's public key, or the key the card reports for
+/// a slot with no certificate — in `Decrypt` → `KeyAgree` →
 /// `Sign` order.
 ///
 /// For each *applicable* operation, [`prepare`] builds the GENERAL

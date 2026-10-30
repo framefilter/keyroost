@@ -840,7 +840,8 @@ enum PivCmd {
     /// challenge on the card and verify the result against the slot
     /// certificate's public key. A slot with no certificate (an X25519 key
     /// never has a self-signed one) is tested against the public key the card
-    /// reports for it, where it reports one (YubiKey 5.3 and later); the
+    /// reports for it, where it reports one (GET METADATA, e.g. a YubiKey 5.3
+    /// or later); the
     /// output says so, and `--json` sets `cert_tested` to false. Reports each
     /// operation's pass / fail / skipped. `--pin` is always optional: it's your
     /// call whether to test with or without a PIN. Depending on device state
@@ -10905,12 +10906,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 &name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    // The self-test verifies against the slot CERTIFICATE's public
-                    // key on purpose: the cert is what other PIV software consumes,
-                    // so a pass proves the cert matches the slot's key material. The
-                    // cert object may hold it gzip-compressed (the writing tool's
-                    // choice); read_certificate inflates it (#147/#148), so reading
-                    // it back here works.
+                    // With a certificate, the self-test verifies against its
+                    // public key on purpose: the cert is what other PIV software
+                    // consumes, so a pass proves the cert matches the slot's key
+                    // material. The cert object may hold it gzip-compressed (the
+                    // writing tool's choice); read_certificate inflates it
+                    // (#147/#148), so reading it back here works.
                     // A slot with no certificate (an X25519 key never has a
                     // self-signed one) is tested against the public key the
                     // card reports for it, and the output says so.
@@ -10923,16 +10924,24 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                     })?;
                             (alg, pubkey, true)
                         }
-                        None => {
-                            let (alg, pubkey) = s.reported_slot_key(piv_slot).ok_or_else(|| {
-                                format!(
+                        None => match s.reported_slot_key(piv_slot) {
+                            Some((alg, pubkey)) => (alg, pubkey, false),
+                            // The card said the slot is empty: say that, not
+                            // that a certificate is missing.
+                            None if s.slot_key_presence(piv_slot)
+                                == keyroost_transport::SlotKeyPresence::NoKey =>
+                            {
+                                return Err(format!("{} has no key", piv_slot.label()).into());
+                            }
+                            None => {
+                                return Err(format!(
                                     "{} has no certificate to test against, and the card \
-                                         doesn't report the slot's public key",
+                                     doesn't report the slot's public key",
                                     piv_slot.label()
                                 )
-                            })?;
-                            (alg, pubkey, false)
-                        }
+                                .into());
+                            }
+                        },
                     };
 
                     if !keyroost_pivtest::SelfTest::all()

@@ -251,7 +251,8 @@ keyroostctl piv key move --from 82 --to 9d   # bring it back</code></pre>
       keyroost can test.</p>
     <p>A slot with a key but no certificate (an X25519 key never has a self-signed one,
       and a freshly generated key has none yet) is tested against the public key the card
-      reports for it, where the card reports one (YubiKey 5.3 and later). The key is
+      reports for it, where the card reports one (GET METADATA: a YubiKey 5.3 or later, for
+      instance, and other cards keyroost lists as supporting it). The key is
       proven to work, but no certificate was part of the test: the result says so, and
       <code>--json</code> sets <code>cert_tested</code> to <code>false</code>.</p>
 <pre><code>keyroostctl piv test --slot 9a --pin env:PIV_PIN  # never asks: --pin names the PIN source

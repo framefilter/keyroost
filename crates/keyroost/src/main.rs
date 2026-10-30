@@ -12637,7 +12637,8 @@ impl App {
 
     /// Run every self-test the selected slot's key algorithm supports
     /// (decrypt, then key-agree, then sign): build a fixed challenge from the
-    /// slot certificate's public key ([`keyroost_pivtest`]), run the
+    /// slot certificate's public key, or with no certificate the key the card
+    /// reports ([`keyroost_pivtest`]), run the
     /// private-key op on the card, and verify the reply against that public
     /// key. Read-only on the card — no write, no management key. The PIN
     /// field is always optional — it's the user's call whether to test with
@@ -14197,9 +14198,9 @@ fn run_piv_self_test(
     // exactly as before, one level in, via `inner`.
     keyroost_transport::PivSession::with_cached_transaction(reader, cached, |s| {
         let inner = (|| -> Result<_, String> {
-            // Verify against the slot CERTIFICATE's public key on purpose: the
-            // cert is what other PIV software consumes, so a pass proves the
-            // cert matches the slot's key material. A compressed cert is
+            // With a certificate, verify against its public key on purpose:
+            // the cert is what other PIV software consumes, so a pass proves
+            // the cert matches the slot's key material. A compressed cert is
             // inflated on read (#147/#148).
             // A slot with no certificate (an X25519 key never has a
             // self-signed one) is tested against the public key the card
@@ -14360,9 +14361,12 @@ fn piv_cert_stays_note(occupancy: PivOccupancy, slot_has_cert: bool, slot: &str)
 }
 
 /// Why the Test button is dimmed, or `None` when it can run: the slot needs
-/// a key (the card didn't say there is none), a certificate or a key the card
-/// reports (the test then runs against that key), and a key type keyroost
-/// knows.
+/// a key (the card didn't say there is none), a certificate or a key known to
+/// be present, and a key type keyroost knows. Without a certificate the test
+/// runs against the key the card reports; a key known only from this session
+/// (generated here on a card without GET METADATA) or from HID Crescendo's
+/// properties leaves the button live, and the test then says the card
+/// doesn't report the key.
 fn piv_test_blocked(
     alg: Option<keyroost_piv::KeyAlg>,
     has_cert: bool,

@@ -5090,7 +5090,7 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// `slot`'s algorithm and public key as the card reports them right now
-    /// (GET METADATA, YubiKey 5.3+), never from what this session cached or
+    /// (GET METADATA, where the card supports it), never from what this session cached or
     /// was handed: for a self-test of a slot with no certificate, where the
     /// key the test checks against must come from the card. `None` when the
     /// card doesn't report one.

@@ -52,10 +52,12 @@ impl Home {
         Home(p)
     }
 
-    /// [`ok`], plus what's needed to understand a failure that doesn't
+    /// gpg's stdout when the step `what` succeeded; on a failure, panics with
+    /// its output plus what's needed to understand a failure that doesn't
     /// reproduce: the gpg version, the agent's log, and the exported key set
     /// when this home has one (`sec.asc`; a throwaway key under the test's
-    /// own passphrase), so the failing key can be replayed.
+    /// own passphrase), so the failing key can be replayed. Every gpg step in
+    /// these tests goes through it.
     fn ok(&self, o: &Output, what: &str) -> String {
         if !o.status.success() {
             let version = Command::new("gpg")
@@ -151,16 +153,6 @@ fn gpg_edit(home: &Path, fpr: &str, commands: &str) -> Output {
         &["--command-fd", "0", "--edit-key", fpr],
         Some(&input),
     )
-}
-
-fn ok(o: &Output, what: &str) -> String {
-    assert!(
-        o.status.success(),
-        "{what} failed:\n{}\n{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    );
-    String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
 fn hex(b: &[u8]) -> String {
@@ -387,9 +379,9 @@ fn revocation_certificate_revokes_in_gpg() {
     let home = Home::new("rev");
     let h = &home.0;
     let public = home.write("pub.asc", out.public.as_bytes());
-    ok(&gpg(h, &["--import", &public], None), "import public");
+    home.ok(&gpg(h, &["--import", &public], None), "import public");
     let list = || {
-        let o = ok(
+        let o = home.ok(
             &gpg(h, &["--with-colons", "--list-keys", &fpr], None),
             "list-keys",
         );
@@ -397,7 +389,7 @@ fn revocation_certificate_revokes_in_gpg() {
     };
     assert_ne!(list().validity, "r");
     let rev = home.write("rev.asc", out.revocation.as_bytes());
-    ok(&gpg(h, &["--import", &rev], None), "import revocation");
+    home.ok(&gpg(h, &["--import", &rev], None), "import revocation");
     let k = list();
     assert_eq!((k.rec.as_str(), k.validity.as_str()), ("pub", "r"));
 }
@@ -412,7 +404,7 @@ fn exported_subpackets_as_gpg_lists_them() {
     for (e, expiring) in [(Expiry::Never, false), (Expiry::Years(3), true)] {
         let (set, out, _) = make(KeyType::Cv25519, e);
         let f = home.write("pub.asc", out.public.as_bytes());
-        let o = ok(&gpg(h, &["--list-packets", &f], None), "list-packets");
+        let o = home.ok(&gpg(h, &["--list-packets", &f], None), "list-packets");
         let exp_lines = o.matches("hashed subpkt 9 len 4").count();
         assert_eq!(exp_lines, if expiring { 3 } else { 0 }, "{e:?}: {o}");
         if expiring {
@@ -438,7 +430,7 @@ fn gpg_made_key_loads(tag: &str, primary: &str, enc: &str, auth: &str, t: KeyTyp
     let home = Home::new(tag);
     let h = &home.0;
     let uid = "T <t@example.org>";
-    ok(
+    home.ok(
         &gpg(
             h,
             &["--quick-gen-key", uid, primary, "default", "never"],
@@ -446,13 +438,13 @@ fn gpg_made_key_loads(tag: &str, primary: &str, enc: &str, auth: &str, t: KeyTyp
         ),
         "quick-gen-key",
     );
-    let o = ok(
+    let o = home.ok(
         &gpg(h, &["--with-colons", "--list-secret-keys", uid], None),
         "list",
     );
     let fpr = colon_keys(&o).remove(0).fpr;
     for (algo, usage) in [(enc, "encr"), (auth, "auth")] {
-        ok(
+        home.ok(
             &gpg(
                 h,
                 &["--quick-add-key", &fpr, algo, usage, "never"],
@@ -464,19 +456,19 @@ fn gpg_made_key_loads(tag: &str, primary: &str, enc: &str, auth: &str, t: KeyTyp
     // An expiry set and then cleared: the newest self-signature has no
     // expiry subpacket, which means never.
     for when in ["1y", "never"] {
-        ok(
+        home.ok(
             &gpg(h, &["--quick-set-expire", &fpr, when], Some(PASS)),
             "quick-set-expire",
         );
     }
-    let o = ok(
+    let o = home.ok(
         &gpg(h, &["--with-colons", "--list-secret-keys", &fpr], None),
         "list",
     );
     let gkeys = colon_keys(&o);
     assert_eq!(gkeys[0].expires, "", "{o}");
     assert_eq!(gkeys.len(), 3, "{o}");
-    let armored = ok(
+    let armored = home.ok(
         &gpg(h, &["--armor", "--export-secret-keys", &fpr], Some(PASS)),
         "export-secret-keys",
     );
@@ -513,7 +505,7 @@ fn gpg_made_key_loads(tag: &str, primary: &str, enc: &str, auth: &str, t: KeyTyp
         Err(Error::NeedsPassphrase)
     ));
     // Subkeys only: the primary's secret was left out.
-    let subs = ok(
+    let subs = home.ok(
         &gpg(h, &["--armor", "--export-secret-subkeys", &fpr], Some(PASS)),
         "export-secret-subkeys",
     );
@@ -545,7 +537,7 @@ fn gpg_certify_only_key_with_history_loads() {
     let h = &home.0;
     let uid = "T <t@example.org>";
     let pass = Some(PASS);
-    ok(
+    home.ok(
         &gpg(
             h,
             &["--quick-gen-key", uid, "ed25519", "cert", "never"],
@@ -553,14 +545,14 @@ fn gpg_certify_only_key_with_history_loads() {
         ),
         "quick-gen-key",
     );
-    let fpr = colon_keys(&ok(
+    let fpr = colon_keys(&home.ok(
         &gpg(h, &["--with-colons", "--list-secret-keys", uid], None),
         "list",
     ))
     .remove(0)
     .fpr;
     let add = |algo: &str, usage: &str| {
-        ok(
+        home.ok(
             &gpg(h, &["--quick-add-key", &fpr, algo, usage, "never"], pass),
             "quick-add-key",
         );
@@ -573,25 +565,25 @@ fn gpg_certify_only_key_with_history_loads() {
     add("cv25519", "encr");
     pause();
     add("cv25519", "encr");
-    ok(
+    home.ok(
         &gpg(h, &["--quick-add-uid", &fpr, "T2 <t2@example.org>"], pass),
         "quick-add-uid",
     );
-    ok(
+    home.ok(
         &gpg(h, &["--quick-set-expire", &fpr, "1y"], pass),
         "set-expire",
     );
-    ok(
+    home.ok(
         &gpg(h, &["--quick-set-expire", &fpr, "2y", "*"], pass),
         "set-expire subkeys",
     );
-    let gkeys = colon_keys(&ok(
+    let gkeys = colon_keys(&home.ok(
         &gpg(h, &["--with-colons", "--list-secret-keys", &fpr], None),
         "list",
     ));
     assert_eq!(gkeys.len(), 6);
     let newest_enc = gkeys[5].fpr.clone();
-    ok(
+    home.ok(
         &gpg_edit(
             h,
             &fpr,
@@ -600,7 +592,7 @@ fn gpg_certify_only_key_with_history_loads() {
         "revkey",
     );
     pause();
-    ok(
+    home.ok(
         &gpg(
             h,
             &[
@@ -614,18 +606,18 @@ fn gpg_certify_only_key_with_history_loads() {
         ),
         "revoker key",
     );
-    let revoker = colon_keys(&ok(
+    let revoker = colon_keys(&home.ok(
         &gpg(h, &["--with-colons", "--list-keys", "r@example.org"], None),
         "list revoker",
     ))
     .remove(0)
     .fpr;
-    ok(
+    home.ok(
         &gpg_edit(h, &fpr, &format!("addrevoker\n{revoker}\ny\nsave\n")),
         "addrevoker",
     );
 
-    let o = ok(
+    let o = home.ok(
         &gpg(h, &["--with-colons", "--list-secret-keys", &fpr], None),
         "list",
     );
@@ -638,7 +630,7 @@ fn gpg_certify_only_key_with_history_loads() {
     let data = home.write("m.txt", b"x\n");
     let msg = home.file("m.gpg");
     let msg = msg.to_str().unwrap();
-    ok(
+    home.ok(
         &gpg(
             h,
             &[
@@ -670,7 +662,7 @@ fn gpg_certify_only_key_with_history_loads() {
         .to_string();
     assert_eq!(enc_to, gkeys[4].fpr[24..], "gpg picks the newest valid one");
 
-    let armored = ok(
+    let armored = home.ok(
         &gpg(h, &["--armor", "--export-secret-keys", &fpr], pass),
         "export-secret-keys",
     );
@@ -702,7 +694,7 @@ fn gpg_certify_only_key_with_history_loads() {
 
     // Subkeys only: the certify-only primary has no secret part; the
     // rest loads and fills the same slots.
-    let subs = ok(
+    let subs = home.ok(
         &gpg(h, &["--armor", "--export-secret-subkeys", &fpr], pass),
         "export-secret-subkeys",
     );
@@ -770,9 +762,9 @@ fn expiries_after_import(tag: &str, fpr: &str, files: &[&str]) -> Vec<(String, S
     let h = &home.0;
     for (i, data) in files.iter().enumerate() {
         let f = home.write(&format!("{i}.asc"), data.as_bytes());
-        ok(&gpg(h, &["--import", &f], None), "import");
+        home.ok(&gpg(h, &["--import", &f], None), "import");
     }
-    let o = ok(
+    let o = home.ok(
         &gpg(h, &["--with-colons", "--list-keys", fpr], None),
         "list-keys",
     );
@@ -841,8 +833,8 @@ fn backup_with_changed_expiry_still_imports_in_gpg() {
     let home = Home::new("expbs");
     let h = &home.0;
     let f = home.write("sec.asc", secret.as_bytes());
-    ok(&gpg(h, &["--import", &f], Some(PASS)), "import secret");
-    let o = ok(
+    home.ok(&gpg(h, &["--import", &f], Some(PASS)), "import secret");
+    let o = home.ok(
         &gpg(h, &["--with-colons", "--list-secret-keys", &fpr], None),
         "list-secret-keys",
     );
@@ -851,7 +843,7 @@ fn backup_with_changed_expiry_still_imports_in_gpg() {
     assert!(keys.iter().all(|k| k.expires == end.to_string()), "{o}");
     // The secret parts still unlock with the same passphrase: sign.
     let msg = home.write("msg.txt", b"hello");
-    ok(
+    home.ok(
         &gpg(
             h,
             &["--local-user", &fpr, "--detach-sign", "--output", "-", &msg],
