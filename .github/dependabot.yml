@@ -66,6 +66,16 @@ updates:
         versions: ['>=0.11']
       - dependency-name: scrypt
         versions: ['>=0.12']
+      # pbkdf2 0.13 and rc2 0.9 (keyroost-p12's PKCS#12 decryption) and
+      # rand_core 0.9+ are the same next generation (cipher 0.5 / digest 0.11
+      # / rand_core 0.10): they move with the whole stack too. They had no
+      # entries, so dependabot proposed pbkdf2 0.13 and rc2 0.9 alone.
+      - dependency-name: pbkdf2
+        versions: ['>=0.13']
+      - dependency-name: rc2
+        versions: ['>=0.9']
+      - dependency-name: rand_core
+        versions: ['>=0.7']
       # p256, p384, p521 and k256 moved to elliptic-curve 0.14 together
       # (#212); their 0.14.x patches are welcome. They share one
       # `ToSec1Point` trait (from p256's re-export) in keyroost-pivtest and
