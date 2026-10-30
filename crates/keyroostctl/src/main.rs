@@ -842,7 +842,7 @@ enum PivCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). Optional and never asked
@@ -1069,7 +1069,7 @@ enum PivKeyCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// Key type to generate (OpenPGP's `nistp256` is `eccp256` here).
         #[arg(long, value_enum, default_value = "eccp256")]
@@ -1130,7 +1130,7 @@ enum PivKeyCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// The PKCS#12 file to import (`.p12` or `.pfx`).
         #[arg(long = "in", short = 'i', value_name = "FILE")]
@@ -1195,7 +1195,7 @@ enum PivKeyCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// The management key (hex): env:NAME reads that environment variable,
         /// stdin reads one line (hidden when typed at a terminal), default uses
@@ -1224,10 +1224,10 @@ enum PivKeyCmd {
     /// with no entry gets a warning.
     Move {
         /// Source slot (9a/9c/9d/9e/82–95).
-        #[arg(long)]
+        #[arg(long, ignore_case = true)]
         from: CliPivSlot,
         /// Destination slot.
-        #[arg(long)]
+        #[arg(long, ignore_case = true)]
         to: CliPivSlot,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -1266,7 +1266,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// Certificate file to import (`.der` or `.pem`).
         #[arg(long = "in", short = 'i', value_name = "FILE")]
@@ -1289,7 +1289,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// Write the certificate to this file instead of stdout.
         #[arg(long, short = 'o', value_name = "FILE")]
@@ -1308,7 +1308,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
         /// (supported attributes: CN, O, OU, C, L, ST).
@@ -1362,7 +1362,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
         /// (supported attributes: CN, O, OU, C, L, ST).
@@ -1430,7 +1430,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// The management key (hex): env:NAME reads that environment variable,
         /// stdin reads one line (hidden when typed at a terminal), default uses
@@ -16601,6 +16601,16 @@ mod cli_tests {
             json_out::piv_slot_token(keyroost_piv::Slot::retired(20).unwrap()),
             "95"
         );
+    }
+
+    /// `piv info` prints slots in capitals ("retired key 9 (8A)"); a slot
+    /// copied from there is accepted as typed.
+    #[test]
+    fn a_piv_slot_is_accepted_in_capitals() {
+        for slot in ["8A", "8a", "9C"] {
+            let cli = Cli::try_parse_from(["keyroostctl", "piv", "test", "--slot", slot]);
+            assert!(cli.is_ok(), "--slot {slot}");
+        }
     }
 
     #[test]
