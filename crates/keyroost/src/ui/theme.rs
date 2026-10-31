@@ -189,6 +189,7 @@ impl Palette {
         v.widgets.active.bg_stroke = Stroke::new(1.0, self.accent);
         v.window_corner_radius = CornerRadius::same(14);
         v.window_stroke = Stroke::new(1.0, self.line);
+        keep_egui_0_35_widget_look(&mut v, mode);
         ctx.set_visuals(v);
         // Solid (space-reserving) scroll bars everywhere, not just wherever a
         // pane happens to opt in locally. egui's default "floating" bars
@@ -203,7 +204,40 @@ impl Palette {
         // always rebuilds its content `Ui` from this ambient context style
         // rather than inheriting the caller's local one. Setting it here,
         // once, for both themes, is what actually reaches every dropdown.
-        ctx.all_styles_mut(|s| s.spacing.scroll = egui::style::ScrollStyle::solid());
+        ctx.all_styles_mut(|s| {
+            s.spacing.scroll = egui::style::ScrollStyle::solid();
+            // egui 0.37 doubled the button padding and raised the minimum
+            // widget height from 18 to 20, which made every row and card a
+            // few pixels taller; keyroost's layout was designed on 0.35's.
+            s.spacing.button_padding = egui::vec2(4.0, 1.0);
+            s.spacing.interact_size = egui::vec2(40.0, 18.0);
+        });
+    }
+}
+
+/// A text box's inner margin as egui 0.35 had it by default. egui 0.37
+/// derives it from the button padding instead, which keyroost keeps at 0.35's
+/// tighter value, so its text boxes would come out 2 px shorter than before;
+/// every text box sets this explicitly.
+pub const TEXT_EDIT_MARGIN: egui::Margin = egui::Margin::symmetric(4, 2);
+
+/// The parts of egui's built-in widget look that egui 0.37 changed and the
+/// palette above doesn't set itself, put back to their 0.35 values: corner
+/// rounding for every widget state, and (dark only) the text/icon color of
+/// idle and hovered widgets and the hover / press fills of the lighter
+/// buttons. keyroost's look was designed on 0.35.
+fn keep_egui_0_35_widget_look(v: &mut egui::Visuals, mode: Mode) {
+    let w = &mut v.widgets;
+    w.noninteractive.corner_radius = CornerRadius::same(2);
+    w.inactive.corner_radius = CornerRadius::same(2);
+    w.hovered.corner_radius = CornerRadius::same(3);
+    w.active.corner_radius = CornerRadius::same(2);
+    w.open.corner_radius = CornerRadius::same(2);
+    if mode == Mode::Dark {
+        w.inactive.fg_stroke.color = Color32::from_gray(180);
+        w.hovered.weak_bg_fill = Color32::from_gray(70);
+        w.hovered.fg_stroke.color = Color32::from_gray(240);
+        w.active.weak_bg_fill = Color32::from_gray(55);
     }
 }
 
@@ -439,7 +473,7 @@ pub fn button_disabled(ui: &mut egui::Ui, p: &Palette, label: &str) -> Response 
     resp
 }
 
-/// A small ⚠ glyph in the warning colour that senses hover, so the caller can
+/// A small ⚠ glyph in the warning color that senses hover, so the caller can
 /// hang an `.on_hover_text(…)` on the returned [`Response`]. For flagging a
 /// control that stays usable but carries a caveat — e.g. a non-standard
 /// command whose support on the connected device is unverified — next to

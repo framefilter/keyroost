@@ -1344,6 +1344,7 @@ impl App {
                     );
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut dlg.current)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .password(true)
                             .desired_width(220.0),
                     );
@@ -1358,6 +1359,7 @@ impl App {
                     );
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut dlg.new)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .password(true)
                             .desired_width(220.0),
                     );
@@ -1370,6 +1372,7 @@ impl App {
                     );
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut dlg.confirm)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .password(true)
                             .desired_width(220.0),
                     );
@@ -1882,6 +1885,7 @@ impl App {
                 ui.add_space(8.0);
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.otp.pin_input)
+                        .margin(theme::TEXT_EDIT_MARGIN)
                         .password(true)
                         .hint_text("OTP PIN")
                         .desired_width(220.0),
@@ -2371,7 +2375,11 @@ impl App {
                     .color(p.txt2),
             );
             if let Some(t) = self.otp.kbd_confirm.as_mut() {
-                ui.add(egui::TextEdit::singleline(&mut t.typed).desired_width(220.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut t.typed)
+                        .margin(theme::TEXT_EDIT_MARGIN)
+                        .desired_width(220.0),
+                );
             }
             ui.add_space(8.0);
             let matched = self

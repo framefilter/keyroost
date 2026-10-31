@@ -270,6 +270,7 @@ pub fn expiry_row(ui: &mut egui::Ui, p: &Palette, input: &mut ExpiryInput, today
         if input.choice == ExpiryChoice::Date {
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut input.text)
+                    .margin(super::theme::TEXT_EDIT_MARGIN)
                     .hint_text("YYYY-MM-DD")
                     .desired_width(110.0)
                     .font(f_reg(13.0)),

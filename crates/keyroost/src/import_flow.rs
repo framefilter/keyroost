@@ -1555,6 +1555,7 @@ impl App {
                     ui.horizontal(|ui| {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut d.file_password)
+                                .margin(theme::TEXT_EDIT_MARGIN)
                                 .id(egui::Id::unique(FILE_PASSWORD_ID))
                                 .password(true)
                                 .desired_width(300.0),
@@ -1661,6 +1662,7 @@ impl App {
                         ui.horizontal(|ui| {
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut d.dest_secret)
+                                    .margin(theme::TEXT_EDIT_MARGIN)
                                     .id(egui::Id::unique(DEST_SECRET_ID))
                                     .password(true)
                                     .desired_width(260.0),

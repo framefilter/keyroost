@@ -8274,6 +8274,7 @@ impl App {
                         );
                         ui.add(
                             egui::TextEdit::singleline(&mut self.oath.add.name)
+                                .margin(theme::TEXT_EDIT_MARGIN)
                                 .hint_text("issuer:account")
                                 .desired_width(300.0),
                         );
@@ -8676,6 +8677,7 @@ impl App {
                     ui.label("Type \u{201c}reset\u{201d} to confirm:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.factory_reset_confirm_typed)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_width(120.0),
                     );
                 });
@@ -9177,6 +9179,7 @@ impl App {
                         ui.label("Type \u{201c}reset\u{201d} to confirm:");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.security_keys.reset.confirm_input)
+                                .margin(theme::TEXT_EDIT_MARGIN)
                                 .desired_width(120.0),
                         );
                     });
@@ -10621,7 +10624,11 @@ fn typed_reset_modal(
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("Type \u{201c}reset\u{201d} to confirm:");
-                ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut buf)
+                        .margin(theme::TEXT_EDIT_MARGIN)
+                        .desired_width(120.0),
+                );
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -10726,6 +10733,7 @@ pub(crate) fn secret_edit(
     let mut resp = None;
     ui.horizontal(|ui| {
         let mut edit = egui::TextEdit::singleline(buf)
+            .margin(theme::TEXT_EDIT_MARGIN)
             .align(egui::Align2::LEFT_CENTER)
             .desired_width(width);
         if !*revealed {
@@ -14545,6 +14553,7 @@ fn pin_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String) {
         );
         let resp = ui.add(
             egui::TextEdit::singleline(buf)
+                .margin(theme::TEXT_EDIT_MARGIN)
                 .password(true)
                 .desired_width(200.0),
         );
@@ -14576,6 +14585,7 @@ fn secret_field(
         );
         let resp = ui.add(
             egui::TextEdit::singleline(buf)
+                .margin(theme::TEXT_EDIT_MARGIN)
                 .password(true)
                 .hint_text(hint)
                 .desired_width(w),
@@ -14970,6 +14980,7 @@ fn text_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String, hin
         );
         ui.add(
             egui::TextEdit::singleline(buf)
+                .margin(theme::TEXT_EDIT_MARGIN)
                 .hint_text(hint)
                 .desired_width(w),
         );
@@ -17507,6 +17518,7 @@ impl App {
         ui.add_space(8.0);
         ui.add(
             egui::TextEdit::singleline(&mut self.filter)
+                .margin(theme::TEXT_EDIT_MARGIN)
                 .hint_text("Filter keys\u{2026}")
                 .desired_width(f32::INFINITY),
         );
@@ -18118,6 +18130,7 @@ impl App {
                 ui.add_sized(
                     [200.0, 32.0],
                     egui::TextEdit::singleline(&mut self.rename_input)
+                        .margin(theme::TEXT_EDIT_MARGIN)
                         .align(egui::Align2::LEFT_CENTER)
                         .hint_text("friendly-name"),
                 )
@@ -18205,6 +18218,7 @@ impl App {
                 );
                 let resp = ui.add(
                     egui::TextEdit::singleline(pin)
+                        .margin(theme::TEXT_EDIT_MARGIN)
                         .password(true)
                         .desired_width(160.0),
                 );
@@ -19383,6 +19397,7 @@ impl App {
                     let resp = ui.add_sized(
                         [220.0, 32.0],
                         egui::TextEdit::singleline(&mut *self.security_keys.pin_input)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .align(egui::Align2::LEFT_CENTER)
                             .password(true)
                             .hint_text("Enter PIN to unlock this key"),
@@ -19818,6 +19833,7 @@ impl App {
                                             ui.add_sized(
                                                 [160.0, 32.0],
                                                 egui::TextEdit::singleline(buf)
+                                                    .margin(theme::TEXT_EDIT_MARGIN)
                                                     .align(egui::Align2::LEFT_CENTER),
                                             );
                                         }
@@ -19870,6 +19886,7 @@ impl App {
                         ui.add_sized(
                             [160.0, 32.0],
                             egui::TextEdit::singleline(&mut self.security_keys.fp_new_name)
+                                .margin(theme::TEXT_EDIT_MARGIN)
                                 .align(egui::Align2::LEFT_CENTER)
                                 .hint_text("name (optional)"),
                         );
@@ -20507,6 +20524,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.add(
                     egui::TextEdit::multiline(&mut self.security_keys.lb_new_text)
+                        .margin(theme::TEXT_EDIT_MARGIN)
                         .desired_rows(2)
                         .desired_width(f32::INFINITY)
                         .hint_text("Type a note to store on the key\u{2026}"),
@@ -20644,7 +20662,7 @@ impl App {
                 if editing == Some(idx) {
                     ui.add_space(6.0);
                     ui.add(
-                        egui::TextEdit::multiline(&mut self.security_keys.lb_edit_text)
+                        egui::TextEdit::multiline(&mut self.security_keys.lb_edit_text).margin(theme::TEXT_EDIT_MARGIN)
                             .desired_rows(2)
                             .desired_width(f32::INFINITY),
                     );
@@ -21442,6 +21460,7 @@ impl App {
                         if let Some(d) = self.security_keys.advanced.as_mut() {
                             ui.add(
                                 egui::TextEdit::singleline(&mut d.min_pin_input)
+                                    .margin(theme::TEXT_EDIT_MARGIN)
                                     .desired_width(64.0)
                                     .hint_text("e.g. 6"),
                             );
@@ -21459,6 +21478,7 @@ impl App {
                     if let Some(d) = self.security_keys.advanced.as_mut() {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut d.pin_input)
+                                .margin(theme::TEXT_EDIT_MARGIN)
                                 .password(true)
                                 .desired_width(160.0),
                         );
@@ -22904,6 +22924,7 @@ impl App {
                                 );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.piv.chuid_guid)
+                                        .margin(theme::TEXT_EDIT_MARGIN)
                                         .hint_text("hex, dashes optional")
                                         .desired_width(chuid_guid_field_width(ui.ctx())),
                                 );
@@ -23496,6 +23517,7 @@ impl App {
                                     path_changed = ui
                                         .add(
                                             egui::TextEdit::singleline(&mut f.public_path)
+                                                .margin(theme::TEXT_EDIT_MARGIN)
                                                 .hint_text("NAME.pub.asc")
                                                 .desired_width(130.0),
                                         )
@@ -23573,6 +23595,7 @@ impl App {
                                                 label_w(ui, "Backup");
                                                 ui.add(
                                                     egui::TextEdit::singleline(&mut f.backup_path)
+                                                        .margin(theme::TEXT_EDIT_MARGIN)
                                                         .hint_text("NAME.asc")
                                                         .desired_width(130.0),
                                                 );
@@ -23650,6 +23673,7 @@ impl App {
                                     label_w(ui, "Save to");
                                     ui.add(
                                         egui::TextEdit::singleline(&mut f.save_path)
+                                            .margin(theme::TEXT_EDIT_MARGIN)
                                             .hint_text("openpgp-backup.asc")
                                             .desired_width(130.0),
                                     );
@@ -23730,6 +23754,7 @@ impl App {
                                     label_w(ui, "File");
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.openpgp.restore_path)
+                                            .margin(theme::TEXT_EDIT_MARGIN)
                                             .hint_text("openpgp-backup.asc")
                                             .desired_width(130.0),
                                     );
@@ -23971,6 +23996,7 @@ impl App {
                     let resp = ui.add_sized(
                         [220.0, 32.0],
                         egui::TextEdit::singleline(&mut self.oath.password_input)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .align(egui::Align2::LEFT_CENTER)
                             .password(true),
                     );
@@ -25531,7 +25557,7 @@ impl App {
                 if let Some(pem) = &gen_pubkey_pem {
                     ui.add_space(6.0);
                     ui.add(
-                        egui::TextEdit::multiline(&mut pem.as_str())
+                        egui::TextEdit::multiline(&mut pem.as_str()).margin(theme::TEXT_EDIT_MARGIN)
                             .desired_rows(4)
                             .desired_width(f32::INFINITY)
                             .font(egui::TextStyle::Monospace),
@@ -26741,7 +26767,7 @@ impl App {
                             ui.label(egui::RichText::new(format!("SLOT {:02}", self.slot)).font(theme::f_bold(11.0)).color(p.brand));
                             ui.add_space(10.0);
                             editor_row(ui, p, "Title", |ui| {
-                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text("\u{2264} 12 chars").desired_width(ui.available_width().min(360.0)));
+                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).margin(theme::TEXT_EDIT_MARGIN).hint_text("\u{2264} 12 chars").desired_width(ui.available_width().min(360.0)));
                             });
                             editor_row(ui, p, "Secret", |ui| {
                                 let mut rev = self
@@ -27273,6 +27299,7 @@ impl App {
                     ui.label("Paste an otpauth:// URI:");
                     let uri_box = ui.add(
                         egui::TextEdit::multiline(&mut self.import_dialog.uri)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_rows(3)
                             .desired_width(420.0)
                             .font(egui::TextStyle::Monospace),
@@ -30088,7 +30115,12 @@ mod tests {
         let mut buf = String::new();
         let frame = |buf: &mut String, focus: bool| {
             let _ = ctx.test_frame(egui::RawInput::default(), |ui| {
-                let resp = ui.add(egui::TextEdit::singleline(&mut *buf).password(true).id(id));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut *buf)
+                        .margin(theme::TEXT_EDIT_MARGIN)
+                        .password(true)
+                        .id(id),
+                );
                 if focus {
                     resp.request_focus();
                 }
