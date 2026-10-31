@@ -692,7 +692,9 @@ impl App {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
+                // Absolute on desktop; an empty path names no file.
+                .filter(|p| !p.as_os_str().is_empty())
                 .collect()
         });
         if !dropped.is_empty() {

@@ -5,7 +5,7 @@ edition.workspace = true
 # This GUI crate's real MSRV floor is higher than the rest of the workspace:
 # eframe / egui 0.35 require Rust 1.92. The libraries and the CLI keep the lower
 # workspace MSRV (1.87), so this is pinned per-crate instead of inherited.
-rust-version = "1.92"
+rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
 description = "Desktop GUI for managing hardware security keys: FIDO2, OATH, OpenPGP, PIV, and Token2 programmable TOTP tokens."
@@ -44,8 +44,8 @@ keyroost-winwebauthn = { path = "../keyroost-winwebauthn", version = "0.15.0" }
 # Windows-only GDI screen capture for QR-from-screen; its unsafe FFI is isolated
 # in that crate so this one keeps forbid(unsafe_code). Inert (no deps) off Windows.
 keyroost-screengrab = { path = "../keyroost-screengrab", version = "0.15.0" }
-eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui = "0.35"
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow", "links", "wayland", "x11"] }
+egui = "0.37"
 # Already in the tree via eframe/egui-winit's clipboard integration; direct
 # use lets the OTP auto-clear check the clipboard still holds *our* code
 # before wiping it, instead of clobbering whatever the user copied since.
@@ -96,8 +96,8 @@ ashpd = { version = "0.13", default-features = false, features = ["async-io", "s
 # renderer where there's no GPU driver), keeping OpenGL as a fallback. Only the
 # DX12 backend is built. Elsewhere the app stays on OpenGL alone.
 [target.'cfg(windows)'.dependencies]
-eframe = { version = "0.35", default-features = false, features = ["wgpu_no_default_features"] }
-wgpu = { version = "29", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+eframe = { version = "0.37", default-features = false, features = ["wgpu_no_default_features"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
 
 [target.'cfg(windows)'.build-dependencies]
 # Embeds the app icon + VS_VERSION_INFO into keyroost.exe (see build.rs).
