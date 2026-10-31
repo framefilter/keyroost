@@ -64,6 +64,10 @@ updates:
       # Drop when a stable rsa 0.10 ships (only release candidates so far).
       - dependency-name: rand
         versions: ['>=0.9']
+      # rsa itself: keyroost-pgpkey signs and generates through rsa 0.9's own
+      # sha2 / rand_core re-exports, so 0.10 is a deliberate upgrade too.
+      - dependency-name: rsa
+        versions: ['>=0.10']
       # p256, p384, p521 and k256 moved to elliptic-curve 0.14 together
       # (#212); their 0.14.x patches are welcome. They share one
       # `ToSec1Point` trait (from p256's re-export) in keyroost-pivtest and

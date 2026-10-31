@@ -160,6 +160,27 @@ fn hostile_scrypt_params_rejected_before_kdf() {
     }
 }
 
+/// RFC 7914 needs N < 2^(16 r): refused before the key derivation, as
+/// scrypt 0.11 did on its own (0.12 no longer checks it).
+#[test]
+fn scrypt_n_too_large_for_r_rejected() {
+    for (n, r) in [(1u64 << 16, 1u32), (1 << 17, 1)] {
+        let err = keyroost_import::aegis::decrypt(&vault_with_params(n, r, 1), b"pw").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid scrypt params"),
+            "n={n} r={r}: got {err}"
+        );
+    }
+    // Just inside the rule it gets past the parameter checks (and fails
+    // later, on this fixture's zero key).
+    let err =
+        keyroost_import::aegis::decrypt(&vault_with_params(1 << 15, 1, 1), b"pw").unwrap_err();
+    assert!(
+        !err.to_string().contains("invalid scrypt params"),
+        "got {err}"
+    );
+}
+
 #[test]
 fn non_power_of_two_n_rejected() {
     // Includes 2^53+1, which the old f64-based check rounded to a power of 2.

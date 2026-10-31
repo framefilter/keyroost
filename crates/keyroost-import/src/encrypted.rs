@@ -135,8 +135,13 @@ fn try_unlock_slot(
             "slot scrypt parameters exceed sanity caps",
         ));
     }
-    // scrypt's `log_n` parameter is log2 of N.
+    // scrypt's `log_n` parameter is log2 of N. RFC 7914 requires
+    // N < 2^(128 * r / 8); scrypt 0.11 refused the rest itself, 0.12 no
+    // longer does.
     let log_n = n.trailing_zeros() as u8;
+    if u32::from(log_n) >= 16 * r {
+        return Err(BulkError::UnsupportedFormat("invalid scrypt params"));
+    }
     let params = scrypt::Params::new(log_n, r, p)
         .map_err(|_| BulkError::UnsupportedFormat("invalid scrypt params"))?;
 

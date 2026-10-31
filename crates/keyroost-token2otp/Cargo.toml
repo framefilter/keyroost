@@ -21,7 +21,7 @@ aes = { version = "0.9", default-features = false }
 hmac = { version = "0.13", default-features = false }
 cbc = { version = "0.2", default-features = false, features = ["block-padding", "alloc"] }
 p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh", "getrandom"] }
-# OsRng for the PIN-session commands' random IVs (the seed-blob IVs are constants). The
+# The OS random source for the PIN-session commands' random IVs (the seed-blob IVs are constants). The
 # per-command ephemeral keypair comes from p256's `getrandom` feature instead.
 getrandom = "0.4"
 # Scrub the decoded seed and derived session key on drop.

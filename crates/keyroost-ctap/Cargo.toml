@@ -37,9 +37,9 @@ hmac = { version = "0.13", default-features = false }
 aes = { version = "0.9", default-features = false }
 cbc = { version = "0.2", default-features = false, features = ["block-padding"] }
 p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh", "getrandom"] }
-# OsRng for the AES IVs. The ephemeral P-256 keypair comes from p256's own
-# `getrandom` feature (the `Generate` trait), since p256 0.14 is on a newer
-# rand_core than this one.
+# The OS random source for the AES IVs and the largeBlob nonces. The
+# ephemeral P-256 keypair comes from p256's own `getrandom` feature (the
+# `Generate` trait).
 getrandom = "0.4"
 # Already in the tree via p256/elliptic-curve; used to scrub shared secrets
 # and pinUvAuthTokens on drop (forbid(unsafe_code) rules out a manual wipe).
