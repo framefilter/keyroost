@@ -362,6 +362,7 @@ pass show keys/fido-pin | keyroostctl fido credential status --pin stdin
 keyroostctl oath import -d "Work key" --in codes.txt --yes
 keyroostctl fido pin status --json</code></pre>
 <pre><code>{
+  "pin_set": true,
   "pin_retries": 8
 }</code></pre>
     <p>keyroostctl exits with <strong>0</strong> when the command worked, <strong>1</strong>

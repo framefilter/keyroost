@@ -186,10 +186,15 @@ pub(crate) struct OptionJson {
     pub value: bool,
 }
 
-/// `keyroostctl fido --json pin status`.
+/// `keyroostctl fido --json pin status`, named as `otp --json pin status`.
+///
+/// `pin_set` is getInfo's clientPin option: `false` means no PIN is set,
+/// and then `pin_retries` is `null` (some keys still answer a count, others
+/// refuse); `null` when the key doesn't say.
 #[derive(Serialize)]
-pub(crate) struct FidoPinRetriesJson {
-    pub pin_retries: u32,
+pub(crate) struct FidoPinStatusJson {
+    pub pin_set: Option<bool>,
+    pub pin_retries: Option<u32>,
 }
 
 /// `keyroostctl piv --json info`.
