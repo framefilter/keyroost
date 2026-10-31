@@ -31,16 +31,16 @@ tool. Workspace contains:
 | `keyroost-proto` | Pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC) | none |
 | `keyroost-transport` | PC/SC reader discovery, Molto2 session, YubiKey CCID serial, OATH + OpenPGP applets, import writers for OATH / Token2 OTP / Molto2 (in-tree `keyroost-import`), PIV key import from .p12/.pfx (in-tree `keyroost-p12`) and the slot self-test (in-tree `keyroost-pivtest`) | `pcsc`; `aes`/`des`/`cipher`/`getrandom`/`zeroize` (PIV mgmt-key auth); `hidapi` (non-Linux HID) |
 | `keyroost-hid` | USB HID enumeration of FIDO devices via sysfs; the shared `UsbDeviceKey` "same physical USB device" evidence and the Windows device-tree decision (`usb_device_node`) | `hidapi` (non-Linux only; Linux uses sysfs); in-tree `keyroost-proto` (trace format), `keyroost-windevtree` (Windows only) |
-| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt, largeBlob (incl. the on-key name entry, `docs/PROTOCOL-device-label.md`) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`aes-gcm`), `rand_core`, `zeroize`, `miniz_oxide` (largeBlob DEFLATE); `hidapi` (non-Linux HID) |
+| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt, largeBlob (incl. the on-key name entry, `docs/PROTOCOL-device-label.md`) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`aes-gcm`), `getrandom`, `zeroize`, `miniz_oxide` (largeBlob DEFLATE); `hidapi` (non-Linux HID) |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management (status, GENERAL AUTHENTICATE, key-gen, cert import, PIN/PUK/mgmt-key, reset) + SPKI/PEM | `zeroize` |
-| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO management byte layer (APDU + HID framing, ECDH+AES seed encryption) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`), `rand_core`, `zeroize` |
+| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO management byte layer (APDU + HID framing, ECDH+AES seed encryption) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`), `getrandom`, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 2nd-gen single-profile programmable-token protocol (SM4 seed/MAC, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints); no hardware | `serde`, `serde_json`, `getrandom` (per-computer salt); in-tree `keyroost-proto` (SHA-256) |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) and naming (on-key names, first-seen records) | in-tree only (incl. `keyroost-ctap`) |
 | `keyroost-rsakey` | Host-side RSA key loading (PKCS#1/PKCS#8 PEM/DER, 2048-4096 bits) for OpenPGP import | `rsa`, `zeroize` (scoped exception) |
-| `keyroost-pgpkey` | Host-side OpenPGP key sets: packet/armor layer, keygen, GnuPG-compatible secret-key backups, restore (feature `card`: `import_set`/`import_loaded`/`CardSigner`) and expiry changes | `rsa`, `p256`/`p384`/`p521`/`k256`, `ed25519-dalek`, `x25519-dalek`, `sha2`, `aes`, `rand_core`, `zeroize` (scoped exception); in-tree `keyroost-transport` behind `card` |
+| `keyroost-pgpkey` | Host-side OpenPGP key sets: packet/armor layer, keygen, GnuPG-compatible secret-key backups, restore (feature `card`: `import_set`/`import_loaded`/`CardSigner`) and expiry changes | `rsa`, `p256`/`p384`/`p521`/`k256`, `ed25519-dalek`, `x25519-dalek`, `sha2`, `aes`, `getrandom`, `zeroize` (scoped exception); in-tree `keyroost-transport` behind `card` |
 | `keyroost-pivtest` | Host-side verification for the PIV slot self-test (`piv test`, and after `piv key import`): fixed challenges checked against a public key, the slot certificate's or a given one | `rsa`, `p256`/`p384`/`p521` (ECDH), `ed25519-dalek`, `x25519-dalek`, `zeroize` (scoped exception) |
 | `keyroost-p12` | Host-side PKCS#12 (.p12/.pfx) reader for PIV key import: BER, PKCS#12 PBE + PBES2, MAC, PKCS#8 → key parts | `rc2`, `des`, `cbc`, `aes`, `hmac`, `sha2`, `pbkdf2`, `p256`/`p384`, `ed25519-dalek`, `x25519-dalek`, `rsa` (RSA key-consistency check), `zeroize` (scoped exception); in-tree `keyroost-oath`, `keyroost-proto`, `keyroost-piv` |
 | `keyroost-import` | otpauth:// + Aegis / 2FAS / otpauth-list parsers, file classification, per-key import plan and write loop | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`/`aes-gcm`/`base64` (behind `encrypted`, for Aegis vaults) |
@@ -135,7 +135,7 @@ workflow during bring-up is:
 - **Linux build prerequisite:** `sudo apt install libpcsclite-dev pcscd` for the
   CLI; the GUI additionally needs `libxkbcommon-dev libwayland-dev libxcb1-dev
   libgl1-mesa-dev` (full per-distro list in the README's "Smart-card
-  prerequisite" section). GUI crate MSRV is 1.92; the rest of the workspace 1.87.
+  prerequisite" section). GUI crate MSRV is 1.92; the rest of the workspace 1.89.
 
 ## Running
 

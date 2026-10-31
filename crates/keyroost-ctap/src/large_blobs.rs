@@ -711,7 +711,7 @@ pub(crate) fn gcm_decrypt(
     let cipher = Aes256Gcm::new_from_slice(key).ok()?;
     cipher
         .decrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::try_from(nonce).ok()?,
             Payload {
                 msg: ciphertext,
                 aad: &aad,
@@ -737,7 +737,7 @@ pub(crate) fn gcm_encrypt(
     aad.extend_from_slice(&orig_size.to_le_bytes());
     Aes256Gcm::new(key.into())
         .encrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::from(*nonce),
             Payload {
                 msg: plain,
                 aad: &aad,
@@ -828,7 +828,7 @@ mod tests {
         let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
         let ct = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::try_from(&nonce[..]).unwrap(),
                 Payload {
                     msg: plaintext,
                     aad: &aad,
@@ -1300,7 +1300,7 @@ mod tests {
         let ct = Aes256Gcm::new_from_slice(&key)
             .unwrap()
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::try_from(&nonce[..]).unwrap(),
                 Payload {
                     msg: &compressed,
                     aad: &aad,

@@ -15,13 +15,12 @@
 
 use crate::cmd::{PIN_ALG_AES256, PIN_DEFAULT_MAX_RETRY};
 use aes::Aes256;
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use hmac::{Hmac, Mac};
+use cbc::cipher::{block_padding::Pkcs7, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
+use hmac::{Hmac, KeyInit, Mac};
 use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
 use p256::elliptic_curve::Generate;
 use p256::{PublicKey, Sec1Point, SecretKey};
-use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -124,7 +123,7 @@ pub fn encrypt_seed_payload(
     work.resize(cleartext.len() + pad_room, 0);
     let ct_len = cleartext.len();
     let ciphertext = Aes256CbcEnc::new((&*session_key).into(), iv.into())
-        .encrypt_padded_mut::<Pkcs7>(&mut work, ct_len)
+        .encrypt_padded::<Pkcs7>(&mut work, ct_len)
         .expect("buffer sized for PKCS7 padding above")
         .to_vec();
 
@@ -182,7 +181,7 @@ mod tests {
         // Full end-to-end: act as the device, derive the same key, and decrypt
         // the host's ciphertext back to the cleartext. Proves the ECDH + key
         // derivation + IV usage all agree with the spec.
-        use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+        use cbc::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
         type Dec = cbc::Decryptor<aes::Aes256>;
 
         let device_secret = SecretKey::from(p256::NonZeroScalar::generate());
@@ -209,8 +208,8 @@ mod tests {
             h.finalize()
         };
         let mut buf = ciphertext.to_vec();
-        let plain = Dec::new(key.as_slice().into(), (&IV_OTP).into())
-            .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        let plain = Dec::new(&key, (&IV_OTP).into())
+            .decrypt_padded::<Pkcs7>(&mut buf)
             .unwrap();
         assert_eq!(plain, cleartext);
     }
@@ -329,7 +328,7 @@ pub fn session_encrypt(key: &[u8; 32], iv: &[u8; 16], cleartext: &[u8]) -> Vec<u
     work.resize(cleartext.len() + pad_room, 0);
     let ct_len = cleartext.len();
     Aes256CbcEnc::new(key.into(), iv.into())
-        .encrypt_padded_mut::<Pkcs7>(&mut work, ct_len)
+        .encrypt_padded::<Pkcs7>(&mut work, ct_len)
         .expect("buffer sized for PKCS7 padding above")
         .to_vec()
 }
@@ -346,7 +345,7 @@ pub fn session_decrypt_raw(key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> 
     }
     let mut buf = ciphertext.to_vec();
     Aes256CbcDec::new(key.into(), iv.into())
-        .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
+        .decrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf)
         .map(|s| s.to_vec())
         .unwrap_or_default()
 }
@@ -362,7 +361,7 @@ pub fn session_decrypt(
     }
     let mut buf = Zeroizing::new(ciphertext.to_vec());
     let plain = Aes256CbcDec::new(key.into(), iv.into())
-        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .decrypt_padded::<Pkcs7>(&mut buf)
         .map_err(|_| EncryptError::BadCiphertext)?;
     Ok(Zeroizing::new(plain.to_vec()))
 }
@@ -611,9 +610,9 @@ fn aes256_cbc_encrypt_nopad(
     }
     let mut buf = data.to_vec();
     let n = buf.len();
-    // encrypt_padded_mut with NoPadding requires buf already block-aligned.
+    // encrypt_padded with NoPadding requires buf already block-aligned.
     Ok(Aes256CbcEnc::new(key.into(), iv.into())
-        .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, n)
+        .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf, n)
         .map_err(|_| EncryptError::BadLength)?
         .to_vec())
 }
@@ -630,10 +629,11 @@ fn pkcs7_pad16(data: &[u8]) -> Zeroizing<Vec<u8>> {
     out
 }
 
+/// Panics if the OS has no randomness to give (as `rand_core`'s `OsRng` did
+/// before).
 fn random_iv() -> [u8; 16] {
-    use rand_core::RngCore;
     let mut iv = [0u8; 16];
-    OsRng.fill_bytes(&mut iv);
+    getrandom::fill(&mut iv).expect("the OS random source failed");
     iv
 }
 
@@ -685,7 +685,7 @@ mod pin_crypto_tests {
     fn dec_nopad(key: &[u8; 32], iv: &[u8; 16], ct: &[u8]) -> Vec<u8> {
         let mut buf = ct.to_vec();
         Aes256CbcDec::new(key.into(), iv.into())
-            .decrypt_padded_mut::<NoPadding>(&mut buf)
+            .decrypt_padded::<NoPadding>(&mut buf)
             .expect("block-aligned")
             .to_vec()
     }

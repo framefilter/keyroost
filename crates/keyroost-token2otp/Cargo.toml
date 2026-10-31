@@ -16,14 +16,14 @@ workspace = true
 # coord for the key, AES-CBC with PKCS#7. This is the exact primitive set the
 # CTAP client-PIN code already depends on (see keyroost-ctap/Cargo.toml); these
 # are RustCrypto-audited and not something forbid(unsafe_code) lets us hand-roll.
-sha2 = { version = "0.10", default-features = false }
-aes = { version = "0.8", default-features = false }
-hmac = { version = "0.12", default-features = false }
-cbc = { version = "0.1", default-features = false, features = ["block-padding", "alloc"] }
+sha2 = { version = "0.11", default-features = false }
+aes = { version = "0.9", default-features = false }
+hmac = { version = "0.13", default-features = false }
+cbc = { version = "0.2", default-features = false, features = ["block-padding", "alloc"] }
 p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh", "getrandom"] }
-# OsRng for the PIN-session commands' random IVs (the seed-blob IVs are constants). The
+# The OS random source for the PIN-session commands' random IVs (the seed-blob IVs are constants). The
 # per-command ephemeral keypair comes from p256's `getrandom` feature instead.
-rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+getrandom = "0.4"
 # Scrub the decoded seed and derived session key on drop.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 

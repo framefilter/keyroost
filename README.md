@@ -432,7 +432,7 @@ The prebuilt binaries need `libpcsclite` at runtime — on a FIDO-only machine i
 
 ### cargo (from source)
 
-Needs the Rust toolchain — **1.92+ for the GUI** (`keyroost`), 1.87+ for the CLI
+Needs the Rust toolchain — **1.92+ for the GUI** (`keyroost`), 1.89+ for the CLI
 (`keyroostctl`) and libraries — and, on Linux, the PC/SC dev package plus the
 GUI's X11/Wayland/GL libraries (see
 [Smart-card prerequisite](#smart-card-prerequisite)):
@@ -1021,18 +1021,18 @@ old script.
 | `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
 | `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session, import writers for OATH / Token2 OTP / Molto2 (in-tree `keyroost-import`), PIV key import from `.p12` / `.pfx` (in-tree `keyroost-p12`) and the slot self-test (in-tree `keyroost-pivtest`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
 | `keyroost-hid` | USB HID enumeration of FIDO devices, and the "same physical USB device" evidence used to pair a key's FIDO and smart-card sides | none on Linux (`sysfs`); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
-| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management, large-blob storage (including the name a key carries) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for client-PIN, `aes-gcm` + `miniz_oxide` for largeBlob entries, `zeroize`; `hidapi` on macOS/Windows |
+| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management, large-blob storage (including the name a key carries) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`) and `getrandom` for client-PIN, `aes-gcm` + `miniz_oxide` for largeBlob entries, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM, applet fingerprinting and per-device feature gates | `zeroize` |
 | `keyroost-p12` | Host-side PKCS#12 (`.p12` / `.pfx`) reader for `piv key import`: legacy and modern encryption, MAC check, keys paired with their certificates | `rc2`, `des`, `cbc`, `aes`, `hmac`, `sha2`, `pbkdf2`, `p256`/`p384`, `ed25519-dalek`, `x25519-dalek`, `rsa`, `zeroize`; in-tree `keyroost-proto`, `keyroost-piv`, `keyroost-oath` |
 | `keyroost-pivtest` | Host-side round-trip self-test for a PIV slot key (decrypt / key-agree / sign), checked against a public key: the slot certificate's, or one given (an imported key's) | `rsa`, `p256`, `p384`, `p521`, `ed25519-dalek`, `x25519-dalek`, `zeroize` |
-| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for ECDH seed encryption and the OTP-PIN session, `zeroize` |
+| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`) and `getrandom` for ECDH seed encryption and the OTP-PIN session, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints) | `serde`, `serde_json`, `getrandom` (the per-computer salt); in-tree SHA-256 from `keyroost-proto` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) and naming (names on the key and on this computer) | none (in-tree only, including `keyroost-ctap`) |
 | `keyroost-rsakey` | Host-side RSA key loading (PKCS#1/PKCS#8, PEM/DER, 2048-4096 bits) for OpenPGP import | `rsa`, `zeroize` |
-| `keyroost-pgpkey` | Host-side OpenPGP key sets: key generation, GnuPG-compatible passphrase-protected backups, reading backups and GnuPG exports, expiry changes; restore onto a card behind the `card` feature | `rsa`, `p256`, `p384`, `p521`, `k256`, `ed25519-dalek`, `x25519-dalek`, `sha2`, `aes`, `rand_core`, `zeroize`; in-tree `keyroost-transport` (behind `card`) |
+| `keyroost-pgpkey` | Host-side OpenPGP key sets: key generation, GnuPG-compatible passphrase-protected backups, reading backups and GnuPG exports, expiry changes; restore onto a card behind the `card` feature | `rsa`, `p256`, `p384`, `p521`, `k256`, `ed25519-dalek`, `x25519-dalek`, `sha2`, `aes`, `getrandom`, `zeroize`; in-tree `keyroost-transport` (behind `card`) |
 | `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers, file classification, and the per-key import plan and write loop | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`, `aes-gcm`, `base64` (behind `encrypted`, which implies `bulk`) |
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots and Google Authenticator export batches — always built in; the GUI's *live screen* capture is behind the `qr` feature (on in the release archives and the AppImage, off in the Flatpak) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
 | `keyroost-winwebauthn` | Windows-only helper for the non-admin FIDO2 path: detect a FIDO key via the HID access-denied signal, open Windows' security-key settings, and relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |

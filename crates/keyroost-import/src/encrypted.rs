@@ -135,9 +135,14 @@ fn try_unlock_slot(
             "slot scrypt parameters exceed sanity caps",
         ));
     }
-    // scrypt's `log_n` parameter is log2 of N.
+    // scrypt's `log_n` parameter is log2 of N. RFC 7914 requires
+    // N < 2^(128 * r / 8); scrypt 0.11 refused the rest itself, 0.12 no
+    // longer does.
     let log_n = n.trailing_zeros() as u8;
-    let params = scrypt::Params::new(log_n, r, p, 32)
+    if u32::from(log_n) >= 16 * r {
+        return Err(BulkError::UnsupportedFormat("invalid scrypt params"));
+    }
+    let params = scrypt::Params::new(log_n, r, p)
         .map_err(|_| BulkError::UnsupportedFormat("invalid scrypt params"))?;
 
     // KEK and master key are wiped on every exit path, including the `?`s
@@ -208,7 +213,7 @@ fn gcm_decrypt(key: &[u8], nonce: &[u8], ct: &[u8], tag: &[u8]) -> Result<Vec<u8
     buf.extend_from_slice(tag);
     cipher
         .decrypt(
-            nonce.into(),
+            nonce.try_into().map_err(|_| ())?,
             Payload {
                 msg: &buf,
                 aad: b"",

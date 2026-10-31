@@ -3,8 +3,8 @@ name = "keyroost"
 version.workspace = true
 edition.workspace = true
 # This GUI crate's real MSRV floor is higher than the rest of the workspace:
-# eframe / egui 0.35 require Rust 1.92. The libraries and the CLI keep the lower
-# workspace MSRV (1.87), so this is pinned per-crate instead of inherited.
+# eframe / egui 0.36+ require Rust 1.95. The libraries and the CLI keep the lower
+# workspace MSRV (1.89), so this is pinned per-crate instead of inherited.
 rust-version = "1.95"
 license.workspace = true
 repository.workspace = true

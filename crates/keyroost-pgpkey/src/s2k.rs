@@ -1,10 +1,9 @@
 //! String-to-key derivation and secret-key protection (RFC 4880 sections
 //! 3.7 and 5.5.3), in the form GnuPG reads and writes.
 
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
 use keyroost_proto::sha1::Sha1;
-use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use zeroize::Zeroizing;
 
@@ -215,7 +214,7 @@ impl Block {
     }
 
     fn encrypt(&self, block: &mut [u8; 16]) {
-        let b = aes::Block::from_mut_slice(block);
+        let b = block.into();
         match self {
             Block::Aes128(c) => c.encrypt_block(b),
             Block::Aes192(c) => c.encrypt_block(b),
@@ -262,9 +261,9 @@ fn sum16(d: &[u8]) -> u16 {
 /// after the public part (usage 254, AES-256, iterated SHA-256, SHA-1 check).
 pub(crate) fn protect(secret_mpis: &[u8], pass: &[u8]) -> Result<Vec<u8>> {
     let mut salt = [0u8; 8];
-    OsRng.fill_bytes(&mut salt);
+    crate::keys::fill_random(&mut salt)?;
     let mut iv = [0u8; 16];
-    OsRng.fill_bytes(&mut iv);
+    crate::keys::fill_random(&mut iv)?;
     let spec = Spec::Iterated(Hash::Sha256, salt, WRITE_COUNT);
     let key = spec.derive(pass, Cipher::Aes256.key_len());
     let mut plain = Zeroizing::new(Vec::with_capacity(secret_mpis.len() + 20));
