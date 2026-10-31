@@ -136,7 +136,7 @@ pub fn capture_virtual_screen() -> Result<Frame, String> {
         }
 
         // BGRA -> RGBA (and force opaque alpha).
-        for px in buf.chunks_exact_mut(4) {
+        for px in buf.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
             px[3] = 255;
         }

@@ -37,7 +37,7 @@ fn make_vault(password: &str, plaintext_db: &str) -> String {
     let db_nonce: [u8; 12] = *b"db-nonce-aaa";
     let master_key: [u8; 32] = *b"master-key-32-bytes-for-aegis-12";
 
-    let params = Params::new(log_n, r, p, 32).unwrap();
+    let params = Params::new(log_n, r, p).unwrap();
     let mut kek = [0u8; 32];
     scrypt::scrypt(password.as_bytes(), salt, &params, &mut kek).unwrap();
 
@@ -158,6 +158,27 @@ fn hostile_scrypt_params_rejected_before_kdf() {
             "n={n} r={r} p={p}: got {err}"
         );
     }
+}
+
+/// RFC 7914 needs N < 2^(16 r): refused before the key derivation, as
+/// scrypt 0.11 did on its own (0.12 no longer checks it).
+#[test]
+fn scrypt_n_too_large_for_r_rejected() {
+    for (n, r) in [(1u64 << 16, 1u32), (1 << 17, 1)] {
+        let err = keyroost_import::aegis::decrypt(&vault_with_params(n, r, 1), b"pw").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid scrypt params"),
+            "n={n} r={r}: got {err}"
+        );
+    }
+    // Just inside the rule it gets past the parameter checks (and fails
+    // later, on this fixture's zero key).
+    let err =
+        keyroost_import::aegis::decrypt(&vault_with_params(1 << 15, 1, 1), b"pw").unwrap_err();
+    assert!(
+        !err.to_string().contains("invalid scrypt params"),
+        "got {err}"
+    );
 }
 
 #[test]

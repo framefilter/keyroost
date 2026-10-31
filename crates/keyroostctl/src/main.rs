@@ -15047,11 +15047,6 @@ fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::E
 fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
     let path = crate::target::fido_path(path)?;
     let (mut dev, _) = open_ctap_hid(&path)?;
-    if json_output() {
-        let n = keyroost_ctap::client_pin::get_pin_retries(&mut dev)?;
-        emit_json(&json_out::FidoPinRetriesJson { pin_retries: n })?;
-        return Ok(());
-    }
     // getInfo's clientPin option says whether a PIN is set (the app's "No PIN
     // configured"). Without one, some keys still answer the retry count,
     // which reads as if a PIN were set, and others refuse it
@@ -15059,21 +15054,27 @@ fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn st
     let pin_set = keyroost_ctap::cmd::get_info(&mut dev)
         .ok()
         .and_then(|info| info.option("clientPin"));
-    if pin_set == Some(false) {
-        println!("{}", pin_status_line(pin_set, 0));
-        return Ok(());
+    let pin_retries = match pin_set {
+        Some(false) => None,
+        _ => Some(keyroost_ctap::client_pin::get_pin_retries(&mut dev)?),
+    };
+    if json_output() {
+        emit_json(&json_out::FidoPinStatusJson {
+            pin_set,
+            pin_retries,
+        })?;
+    } else {
+        println!("{}", pin_status_line(pin_retries));
     }
-    let n = keyroost_ctap::client_pin::get_pin_retries(&mut dev)?;
-    println!("{}", pin_status_line(pin_set, n));
     Ok(())
 }
 
 /// `fido pin status`'s line: the retry count when a PIN is set (or when the
-/// key doesn't say), else that none is set.
-fn pin_status_line(pin_set: Option<bool>, retries: u32) -> String {
-    match pin_set {
-        Some(false) => "No FIDO2 PIN is set. Set one with `keyroostctl fido pin set`.".into(),
-        _ => format!("{retries} PIN attempt(s) remaining"),
+/// key doesn't say), else (`None`) that none is set.
+fn pin_status_line(pin_retries: Option<u32>) -> String {
+    match pin_retries {
+        None => "No FIDO2 PIN is set. Set one with `keyroostctl fido pin set`.".into(),
+        Some(n) => format!("{n} PIN attempt(s) remaining"),
     }
 }
 
@@ -16743,11 +16744,10 @@ mod cli_tests {
     #[test]
     fn fido_pin_status_says_when_no_pin_is_set() {
         assert_eq!(
-            pin_status_line(Some(false), 8),
+            pin_status_line(None),
             "No FIDO2 PIN is set. Set one with `keyroostctl fido pin set`."
         );
-        assert_eq!(pin_status_line(Some(true), 7), "7 PIN attempt(s) remaining");
-        assert_eq!(pin_status_line(None, 8), "8 PIN attempt(s) remaining");
+        assert_eq!(pin_status_line(Some(7)), "7 PIN attempt(s) remaining");
     }
 
     /// `piv info` prints slots in capitals ("retired key 9 (8A)"); a slot
@@ -24125,9 +24125,24 @@ mod cli_tests {
     }
 
     #[test]
-    fn fido_pin_retries_json_serializes() {
-        let p = json_out::FidoPinRetriesJson { pin_retries: 8 };
-        assert_json_has_keys(&p, &["pin_retries"]);
+    fn fido_pin_status_json_serializes() {
+        let set = json_out::FidoPinStatusJson {
+            pin_set: Some(true),
+            pin_retries: Some(8),
+        };
+        assert_eq!(
+            serde_json::to_value(&set).unwrap(),
+            serde_json::json!({"pin_set": true, "pin_retries": 8})
+        );
+        // No PIN: both fields present, the count null.
+        let unset = json_out::FidoPinStatusJson {
+            pin_set: Some(false),
+            pin_retries: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&unset).unwrap(),
+            serde_json::json!({"pin_set": false, "pin_retries": null})
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub(crate) fn random_credential_guess(
     let mut raw = Zeroizing::new([0u8; GUESS_LEN]);
     // No fallback to a constant: a factory reset that can't draw fresh entropy
     // has to stop, not go back to guessing something predictable.
-    getrandom::getrandom(&mut raw[..]).map_err(|_| TransportError::HostRngFailed)?;
+    getrandom::fill(&mut raw[..]).map_err(|_| TransportError::HostRngFailed)?;
     Ok(credential_guess_from(&raw, previous))
 }
 
@@ -1232,7 +1232,7 @@ fn pick_mgmt_alg(accepted: &[MgmtAlg], key_len: usize) -> Option<MgmtAlg> {
 /// settled on — their own manual value included — to the card.
 pub fn random_chuid_guid() -> Result<[u8; 16], TransportError> {
     let mut guid = [0u8; 16];
-    getrandom::getrandom(&mut guid).map_err(|_| TransportError::HostRngFailed)?;
+    getrandom::fill(&mut guid).map_err(|_| TransportError::HostRngFailed)?;
     Ok(guid)
 }
 
@@ -1245,7 +1245,7 @@ pub fn random_chuid_guid() -> Result<[u8; 16], TransportError> {
 /// in this crate.
 pub fn random_management_key(alg: MgmtAlg) -> Result<zeroize::Zeroizing<Vec<u8>>, TransportError> {
     let mut key = zeroize::Zeroizing::new(vec![0u8; alg.key_len()]);
-    getrandom::getrandom(&mut key).map_err(|_| TransportError::HostRngFailed)?;
+    getrandom::fill(&mut key).map_err(|_| TransportError::HostRngFailed)?;
     Ok(key)
 }
 
@@ -3420,7 +3420,7 @@ impl<'tx> PivSession<'tx> {
 
         // Step 2: return the decrypted witness plus our own random challenge.
         let mut challenge = vec![0u8; alg.block_size()];
-        getrandom::getrandom(&mut challenge).map_err(|_| TransportError::HostRngFailed)?;
+        getrandom::fill(&mut challenge).map_err(|_| TransportError::HostRngFailed)?;
         let apdu = Zeroizing::new(piv::general_auth_mutual(
             alg,
             piv::KEY_REF_MANAGEMENT,
@@ -5254,7 +5254,7 @@ impl<'tx> PivSession<'tx> {
         // 16 random bytes keep the serial unique and well under RFC 5280's
         // 20-octet ceiling even after the positive-INTEGER zero prefix.
         let mut serial = [0u8; 16];
-        getrandom::getrandom(&mut serial).map_err(|_| TransportError::HostRngFailed)?;
+        getrandom::fill(&mut serial).map_err(|_| TransportError::HostRngFailed)?;
         let tbs = piv::x509::tbs_certificate(
             &serial, alg, &subject, not_before, not_after, &spki, key_usage,
         )
@@ -6982,8 +6982,7 @@ fn block_crypt(
     data: &[u8],
     op: CryptOp,
 ) -> Result<Vec<u8>, TransportError> {
-    use cipher::generic_array::GenericArray;
-    use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+    use cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 
     if data.is_empty() || !data.len().is_multiple_of(alg.block_size()) {
         return Err(TransportError::MalformedResponse(
@@ -6991,10 +6990,15 @@ fn block_crypt(
         ));
     }
 
-    fn run<C: BlockEncrypt + BlockDecrypt>(c: &C, data: &[u8], op: CryptOp, bs: usize) -> Vec<u8> {
+    fn run<C: BlockCipherEncrypt + BlockCipherDecrypt>(
+        c: &C,
+        data: &[u8],
+        op: CryptOp,
+        bs: usize,
+    ) -> Vec<u8> {
         let mut out = Vec::with_capacity(data.len());
         for chunk in data.chunks(bs) {
-            let mut block = GenericArray::clone_from_slice(chunk);
+            let mut block = cipher::Block::<C>::try_from(chunk).expect("length checked above");
             match op {
                 CryptOp::Encrypt => c.encrypt_block(&mut block),
                 CryptOp::Decrypt => c.decrypt_block(&mut block),

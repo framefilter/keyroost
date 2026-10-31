@@ -575,7 +575,7 @@ fn decode_ascii_hex(hex: &[u8]) -> Result<Vec<u8>, ParseError> {
         return Err(ParseError::Malformed("serial hex length is odd"));
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.chunks_exact(2) {
+    for pair in hex.as_chunks::<2>().0 {
         let hi = hex_nibble(pair[0]).ok_or(ParseError::Malformed("non-hex char in serial"))?;
         let lo = hex_nibble(pair[1]).ok_or(ParseError::Malformed("non-hex char in serial"))?;
         out.push((hi << 4) | lo);

@@ -5,7 +5,7 @@
 use aes::{Aes128, Aes192, Aes256};
 use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::typenum::Unsigned;
-use cbc::cipher::{BlockCipher, BlockDecryptMut, InnerIvInit, KeyIvInit};
+use cbc::cipher::{BlockCipherDecrypt, BlockModeDecrypt, InnerIvInit, KeyIvInit};
 use des::TdesEde3;
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -308,7 +308,7 @@ fn decrypt_pbes2(
 
 fn cbc_decrypt<C>(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, P12Error>
 where
-    C: BlockCipher + cbc::cipher::BlockDecrypt + cbc::cipher::KeyInit,
+    C: BlockCipherDecrypt + cbc::cipher::KeyInit,
 {
     let dec =
         cbc::Decryptor::<C>::new_from_slices(key, iv).map_err(|_| bad("bad key or IV length"))?;
@@ -318,14 +318,14 @@ where
 /// Run CBC decryption and strip PKCS#7 padding into a zeroizing buffer.
 fn finish<D>(dec: D, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, P12Error>
 where
-    D: BlockDecryptMut,
+    D: BlockModeDecrypt,
 {
     if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(D::BlockSize::USIZE) {
         return Err(bad("ciphertext is not a whole number of blocks"));
     }
     let mut buf = Zeroizing::new(ciphertext.to_vec());
     let len = dec
-        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .decrypt_padded::<Pkcs7>(&mut buf)
         .map_err(|_| P12Error::WrongPassword)?
         .len();
     buf.truncate(len);
@@ -336,8 +336,7 @@ where
 mod tests {
     use super::*;
     use crate::ber::read_tlv;
-    use rc2::cipher::generic_array::GenericArray;
-    use rc2::cipher::{BlockDecrypt, BlockEncrypt};
+    use rc2::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt};
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len() / 2)
@@ -358,7 +357,7 @@ mod tests {
     fn rc2_matches_rfc2268_vector() {
         let key = unhex("88bca90e90875a");
         let cipher = rc2::Rc2::new_with_eff_key_len(&key, 64);
-        let mut block = GenericArray::clone_from_slice(&[0u8; 8]);
+        let mut block = Array::from([0u8; 8]);
         cipher.encrypt_block(&mut block);
         assert_eq!(block.as_slice(), unhex("6ccf4308974c267f"));
         cipher.decrypt_block(&mut block);

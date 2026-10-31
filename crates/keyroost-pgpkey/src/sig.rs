@@ -71,10 +71,11 @@ impl Signer for HostSigner<'_> {
                 let b = BigUint::from_bytes_be;
                 let key = RsaPrivateKey::from_components(b(n), b(e), b(d), vec![b(p), b(q)])
                     .map_err(crypto)?;
+                // `rsa` 0.9 takes the hash types of its own `sha2` generation.
                 let scheme = match hash {
-                    Hash::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
-                    Hash::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
-                    Hash::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
+                    Hash::Sha256 => Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+                    Hash::Sha384 => Pkcs1v15Sign::new::<rsa::sha2::Sha384>(),
+                    Hash::Sha512 => Pkcs1v15Sign::new::<rsa::sha2::Sha512>(),
                     Hash::Sha1 => return Err(Error::Unsupported("SHA-1 signatures")),
                 };
                 Ok(vec![key.sign(scheme, digest).map_err(crypto)?])
@@ -451,7 +452,7 @@ mod tests {
                 assert_eq!(hash, 8);
                 assert_eq!(mpis.len(), 1);
                 let s = pad(&mpis[0], n.len());
-                pk.verify(Pkcs1v15Sign::new::<Sha256>(), digest, &s)
+                pk.verify(Pkcs1v15Sign::new::<rsa::sha2::Sha256>(), digest, &s)
                     .unwrap();
             }
             Material::Ecdsa { curve, point, .. } => {
