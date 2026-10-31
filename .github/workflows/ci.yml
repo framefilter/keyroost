@@ -123,7 +123,7 @@ jobs:
   # Enforce the declared MSRV so an accidental use of a newer language/library
   # feature (or a dependency that bumped its own MSRV) can't ship silently to
   # distro/crates.io consumers. The workspace floor is rust-version = "1.89"; the
-  # `keyroost` GUI overrides to 1.92 (its eframe/egui stack needs it), so it is
+  # `keyroost` GUI overrides to 1.95 (its eframe/egui stack needs it), so it is
   # excluded here and covered by the stable `test` job above instead.
   msrv:
     name: MSRV (1.89, libs + CLI)

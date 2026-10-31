@@ -327,7 +327,7 @@ pub fn month_grid(month: Date) -> [Date; 42] {
 }
 
 fn showing_id() -> egui::Id {
-    egui::Id::new("expiry_calendar_showing")
+    egui::Id::unique("expiry_calendar_showing")
 }
 
 fn set_calendar_showing(ctx: &egui::Context, on: bool) {

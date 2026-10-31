@@ -9347,7 +9347,7 @@ impl App {
         let Some(label) = self.touch_banner_text() else {
             return;
         };
-        egui::Area::new(egui::Id::new("touch_banner"))
+        egui::Area::new(egui::Id::unique("touch_banner"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
             .interactable(false)
@@ -10726,7 +10726,7 @@ pub(crate) fn secret_edit(
     let mut resp = None;
     ui.horizontal(|ui| {
         let mut edit = egui::TextEdit::singleline(buf)
-            .vertical_align(egui::Align::Center)
+            .align(egui::Align2::LEFT_CENTER)
             .desired_width(width);
         if !*revealed {
             edit = edit.password(true);
@@ -13689,7 +13689,7 @@ fn sub_tab_strip<T: Copy>(
     joined: bool,
     trailing: impl FnOnce(&mut egui::Ui),
 ) -> SubTabs<T> {
-    let id = ui.id().with(id_salt);
+    let id = ui.scope_id().with(id_salt);
     let font = theme::f_sb(13.5);
     let pad = egui::vec2(12.0, 7.0);
     let line = egui::Stroke::new(1.0, p.line);
@@ -13800,8 +13800,8 @@ fn join_open_tab(ui: &egui::Ui, p: &Palette, tab: Option<egui::Rect>) {
 /// the opacity to restore with `ui.set_opacity` where the tab's panel ends.
 fn fade_in_on_switch(ui: &mut egui::Ui, id_salt: &str, key: impl std::fmt::Debug) -> f32 {
     let prev = ui.opacity();
-    let id = ui.id().with(id_salt).with("fade");
-    let key = egui::Id::new(format!("{key:?}"));
+    let id = ui.scope_id().with(id_salt).with("fade");
+    let key = egui::Id::unique(format!("{key:?}"));
     let now = ui.input(|i| i.time);
     let start = ui.data_mut(|d| {
         let seen = d.get_temp::<(egui::Id, f64)>(id);
@@ -16911,7 +16911,7 @@ impl App {
                                 );
                             }
                             ui.add_space(TOPBAR_GAP);
-                            let menu_id = egui::Id::new("topbar_menu");
+                            let menu_id = egui::Id::unique("topbar_menu");
                             let trigger = if fit.links_in_menu {
                                 theme::button(ui, p, BtnKind::Ghost, TOPBAR_MENU)
                                     .on_hover_text("Appearance, Learn and Activity log")
@@ -17379,7 +17379,7 @@ impl App {
         }
         // Called every frame so opening the overlay slides it in from 0.
         let slide = ctx.animate_bool_with_time(
-            egui::Id::new("sidebar_overlay_slide"),
+            egui::Id::unique("sidebar_overlay_slide"),
             self.sidebar_overlay,
             0.16,
         );
@@ -17652,7 +17652,7 @@ impl App {
         // The dimmed window, top bar included: also swallows the press that
         // closes the list, so it never reaches a button underneath.
         let window = ctx.content_rect();
-        egui::Area::new(egui::Id::new("sidebar_scrim"))
+        egui::Area::new(egui::Id::unique("sidebar_scrim"))
             .order(egui::Order::Foreground)
             .fixed_pos(window.min)
             .interactable(true)
@@ -17664,7 +17664,7 @@ impl App {
                     egui::Color32::from_black_alpha((120.0 * slide) as u8),
                 );
             });
-        let shown = egui::Area::new(egui::Id::new("sidebar_overlay"))
+        let shown = egui::Area::new(egui::Id::unique("sidebar_overlay"))
             .order(egui::Order::Foreground)
             .fixed_pos(rect.min)
             .constrain(false)
@@ -18118,7 +18118,7 @@ impl App {
                 ui.add_sized(
                     [200.0, 32.0],
                     egui::TextEdit::singleline(&mut self.rename_input)
-                        .vertical_align(egui::Align::Center)
+                        .align(egui::Align2::LEFT_CENTER)
                         .hint_text("friendly-name"),
                 )
             })
@@ -19383,7 +19383,7 @@ impl App {
                     let resp = ui.add_sized(
                         [220.0, 32.0],
                         egui::TextEdit::singleline(&mut *self.security_keys.pin_input)
-                            .vertical_align(egui::Align::Center)
+                            .align(egui::Align2::LEFT_CENTER)
                             .password(true)
                             .hint_text("Enter PIN to unlock this key"),
                     );
@@ -19818,7 +19818,7 @@ impl App {
                                             ui.add_sized(
                                                 [160.0, 32.0],
                                                 egui::TextEdit::singleline(buf)
-                                                    .vertical_align(egui::Align::Center),
+                                                    .align(egui::Align2::LEFT_CENTER),
                                             );
                                         }
                                         if theme::button(ui, p, BtnKind::Primary, "Save").clicked()
@@ -19870,7 +19870,7 @@ impl App {
                         ui.add_sized(
                             [160.0, 32.0],
                             egui::TextEdit::singleline(&mut self.security_keys.fp_new_name)
-                                .vertical_align(egui::Align::Center)
+                                .align(egui::Align2::LEFT_CENTER)
                                 .hint_text("name (optional)"),
                         );
                         if theme::button(ui, p, BtnKind::Primary, "Enroll new\u{2026}").clicked() {
@@ -22705,7 +22705,7 @@ impl App {
                                         // imperceptible for a row that only
                                         // changes on a device switch.
                                         let row_w_id =
-                                            egui::Id::new("piv-allow-pin-unlock-row-width");
+                                            egui::Id::unique("piv-allow-pin-unlock-row-width");
                                         let last_row_w =
                                             ui.data(|d| d.get_temp::<f32>(row_w_id)).unwrap_or(0.0);
                                         ui.horizontal(|ui| {
@@ -23971,7 +23971,7 @@ impl App {
                     let resp = ui.add_sized(
                         [220.0, 32.0],
                         egui::TextEdit::singleline(&mut self.oath.password_input)
-                            .vertical_align(egui::Align::Center)
+                            .align(egui::Align2::LEFT_CENTER)
                             .password(true),
                     );
                     guard_secret_field(ui.ctx(), &resp);
@@ -27533,6 +27533,29 @@ fn slot_summary(attrs: &[u8], fpr: &[u8; 20], key_present: Option<bool>) -> Stri
 mod tests {
     use super::*;
 
+    /// One headless egui frame for a test. The frame's texture changes are
+    /// cleared, as a renderer would apply them: egui 0.37 asserts (in debug
+    /// builds) that a frame's output never drops them unapplied.
+    trait TestFrame {
+        fn test_frame(
+            &self,
+            input: egui::RawInput,
+            ui: impl FnMut(&mut egui::Ui),
+        ) -> egui::FullOutput;
+    }
+
+    impl TestFrame for egui::Context {
+        fn test_frame(
+            &self,
+            input: egui::RawInput,
+            ui: impl FnMut(&mut egui::Ui),
+        ) -> egui::FullOutput {
+            let mut output = self.run_ui(input, ui);
+            output.textures_delta.clear();
+            output
+        }
+    }
+
     /// The `test-isolation` dev-dependency feature is on: a test here can
     /// never resolve, read or write the person's config directory.
     #[test]
@@ -27667,7 +27690,7 @@ mod tests {
             if let Some(r) = row_rect.filter(|_| frame >= 1) {
                 input.events.push(egui::Event::PointerMoved(r.center()));
             }
-            let _ = ctx.run_ui(input, |ctx| {
+            let _ = ctx.test_frame(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.set_min_width(160.0);
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -29656,7 +29679,7 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let output = ctx.run_ui(input, |ctx| {
+            let output = ctx.test_frame(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     app.render_fido_advanced(ui, &palette);
                 });
@@ -29717,7 +29740,7 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let output = ctx.run_ui(input, |ctx| {
+            let output = ctx.test_frame(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     app.render_fido_advanced(ui, &palette);
                 });
@@ -30021,7 +30044,7 @@ mod tests {
     #[test]
     fn clear_edit_undo_purges_retained_plaintext() {
         let ctx = egui::Context::default();
-        let id = egui::Id::new("pin-field-test");
+        let id = egui::Id::unique("pin-field-test");
         let empty = (egui::text::CCursorRange::default(), String::new());
 
         // Simulate egui recording undo history as the user types a PIN. An undo
@@ -30061,10 +30084,10 @@ mod tests {
     #[test]
     fn dropping_focus_scrubs_a_focused_secret_box() {
         let ctx = egui::Context::default();
-        let id = egui::Id::new("idle-focus-test");
+        let id = egui::Id::unique("idle-focus-test");
         let mut buf = String::new();
         let frame = |buf: &mut String, focus: bool| {
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = ctx.test_frame(egui::RawInput::default(), |ui| {
                 let resp = ui.add(egui::TextEdit::singleline(&mut *buf).password(true).id(id));
                 if focus {
                     resp.request_focus();
@@ -30096,7 +30119,7 @@ mod tests {
         // isn't drawn again (the lock may have closed its dialog).
         wipe(&mut buf);
         surrender_text_focus(&ctx);
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let _ = ctx.test_frame(egui::RawInput::default(), |_| {});
         let after = egui::TextEdit::load_state(&ctx, id).unwrap();
         assert!(!edit_state_needs_scrub(&after), "the history is scrubbed");
         assert!(ctx.memory(|m| m.focused()).is_none());
@@ -32359,7 +32382,7 @@ mod tests {
             app.piv.status = Some(status);
             app.piv.gen_pin_policy = PinPolicy::Always;
             app.piv.gen_touch_policy = TouchPolicy::Always;
-            let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            let _ = ctx.test_frame(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     app.piv_modal_policy_fields(ui, &palette, allow_override);
                 });

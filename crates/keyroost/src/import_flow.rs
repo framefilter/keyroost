@@ -815,7 +815,7 @@ impl App {
     /// Scrub the undo history of one of the dialog's masked fields.
     fn import_scrub(&self, id: &str) {
         if let Some(ctx) = self.egui_ctx.as_ref() {
-            clear_edit_undo(ctx, egui::Id::new(id));
+            clear_edit_undo(ctx, egui::Id::unique(id));
         }
     }
 
@@ -1479,7 +1479,7 @@ impl App {
             let before = d.dest.clone();
             d.follow_devices(&dests, pre);
             if d.dest != before {
-                clear_edit_undo(ctx, egui::Id::new(DEST_SECRET_ID));
+                clear_edit_undo(ctx, egui::Id::unique(DEST_SECRET_ID));
             }
         }
         // A Molto2 destination works on its own: select it (once per choice)
@@ -1555,7 +1555,7 @@ impl App {
                     ui.horizontal(|ui| {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut d.file_password)
-                                .id(egui::Id::new(FILE_PASSWORD_ID))
+                                .id(egui::Id::unique(FILE_PASSWORD_ID))
                                 .password(true)
                                 .desired_width(300.0),
                         );
@@ -1661,7 +1661,7 @@ impl App {
                         ui.horizontal(|ui| {
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut d.dest_secret)
-                                    .id(egui::Id::new(DEST_SECRET_ID))
+                                    .id(egui::Id::unique(DEST_SECRET_ID))
                                     .password(true)
                                     .desired_width(260.0),
                             );
@@ -1824,13 +1824,13 @@ impl App {
         d.settle_open(open, close_clicked);
         if !d.open {
             self.import_flow.dialog = None;
-            clear_edit_undo(ctx, egui::Id::new(FILE_PASSWORD_ID));
-            clear_edit_undo(ctx, egui::Id::new(DEST_SECRET_ID));
+            clear_edit_undo(ctx, egui::Id::unique(FILE_PASSWORD_ID));
+            clear_edit_undo(ctx, egui::Id::unique(DEST_SECRET_ID));
             return;
         }
         if let Some(k) = picked {
             d.set_dest(Some(k), true);
-            clear_edit_undo(ctx, egui::Id::new(DEST_SECRET_ID));
+            clear_edit_undo(ctx, egui::Id::unique(DEST_SECRET_ID));
         }
         if do_unlock {
             d.preview_wanted = true;

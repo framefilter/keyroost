@@ -40,7 +40,7 @@ pub fn help_popover(ctx: &egui::Context, p: &Palette, topic: &str, anchor: egui:
     let screen = ctx.content_rect();
 
     // --- dimmed backdrop (Middle layer): click anywhere to close ---
-    egui::Area::new(egui::Id::new("help_scrim"))
+    egui::Area::new(egui::Id::unique("help_scrim"))
         .order(egui::Order::Middle)
         .fixed_pos(screen.min)
         .interactable(true)
@@ -57,7 +57,7 @@ pub fn help_popover(ctx: &egui::Context, p: &Palette, topic: &str, anchor: egui:
     let x = (anchor.x).min(screen.right() - width - 12.0).max(12.0);
     let pos = egui::pos2(x, anchor.y + 7.0);
 
-    egui::Area::new(egui::Id::new("help_pop"))
+    egui::Area::new(egui::Id::unique("help_pop"))
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
         .show(ctx, |ui| {

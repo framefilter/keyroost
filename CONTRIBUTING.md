@@ -40,7 +40,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 python3 packaging/assemble-changelog.py --check
 ```
 
-MSRV is Rust 1.89 for the workspace (1.92 for the `keyroost` GUI crate).
+MSRV is Rust 1.89 for the workspace (1.95 for the `keyroost` GUI crate).
 
 The CLI tests run with `KEYROOST_DEVICE_TEST=none`, which makes keyroost act as if no keys are connected, on every system. A new test that runs `keyroostctl` sets it too. It's a test-only setting, not for users.
 
