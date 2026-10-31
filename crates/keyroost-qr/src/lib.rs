@@ -120,7 +120,7 @@ pub fn texts_from_rgba(
     // Rec. 601 luma, integer approximation — rqrr only needs contrast, and this
     // mirrors the grayscale the PNG/JPEG file path already produces.
     let mut luma = vec![0u8; pixels as usize];
-    for (dst, px) in luma.iter_mut().zip(rgba.chunks_exact(4)) {
+    for (dst, px) in luma.iter_mut().zip(rgba.as_chunks::<4>().0) {
         let (r, g, b) = (px[0] as u32, px[1] as u32, px[2] as u32);
         *dst = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
     }
@@ -355,9 +355,19 @@ fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), QrError> {
     let data = &buf[..out.buffer_size()];
     let luma = match out.color_type {
         png::ColorType::Grayscale => data.to_vec(),
-        png::ColorType::GrayscaleAlpha => data.chunks_exact(2).map(|p| p[0]).collect(),
-        png::ColorType::Rgb => data.chunks_exact(3).map(rgb_luma).collect(),
-        png::ColorType::Rgba => data.chunks_exact(4).map(rgb_luma).collect(),
+        png::ColorType::GrayscaleAlpha => data.as_chunks::<2>().0.iter().map(|p| p[0]).collect(),
+        png::ColorType::Rgb => data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| rgb_luma(p))
+            .collect(),
+        png::ColorType::Rgba => data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| rgb_luma(p))
+            .collect(),
         other => {
             return Err(QrError::ImageDecode(format!(
                 "unsupported PNG color type {:?}",
@@ -383,10 +393,17 @@ fn decode_jpeg(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), QrError> {
         .map_err(|e| QrError::ImageDecode(e.to_string()))?;
     let luma = match info.pixel_format {
         jpeg_decoder::PixelFormat::L8 => data,
-        jpeg_decoder::PixelFormat::L16 => data.chunks_exact(2).map(|p| p[0]).collect(),
-        jpeg_decoder::PixelFormat::RGB24 => data.chunks_exact(3).map(rgb_luma).collect(),
+        jpeg_decoder::PixelFormat::L16 => data.as_chunks::<2>().0.iter().map(|p| p[0]).collect(),
+        jpeg_decoder::PixelFormat::RGB24 => data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| rgb_luma(p))
+            .collect(),
         jpeg_decoder::PixelFormat::CMYK32 => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| {
                 // Approximate CMYK→luma; QR detection only needs contrast.
                 let k = u32::from(p[3]);

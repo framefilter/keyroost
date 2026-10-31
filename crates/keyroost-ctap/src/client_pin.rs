@@ -143,9 +143,9 @@ impl PinUvAuthToken {
     /// CTAP `pinUvAuthParam`: HMAC of `data` under the token. v1 truncates
     /// to 16 bytes, v2 returns the full 32-byte tag.
     pub fn authenticate(&self, data: &[u8]) -> Vec<u8> {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.token)
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.token)
             .expect("HMAC accepts any key length");
         mac.update(data);
         let full = mac.finalize().into_bytes();

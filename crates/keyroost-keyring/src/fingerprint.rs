@@ -119,7 +119,7 @@ fn unhex_32(text: &str) -> Option<[u8; 32]> {
     }
     let nibble = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let mut out = [0u8; 32];
-    for (i, pair) in raw.chunks_exact(2).enumerate() {
+    for (i, pair) in raw.as_chunks::<2>().0.iter().enumerate() {
         out[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Some(out)
@@ -176,7 +176,7 @@ pub(crate) fn persist_salt(dir: &Path, salt: &Salt) -> Result<(), KeyringError> 
 /// A fresh salt from the operating system's random source.
 pub(crate) fn generate_salt() -> Result<Salt, KeyringError> {
     let mut b = [0u8; 32];
-    getrandom::getrandom(&mut b).map_err(|e| {
+    getrandom::fill(&mut b).map_err(|e| {
         KeyringError::Io(io::Error::other(format!(
             "no OS randomness for the keyring salt: {e}"
         )))

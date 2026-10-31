@@ -17,15 +17,13 @@
 //! (`clientPin` subcommands, getting a pinUvAuthToken, etc.) live in
 //! [`crate::client_pin`].
 
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use aes::Aes256;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use p256::ecdh::EphemeralSecret;
 use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
 use p256::elliptic_curve::Generate;
 use p256::{AffinePoint, PublicKey, Sec1Point};
-use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
@@ -232,9 +230,8 @@ fn aes256_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8
     );
     let mut out = plaintext.to_vec();
     let mut enc = Aes256CbcEnc::new(key.into(), iv.into());
-    for chunk in out.chunks_exact_mut(16) {
-        let block = GenericArray::from_mut_slice(chunk);
-        enc.encrypt_block_mut(block);
+    for block in out.as_chunks_mut::<16>().0 {
+        enc.encrypt_block(block.into());
     }
     out
 }
@@ -249,9 +246,8 @@ fn aes256_cbc_decrypt(
     }
     let mut out = ciphertext.to_vec();
     let mut dec = Aes256CbcDec::new(key.into(), iv.into());
-    for chunk in out.chunks_exact_mut(16) {
-        let block = GenericArray::from_mut_slice(chunk);
-        dec.decrypt_block_mut(block);
+    for block in out.as_chunks_mut::<16>().0 {
+        dec.decrypt_block(block.into());
     }
     Ok(out)
 }
@@ -284,10 +280,10 @@ fn hkdf_sha256_l32(salt: &[u8; 32], ikm: &[u8], info: &[u8]) -> [u8; 32] {
 
 /// Fill an IV from the OS RNG. CTAP doesn't allow IV reuse with the same
 /// key, but we generate a fresh ephemeral keypair per session anyway, so a
-/// counter would also be fine — using OsRng keeps it simple.
+/// counter would also be fine — the OS RNG keeps it simple. Panics if the
+/// OS has no randomness to give (as `rand_core`'s `OsRng` did before).
 fn getrandom_iv(iv: &mut [u8; 16]) {
-    use rand_core::RngCore;
-    OsRng.fill_bytes(iv);
+    getrandom::fill(iv).expect("the OS random source failed");
 }
 
 /// Helper for callers building the `getPinHash` flow: the CTAP spec asks

@@ -139,8 +139,7 @@ impl Sm4 {
             data.len().is_multiple_of(BLOCK_SIZE),
             "ECB requires block-aligned input"
         );
-        for chunk in data.chunks_exact_mut(BLOCK_SIZE) {
-            let block: &mut [u8; BLOCK_SIZE] = chunk.try_into().unwrap();
+        for block in data.as_chunks_mut::<BLOCK_SIZE>().0 {
             self.encrypt_block(block);
         }
     }
@@ -152,13 +151,12 @@ impl Sm4 {
             "CBC requires block-aligned input"
         );
         let mut prev = *iv;
-        for chunk in data.chunks_exact_mut(BLOCK_SIZE) {
+        for block in data.as_chunks_mut::<BLOCK_SIZE>().0 {
             for i in 0..BLOCK_SIZE {
-                chunk[i] ^= prev[i];
+                block[i] ^= prev[i];
             }
-            let block: &mut [u8; BLOCK_SIZE] = chunk.try_into().unwrap();
             self.encrypt_block(block);
-            prev.copy_from_slice(chunk);
+            prev = *block;
         }
     }
 }

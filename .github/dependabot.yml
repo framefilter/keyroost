@@ -29,53 +29,41 @@ updates:
       cargo-minor:
         update-types: [minor, patch]
     ignore:
-      # The CTAP crypto stack (p256, aes-gcm, scrypt, sha2) is built on the
-      # cipher 0.4 / digest 0.10 RustCrypto trait generation. aes 0.9+,
-      # cbc 0.2+, and hmac 0.13+ belong to the next generation and cannot
-      # interoperate with it; drop these ignores when bumping the whole
-      # RustCrypto stack together.
+      # The RustCrypto block ciphers, modes, MACs, hashes and KDFs moved to
+      # one trait generation together (cipher 0.5 / digest 0.11 /
+      # rand_core 0.10): aes 0.9, cbc 0.2, des 0.9, rc2 0.9, cipher 0.5,
+      # hmac 0.13, sha2 0.11, aes-gcm 0.11, pbkdf2 0.13, scrypt 0.12, with
+      # getrandom 0.4 as the OS random source. Their patches are welcome; a
+      # next breaking generation moves as one deliberate upgrade, never one
+      # crate alone (aes-gcm 0.11 once arrived solo with CI red across the
+      # board).
       - dependency-name: aes
-        versions: ['>=0.9']
+        versions: ['>=0.10']
       - dependency-name: cbc
-        versions: ['>=0.2']
+        versions: ['>=0.3']
+      - dependency-name: des
+        versions: ['>=0.10']
+      - dependency-name: rc2
+        versions: ['>=0.10']
+      - dependency-name: cipher
+        versions: ['>=0.6']
       - dependency-name: hmac
-        versions: ['>=0.13']
+        versions: ['>=0.14']
       - dependency-name: sha2
-        versions: ['>=0.11']
-      # rsa 0.9 (keyroost-rsakey's scoped exception) requires the rand 0.8 /
-      # rand_core 0.6 interfaces; drop when a rand-0.9+-compatible rsa ships.
+        versions: ['>=0.12']
+      - dependency-name: aes-gcm
+        versions: ['>=0.12']
+      - dependency-name: pbkdf2
+        versions: ['>=0.14']
+      - dependency-name: scrypt
+        versions: ['>=0.13']
+      - dependency-name: getrandom
+        versions: ['>=0.5']
+      # rsa 0.9 (the scoped RSA exception) still takes the rand 0.8 /
+      # rand_core 0.6 interfaces; keyroost-rsakey's tests feed it rand 0.8.
+      # Drop when a stable rsa 0.10 ships (only release candidates so far).
       - dependency-name: rand
         versions: ['>=0.9']
-      # des and cipher are the same block-cipher generation as aes/cbc above:
-      # des 0.9 / cipher 0.5 use the cipher-0.5 traits and cannot interoperate
-      # with the pinned aes 0.8 / cbc 0.1, so they must move with the whole stack.
-      # getrandom 0.3 needs the rand 0.9 interfaces (rand is pinned just above).
-      - dependency-name: des
-        versions: ['>=0.9']
-      - dependency-name: cipher
-        versions: ['>=0.5']
-      - dependency-name: getrandom
-        versions: ['>=0.3']
-      # aes-gcm 0.11 and scrypt 0.12 are the same next-generation wave (aes
-      # 0.9 / cipher 0.5 / digest 0.11): the comment above already names them
-      # as part of the coupled stack, but they had no entries of their own, so
-      # dependabot kept proposing them solo (aes-gcm 0.11 arrived with CI red
-      # across the board). Move them with the whole stack, not one crate at a
-      # time.
-      - dependency-name: aes-gcm
-        versions: ['>=0.11']
-      - dependency-name: scrypt
-        versions: ['>=0.12']
-      # pbkdf2 0.13 and rc2 0.9 (keyroost-p12's PKCS#12 decryption) and
-      # rand_core 0.9+ are the same next generation (cipher 0.5 / digest 0.11
-      # / rand_core 0.10): they move with the whole stack too. They had no
-      # entries, so dependabot proposed pbkdf2 0.13 and rc2 0.9 alone.
-      - dependency-name: pbkdf2
-        versions: ['>=0.13']
-      - dependency-name: rc2
-        versions: ['>=0.9']
-      - dependency-name: rand_core
-        versions: ['>=0.7']
       # p256, p384, p521 and k256 moved to elliptic-curve 0.14 together
       # (#212); their 0.14.x patches are welcome. They share one
       # `ToSec1Point` trait (from p256's re-export) in keyroost-pivtest and
@@ -89,18 +77,16 @@ updates:
         versions: ['>=0.15']
       - dependency-name: p521
         versions: ['>=0.15']
-      # The dalek crypto crates (keyroost-pivtest's Ed25519 / X25519 host-side
-      # verification) are held at 2.x deliberately, not for a build conflict:
-      # the 3.0 line pulls curve25519-dalek 5.0, a brand-new major, and gains
-      # us nothing the self-test doesn't already do on 2.x. Treated like the
-      # rest of the crypto surface — moved as a deliberate upgrade, not a
-      # single-crate bump. Revisit alongside the #106 dependency-ledger work.
+      # The dalek crates (Ed25519 / X25519 in keyroost-p12, -pgpkey and
+      # -pivtest) moved to 3.x / curve25519-dalek 5 with the RustCrypto
+      # generation above (they share sha2 0.11 / rand_core 0.10); a next
+      # major moves the same deliberate way.
       - dependency-name: ed25519-dalek
-        versions: ['>=3']
+        versions: ['>=4']
       - dependency-name: x25519-dalek
-        versions: ['>=3']
+        versions: ['>=4']
       - dependency-name: curve25519-dalek
-        versions: ['>=5']
+        versions: ['>=6']
       # eframe pins its own egui version, so the pair can only move in
       # lock-step, and a multi-version egui jump needs hand-migration of the
       # GUI code — an upgrade to do deliberately, not via single-crate bumps.
@@ -113,11 +99,6 @@ updates:
       # stay the one eframe 0.35's egui-wgpu uses, so it moves with eframe.
       - dependency-name: wgpu
         versions: ['>=30']
-      # proptest 1.12 raised its minimum Rust to 1.88, past the workspace's
-      # 1.87 MSRV; the MSRV job builds tests, so it can't move until the MSRV
-      # does. Test-only: nothing that ships depends on it.
-      - dependency-name: proptest
-        versions: ['>=1.12']
   # Keeps the flake.lock inputs (nixpkgs, flake-parts) fresh for the Nix
   # packaging added in #109. Grouped so all input bumps arrive as one
   # reviewable PR, like the cargo tree above.

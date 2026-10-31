@@ -409,7 +409,7 @@ impl OathSession {
 /// response be replayed, defeating the card-side half of mutual auth.
 fn random_challenge() -> Result<[u8; 8], TransportError> {
     let mut buf = [0u8; 8];
-    getrandom::getrandom(&mut buf).map_err(|_| TransportError::HostRngFailed)?;
+    getrandom::fill(&mut buf).map_err(|_| TransportError::HostRngFailed)?;
     Ok(buf)
 }
 

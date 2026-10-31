@@ -63,7 +63,7 @@ pub fn to_utf8(bytes: &[u8]) -> Result<Utf8Bytes<'_>, DamagedUtf16> {
     if body.len() % 2 != 0 {
         return Err(DamagedUtf16);
     }
-    let units = body.chunks_exact(2).map(|p| {
+    let units = body.as_chunks::<2>().0.iter().map(|p| {
         if le {
             u16::from_le_bytes([p[0], p[1]])
         } else {

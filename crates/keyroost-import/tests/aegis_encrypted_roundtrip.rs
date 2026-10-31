@@ -37,7 +37,7 @@ fn make_vault(password: &str, plaintext_db: &str) -> String {
     let db_nonce: [u8; 12] = *b"db-nonce-aaa";
     let master_key: [u8; 32] = *b"master-key-32-bytes-for-aegis-12";
 
-    let params = Params::new(log_n, r, p, 32).unwrap();
+    let params = Params::new(log_n, r, p).unwrap();
     let mut kek = [0u8; 32];
     scrypt::scrypt(password.as_bytes(), salt, &params, &mut kek).unwrap();
 

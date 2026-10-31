@@ -7,7 +7,6 @@
 //! form the card import takes.
 
 use keyroost_openpgp::{ecdh_kdf_params, AlgorithmInformation, Curve, EccKind, KeyAlg, KeyCrt};
-use rand_core::{OsRng, RngCore};
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use rsa::{BigUint, RsaPrivateKey};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -360,8 +359,15 @@ fn rsa_material(n: &[u8], e: &[u8], d: &[u8], a: &[u8], b: &[u8]) -> Result<Mate
     })
 }
 
+/// Fill `buf` from the operating system's random source.
+pub(crate) fn fill_random(buf: &mut [u8]) -> Result<()> {
+    getrandom::fill(buf).map_err(|e| Error::Crypto(format!("no OS randomness: {e}")))
+}
+
 fn rsa_generate(bits: usize) -> Result<Material> {
-    let mut key = RsaPrivateKey::new(&mut OsRng, bits).map_err(|e| Error::Crypto(e.to_string()))?;
+    // `rsa` 0.9 takes the RNG of its own `rand_core` generation.
+    let mut key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, bits)
+        .map_err(|e| Error::Crypto(e.to_string()))?;
     key.precompute().map_err(|e| Error::Crypto(e.to_string()))?;
     let primes = key.primes();
     let (a, b) = (
@@ -394,11 +400,11 @@ fn ed25519_from_seed(seed: &[u8; 32]) -> [u8; 32] {
         .to_bytes()
 }
 
-fn ed25519_generate() -> Material {
+fn ed25519_generate() -> Result<Material> {
     let mut seed = [0u8; 32];
-    OsRng.fill_bytes(&mut seed);
+    fill_random(&mut seed)?;
     let point = ed25519_from_seed(&seed);
-    Material::EdDsa { seed, point }
+    Ok(Material::EdDsa { seed, point })
 }
 
 fn x25519_point(d_le: &[u8; 32]) -> [u8; 32] {
@@ -406,21 +412,23 @@ fn x25519_point(d_le: &[u8; 32]) -> [u8; 32] {
     x25519_dalek::PublicKey::from(&secret).to_bytes()
 }
 
-fn x25519_generate() -> Material {
-    let secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-    let mut d = Zeroizing::new(secret.to_bytes());
+fn x25519_generate() -> Result<Material> {
+    // A uniformly random 32-byte string, as `StaticSecret`'s own generator
+    // makes.
+    let mut d = Zeroizing::new([0u8; 32]);
+    fill_random(&mut d[..])?;
     // Store the clamped scalar, as GnuPG does; X25519 clamps anyway, so the
     // public key is unchanged.
     d[0] &= 0xF8;
     d[31] &= 0x7F;
     d[31] |= 0x40;
     let point = x25519_point(&d).to_vec();
-    Material::Ecdh {
+    Ok(Material::Ecdh {
         curve: Curve::X25519,
         d: d.to_vec(),
         point,
         kdf: ecdh_kdf_params(Curve::X25519),
-    }
+    })
 }
 
 /// Generate a key set of type `t`: index 0 signs (the primary key), 1
@@ -436,7 +444,7 @@ pub(crate) fn generate(t: KeyType, created: u32) -> Result<[KeyPart; 3]> {
                 rsa_generate(bits)?,
             ]
         }
-        KeyType::Cv25519 => [ed25519_generate(), x25519_generate(), ed25519_generate()],
+        KeyType::Cv25519 => [ed25519_generate()?, x25519_generate()?, ed25519_generate()?],
         _ => {
             let curve = t
                 .card_alg(KeyCrt::Sign)

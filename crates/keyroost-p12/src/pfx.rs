@@ -4,7 +4,7 @@
 //! SafeBag, attributes. Each level is read once; there is no recursion, and a
 //! nested `safeContentsBag` is skipped.
 
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use keyroost_oath::crypto::hmac_sha1;
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -457,8 +457,10 @@ fn bmp_to_string(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| u16::from_be_bytes(c))
         .collect();
     String::from_utf16(&units).ok()
 }

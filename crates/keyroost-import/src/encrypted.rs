@@ -137,7 +137,7 @@ fn try_unlock_slot(
     }
     // scrypt's `log_n` parameter is log2 of N.
     let log_n = n.trailing_zeros() as u8;
-    let params = scrypt::Params::new(log_n, r, p, 32)
+    let params = scrypt::Params::new(log_n, r, p)
         .map_err(|_| BulkError::UnsupportedFormat("invalid scrypt params"))?;
 
     // KEK and master key are wiped on every exit path, including the `?`s
@@ -208,7 +208,7 @@ fn gcm_decrypt(key: &[u8], nonce: &[u8], ct: &[u8], tag: &[u8]) -> Result<Vec<u8
     buf.extend_from_slice(tag);
     cipher
         .decrypt(
-            nonce.into(),
+            nonce.try_into().map_err(|_| ())?,
             Payload {
                 msg: &buf,
                 aad: b"",

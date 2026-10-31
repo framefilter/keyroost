@@ -18,16 +18,16 @@ keyroost-proto = { path = "../keyroost-proto", version = "0.15.0" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.15.0" }
 # Only with the `card` feature: the restore-onto-a-card glue.
 keyroost-transport = { path = "../keyroost-transport", version = "0.15.0", optional = true }
-rsa = { version = "0.9", features = ["sha2"] }
+rsa = { version = "0.9", features = ["getrandom", "sha2"] }
 p256 = { version = "0.14", features = ["ecdsa", "ecdh"] }
 p384 = { version = "0.14", features = ["ecdsa", "ecdh"] }
 p521 = { version = "0.14", features = ["ecdsa", "ecdh"] }
 k256 = { version = "0.14", features = ["ecdsa", "ecdh"] }
-ed25519-dalek = "2"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-sha2 = "0.10"
-aes = "0.8"
-rand_core = { version = "0.6", features = ["getrandom"] }
+ed25519-dalek = "3"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+sha2 = "0.11"
+aes = "0.9"
+getrandom = "0.4"
 zeroize = { version = "1", features = ["alloc", "zeroize_derive"] }
 
 [features]

@@ -293,11 +293,11 @@ pub fn apply_label_plan(
     Ok(())
 }
 
-/// A fresh random 12-byte nonce for [`encode_entry`].
+/// A fresh random 12-byte nonce for [`encode_entry`]. Panics if the OS has
+/// no randomness to give (as `rand_core`'s `OsRng` did before).
 pub fn random_nonce() -> [u8; 12] {
-    use rand_core::{OsRng, RngCore};
     let mut nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce);
+    getrandom::fill(&mut nonce).expect("the OS random source failed");
     nonce
 }
 
