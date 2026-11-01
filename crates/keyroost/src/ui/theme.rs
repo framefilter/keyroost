@@ -211,6 +211,11 @@ impl Palette {
             // few pixels taller; keyroost's layout was designed on 0.35's.
             s.spacing.button_padding = egui::vec2(4.0, 1.0);
             s.spacing.interact_size = egui::vec2(40.0, 18.0);
+            // egui 0.37 also made scrolling kinetic (lists coast and
+            // rubber-band after a touchpad fling); 0.35 stopped where the
+            // input stopped.
+            s.spacing.scroll.kinetic.decay_time = 0.0;
+            s.spacing.scroll.kinetic.rubber_band = false;
         });
     }
 }

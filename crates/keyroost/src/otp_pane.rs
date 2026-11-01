@@ -2096,11 +2096,17 @@ impl App {
                     // ("Accou/nt"); the fields take the squeeze instead.
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     ui.label("Issuer / app");
-                    ui.text_edit_singleline(&mut self.otp.add.app_name);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.otp.add.app_name)
+                            .margin(theme::TEXT_EDIT_MARGIN),
+                    );
                     ui.end_row();
 
                     ui.label("Account");
-                    ui.text_edit_singleline(&mut self.otp.add.account_name);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.otp.add.account_name)
+                            .margin(theme::TEXT_EDIT_MARGIN),
+                    );
                     ui.end_row();
 
                     ui.label("Secret (Base32)");

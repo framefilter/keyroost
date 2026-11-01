@@ -100,6 +100,37 @@ fn is_user_activity(event: &egui::Event) -> bool {
     )
 }
 
+/// Keeps text selections out of the X11 / Wayland primary selection (the one
+/// a middle click pastes). egui 0.37 sends every settled selection there,
+/// from text boxes and selectable labels alike; keyroost shows OTP codes and
+/// (when revealed) secrets as selectable text, and a primary-selection copy
+/// skips everything [`copy_concealed`] does: no "keep out of history"
+/// marker, no auto-clear. egui 0.35 never wrote the primary selection, so
+/// this drops those commands; Ctrl+C and the Copy buttons are unchanged.
+///
+/// A plugin, not an end-of-pass callback: label selections report from
+/// egui's own label-selection plugin, which runs after the callback plugin
+/// but before plugins added later, like this one.
+struct NoPrimarySelection;
+
+impl egui::plugin::Plugin for NoPrimarySelection {
+    fn debug_name(&self) -> &'static str {
+        "keyroost: no primary selection"
+    }
+
+    fn on_end_pass(&mut self, ui: &mut egui::Ui) {
+        drop_primary_selection(ui.ctx());
+    }
+}
+
+/// Remove this pass's primary-selection commands (see [`NoPrimarySelection`]).
+fn drop_primary_selection(ctx: &egui::Context) {
+    ctx.output_mut(|o| {
+        o.commands
+            .retain(|c| !matches!(c, egui::OutputCommand::TextSelectionSettled(_)));
+    });
+}
+
 /// Put a secret on the system clipboard through `slot`'s arboard handle
 /// (created on first use), with the platform's "keep this out of clipboard
 /// history" marker: `org.nspasteboard.ConcealedType` on macOS, the
@@ -4478,6 +4509,7 @@ fn main() -> eframe::Result<()> {
                 // Register IBM Plex Sans + JetBrains Mono so the redesign's type
                 // weights resolve. (Vendored under assets/.)
                 theme::install_fonts(&cc.egui_ctx);
+                cc.egui_ctx.add_plugin(NoPrimarySelection);
                 // Restore the persisted UI preferences (theme mode + accent +
                 // colorblind + zoom) from our own settings.json, defaulting to the
                 // refined dark + blue accent the prototype ships with. eframe's own
@@ -20662,7 +20694,8 @@ impl App {
                 if editing == Some(idx) {
                     ui.add_space(6.0);
                     ui.add(
-                        egui::TextEdit::multiline(&mut self.security_keys.lb_edit_text).margin(theme::TEXT_EDIT_MARGIN)
+                        egui::TextEdit::multiline(&mut self.security_keys.lb_edit_text)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_rows(2)
                             .desired_width(f32::INFINITY),
                     );
@@ -25557,7 +25590,8 @@ impl App {
                 if let Some(pem) = &gen_pubkey_pem {
                     ui.add_space(6.0);
                     ui.add(
-                        egui::TextEdit::multiline(&mut pem.as_str()).margin(theme::TEXT_EDIT_MARGIN)
+                        egui::TextEdit::multiline(&mut pem.as_str())
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_rows(4)
                             .desired_width(f32::INFINITY)
                             .font(egui::TextStyle::Monospace),
@@ -27559,6 +27593,77 @@ fn slot_summary(attrs: &[u8], fpr: &[u8; 20], key_present: Option<bool>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drag across a selectable label, as separate frames: press at the
+    /// left end, move to the right end, release. Returns every output
+    /// command those frames produced.
+    fn drag_select_label(ctx: &egui::Context) -> Vec<egui::OutputCommand> {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
+        let frame = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let press = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (start, end) = (egui::pos2(12.0, 10.0), egui::pos2(150.0, 10.0));
+        let mut commands = Vec::new();
+        for events in [
+            vec![egui::Event::PointerMoved(start)],
+            vec![press(start, true)],
+            vec![egui::Event::PointerMoved(egui::pos2(60.0, 10.0))],
+            vec![egui::Event::PointerMoved(end)],
+            vec![press(end, false)],
+            vec![],
+        ] {
+            let out = ctx.test_frame(frame(events), |ui| {
+                ui.label("123456 a one-time code");
+            });
+            commands.extend(out.platform_output.commands);
+        }
+        commands
+    }
+
+    /// egui 0.37 sends a settled label selection to the primary selection;
+    /// keyroost's plugin drops it (see `NoPrimarySelection`). Without the
+    /// plugin the same drag does produce it, so the test can't pass vacuously.
+    #[test]
+    fn a_label_selection_never_reaches_the_primary_selection() {
+        let settled =
+            |c: &egui::OutputCommand| matches!(c, egui::OutputCommand::TextSelectionSettled(_));
+        let plain = egui::Context::default();
+        assert!(
+            drag_select_label(&plain).iter().any(settled),
+            "egui no longer reports label selections this way; recheck NoPrimarySelection"
+        );
+        let ctx = egui::Context::default();
+        ctx.add_plugin(NoPrimarySelection);
+        assert!(!drag_select_label(&ctx).iter().any(settled));
+    }
+
+    /// A copy the app asks for still goes through; only the primary-selection
+    /// command is dropped.
+    #[test]
+    fn dropping_the_primary_selection_keeps_explicit_copies() {
+        let ctx = egui::Context::default();
+        ctx.add_plugin(NoPrimarySelection);
+        let out = ctx.test_frame(egui::RawInput::default(), |ui| {
+            ui.ctx()
+                .send_cmd(egui::OutputCommand::TextSelectionSettled("seed".into()));
+            ui.ctx().copy_text("code".into());
+        });
+        let commands = out.platform_output.commands;
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == "code")));
+        assert!(!commands
+            .iter()
+            .any(|c| matches!(c, egui::OutputCommand::TextSelectionSettled(_))));
+    }
 
     /// One headless egui frame for a test. The frame's texture changes are
     /// cleared, as a renderer would apply them: egui 0.37 asserts (in debug
