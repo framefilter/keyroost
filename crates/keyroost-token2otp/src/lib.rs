@@ -188,6 +188,10 @@ pub enum OtpError {
     PinInvalidRetries(u8),
     /// `6983` — OTP PIN locked; a global OTP reset is required to recover it.
     PinLocked,
+    /// `6A80` to a PIN set or change: the applet refused the new PIN under its
+    /// PIN rules (spec §9). Only [`check_new_pin`](OtpError::check_new_pin)
+    /// reads `6A80` this way; elsewhere it is [`EntryNotFound`](OtpError::EntryNotFound).
+    PinRejected,
     /// Any other non-`9000` status word.
     BadStatusCode(u16),
 }
@@ -230,6 +234,17 @@ impl OtpError {
         }
     }
 
+    /// [`check_pin`](OtpError::check_pin) for a command that sends a new PIN
+    /// (set, or change to a PIN). The applet answers `6A80` to a PIN that
+    /// breaks its rules (spec §9; a PIN+ R3.4 does so for `12345678`), which
+    /// [`check`](OtpError::check) would report as "entry not found".
+    pub fn check_new_pin(sw: u16) -> Result<(), OtpError> {
+        match sw {
+            sw::ENTRY_NOT_FOUND => Err(OtpError::PinRejected),
+            other => OtpError::check_pin(other),
+        }
+    }
+
     /// True for the `EntryNotFound` that a READ_ALL returns on an empty token,
     /// which the caller should treat as "zero entries", not an error (spec §3.1,
     /// §11).
@@ -261,6 +276,7 @@ impl OtpError {
             OtpError::PinInvalid => sw::PIN_INVALID,
             OtpError::PinInvalidRetries(n) => 0x6300 | (*n as u16),
             OtpError::PinLocked => sw::PIN_LOCKED,
+            OtpError::PinRejected => sw::ENTRY_NOT_FOUND,
             OtpError::BadStatusCode(sw) => *sw,
         }
     }
@@ -300,6 +316,12 @@ impl std::fmt::Display for OtpError {
                 f,
                 "the OTP PIN is locked after too many wrong attempts; a global \
                  OTP reset is required to recover it"
+            ),
+            OtpError::PinRejected => write!(
+                f,
+                "the key refused this PIN: it doesn't meet the key's PIN rules \
+                 (6 or more digits with no runs such as 1234, no repeated or \
+                 mirrored patterns, or 10 or more characters mixing two kinds)"
             ),
             OtpError::BadStatusCode(sw) => write!(f, "unexpected status word {:#06X}", sw),
         }
@@ -521,10 +543,25 @@ pub fn erase_all_usb() -> Vec<u8> {
 
 /// [`read_config`] for USB-HID: the byte count as a one-byte body behind an
 /// extended Lc (spec §3, §6.9). A PIN+ (R3.4) answers the short `Le` form
-/// with `6FFB` over USB and this one with `9000`.
+/// with `6FFB` over USB, and this one with a single byte; for that key see
+/// [`read_config_usb_padded`].
 pub fn read_config_usb(num_bytes: u8) -> Vec<u8> {
     let mut apdu = cmd::READ_CONFIG.to_vec();
     apdu.extend_from_slice(&[0x00, 0x00, 0x01, num_bytes.clamp(1, 64)]);
+    apdu
+}
+
+/// [`read_config`] for USB-HID in the form Token2's own tools send (captured
+/// from their Companion app): the byte count as a short Lc followed by that
+/// many zero bytes. A PIN+ (R3.4) answers with as many bytes as the body
+/// carries, so this reads its whole block where the documented
+/// [`read_config_usb`] gets one byte. Not in the published spec, so callers
+/// send it only after the documented form came back that short.
+pub fn read_config_usb_padded(num_bytes: u8) -> Vec<u8> {
+    let n = num_bytes.clamp(1, 64);
+    let mut apdu = cmd::READ_CONFIG.to_vec();
+    apdu.push(n);
+    apdu.extend(std::iter::repeat_n(0u8, usize::from(n)));
     apdu
 }
 
@@ -859,6 +896,12 @@ mod tests {
         );
         assert_eq!(*read_config_usb(0).last().unwrap(), 0x01); // clamped to >=1
         assert_eq!(*read_config_usb(200).last().unwrap(), 0x40); // clamped to <=64
+        let padded = read_config_usb_padded(64);
+        assert_eq!(padded[..5], [0x80, 0xC5, 0x02, 0x00, 0x40]);
+        assert_eq!(padded.len(), 5 + 64);
+        assert!(padded[5..].iter().all(|&b| b == 0));
+        assert_eq!(read_config_usb_padded(0).len(), 5 + 1); // clamped to >=1
+        assert_eq!(read_config_usb_padded(200).len(), 5 + 64); // clamped to <=64
     }
 
     #[test]
@@ -1209,6 +1252,21 @@ mod otp_pin_wire_tests {
             PinFlag::parse(&long).unwrap(),
             PinFlag::parse(&challenge_response()).unwrap()
         );
+    }
+
+    #[test]
+    fn a_refused_new_pin_is_not_a_missing_entry() {
+        // A PIN+ R3.4 answers 6A80 to `otp pin set` with 12345678.
+        assert_eq!(OtpError::check_new_pin(0x6A80), Err(OtpError::PinRejected));
+        assert_eq!(OtpError::PinRejected.status_word(), 0x6A80);
+        // The other PIN answers read as before.
+        assert_eq!(
+            OtpError::check_new_pin(0x6362),
+            Err(OtpError::PinInvalidRetries(98))
+        );
+        assert_eq!(OtpError::check_new_pin(0x9000), Ok(()));
+        // Everywhere else 6A80 is still a missing entry.
+        assert_eq!(OtpError::check_pin(0x6A80), Err(OtpError::EntryNotFound));
     }
 
     #[test]

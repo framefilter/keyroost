@@ -94,15 +94,15 @@ updates:
       # eframe pins its own egui version, so the pair can only move in
       # lock-step, and a multi-version egui jump needs hand-migration of the
       # GUI code — an upgrade to do deliberately, not via single-crate bumps.
-      # v0.7.3 already made the deliberate jump to 0.35; defer the next one.
+      # v0.16 made the deliberate jump to 0.37; defer the next one.
       - dependency-name: eframe
-        versions: ['>=0.36']
+        versions: ['>=0.38']
       - dependency-name: egui
-        versions: ['>=0.36']
+        versions: ['>=0.38']
       # The Windows-only direct wgpu dep only picks backends; its version must
-      # stay the one eframe 0.35's egui-wgpu uses, so it moves with eframe.
+      # stay the one eframe 0.37's egui-wgpu uses, so it moves with eframe.
       - dependency-name: wgpu
-        versions: ['>=30']
+        versions: ['>=31']
   # Keeps the flake.lock inputs (nixpkgs, flake-parts) fresh for the Nix
   # packaging added in #109. Grouped so all input bumps arrive as one
   # reviewable PR, like the cargo tree above.

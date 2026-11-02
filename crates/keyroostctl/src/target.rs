@@ -125,6 +125,7 @@ fn typed_device(reader: Option<String>, hid_path: Option<PathBuf>, typed: &str) 
         hid_path,
         reader,
         hid_serial: None,
+        former_serial: None,
         naming: Default::default(),
         smart_card_unlisted: false,
     }
@@ -226,7 +227,7 @@ pub(crate) fn select(
             &mut picker,
         )
         .map_err(|e| add_admin_hint(e, need, crate::admin_only_fido_key_present))?;
-        eprintln!("{line}");
+        errln!("{line}");
         Ok(dev)
     })
 }
@@ -425,7 +426,7 @@ pub(crate) fn reverify(before: &Device) -> Result<(), Box<dyn Error>> {
         Recheck::Same => Ok(()),
         Recheck::Skip => {
             if debug_on() {
-                eprintln!(
+                errln!(
                     "[target] {label}: not a detected key; not re-checked after waiting for input"
                 );
             }
@@ -463,6 +464,7 @@ mod tests {
             hid_path: Some("/dev/hidraw16".into()),
             reader: Some("Yubico YubiKey OTP+FIDO+CCID 00 00".into()),
             hid_serial: None,
+            former_serial: None,
             naming: keyroost_resolve::Naming::local(name),
             smart_card_unlisted: false,
         }

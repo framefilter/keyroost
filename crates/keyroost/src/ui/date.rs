@@ -270,6 +270,7 @@ pub fn expiry_row(ui: &mut egui::Ui, p: &Palette, input: &mut ExpiryInput, today
         if input.choice == ExpiryChoice::Date {
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut input.text)
+                    .margin(super::theme::TEXT_EDIT_MARGIN)
                     .hint_text("YYYY-MM-DD")
                     .desired_width(110.0)
                     .font(f_reg(13.0)),
@@ -327,7 +328,7 @@ pub fn month_grid(month: Date) -> [Date; 42] {
 }
 
 fn showing_id() -> egui::Id {
-    egui::Id::new("expiry_calendar_showing")
+    egui::Id::unique("expiry_calendar_showing")
 }
 
 fn set_calendar_showing(ctx: &egui::Context, on: bool) {

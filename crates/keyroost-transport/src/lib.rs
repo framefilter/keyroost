@@ -1178,6 +1178,10 @@ pub struct ReaderProbe {
     /// later via [`Session::read_info`]), and security keys carry their serial
     /// in [`ReaderProbe::yubikey_serial`] instead.
     pub serial: Option<String>,
+    /// The serial an earlier keyroost knew this card by, when `serial` now
+    /// differs: a Token2 PIN+ R3.4's OpenPGP-AID serial, once its full serial
+    /// is read from the OTP applet. Names saved under it still apply.
+    pub former_serial: Option<String>,
     /// OpenPGP card manufacturer ID (bytes 8..10 of the AID), when an OpenPGP
     /// applet was read. Maps to a vendor name via
     /// `keyroost_openpgp::manufacturer_name` — the card-content vendor signal
@@ -1330,6 +1334,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 reader_name,
                 is_molto2: true,
                 serial: None,
+                former_serial: None,
                 openpgp_manufacturer: None,
                 has_oath: false,
                 has_openpgp: false,
@@ -1350,6 +1355,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             reader_name,
             is_molto2: false,
             serial: None,
+            former_serial: None,
             openpgp_manufacturer: None,
             has_oath: false,
             has_openpgp: false,
@@ -1476,6 +1482,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             // validating: a well-formed `D1 len ascii-hex` parse proves it is a
             // Token2 device; anything else falls through harmlessly. SELECT is
             // best-effort (some PIN+ firmware answers 6A81 yet switches applets).
+            let mut otp_serial_r34 = false;
             if probe.has_fido {
                 let _ = transmit_apdu(
                     &card,
@@ -1502,6 +1509,37 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                         probe_note("token2 serial parse failed (not a Token2 card)");
                     }
                 }
+            } else if probe.has_otp {
+                // A PIN+ R3.4 refuses the FIDO SELECT over its reader on
+                // Windows (6A81 elevated, "access denied" from Windows
+                // otherwise), but its OTP applet answers the same request with
+                // the printed serial, as `piv info` reads it (and Token2's own
+                // tool). Other keys carry this applet too (Thetis) and older
+                // Token2 releases are unverified, so the answer is kept only
+                // when its prefix names an R3.4 model; otherwise the
+                // OpenPGP-AID serial below stays the serial, as before.
+                let sn = crate::token2otp::read_otp_applet_serial(|apdu| {
+                    exchange_apdu(&card, apdu, 0x61, || vec![0x00, 0xC0, 0x00, 0x00, 0x00])
+                });
+                // Token2's prefix reference documents 12-digit serials; an
+                // R3.4 reports 14.
+                let r34 = sn.is_some_and(|sn| {
+                    (12..=14).contains(&sn.to_string().len())
+                        && keyroost_piv::fingerprint::token2_firmware_from_serial(sn)
+                            == Some(&[3, 4][..])
+                });
+                if r34 {
+                    probe.serial = sn.map(|sn| sn.to_string());
+                    otp_serial_r34 = true;
+                }
+                if trace {
+                    let shown = sn.map(|sn| abbreviate(&sn.to_string()));
+                    probe_note(&if r34 {
+                        format!("token2 full serial (otp applet) -> {shown:?}")
+                    } else {
+                        format!("token2 otp serial -> {shown:?}, not an R3.4 prefix: not used")
+                    });
+                }
             }
             // OpenPGP present: read the AID once. Capture the manufacturer ID
             // (card-content vendor signal, #83) always; use the embedded
@@ -1526,18 +1564,18 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                             probe.openpgp_manufacturer
                         ));
                     }
-                    if probe.serial.is_none()
-                        && aid.len() >= 14
-                        && aid[0..6] == [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01]
-                    {
-                        let sn = &aid[10..14];
-                        probe.serial =
-                            Some(sn.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    if aid.len() >= 14 && aid[0..6] == [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01] {
+                        let sn: String = aid[10..14].iter().map(|b| format!("{b:02x}")).collect();
                         if trace {
-                            probe_note(&format!(
-                                "openpgp serial (aid) -> {:?}",
-                                probe.serial.as_deref().map(abbreviate)
-                            ));
+                            probe_note(&format!("openpgp serial (aid) -> {:?}", abbreviate(&sn)));
+                        }
+                        if probe.serial.is_none() {
+                            probe.serial = Some(sn);
+                        } else if otp_serial_r34 && probe.serial.as_deref() != Some(sn.as_str()) {
+                            // keyroost 0.15 and earlier knew this key by the
+                            // AID serial on Windows; names saved under it
+                            // still apply.
+                            probe.former_serial = Some(sn);
                         }
                     }
                 }

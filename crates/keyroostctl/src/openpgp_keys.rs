@@ -376,18 +376,18 @@ fn create(
             expires: Some(expires),
         });
     }
-    println!(
+    outln!(
         "Made {} keys ({}) for {} and put them on the card.",
         key_type.label(),
         key_type.cli_name(),
         sanitize_terminal(&set.user_id)
     );
-    println!("  Fingerprint: {}", hex_encode(&fprs[0]));
-    println!("  Expires:     {expires}");
-    println!("  Backup:      {}", paths.secret.display());
-    println!("  Public key:  {}", paths.public.display());
-    println!("  Revocation:  {}", paths.revocation.display());
-    println!("Keep the backup and the revocation certificate offline.");
+    outln!("  Fingerprint: {}", hex_encode(&fprs[0]));
+    outln!("  Expires:     {expires}");
+    outln!("  Backup:      {}", paths.secret.display());
+    outln!("  Public key:  {}", paths.public.display());
+    outln!("  Revocation:  {}", paths.revocation.display());
+    outln!("Keep the backup and the revocation certificate offline.");
     Ok(())
 }
 
@@ -441,7 +441,7 @@ fn restore(
         return Err(format!("{} has no key that fits a card slot.", path.display()).into());
     }
     for note in &loaded.notes {
-        eprintln!("note: {}", sanitize_terminal(note));
+        errln!("note: {}", sanitize_terminal(note));
     }
 
     let dev = crate::target::select(Need::OpenPgp, reader, None)?;
@@ -473,7 +473,7 @@ fn restore(
             expires: None,
         });
     }
-    println!("Restored from {}:", path.display());
+    outln!("Restored from {}:", path.display());
     for (s, fpr) in slots.iter().zip(&fprs) {
         let kind = loaded
             .keys
@@ -481,14 +481,14 @@ fn restore(
             .find(|k| k.slot == Some(*s))
             .and_then(|k| k.key_type)
             .map_or("", |t| t.label());
-        println!(
+        outln!(
             "  {:<15} {} ({kind})",
             format!("{}:", slot_label(*s)),
             hex_encode(fpr)
         );
     }
     for uid in &loaded.user_ids {
-        println!("  User ID:        {}", sanitize_terminal(uid));
+        outln!("  User ID:        {}", sanitize_terminal(uid));
     }
     Ok(())
 }
@@ -563,11 +563,11 @@ fn import_rsa_file(
             expires: None,
         });
     }
-    println!("Imported {} key ({}):", slot.label(), alg.label());
-    println!("  modulus:  {}", hex_encode(&k.n));
-    println!("  exponent: {}", hex_encode(&k.e));
-    println!("  fingerprint: {}", hex_encode(&fpr));
-    println!("  created:     {} (unix)", creation_time);
+    outln!("Imported {} key ({}):", slot.label(), alg.label());
+    outln!("  modulus:  {}", hex_encode(&k.n));
+    outln!("  exponent: {}", hex_encode(&k.e));
+    outln!("  fingerprint: {}", hex_encode(&fpr));
+    outln!("  created:     {} (unix)", creation_time);
     Ok(())
 }
 
@@ -677,12 +677,12 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
             expires: Some(expires),
         });
     }
-    println!("Fingerprint: {}", hex_encode(&cert.primary.fpr));
-    println!("Expires:     {expires}");
+    outln!("Fingerprint: {}", hex_encode(&cert.primary.fpr));
+    outln!("Expires:     {expires}");
     for p in &written {
-        println!("Updated:     {}", p.display());
+        outln!("Updated:     {}", p.display());
     }
-    println!("Share the updated public key again.");
+    outln!("Share the updated public key again.");
     Ok(())
 }
 

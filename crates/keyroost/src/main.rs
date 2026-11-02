@@ -100,6 +100,37 @@ fn is_user_activity(event: &egui::Event) -> bool {
     )
 }
 
+/// Keeps text selections out of the X11 / Wayland primary selection (the one
+/// a middle click pastes). egui 0.37 sends every settled selection there,
+/// from text boxes and selectable labels alike; keyroost shows OTP codes and
+/// (when revealed) secrets as selectable text, and a primary-selection copy
+/// skips everything [`copy_concealed`] does: no "keep out of history"
+/// marker, no auto-clear. egui 0.35 never wrote the primary selection, so
+/// this drops those commands; Ctrl+C and the Copy buttons are unchanged.
+///
+/// A plugin, not an end-of-pass callback: label selections report from
+/// egui's own label-selection plugin, which runs after the callback plugin
+/// but before plugins added later, like this one.
+struct NoPrimarySelection;
+
+impl egui::plugin::Plugin for NoPrimarySelection {
+    fn debug_name(&self) -> &'static str {
+        "keyroost: no primary selection"
+    }
+
+    fn on_end_pass(&mut self, ui: &mut egui::Ui) {
+        drop_primary_selection(ui.ctx());
+    }
+}
+
+/// Remove this pass's primary-selection commands (see [`NoPrimarySelection`]).
+fn drop_primary_selection(ctx: &egui::Context) {
+    ctx.output_mut(|o| {
+        o.commands
+            .retain(|c| !matches!(c, egui::OutputCommand::TextSelectionSettled(_)));
+    });
+}
+
 /// Put a secret on the system clipboard through `slot`'s arboard handle
 /// (created on first use), with the platform's "keep this out of clipboard
 /// history" marker: `org.nspasteboard.ConcealedType` on macOS, the
@@ -4435,6 +4466,46 @@ impl Worker {
     }
 }
 
+/// keyroost's icon for its window. Without one eframe sets egui's own, and
+/// Windows shows that on the title bar and taskbar instead of the icon
+/// embedded in keyroost.exe. Taken from the largest image in that same .ico
+/// (every image in it is a PNG); an empty icon, if that fails, makes eframe
+/// leave the platform's own.
+fn window_icon() -> egui::IconData {
+    const ICO: &[u8] = include_bytes!("../assets/keyroost.ico");
+    let count = ICO
+        .get(4..6)
+        .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+    let largest = (0..usize::from(count))
+        .filter_map(|i| {
+            let e = ICO.get(6 + 16 * i..6 + 16 * (i + 1))?;
+            // A width byte of 0 means 256.
+            let width = if e[0] == 0 { 256 } else { u32::from(e[0]) };
+            let size = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as usize;
+            let offset = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as usize;
+            Some((width, ICO.get(offset..offset.checked_add(size)?)?))
+        })
+        .max_by_key(|(width, _)| *width);
+    largest
+        .and_then(|(_, png)| ui::mds::decode_png_rgba(png))
+        .map(|([w, h], rgba)| egui::IconData {
+            rgba,
+            width: w as u32,
+            height: h as u32,
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod window_icon_tests {
+    #[test]
+    fn the_window_icon_is_the_largest_image_in_the_ico() {
+        let icon = super::window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // KEYROOST_X11=1 forces the GUI onto X11/XWayland instead of native Wayland.
     // On some compositors — observed on KDE Plasma 6.7 / KWin (issue #48) — the
@@ -4465,7 +4536,8 @@ fn main() -> eframe::Result<()> {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1180.0, 760.0])
                 .with_min_inner_size([900.0, 560.0])
-                .with_title("keyroost"),
+                .with_title("keyroost")
+                .with_icon(window_icon()),
             ..Default::default()
         };
         if let Some(r) = renderer {
@@ -4478,6 +4550,7 @@ fn main() -> eframe::Result<()> {
                 // Register IBM Plex Sans + JetBrains Mono so the redesign's type
                 // weights resolve. (Vendored under assets/.)
                 theme::install_fonts(&cc.egui_ctx);
+                cc.egui_ctx.add_plugin(NoPrimarySelection);
                 // Restore the persisted UI preferences (theme mode + accent +
                 // colorblind + zoom) from our own settings.json, defaulting to the
                 // refined dark + blue accent the prototype ships with. eframe's own
@@ -4950,6 +5023,9 @@ struct App {
         FileTarget,
         std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
     )>,
+    /// File-chooser dialogs asked for this frame, opened at its end
+    /// (`launch_file_dialogs`), where the window they belong to is at hand.
+    file_dialog_queue: Vec<FileDialogRequest>,
     /// Monotonic id handed to each "Save certificate…" request so its dialog
     /// and its parked certificate stay paired. Never reset (not even on a
     /// selection change): an id must not be reused while a dialog opened for
@@ -5022,16 +5098,19 @@ fn take_pending_cert(
     pending.remove(&id)
 }
 
+/// A file-chooser asked for during a frame (see [`App::spawn_file_dialog`]).
+struct FileDialogRequest {
+    target: FileTarget,
+    save: bool,
+    filters: Vec<(String, Vec<String>)>,
+    default_name: Option<String>,
+}
+
 impl App {
-    /// Spawn a native file-chooser for `target`. `save` picks the dialog kind
-    /// (Save… vs open); `filters` is `(name, &[extensions])` rows for the
-    /// type dropdown; `default_name` seeds the filename on save dialogs.
-    ///
-    /// rfd's portal backend is async, so the dialog runs on a throwaway thread
-    /// (driven by `pollster::block_on`) and the result returns over a channel
-    /// drained in `update()` — the egui frame thread is never blocked. The
-    /// frame loop is woken via `request_repaint` once the user dismisses the
-    /// dialog so the picked path lands without waiting for the next input event.
+    /// Ask for a native file-chooser for `target`. `save` picks the dialog
+    /// kind (Save… vs open); `filters` is `(name, &[extensions])` rows for the
+    /// type dropdown; `default_name` seeds the filename on save dialogs. The
+    /// dialog opens at the end of this frame ([`Self::launch_file_dialogs`]).
     fn spawn_file_dialog(
         &mut self,
         target: FileTarget,
@@ -5039,8 +5118,7 @@ impl App {
         filters: &[(&'static str, &'static [&'static str])],
         default_name: Option<&str>,
     ) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let owned_filters: Vec<(String, Vec<String>)> = filters
+        let filters = filters
             .iter()
             .map(|(name, exts)| {
                 (
@@ -5049,31 +5127,62 @@ impl App {
                 )
             })
             .collect();
-        let default_name = default_name.map(str::to_owned);
-        let egui_ctx = self.egui_ctx.clone();
-        std::thread::spawn(move || {
-            let result = pollster::block_on(async move {
-                let mut dialog = rfd::AsyncFileDialog::new();
-                for (name, exts) in &owned_filters {
-                    let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
-                    dialog = dialog.add_filter(name, &ext_refs);
-                }
-                if let Some(name) = &default_name {
-                    dialog = dialog.set_file_name(name);
-                }
-                let handle = if save {
-                    dialog.save_file().await
-                } else {
-                    dialog.pick_file().await
-                };
-                handle.map(|h| h.path().to_path_buf())
-            });
-            let _ = tx.send(result);
-            if let Some(ctx) = egui_ctx {
-                ctx.request_repaint();
-            }
+        self.file_dialog_queue.push(FileDialogRequest {
+            target,
+            save,
+            filters,
+            default_name: default_name.map(str::to_owned),
         });
-        self.pending_files.push((target, rx));
+    }
+
+    /// Open the file-choosers asked for this frame.
+    ///
+    /// On Windows each one is given keyroost's window as its parent: without
+    /// one, Windows may open the dialog (and any message box it shows) behind
+    /// keyroost, where it looks as if the button did nothing.
+    ///
+    /// rfd's portal backend is async, so the dialog runs on a throwaway thread
+    /// (driven by `pollster::block_on`) and the result returns over a channel
+    /// drained in `update()` — the egui frame thread is never blocked. The
+    /// frame loop is woken via `request_repaint` once the user dismisses the
+    /// dialog so the picked path lands without waiting for the next input event.
+    fn launch_file_dialogs(&mut self, frame: &eframe::Frame) {
+        for request in std::mem::take(&mut self.file_dialog_queue) {
+            let FileDialogRequest {
+                target,
+                save,
+                filters,
+                default_name,
+            } = request;
+            let mut dialog = rfd::AsyncFileDialog::new();
+            for (name, exts) in &filters {
+                let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+                dialog = dialog.add_filter(name, &ext_refs);
+            }
+            if let Some(name) = &default_name {
+                dialog = dialog.set_file_name(name);
+            }
+            if cfg!(windows) {
+                dialog = dialog.set_parent(frame);
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let egui_ctx = self.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let result = pollster::block_on(async move {
+                    let handle = if save {
+                        dialog.save_file().await
+                    } else {
+                        dialog.pick_file().await
+                    };
+                    handle.map(|h| h.path().to_path_buf())
+                });
+                let _ = tx.send(result);
+                if let Some(ctx) = egui_ctx {
+                    ctx.request_repaint();
+                }
+            });
+            self.pending_files.push((target, rx));
+        }
     }
 
     /// Drain any resolved file-chooser dialogs and write the picked path into
@@ -8274,6 +8383,7 @@ impl App {
                         );
                         ui.add(
                             egui::TextEdit::singleline(&mut self.oath.add.name)
+                                .margin(theme::TEXT_EDIT_MARGIN)
                                 .hint_text("issuer:account")
                                 .desired_width(300.0),
                         );
@@ -8676,6 +8786,7 @@ impl App {
                     ui.label("Type \u{201c}reset\u{201d} to confirm:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.factory_reset_confirm_typed)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_width(120.0),
                     );
                 });
@@ -9177,6 +9288,7 @@ impl App {
                         ui.label("Type \u{201c}reset\u{201d} to confirm:");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.security_keys.reset.confirm_input)
+                                .margin(theme::TEXT_EDIT_MARGIN)
                                 .desired_width(120.0),
                         );
                     });
@@ -9347,7 +9459,7 @@ impl App {
         let Some(label) = self.touch_banner_text() else {
             return;
         };
-        egui::Area::new(egui::Id::new("touch_banner"))
+        egui::Area::new(egui::Id::unique("touch_banner"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
             .interactable(false)
@@ -10621,7 +10733,11 @@ fn typed_reset_modal(
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("Type \u{201c}reset\u{201d} to confirm:");
-                ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut buf)
+                        .margin(theme::TEXT_EDIT_MARGIN)
+                        .desired_width(120.0),
+                );
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -10726,7 +10842,8 @@ pub(crate) fn secret_edit(
     let mut resp = None;
     ui.horizontal(|ui| {
         let mut edit = egui::TextEdit::singleline(buf)
-            .vertical_align(egui::Align::Center)
+            .margin(theme::TEXT_EDIT_MARGIN)
+            .align(egui::Align2::LEFT_CENTER)
             .desired_width(width);
         if !*revealed {
             edit = edit.password(true);
@@ -10958,6 +11075,7 @@ impl App {
                                         hid_path: None,
                                         reader: None,
                                         hid_serial: None,
+                                        former_serial: None,
                                         naming: Default::default(),
                                         smart_card_unlisted: false,
                                     });
@@ -13689,7 +13807,7 @@ fn sub_tab_strip<T: Copy>(
     joined: bool,
     trailing: impl FnOnce(&mut egui::Ui),
 ) -> SubTabs<T> {
-    let id = ui.id().with(id_salt);
+    let id = ui.scope_id().with(id_salt);
     let font = theme::f_sb(13.5);
     let pad = egui::vec2(12.0, 7.0);
     let line = egui::Stroke::new(1.0, p.line);
@@ -13800,8 +13918,8 @@ fn join_open_tab(ui: &egui::Ui, p: &Palette, tab: Option<egui::Rect>) {
 /// the opacity to restore with `ui.set_opacity` where the tab's panel ends.
 fn fade_in_on_switch(ui: &mut egui::Ui, id_salt: &str, key: impl std::fmt::Debug) -> f32 {
     let prev = ui.opacity();
-    let id = ui.id().with(id_salt).with("fade");
-    let key = egui::Id::new(format!("{key:?}"));
+    let id = ui.scope_id().with(id_salt).with("fade");
+    let key = egui::Id::unique(format!("{key:?}"));
     let now = ui.input(|i| i.time);
     let start = ui.data_mut(|d| {
         let seen = d.get_temp::<(egui::Id, f64)>(id);
@@ -14545,6 +14663,7 @@ fn pin_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String) {
         );
         let resp = ui.add(
             egui::TextEdit::singleline(buf)
+                .margin(theme::TEXT_EDIT_MARGIN)
                 .password(true)
                 .desired_width(200.0),
         );
@@ -14576,6 +14695,7 @@ fn secret_field(
         );
         let resp = ui.add(
             egui::TextEdit::singleline(buf)
+                .margin(theme::TEXT_EDIT_MARGIN)
                 .password(true)
                 .hint_text(hint)
                 .desired_width(w),
@@ -14970,6 +15090,7 @@ fn text_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String, hin
         );
         ui.add(
             egui::TextEdit::singleline(buf)
+                .margin(theme::TEXT_EDIT_MARGIN)
                 .hint_text(hint)
                 .desired_width(w),
         );
@@ -15936,7 +16057,7 @@ impl eframe::App for App {
     // are persisted by `App::persist_settings` into `settings.json` instead —
     // see the `settings` module.
 
-    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // eframe 0.35 drives the app through `App::ui` with a root `Ui` rather
         // than the old `update(ctx)`. Our layout is panel-based: the four panels
         // below are shown into `root_ui`, while the dialogs/popovers (which still
@@ -16234,6 +16355,7 @@ impl eframe::App for App {
         if animating {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+        self.launch_file_dialogs(frame);
     }
 }
 
@@ -16911,7 +17033,7 @@ impl App {
                                 );
                             }
                             ui.add_space(TOPBAR_GAP);
-                            let menu_id = egui::Id::new("topbar_menu");
+                            let menu_id = egui::Id::unique("topbar_menu");
                             let trigger = if fit.links_in_menu {
                                 theme::button(ui, p, BtnKind::Ghost, TOPBAR_MENU)
                                     .on_hover_text("Appearance, Learn and Activity log")
@@ -17379,7 +17501,7 @@ impl App {
         }
         // Called every frame so opening the overlay slides it in from 0.
         let slide = ctx.animate_bool_with_time(
-            egui::Id::new("sidebar_overlay_slide"),
+            egui::Id::unique("sidebar_overlay_slide"),
             self.sidebar_overlay,
             0.16,
         );
@@ -17507,6 +17629,7 @@ impl App {
         ui.add_space(8.0);
         ui.add(
             egui::TextEdit::singleline(&mut self.filter)
+                .margin(theme::TEXT_EDIT_MARGIN)
                 .hint_text("Filter keys\u{2026}")
                 .desired_width(f32::INFINITY),
         );
@@ -17652,7 +17775,7 @@ impl App {
         // The dimmed window, top bar included: also swallows the press that
         // closes the list, so it never reaches a button underneath.
         let window = ctx.content_rect();
-        egui::Area::new(egui::Id::new("sidebar_scrim"))
+        egui::Area::new(egui::Id::unique("sidebar_scrim"))
             .order(egui::Order::Foreground)
             .fixed_pos(window.min)
             .interactable(true)
@@ -17664,7 +17787,7 @@ impl App {
                     egui::Color32::from_black_alpha((120.0 * slide) as u8),
                 );
             });
-        let shown = egui::Area::new(egui::Id::new("sidebar_overlay"))
+        let shown = egui::Area::new(egui::Id::unique("sidebar_overlay"))
             .order(egui::Order::Foreground)
             .fixed_pos(rect.min)
             .constrain(false)
@@ -18118,7 +18241,8 @@ impl App {
                 ui.add_sized(
                     [200.0, 32.0],
                     egui::TextEdit::singleline(&mut self.rename_input)
-                        .vertical_align(egui::Align::Center)
+                        .margin(theme::TEXT_EDIT_MARGIN)
+                        .align(egui::Align2::LEFT_CENTER)
                         .hint_text("friendly-name"),
                 )
             })
@@ -18205,6 +18329,7 @@ impl App {
                 );
                 let resp = ui.add(
                     egui::TextEdit::singleline(pin)
+                        .margin(theme::TEXT_EDIT_MARGIN)
                         .password(true)
                         .desired_width(160.0),
                 );
@@ -19383,7 +19508,8 @@ impl App {
                     let resp = ui.add_sized(
                         [220.0, 32.0],
                         egui::TextEdit::singleline(&mut *self.security_keys.pin_input)
-                            .vertical_align(egui::Align::Center)
+                            .margin(theme::TEXT_EDIT_MARGIN)
+                            .align(egui::Align2::LEFT_CENTER)
                             .password(true)
                             .hint_text("Enter PIN to unlock this key"),
                     );
@@ -19818,7 +19944,8 @@ impl App {
                                             ui.add_sized(
                                                 [160.0, 32.0],
                                                 egui::TextEdit::singleline(buf)
-                                                    .vertical_align(egui::Align::Center),
+                                                    .margin(theme::TEXT_EDIT_MARGIN)
+                                                    .align(egui::Align2::LEFT_CENTER),
                                             );
                                         }
                                         if theme::button(ui, p, BtnKind::Primary, "Save").clicked()
@@ -19870,7 +19997,8 @@ impl App {
                         ui.add_sized(
                             [160.0, 32.0],
                             egui::TextEdit::singleline(&mut self.security_keys.fp_new_name)
-                                .vertical_align(egui::Align::Center)
+                                .margin(theme::TEXT_EDIT_MARGIN)
+                                .align(egui::Align2::LEFT_CENTER)
                                 .hint_text("name (optional)"),
                         );
                         if theme::button(ui, p, BtnKind::Primary, "Enroll new\u{2026}").clicked() {
@@ -20507,6 +20635,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.add(
                     egui::TextEdit::multiline(&mut self.security_keys.lb_new_text)
+                        .margin(theme::TEXT_EDIT_MARGIN)
                         .desired_rows(2)
                         .desired_width(f32::INFINITY)
                         .hint_text("Type a note to store on the key\u{2026}"),
@@ -20645,6 +20774,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.add(
                         egui::TextEdit::multiline(&mut self.security_keys.lb_edit_text)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_rows(2)
                             .desired_width(f32::INFINITY),
                     );
@@ -21442,6 +21572,7 @@ impl App {
                         if let Some(d) = self.security_keys.advanced.as_mut() {
                             ui.add(
                                 egui::TextEdit::singleline(&mut d.min_pin_input)
+                                    .margin(theme::TEXT_EDIT_MARGIN)
                                     .desired_width(64.0)
                                     .hint_text("e.g. 6"),
                             );
@@ -21459,6 +21590,7 @@ impl App {
                     if let Some(d) = self.security_keys.advanced.as_mut() {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut d.pin_input)
+                                .margin(theme::TEXT_EDIT_MARGIN)
                                 .password(true)
                                 .desired_width(160.0),
                         );
@@ -22705,7 +22837,7 @@ impl App {
                                         // imperceptible for a row that only
                                         // changes on a device switch.
                                         let row_w_id =
-                                            egui::Id::new("piv-allow-pin-unlock-row-width");
+                                            egui::Id::unique("piv-allow-pin-unlock-row-width");
                                         let last_row_w =
                                             ui.data(|d| d.get_temp::<f32>(row_w_id)).unwrap_or(0.0);
                                         ui.horizontal(|ui| {
@@ -22904,6 +23036,7 @@ impl App {
                                 );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.piv.chuid_guid)
+                                        .margin(theme::TEXT_EDIT_MARGIN)
                                         .hint_text("hex, dashes optional")
                                         .desired_width(chuid_guid_field_width(ui.ctx())),
                                 );
@@ -23496,6 +23629,7 @@ impl App {
                                     path_changed = ui
                                         .add(
                                             egui::TextEdit::singleline(&mut f.public_path)
+                                                .margin(theme::TEXT_EDIT_MARGIN)
                                                 .hint_text("NAME.pub.asc")
                                                 .desired_width(130.0),
                                         )
@@ -23573,6 +23707,7 @@ impl App {
                                                 label_w(ui, "Backup");
                                                 ui.add(
                                                     egui::TextEdit::singleline(&mut f.backup_path)
+                                                        .margin(theme::TEXT_EDIT_MARGIN)
                                                         .hint_text("NAME.asc")
                                                         .desired_width(130.0),
                                                 );
@@ -23650,6 +23785,7 @@ impl App {
                                     label_w(ui, "Save to");
                                     ui.add(
                                         egui::TextEdit::singleline(&mut f.save_path)
+                                            .margin(theme::TEXT_EDIT_MARGIN)
                                             .hint_text("openpgp-backup.asc")
                                             .desired_width(130.0),
                                     );
@@ -23730,6 +23866,7 @@ impl App {
                                     label_w(ui, "File");
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.openpgp.restore_path)
+                                            .margin(theme::TEXT_EDIT_MARGIN)
                                             .hint_text("openpgp-backup.asc")
                                             .desired_width(130.0),
                                     );
@@ -23971,7 +24108,8 @@ impl App {
                     let resp = ui.add_sized(
                         [220.0, 32.0],
                         egui::TextEdit::singleline(&mut self.oath.password_input)
-                            .vertical_align(egui::Align::Center)
+                            .margin(theme::TEXT_EDIT_MARGIN)
+                            .align(egui::Align2::LEFT_CENTER)
                             .password(true),
                     );
                     guard_secret_field(ui.ctx(), &resp);
@@ -25532,6 +25670,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.add(
                         egui::TextEdit::multiline(&mut pem.as_str())
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_rows(4)
                             .desired_width(f32::INFINITY)
                             .font(egui::TextStyle::Monospace),
@@ -26741,7 +26880,7 @@ impl App {
                             ui.label(egui::RichText::new(format!("SLOT {:02}", self.slot)).font(theme::f_bold(11.0)).color(p.brand));
                             ui.add_space(10.0);
                             editor_row(ui, p, "Title", |ui| {
-                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text("\u{2264} 12 chars").desired_width(ui.available_width().min(360.0)));
+                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).margin(theme::TEXT_EDIT_MARGIN).hint_text("\u{2264} 12 chars").desired_width(ui.available_width().min(360.0)));
                             });
                             editor_row(ui, p, "Secret", |ui| {
                                 let mut rev = self
@@ -27273,6 +27412,7 @@ impl App {
                     ui.label("Paste an otpauth:// URI:");
                     let uri_box = ui.add(
                         egui::TextEdit::multiline(&mut self.import_dialog.uri)
+                            .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_rows(3)
                             .desired_width(420.0)
                             .font(egui::TextStyle::Monospace),
@@ -27533,6 +27673,100 @@ fn slot_summary(attrs: &[u8], fpr: &[u8; 20], key_present: Option<bool>) -> Stri
 mod tests {
     use super::*;
 
+    /// A drag across a selectable label, as separate frames: press at the
+    /// left end, move to the right end, release. Returns every output
+    /// command those frames produced.
+    fn drag_select_label(ctx: &egui::Context) -> Vec<egui::OutputCommand> {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
+        let frame = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let press = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (start, end) = (egui::pos2(12.0, 10.0), egui::pos2(150.0, 10.0));
+        let mut commands = Vec::new();
+        for events in [
+            vec![egui::Event::PointerMoved(start)],
+            vec![press(start, true)],
+            vec![egui::Event::PointerMoved(egui::pos2(60.0, 10.0))],
+            vec![egui::Event::PointerMoved(end)],
+            vec![press(end, false)],
+            vec![],
+        ] {
+            let out = ctx.test_frame(frame(events), |ui| {
+                ui.label("123456 a one-time code");
+            });
+            commands.extend(out.platform_output.commands);
+        }
+        commands
+    }
+
+    /// egui 0.37 sends a settled label selection to the primary selection;
+    /// keyroost's plugin drops it (see `NoPrimarySelection`). Without the
+    /// plugin the same drag does produce it, so the test can't pass vacuously.
+    #[test]
+    fn a_label_selection_never_reaches_the_primary_selection() {
+        let settled =
+            |c: &egui::OutputCommand| matches!(c, egui::OutputCommand::TextSelectionSettled(_));
+        let plain = egui::Context::default();
+        assert!(
+            drag_select_label(&plain).iter().any(settled),
+            "egui no longer reports label selections this way; recheck NoPrimarySelection"
+        );
+        let ctx = egui::Context::default();
+        ctx.add_plugin(NoPrimarySelection);
+        assert!(!drag_select_label(&ctx).iter().any(settled));
+    }
+
+    /// A copy the app asks for still goes through; only the primary-selection
+    /// command is dropped.
+    #[test]
+    fn dropping_the_primary_selection_keeps_explicit_copies() {
+        let ctx = egui::Context::default();
+        ctx.add_plugin(NoPrimarySelection);
+        let out = ctx.test_frame(egui::RawInput::default(), |ui| {
+            ui.ctx()
+                .send_cmd(egui::OutputCommand::TextSelectionSettled("seed".into()));
+            ui.ctx().copy_text("code".into());
+        });
+        let commands = out.platform_output.commands;
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == "code")));
+        assert!(!commands
+            .iter()
+            .any(|c| matches!(c, egui::OutputCommand::TextSelectionSettled(_))));
+    }
+
+    /// One headless egui frame for a test. The frame's texture changes are
+    /// cleared, as a renderer would apply them: egui 0.37 asserts (in debug
+    /// builds) that a frame's output never drops them unapplied.
+    trait TestFrame {
+        fn test_frame(
+            &self,
+            input: egui::RawInput,
+            ui: impl FnMut(&mut egui::Ui),
+        ) -> egui::FullOutput;
+    }
+
+    impl TestFrame for egui::Context {
+        fn test_frame(
+            &self,
+            input: egui::RawInput,
+            ui: impl FnMut(&mut egui::Ui),
+        ) -> egui::FullOutput {
+            let mut output = self.run_ui(input, ui);
+            output.textures_delta.clear();
+            output
+        }
+    }
+
     /// The `test-isolation` dev-dependency feature is on: a test here can
     /// never resolve, read or write the person's config directory.
     #[test]
@@ -27667,7 +27901,7 @@ mod tests {
             if let Some(r) = row_rect.filter(|_| frame >= 1) {
                 input.events.push(egui::Event::PointerMoved(r.center()));
             }
-            let _ = ctx.run_ui(input, |ctx| {
+            let _ = ctx.test_frame(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.set_min_width(160.0);
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -29656,7 +29890,7 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let output = ctx.run_ui(input, |ctx| {
+            let output = ctx.test_frame(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     app.render_fido_advanced(ui, &palette);
                 });
@@ -29717,7 +29951,7 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let output = ctx.run_ui(input, |ctx| {
+            let output = ctx.test_frame(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     app.render_fido_advanced(ui, &palette);
                 });
@@ -30021,7 +30255,7 @@ mod tests {
     #[test]
     fn clear_edit_undo_purges_retained_plaintext() {
         let ctx = egui::Context::default();
-        let id = egui::Id::new("pin-field-test");
+        let id = egui::Id::unique("pin-field-test");
         let empty = (egui::text::CCursorRange::default(), String::new());
 
         // Simulate egui recording undo history as the user types a PIN. An undo
@@ -30061,11 +30295,16 @@ mod tests {
     #[test]
     fn dropping_focus_scrubs_a_focused_secret_box() {
         let ctx = egui::Context::default();
-        let id = egui::Id::new("idle-focus-test");
+        let id = egui::Id::unique("idle-focus-test");
         let mut buf = String::new();
         let frame = |buf: &mut String, focus: bool| {
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-                let resp = ui.add(egui::TextEdit::singleline(&mut *buf).password(true).id(id));
+            let _ = ctx.test_frame(egui::RawInput::default(), |ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut *buf)
+                        .margin(theme::TEXT_EDIT_MARGIN)
+                        .password(true)
+                        .id(id),
+                );
                 if focus {
                     resp.request_focus();
                 }
@@ -30096,7 +30335,7 @@ mod tests {
         // isn't drawn again (the lock may have closed its dialog).
         wipe(&mut buf);
         surrender_text_focus(&ctx);
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let _ = ctx.test_frame(egui::RawInput::default(), |_| {});
         let after = egui::TextEdit::load_state(&ctx, id).unwrap();
         assert!(!edit_state_needs_scrub(&after), "the history is scrubbed");
         assert!(ctx.memory(|m| m.focused()).is_none());
@@ -32359,7 +32598,7 @@ mod tests {
             app.piv.status = Some(status);
             app.piv.gen_pin_policy = PinPolicy::Always;
             app.piv.gen_touch_policy = TouchPolicy::Always;
-            let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            let _ = ctx.test_frame(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     app.piv_modal_policy_fields(ui, &palette, allow_override);
                 });
@@ -32670,6 +32909,7 @@ mod tests {
             hid_path: None,
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: keyroost_resolve::Naming::local(name),
             smart_card_unlisted: false,
         }
@@ -33773,6 +34013,7 @@ mod tests {
             hid_path: None,
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: keyroost_resolve::Naming {
                 on_key: on_key.map_or(keyroost_resolve::KeyLabel::NotRead, |n| {
                     keyroost_resolve::KeyLabel::Present(n.into())

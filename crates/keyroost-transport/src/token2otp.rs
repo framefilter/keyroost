@@ -1661,7 +1661,7 @@ impl Token2OtpSession {
             t2::crypto::build_set_pin_data(keys, pin.as_bytes(), t2::cmd::PIN_DEFAULT_MAX_RETRY)?;
         let apdu = t2::build_apdu(t2::cmd::SET_OTP_PIN, &data);
         let (_, sw) = self.transport.transmit(&apdu, false)?;
-        OtpError::check_pin(sw)?;
+        OtpError::check_new_pin(sw)?;
         Ok(())
     }
 
@@ -1742,7 +1742,11 @@ impl Token2OtpSession {
             t2::crypto::build_change_pin_data(keys, new_bytes, current.as_bytes(), &rand)?;
         let apdu = t2::build_apdu(t2::cmd::CHANGE_OTP_PIN, &data_field);
         let (_, sw) = self.transport.transmit(&apdu, false)?;
-        OtpError::check_pin(sw)?;
+        if new.is_some() {
+            OtpError::check_new_pin(sw)?;
+        } else {
+            OtpError::check_pin(sw)?;
+        }
         self.pin_verified = false;
         self.typed_pin_verified = false;
         Ok(())
@@ -2147,14 +2151,28 @@ impl Token2OtpSession {
         // We return whatever we get; `DeviceInfo::parse` records the length so
         // callers can tell which fields are actually backed by real bytes rather
         // than zero-padding (see `DeviceInfo::has_config_byte`).
-        let apdu = if self.is_pcsc {
-            t2::read_config(64)
-        } else {
-            t2::read_config_usb(64)
-        };
-        let (data, sw) = self.transport.transmit(&apdu, false)?;
+        if self.is_pcsc {
+            let (data, sw) = self.transport.transmit(&t2::read_config(64), false)?;
+            OtpError::check(sw)?;
+            return Ok(data);
+        }
+        // Over USB, the documented form first. A PIN+ (R3.4) answers it with
+        // a single byte; only then try the form Token2's own tools send, and
+        // keep whichever answer is longer.
+        let (data, sw) = self.transport.transmit(&t2::read_config_usb(64), false)?;
         OtpError::check(sw)?;
-        Ok(data)
+        if data.len() > 1 {
+            return Ok(data);
+        }
+        match self
+            .transport
+            .transmit(&t2::read_config_usb_padded(64), false)
+        {
+            Ok((padded, sw)) if OtpError::check(sw).is_ok() && padded.len() > data.len() => {
+                Ok(padded)
+            }
+            _ => Ok(data),
+        }
     }
 
     /// Read and parse the device-info / configuration block (spec §6.9). Callers

@@ -265,7 +265,7 @@ fn print_dry_run(lines: &[String], plan: &Plan, key_read: bool) -> Result<(), Bo
         emit_json(&import_json(plan, None, true, key_read))?;
     } else {
         for l in lines {
-            println!("{l}");
+            outln!("{l}");
         }
     }
     Ok(())
@@ -361,7 +361,7 @@ fn preview_and_ask(
         return Ok(None);
     }
     for l in &lines {
-        eprintln!("{l}");
+        errln!("{l}");
     }
     let c = plan.counts();
     let n = c.add + c.replace;
@@ -377,7 +377,7 @@ fn preview_and_ask(
                 true,
             ))?;
         } else {
-            println!("Nothing to add.");
+            outln!("Nothing to add.");
         }
         return Ok(None);
     }
@@ -419,7 +419,7 @@ fn write_and_report(
     store: &mut dyn CodeStore,
 ) -> Result<(), Box<dyn Error>> {
     let report = keyroost_import::run::run(file, plan, store, &mut |done, total, row| {
-        eprintln!(
+        errln!(
             "[{}/{}] {} {}",
             done + 1,
             total,
@@ -431,7 +431,7 @@ fn write_and_report(
     if json_output() {
         emit_json(&import_json(plan, Some(&report), false, true))?;
     } else if let Ok(line) = &summary {
-        println!("{line}");
+        outln!("{line}");
     }
     summary.map(|_| ()).map_err(Into::into)
 }

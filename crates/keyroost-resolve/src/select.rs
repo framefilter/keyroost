@@ -823,6 +823,7 @@ mod tests {
             hid_path: hid.map(PathBuf::from),
             reader: reader.map(str::to_owned),
             hid_serial: None,
+            former_serial: None,
             naming: Naming::local(name),
             smart_card_unlisted: false,
         }

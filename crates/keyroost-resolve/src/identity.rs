@@ -697,6 +697,7 @@ mod tests {
             reader_name: name.into(),
             is_molto2: keyroost_proto::is_molto2_reader(name),
             serial: None,
+            former_serial: None,
             openpgp_manufacturer: None,
             has_oath: true,
             has_openpgp: false,

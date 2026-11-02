@@ -149,18 +149,18 @@ pub fn correlated_lines(rows: &[(usize, &Device)]) -> Vec<String> {
 
 /// Print the bare-invocation friendly overview to stdout.
 pub fn print_overview(rows: &[(usize, &Device)]) {
-    println!("Connected devices");
-    println!();
+    outln!("Connected devices");
+    outln!();
     for line in overview_lines(rows) {
-        println!("{line}");
+        outln!("{line}");
     }
 }
 
 /// Print the `list` "Correlated devices" summary section to stdout.
 pub fn print_correlated(rows: &[(usize, &Device)]) {
-    println!("Correlated devices (what keyroost sees):");
+    outln!("Correlated devices (what keyroost sees):");
     for line in correlated_lines(rows) {
-        println!("{line}");
+        outln!("{line}");
     }
 }
 
@@ -192,6 +192,7 @@ mod tests {
             hid_path: None,
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: keyroost_resolve::Naming::local(name),
             smart_card_unlisted: false,
         }

@@ -432,7 +432,7 @@ The prebuilt binaries need `libpcsclite` at runtime — on a FIDO-only machine i
 
 ### cargo (from source)
 
-Needs the Rust toolchain — **1.92+ for the GUI** (`keyroost`), 1.89+ for the CLI
+Needs the Rust toolchain — **1.95+ for the GUI** (`keyroost`), 1.89+ for the CLI
 (`keyroostctl`) and libraries — and, on Linux, the PC/SC dev package plus the
 GUI's X11/Wayland/GL libraries (see
 [Smart-card prerequisite](#smart-card-prerequisite)):
@@ -677,6 +677,18 @@ The script asks `keyroostctl` for suggestions as you type, so
 `--device <Tab>` offers the names recorded in this computer's `keys.json`
 (it never reads the keys). If you installed a completion file
 from v0.12.0 or earlier, generate it again to get this.
+
+**Piping output in PowerShell.** PowerShell reads a program's piped or
+redirected output (`| Select-String`, `> file.txt`, `| clip`) in the
+console's old code page instead of UTF-8. keyroostctl writes its own arrows
+and dashes in plain ASCII there, but letters like é in a key's name still
+come out wrong (`├⌐` instead of `é`), and so does `--json` piped into `ConvertFrom-Json`. Output
+shown in the window is never affected. To fix it, run this once per
+session, or add it to your `$PROFILE`:
+
+```powershell
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+```
 
 ## Quick start
 
