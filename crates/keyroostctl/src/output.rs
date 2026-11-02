@@ -19,13 +19,16 @@ fn stderr_piped() -> bool {
     *STDERR_PIPED.get_or_init(|| cfg!(windows) && !std::io::stderr().is_terminal())
 }
 
-/// `text` with the punctuation keyroost writes itself in ASCII.
+/// `text` with the punctuation keyroost writes in ASCII.
 ///
-/// Windows PowerShell 5.1 reads a program's piped or redirected output in the
-/// console's legacy code page, not UTF-8, so `→` arrives as `ΓåÆ` and `·` as
-/// `┬╖`. A console shows UTF-8 correctly, so this is only for a Windows stream
-/// that isn't one. Other characters (a key's name, say) pass through as they
-/// are; JSON never comes here.
+/// PowerShell reads a program's piped or redirected output in the console's
+/// legacy code page, not UTF-8 (unless Windows' system-wide UTF-8 setting is
+/// on), so `→` arrives as `ΓåÆ` and `·` as `┬╖`. A console shows UTF-8
+/// correctly, so this is only for a Windows stream that isn't one. It maps
+/// these characters wherever they are on the line, in a key's or an
+/// account's name too (PowerShell would garble them there anyway); every
+/// other character passes through as it is. JSON and the files keyroost
+/// writes never come here, so exported data stays exact.
 pub(crate) fn ascii_punctuation(text: &str) -> Cow<'_, str> {
     if text.is_ascii() {
         return Cow::Borrowed(text);
