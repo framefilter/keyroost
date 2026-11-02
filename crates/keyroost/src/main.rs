@@ -5811,6 +5811,22 @@ impl App {
     /// lines such as the device-scan count, which every refresh repeats.
     fn log_global_bg_once(&mut self, severity: Severity, text: impl Into<String>) {
         let text = without_home(&text.into());
+        // The same words as the newest line, with traffic of its own (a
+        // Refresh's burst of rescans with "APDU trace" on): the traffic goes
+        // under that line rather than starting a new one, so one Refresh
+        // reads as one scan. Only onto the newest line, so traffic never
+        // lands above a later entry.
+        if let Some(last) = self.log.last_mut() {
+            if last.text == text
+                && matches!(last.kind, LogKind::Background)
+                && std::mem::discriminant(&last.severity) == std::mem::discriminant(&severity)
+            {
+                if let Some(more) = self.pending_trace.take().filter(|t| !t.is_empty()) {
+                    last.trace.get_or_insert_with(Vec::new).extend(more);
+                }
+                return;
+            }
+        }
         // A line that would carry this job's APDU trace is never dropped:
         // the traffic is new even when the words aren't, and dropping the
         // line would only leave the trace to the job's automatic line.
@@ -31987,13 +32003,26 @@ mod tests {
                 "device scan: 2 devices found"
             ]
         );
-        // With APDU trace on, each scan's line carries its traffic: kept.
+        // With APDU trace on, a repeat scan's traffic goes under the newest
+        // line rather than a new one: a Refresh's burst reads as one scan,
+        // and no traffic is lost.
         app.pending_trace = Some(vec!["> select".into()]);
         app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        app.pending_trace = Some(vec!["> select again".into()]);
+        app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        assert_eq!(app.log.len(), 4);
         let last = app.log.last().expect("logged");
         assert_eq!(last.text, "device scan: 2 devices found");
-        assert!(last.trace.is_some());
-        assert_eq!(app.log.len(), 5);
+        assert_eq!(
+            last.trace.as_deref(),
+            Some(&["> select".to_string(), "> select again".to_string()][..])
+        );
+        // After another entry, a traced scan is a new line again.
+        app.log(Severity::Info, "a: something else");
+        app.pending_trace = Some(vec!["> select once more".into()]);
+        app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        assert_eq!(app.log.len(), 6);
+        assert!(app.log.last().expect("logged").trace.is_some());
     }
 
     /// A FIDO2 reset run on its own (not a factory reset's last step) writes
