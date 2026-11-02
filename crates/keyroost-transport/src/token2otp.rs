@@ -249,21 +249,27 @@ enum HidIo {
     Hidapi(hidapi::HidDevice),
 }
 
-/// True when the *response* to `apdu` carries user secrets — account names and
-/// live OTP codes — and so must be redacted from the debug trace.
+/// True when the *response* to `apdu` carries user data — account names and
+/// live OTP codes, or the key's serial — and so must be redacted from the
+/// debug trace.
 ///
-/// Only the `ENUM_CODES` / `ENUM_CODES_CONTINUE` reads (INS `0xC5`, P1 `0x05`,
-/// P2 `0x00`/`0x01`) return entry data. `WRITE_SEED` shares P1 `0x05` but its
-/// request (not response) is the secret-bearing side and answers with a status
-/// word only; every other command returns public config, the public ECDH key,
-/// the serial, or a bare status word. Keyed off the *original* command so a
-/// `61xx` GET-RESPONSE continuation (which resends a different header) still
-/// inherits the correct verdict.
+/// The `ENUM_CODES` / `ENUM_CODES_CONTINUE` reads (INS `0xC5`, P1 `0x05`, P2
+/// `0x00`/`0x01`) return entry data. The serial read (`READ_SERIAL_INS`, INS
+/// `0x33`) returns the key's serial: identifying, so redacted like the FIDO
+/// layer's vendor payloads below it, and as keyroost's probe notes shorten
+/// serials, since people post `--debug` output publicly. `WRITE_SEED` shares
+/// P1 `0x05` but its request (not response) is the secret-bearing side and
+/// answers with a status word only; every other command returns public
+/// config, the public ECDH key, or a bare status word. Keyed off the
+/// *original* command so a `61xx` GET-RESPONSE continuation (which resends a
+/// different header) still inherits the correct verdict.
 fn response_is_sensitive(apdu: &[u8]) -> bool {
-    matches!(
+    let entries = matches!(
         (apdu.get(1), apdu.get(2), apdu.get(3)),
         (Some(&0xC5), Some(&0x05), Some(&0x00) | Some(&0x01))
-    )
+    );
+    let serial = apdu.get(..4) == Some(&cmd::READ_SERIAL_INS[..]);
+    entries || serial
 }
 
 /// True when `apdu`'s *request* body carries a secret and must be redacted from
@@ -2442,13 +2448,22 @@ mod trace_redaction_tests {
 
     #[test]
     fn public_and_status_only_responses_are_not_sensitive() {
-        // ECDH pubkey and device config are public; the serial read and a bare
-        // GET RESPONSE / SELECT return non-secret bytes or a status word.
+        // ECDH pubkey and device config are public; a bare GET RESPONSE /
+        // SELECT returns non-secret bytes or a status word.
         assert!(!response_is_sensitive(&cmd::GET_ECDH_PUBKEY));
         assert!(!response_is_sensitive(&cmd::READ_CONFIG));
-        assert!(!response_is_sensitive(&cmd::READ_SERIAL_INS));
         assert!(!response_is_sensitive(&[0x00, 0xC0, 0x00, 0x00, 0x20])); // GET RESPONSE
         assert!(!response_is_sensitive(&[0x00, 0xA4, 0x04, 0x00])); // SELECT
+    }
+
+    /// The serial read's reply identifies the key: redacted like the FIDO
+    /// layer's vendor payloads, with or without the request's body.
+    #[test]
+    fn the_serial_reply_is_redacted() {
+        assert!(response_is_sensitive(&cmd::READ_SERIAL_INS));
+        let mut with_body = cmd::READ_SERIAL_INS.to_vec();
+        with_body.extend_from_slice(&[0x12, 0xD1, 0x10]);
+        assert!(response_is_sensitive(&with_body));
     }
 
     #[test]
