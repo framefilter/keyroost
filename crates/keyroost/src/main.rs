@@ -8345,7 +8345,14 @@ impl App {
                         }
                     }
                 }
+                let listed = result.is_ok();
                 Self::apply_oath_rows(app, result, password);
+                // As the code read does: say it in the pane too, not only in
+                // the log, unless the re-list's own error is showing.
+                if gone && listed {
+                    app.oath.error =
+                        Some("That account was no longer on the key; nothing was deleted.".into());
+                }
             })
         });
     }
