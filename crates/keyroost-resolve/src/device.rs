@@ -126,6 +126,10 @@ pub struct Device {
     /// The FIDO HID node's own serial, when this merged row's `serial` came
     /// from its card applet and differs: a name saved under it still applies.
     pub hid_serial: Option<String>,
+    /// The serial an earlier keyroost knew this key by, when its card serial
+    /// now reads differently (see `ReaderProbe::former_serial`): a name saved
+    /// under it still applies.
+    pub former_serial: Option<String>,
     /// How the row is named (see [`crate::names::apply_names`]); `name` is
     /// the text to show.
     pub naming: Naming,
@@ -705,6 +709,7 @@ pub fn correlate_with(
             hid_path: None,
             reader: Some(p.reader_name.clone()),
             hid_serial: None,
+            former_serial: None,
             naming: Naming::default(),
             smart_card_unlisted: false,
         });
@@ -733,6 +738,7 @@ pub fn correlate_with(
             hid_path: None,
             reader: Some(p.reader_name.clone()),
             hid_serial: None,
+            former_serial: None,
             naming: Naming::default(),
             smart_card_unlisted: false,
         });
@@ -810,6 +816,7 @@ pub fn correlate_with(
             hid_path: None,
             reader: Some(p.reader_name.clone()),
             hid_serial: None,
+            former_serial: p.former_serial.clone(),
             naming: Naming::default(),
             smart_card_unlisted: false,
         });
@@ -957,6 +964,7 @@ pub fn correlate_with(
                 hid_path: Some(hid.path.clone()),
                 reader: reader_name,
                 hid_serial: None,
+                former_serial: None,
                 naming: Naming::default(),
                 smart_card_unlisted: false,
             });
@@ -1894,6 +1902,7 @@ mod tests {
             hid_path: hid.map(PathBuf::from),
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: Naming::default(),
             smart_card_unlisted: false,
         }
@@ -1985,6 +1994,7 @@ mod tests {
             reader_name: name.into(),
             is_molto2: molto2,
             serial: None,
+            former_serial: None,
             openpgp_manufacturer: None,
             has_oath: oath,
             has_openpgp: pgp,

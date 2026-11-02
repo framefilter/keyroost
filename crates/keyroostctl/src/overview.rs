@@ -192,6 +192,7 @@ mod tests {
             hid_path: None,
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: keyroost_resolve::Naming::local(name),
             smart_card_unlisted: false,
         }

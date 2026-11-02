@@ -252,6 +252,7 @@ mod tests {
             hid_path: hid.then(|| "/dev/hidraw0".into()),
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: Naming {
                 on_key,
                 ..Naming::default()

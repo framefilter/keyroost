@@ -16,7 +16,8 @@
 //! * A key whose name can't be read (a failed read, a damaged or invalid
 //!   name entry, no large-blob storage) is treated as carrying no name.
 //! * Otherwise the name this computer saved for the key is shown (looked up
-//!   by the row's serial, else by its FIDO HID serial when that differs).
+//!   by the row's serial, else by its FIDO HID serial when that differs, else
+//!   by the serial an earlier keyroost knew it by).
 //!
 //! Keys that report one fixed serial for every unit are indistinguishable
 //! here, as they are everywhere else: units sharing a name are all
@@ -164,7 +165,8 @@ pub fn apply_names(
         let serial = d.serial.clone();
         let canon = canonical_serial(&serial);
         let hid_serial = d.hid_serial.clone();
-        let known = known_serials(&serial, hid_serial.as_deref());
+        let former_serial = d.former_serial.clone();
+        let known = known_serials(&serial, hid_serial.as_deref(), former_serial.as_deref());
         let mut shown = None;
         if let KeyLabel::Present(l) = &on_key {
             naming.source = Some(NameSource::Key);
@@ -254,19 +256,30 @@ pub fn apply_names(
 }
 
 /// The serials a row may be known by: its own, then its FIDO HID node's
-/// when that differs (a merged row named under the HID serial). Unusable
-/// (empty) serials are left out.
-fn known_serials<'a>(serial: &'a str, hid_serial: Option<&'a str>) -> Vec<&'a str> {
+/// when that differs (a merged row named under the HID serial), then the
+/// serial an earlier keyroost knew it by. Unusable (empty) serials are left
+/// out.
+fn known_serials<'a>(
+    serial: &'a str,
+    hid_serial: Option<&'a str>,
+    former_serial: Option<&'a str>,
+) -> Vec<&'a str> {
     std::iter::once(serial)
         .chain(hid_serial)
+        .chain(former_serial)
         .filter(|s| !canonical_serial(s).is_empty())
         .collect()
 }
 
 /// Every serial `d` may be recorded under: its own, then its FIDO HID
-/// node's when that differs — the serials the naming pass looks names up by.
+/// node's when that differs, then its former serial — the serials the
+/// naming pass looks names up by.
 pub fn row_serials(d: &Device) -> Vec<&str> {
-    known_serials(&d.serial, d.hid_serial.as_deref())
+    known_serials(
+        &d.serial,
+        d.hid_serial.as_deref(),
+        d.former_serial.as_deref(),
+    )
 }
 
 /// Whether a record of another key (or one that matches no key) holds
@@ -364,6 +377,7 @@ mod tests {
             hid_path: Some("/dev/x".into()),
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: Naming::default(),
             smart_card_unlisted: false,
         }
@@ -473,6 +487,34 @@ mod tests {
         apply_names(&mut devs, &ring, &HashMap::new());
         assert_eq!(devs[0].name.as_deref(), Some("Work"));
         assert!(devs[0].naming.selectable);
+    }
+
+    #[test]
+    fn local_name_falls_back_to_the_former_serial() {
+        // A Token2 PIN+ R3.4 named under its OpenPGP-AID serial by keyroost
+        // 0.15, now read by its full serial.
+        let mut ring = Keyring::default();
+        local(&mut ring, "12345678", "Work");
+        let mut d = key("65103012345678");
+        d.former_serial = Some("12345678".into());
+        assert_eq!(row_serials(&d), vec!["65103012345678", "12345678"]);
+        let mut devs = vec![d];
+        apply_names(&mut devs, &ring, &HashMap::new());
+        assert_eq!(devs[0].name.as_deref(), Some("Work"));
+        assert!(devs[0].naming.selectable);
+        // Renaming records it under the full serial and drops the old record.
+        let serials = row_serials(&devs[0]);
+        set_key_name(
+            &mut ring,
+            &serials,
+            "Home",
+            NameStore::Computer,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        assert_eq!(ring.keys.len(), 1);
+        assert_eq!(ring.local_name_for("65103012345678"), Some("Home"));
+        assert_eq!(ring.local_name_for("12345678"), None);
     }
 
     #[test]

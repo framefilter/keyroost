@@ -1921,6 +1921,7 @@ mod tests {
             hid_path: None,
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: Default::default(),
             smart_card_unlisted: false,
         }

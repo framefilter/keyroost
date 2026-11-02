@@ -10998,6 +10998,7 @@ impl App {
                                         hid_path: None,
                                         reader: None,
                                         hid_serial: None,
+                                        former_serial: None,
                                         naming: Default::default(),
                                         smart_card_unlisted: false,
                                     });
@@ -32830,6 +32831,7 @@ mod tests {
             hid_path: None,
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: keyroost_resolve::Naming::local(name),
             smart_card_unlisted: false,
         }
@@ -33933,6 +33935,7 @@ mod tests {
             hid_path: None,
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: keyroost_resolve::Naming {
                 on_key: on_key.map_or(keyroost_resolve::KeyLabel::NotRead, |n| {
                     keyroost_resolve::KeyLabel::Present(n.into())

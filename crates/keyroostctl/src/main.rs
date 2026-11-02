@@ -18930,6 +18930,7 @@ mod cli_tests {
             hid_path: Some("/dev/hidraw3".into()),
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: Default::default(),
             smart_card_unlisted: false,
         }
@@ -19030,6 +19031,7 @@ mod cli_tests {
             hid_path: Some("/dev/hidraw3".into()),
             reader: Some("R 00".into()),
             hid_serial: None,
+            former_serial: None,
             naming: Default::default(),
             smart_card_unlisted: false,
         };
@@ -20506,6 +20508,7 @@ mod cli_tests {
                 hid_path: hid.map(std::path::PathBuf::from),
                 reader: reader.map(str::to_owned),
                 hid_serial: None,
+                former_serial: None,
                 naming: keyroost_resolve::Naming::local(Some(name)),
                 smart_card_unlisted: false,
             }
@@ -20566,6 +20569,7 @@ mod cli_tests {
             hid_path: None,
             reader: Some("Some Reader".to_string()),
             hid_serial: None,
+            former_serial: None,
             naming: Default::default(),
             smart_card_unlisted: false,
         };
@@ -24907,6 +24911,7 @@ mod cli_tests {
             hid_path: Some("/dev/hidraw16".into()),
             reader: Some("Yubico 00".into()),
             hid_serial: None,
+            former_serial: None,
             naming: Default::default(),
             smart_card_unlisted: false,
         };
@@ -24968,6 +24973,7 @@ mod cli_tests {
             hid_path: None,
             reader: None,
             hid_serial: None,
+            former_serial: None,
             naming: Default::default(),
             smart_card_unlisted: false,
         };
@@ -25008,6 +25014,7 @@ mod cli_tests {
                 hid_path: None,
                 reader: Some(reader.into()),
                 hid_serial: None,
+                former_serial: None,
                 naming: keyroost_resolve::Naming::local(Some(name)),
                 smart_card_unlisted: false,
             }
@@ -25383,6 +25390,7 @@ mod cli_tests {
             hid_path: Some("/dev/hidraw1".into()),
             reader: reader.map(str::to_owned),
             hid_serial: None,
+            former_serial: None,
             naming: keyroost_resolve::Naming::local(name),
             smart_card_unlisted: false,
         };
@@ -25464,6 +25472,7 @@ mod cli_tests {
             hid_path: Some("/dev/hidraw1".into()),
             reader: reader.map(str::to_owned),
             hid_serial: None,
+            former_serial: None,
             naming: keyroost_resolve::Naming::local(name),
             smart_card_unlisted: false,
         };
@@ -25519,6 +25528,7 @@ mod prop_tests {
             hid_path: hid.map(PathBuf::from),
             reader: reader.map(String::from),
             hid_serial: None,
+            former_serial: None,
             naming: keyroost_resolve::Naming::local(name),
             smart_card_unlisted: false,
         }
