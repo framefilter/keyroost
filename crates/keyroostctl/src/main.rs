@@ -6875,7 +6875,12 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
                     outln!("  {}  [Molto2 token]", sanitize_terminal(&p.reader_name));
                     continue;
                 }
+                // Every applet the reader answered for, in the matched rows'
+                // order (a Token2 PIN+'s OTP applet included).
                 let mut applets = Vec::new();
+                if p.has_fido {
+                    applets.push("FIDO2");
+                }
                 if p.has_oath {
                     applets.push("OATH");
                 }
@@ -6884,6 +6889,9 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
                 }
                 if p.has_piv {
                     applets.push("PIV");
+                }
+                if p.has_otp {
+                    applets.push("OTP");
                 }
                 let list = if applets.is_empty() {
                     "(none detected)".to_string()
