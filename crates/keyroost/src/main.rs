@@ -11050,7 +11050,9 @@ impl App {
             Reread::Otp => self.refresh_otp(),
             Reread::Passkeys => self.refresh_credentials(),
             Reread::Fingerprints => self.refresh_fingerprints(),
-            Reread::LargeBlobs => self.load_large_blobs(),
+            Reread::LargeBlobs => {
+                self.load_large_blobs();
+            }
             Reread::FidoInfo => self.fetch_selected_info(),
             Reread::Nothing => {}
         }
@@ -20309,44 +20311,57 @@ impl App {
 
     /// Read the large-blob array from the selected key (no PIN required) and
     /// cache it. Runs synchronously — a read is one or two small fragments.
-    fn load_large_blobs(&mut self) {
+    /// Read the key's large-blob store on the worker thread, as every other
+    /// read is, so a slow key doesn't freeze the window and the read shows in
+    /// the APDU trace. `false` when another job is running and nothing was
+    /// queued (the caller may try again).
+    fn load_large_blobs(&mut self) -> bool {
         let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
-            return;
+            return true;
         };
-        let result = (|| -> Result<
-            (
-                keyroost_ctap::large_blobs::LargeBlobArray,
-                keyroost_ctap::large_blobs::BlobCapacity,
-            ),
-            String,
-        > {
-            let (mut dev, cbor, _init) = open_fido(&target)?;
-            if !cbor {
-                return Err("device is U2F-only".into());
-            }
-            let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
-            let array =
-                keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
-            let cap = array.capacity(&info);
-            Ok((array, cap))
-        })();
-        match result {
-            Ok((array, cap)) => {
-                let n = array.len();
-                self.security_keys.large_blobs = Some(array);
-                self.security_keys.lb_capacity = Some(cap);
-                self.security_keys.lb_selected = None;
-                self.security_keys.lb_status = Some(format!(
-                    "Loaded {n} entr{}.",
-                    if n == 1 { "y" } else { "ies" }
-                ));
-            }
-            Err(e) => {
-                self.log_bg_once(Severity::Err, format!("Storage: load failed: {e}"));
-                self.security_keys.lb_status = Some(format!("Load failed: {e}"));
-            }
-        }
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Reading large-blob storage\u{2026}", move || {
+            let result = (|| -> Result<
+                (
+                    keyroost_ctap::large_blobs::LargeBlobArray,
+                    keyroost_ctap::large_blobs::BlobCapacity,
+                ),
+                String,
+            > {
+                let (mut dev, cbor, _init) = open_fido(&target)?;
+                if !cbor {
+                    return Err("device is U2F-only".into());
+                }
+                let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+                let array = keyroost_ctap::large_blobs::read(&mut dev, &info)
+                    .map_err(|e| e.to_string())?;
+                let cap = array.capacity(&info);
+                Ok((array, cap))
+            })();
+            Box::new(move |app: &mut App| {
+                // Another key selected meanwhile: this read isn't its store.
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
+                match result {
+                    Ok((array, cap)) => {
+                        let n = array.len();
+                        app.security_keys.large_blobs = Some(array);
+                        app.security_keys.lb_capacity = Some(cap);
+                        app.security_keys.lb_selected = None;
+                        app.security_keys.lb_status = Some(format!(
+                            "Loaded {n} entr{}.",
+                            if n == 1 { "y" } else { "ies" }
+                        ));
+                    }
+                    Err(e) => {
+                        app.log_bg_once(Severity::Err, format!("Storage: load failed: {e}"));
+                        app.security_keys.lb_status = Some(format!("Load failed: {e}"));
+                    }
+                }
+            })
+        })
     }
 
     /// Delete entry `idx`, re-serialize the remaining entries with a fresh
@@ -20567,9 +20582,13 @@ impl App {
         // Auto-load the array the first time this tab is shown, so entries
         // appear on their own. The flag stops a failed read from retrying every
         // frame; the top bar's Refresh reads it again.
-        if !self.security_keys.lb_autoloaded && self.security_keys.large_blobs.is_none() {
+        // Marked only once the read is queued: with another job running it
+        // tries again on a later frame.
+        if !self.security_keys.lb_autoloaded
+            && self.security_keys.large_blobs.is_none()
+            && self.load_large_blobs()
+        {
             self.security_keys.lb_autoloaded = true;
-            self.load_large_blobs();
         }
 
         // Header + Add control.
