@@ -251,6 +251,14 @@ pub fn decode_icon(data_uri: &str) -> Option<egui::ColorImage> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .ok()?;
+    let ([w, h], rgba) = decode_png_rgba(&bytes)?;
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba))
+}
+
+/// Decode PNG bytes to `([width, height], RGBA8 pixels)`. `None` on a decode
+/// error or a pixel format this doesn't expand; the buffer is always exactly
+/// `width * height * 4` bytes.
+pub fn decode_png_rgba(bytes: &[u8]) -> Option<([usize; 2], Vec<u8>)> {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0u8; reader.output_buffer_size()?];
@@ -282,5 +290,5 @@ pub fn decode_icon(data_uri: &str) -> Option<egui::ColorImage> {
     if rgba.len() != w * h * 4 {
         return None;
     }
-    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba))
+    Some(([w, h], rgba))
 }

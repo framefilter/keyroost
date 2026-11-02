@@ -4466,6 +4466,46 @@ impl Worker {
     }
 }
 
+/// keyroost's icon for its window. Without one eframe sets egui's own, and
+/// Windows shows that on the title bar and taskbar instead of the icon
+/// embedded in keyroost.exe. Taken from the largest image in that same .ico
+/// (every image in it is a PNG); an empty icon, if that fails, makes eframe
+/// leave the platform's own.
+fn window_icon() -> egui::IconData {
+    const ICO: &[u8] = include_bytes!("../assets/keyroost.ico");
+    let count = ICO
+        .get(4..6)
+        .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+    let largest = (0..usize::from(count))
+        .filter_map(|i| {
+            let e = ICO.get(6 + 16 * i..6 + 16 * (i + 1))?;
+            // A width byte of 0 means 256.
+            let width = if e[0] == 0 { 256 } else { u32::from(e[0]) };
+            let size = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as usize;
+            let offset = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as usize;
+            Some((width, ICO.get(offset..offset.checked_add(size)?)?))
+        })
+        .max_by_key(|(width, _)| *width);
+    largest
+        .and_then(|(_, png)| ui::mds::decode_png_rgba(png))
+        .map(|([w, h], rgba)| egui::IconData {
+            rgba,
+            width: w as u32,
+            height: h as u32,
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod window_icon_tests {
+    #[test]
+    fn the_window_icon_is_the_largest_image_in_the_ico() {
+        let icon = super::window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // KEYROOST_X11=1 forces the GUI onto X11/XWayland instead of native Wayland.
     // On some compositors — observed on KDE Plasma 6.7 / KWin (issue #48) — the
@@ -4496,7 +4536,8 @@ fn main() -> eframe::Result<()> {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1180.0, 760.0])
                 .with_min_inner_size([900.0, 560.0])
-                .with_title("keyroost"),
+                .with_title("keyroost")
+                .with_icon(window_icon()),
             ..Default::default()
         };
         if let Some(r) = renderer {
