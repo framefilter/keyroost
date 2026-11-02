@@ -9166,7 +9166,8 @@ fn run_otp(
             let raw = session.read_config()?;
             let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
             output::status(&format!("READ_CONFIG returned {} bytes: {hex}", raw.len()));
-            let info = session.read_device_info()?;
+            // Parsed from the same read, not a second one.
+            let info = keyroost_token2otp::DeviceInfo::parse(&raw)?;
             outln!("Device configuration:");
             outln!(
                 "  FIDO interface:         {}",
