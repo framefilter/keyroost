@@ -870,7 +870,10 @@ impl Session {
             )
         });
         let mut buf = [0u8; 2048];
-        let response = self.card.transmit(&cmd.apdu, &mut buf)?;
+        let response = self
+            .card
+            .transmit(&cmd.apdu, &mut buf)
+            .inspect_err(|e| trace_pcsc_error(self.debug, cmd.label, e))?;
         trace::line(self.debug, || {
             format_line(Dir::Received, cmd.label, &hex_dump(response))
         });
@@ -909,7 +912,10 @@ impl Session {
             )
         });
         let mut buf = [0u8; 2048];
-        let response = self.card.transmit(&cmd.apdu, &mut buf)?;
+        let response = self
+            .card
+            .transmit(&cmd.apdu, &mut buf)
+            .inspect_err(|e| trace_pcsc_error(self.debug, cmd.label, e))?;
         trace::line(self.debug, || {
             format_line(Dir::Received, cmd.label, &hex_dump(response))
         });
@@ -1302,6 +1308,15 @@ fn probe_note(body: &str) {
 ///
 /// PC/SC service failure errors; an individual reader that can't be connected is
 /// returned with all-false capabilities rather than failing the whole scan.
+/// A transmit that failed below the card (PC/SC itself: Windows' "access is
+/// denied" on a FIDO applet, a removed card) gets an answer line in the
+/// trace, so a request is never left without one.
+fn trace_pcsc_error(debug: bool, label: &str, e: &pcsc::Error) {
+    trace::line(debug, || {
+        format_line(Dir::Received, label, &format!("PC/SC error: {e}"))
+    });
+}
+
 /// A PIN+ R3.4's printed serial from its last successful read through the OTP
 /// applet, by reader and the 8-digit OpenPGP-AID serial the key also reports:
 /// a scan whose read fails (the key busy, say) keeps the printed serial, so
@@ -2219,7 +2234,9 @@ pub(crate) fn transmit_applet(
             format_line(Dir::Sent, io.label, &dump_cmd(&to_send, cmd_sensitive))
         });
         let mut buf = [0u8; 4096];
-        let resp = card.transmit(&to_send, &mut buf)?;
+        let resp = card
+            .transmit(&to_send, &mut buf)
+            .inspect_err(|e| trace_pcsc_error(debug, io.label, e))?;
         trace::line(debug, || {
             format_line(Dir::Received, io.label, &dump_resp(resp, resp_sensitive))
         });

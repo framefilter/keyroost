@@ -1058,7 +1058,17 @@ impl PcScOtpTransport {
                     to_send = apdu.to_vec();
                     continue;
                 }
-                Err(e) => return Err(OtpTransportError::Pcsc(e)),
+                Err(e) => {
+                    // A request is never left without an answer line.
+                    crate::trace::line(self.debug, || {
+                        format_line(
+                            Dir::Received,
+                            &otp_label("PCSC"),
+                            &format!("PC/SC error: {e}"),
+                        )
+                    });
+                    return Err(OtpTransportError::Pcsc(e));
+                }
             };
             trace_bytes(self.debug, Dir::Received, "PCSC", "", resp, resp_sensitive);
             if resp.len() < 2 {
