@@ -541,12 +541,23 @@ pub fn erase_all_usb() -> Vec<u8> {
     apdu
 }
 
-/// [`read_config`] for USB-HID: the byte count as a short Lc followed by that
-/// many zero bytes, the form Token2's own tools send over USB (captured from
-/// their Companion app). A PIN+ (R3.4) answers with as many bytes as the body
-/// carries: the short `Le` form gets `6FFB`, and a one-byte body behind an
-/// extended Lc (spec §3) gets one byte, leaving the capability bits unread.
+/// [`read_config`] for USB-HID: the byte count as a one-byte body behind an
+/// extended Lc (spec §3, §6.9). A PIN+ (R3.4) answers the short `Le` form
+/// with `6FFB` over USB, and this one with a single byte; for that key see
+/// [`read_config_usb_padded`].
 pub fn read_config_usb(num_bytes: u8) -> Vec<u8> {
+    let mut apdu = cmd::READ_CONFIG.to_vec();
+    apdu.extend_from_slice(&[0x00, 0x00, 0x01, num_bytes.clamp(1, 64)]);
+    apdu
+}
+
+/// [`read_config`] for USB-HID in the form Token2's own tools send (captured
+/// from their Companion app): the byte count as a short Lc followed by that
+/// many zero bytes. A PIN+ (R3.4) answers with as many bytes as the body
+/// carries, so this reads its whole block where the documented
+/// [`read_config_usb`] gets one byte. Not in the published spec, so callers
+/// send it only after the documented form came back that short.
+pub fn read_config_usb_padded(num_bytes: u8) -> Vec<u8> {
     let n = num_bytes.clamp(1, 64);
     let mut apdu = cmd::READ_CONFIG.to_vec();
     apdu.push(n);
@@ -879,12 +890,18 @@ mod tests {
             erase_all_usb(),
             vec![0x80, 0xC5, 0x05, 0x02, 0x00, 0x00, 0x00]
         );
-        let usb = read_config_usb(64);
-        assert_eq!(usb[..5], [0x80, 0xC5, 0x02, 0x00, 0x40]);
-        assert_eq!(usb.len(), 5 + 64);
-        assert!(usb[5..].iter().all(|&b| b == 0));
-        assert_eq!(read_config_usb(0).len(), 5 + 1); // clamped to >=1
-        assert_eq!(read_config_usb(200).len(), 5 + 64); // clamped to <=64
+        assert_eq!(
+            read_config_usb(64),
+            vec![0x80, 0xC5, 0x02, 0x00, 0x00, 0x00, 0x01, 0x40]
+        );
+        assert_eq!(*read_config_usb(0).last().unwrap(), 0x01); // clamped to >=1
+        assert_eq!(*read_config_usb(200).last().unwrap(), 0x40); // clamped to <=64
+        let padded = read_config_usb_padded(64);
+        assert_eq!(padded[..5], [0x80, 0xC5, 0x02, 0x00, 0x40]);
+        assert_eq!(padded.len(), 5 + 64);
+        assert!(padded[5..].iter().all(|&b| b == 0));
+        assert_eq!(read_config_usb_padded(0).len(), 5 + 1); // clamped to >=1
+        assert_eq!(read_config_usb_padded(200).len(), 5 + 64); // clamped to <=64
     }
 
     #[test]

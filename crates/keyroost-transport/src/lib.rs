@@ -1521,8 +1521,12 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 let sn = crate::token2otp::read_otp_applet_serial(|apdu| {
                     exchange_apdu(&card, apdu, 0x61, || vec![0x00, 0xC0, 0x00, 0x00, 0x00])
                 });
+                // Token2's prefix reference documents 12-digit serials; an
+                // R3.4 reports 14.
                 let r34 = sn.is_some_and(|sn| {
-                    keyroost_piv::fingerprint::token2_firmware_from_serial(sn) == Some(&[3, 4][..])
+                    (12..=14).contains(&sn.to_string().len())
+                        && keyroost_piv::fingerprint::token2_firmware_from_serial(sn)
+                            == Some(&[3, 4][..])
                 });
                 if r34 {
                     probe.serial = sn.map(|sn| sn.to_string());

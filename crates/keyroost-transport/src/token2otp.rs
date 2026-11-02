@@ -2151,14 +2151,28 @@ impl Token2OtpSession {
         // We return whatever we get; `DeviceInfo::parse` records the length so
         // callers can tell which fields are actually backed by real bytes rather
         // than zero-padding (see `DeviceInfo::has_config_byte`).
-        let apdu = if self.is_pcsc {
-            t2::read_config(64)
-        } else {
-            t2::read_config_usb(64)
-        };
-        let (data, sw) = self.transport.transmit(&apdu, false)?;
+        if self.is_pcsc {
+            let (data, sw) = self.transport.transmit(&t2::read_config(64), false)?;
+            OtpError::check(sw)?;
+            return Ok(data);
+        }
+        // Over USB, the documented form first. A PIN+ (R3.4) answers it with
+        // a single byte; only then try the form Token2's own tools send, and
+        // keep whichever answer is longer.
+        let (data, sw) = self.transport.transmit(&t2::read_config_usb(64), false)?;
         OtpError::check(sw)?;
-        Ok(data)
+        if data.len() > 1 {
+            return Ok(data);
+        }
+        match self
+            .transport
+            .transmit(&t2::read_config_usb_padded(64), false)
+        {
+            Ok((padded, sw)) if OtpError::check(sw).is_ok() && padded.len() > data.len() => {
+                Ok(padded)
+            }
+            _ => Ok(data),
+        }
     }
 
     /// Read and parse the device-info / configuration block (spec §6.9). Callers
