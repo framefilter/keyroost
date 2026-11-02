@@ -401,6 +401,15 @@ keyroostctl fido pin status --json</code></pre>
         run without a terminal to ask on. Add <code>--yes</code> if you meant it.</li>
       <li><strong><code>canceled; nothing was changed</code></strong>: you answered no, or
         pressed Ctrl-C or Ctrl-D.</li>
+      <li><strong>Odd characters like <code>├⌐</code> for é in PowerShell</strong>: PowerShell
+        reads a program's piped or redirected output (<code>| Select-String</code>,
+        <code>&gt; file.txt</code>, <code>| clip</code>) in the console's old code page
+        instead of UTF-8. keyroostctl writes its own arrows and dashes in plain ASCII
+        there, but letters like é in a key's name still come out wrong, and so does
+        <code>--json</code> piped into <code>ConvertFrom-Json</code>. Output shown in
+        the window is never affected. To fix it, run this once per session, or add it
+        to your <code>$PROFILE</code>:
+        <code>[Console]::OutputEncoding = [Text.UTF8Encoding]::new()</code></li>
     </ul>
     <p>Still stuck? <code>--debug</code> prints every message sent to and from the key.
       Look it over before posting it publicly, then share it in an
