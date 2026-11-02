@@ -25099,9 +25099,13 @@ impl App {
                                 .custom_formatter(blank_when_unsupported),
                         );
                         ui.label(
-                            egui::RichText::new("PUK tries")
+                            egui::RichText::new("New PUK tries")
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt2),
+                        )
+                        .on_hover_text(
+                            "The count to set, not the key's current one. Setting it also \
+                             resets the PIN and PUK to their defaults.",
                         );
                         ui.add_space(8.0);
                         ui.add_enabled(
@@ -25111,9 +25115,13 @@ impl App {
                                 .custom_formatter(blank_when_unsupported),
                         );
                         ui.label(
-                            egui::RichText::new("PIN tries")
+                            egui::RichText::new("New PIN tries")
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt2),
+                        )
+                        .on_hover_text(
+                            "The count to set, not the key's current one. Setting it also \
+                             resets the PIN and PUK to their defaults.",
                         );
                     },
                 );
