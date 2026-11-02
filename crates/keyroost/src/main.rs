@@ -100,6 +100,25 @@ fn is_user_activity(event: &egui::Event) -> bool {
     )
 }
 
+/// What a PIV reset returned the card to, when keyroost knows: `": PIN
+/// 865362, PUK 86536286 and the factory management key (\"Use default
+/// management key\")"`, or `""`. The CLI's `piv reset` says the same, naming
+/// its `--mgmt-key default` instead.
+fn piv_reset_defaults_note(
+    quirks: &std::collections::BTreeSet<keyroost_piv::compat::PivQuirk>,
+) -> String {
+    let pin_puk = keyroost_piv::compat::default_pin_puk_text(quirks);
+    let mgmt = keyroost_piv::compat::default_9b_management_key(quirks)
+        .is_some()
+        .then_some("the factory management key (\"Use default management key\")");
+    match (pin_puk, mgmt) {
+        (Some(p), Some(m)) => format!(": {p} and {m}"),
+        (Some(p), None) => format!(": {p}"),
+        (None, Some(m)) => format!(": {m}"),
+        (None, None) => String::new(),
+    }
+}
+
 /// Keeps text selections out of the X11 / Wayland primary selection (the one
 /// a middle click pastes). egui 0.37 sends every settled selection there,
 /// from text boxes and selectable labels alike; keyroost shows OTP codes and
@@ -11977,11 +11996,13 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Setting PIV retry counts\u{2026}", move || {
+            let mut defaults = None;
             let result =
                 keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
                     piv_authenticate(s, &mgmt)?;
                     s.verify_pin(pin.as_bytes())?;
                     s.set_pin_retries(pin_tries, puk_tries)?;
+                    defaults = keyroost_piv::compat::default_pin_puk_text(&s.quirks());
                     let status = s.status()?;
                     Ok((status, s.state()))
                 });
@@ -11992,7 +12013,10 @@ impl App {
                 Self::apply_piv_write(
                     app,
                     result,
-                    "Retry counts set; PIN/PUK reset to defaults.".into(),
+                    match defaults {
+                        Some(d) => format!("Retry counts set; PIN/PUK reset to defaults ({d})."),
+                        None => "Retry counts set; PIN/PUK reset to defaults.".into(),
+                    },
                 );
                 Self::apply_piv_cred_result(app);
             })
@@ -13294,6 +13318,7 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         let queued = self.spawn_piv_job("Resetting PIV applet\u{2026}", move || {
+            let mut defaults = String::new();
             let result =
                 keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
                     // The PIV pane's "Reset applet" card collects no
@@ -13309,6 +13334,7 @@ impl App {
                     // already the post-reset state; there's nothing left to
                     // clear by hand.
                     s.force_reset_if_known_supported(None, false)?;
+                    defaults = piv_reset_defaults_note(&s.quirks());
                     let status = s.status()?;
                     Ok((status, s.state()))
                 });
@@ -13317,7 +13343,7 @@ impl App {
                 Self::apply_piv_write(
                     app,
                     result,
-                    "PIV application reset to factory defaults.".into(),
+                    format!("PIV application reset to factory defaults{defaults}."),
                 );
             })
         });

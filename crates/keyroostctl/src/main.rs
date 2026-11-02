@@ -10195,10 +10195,14 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     authenticate_piv(s, &mgmt)?;
                     s.verify_pin(pin.as_bytes())?;
                     s.set_pin_retries(*pin_tries, *puk_tries)?;
+                    let defaults = keyroost_piv::compat::default_pin_puk_text(&s.quirks())
+                        .map(|t| format!(": {t}"))
+                        .unwrap_or_default();
                     outln!(
-                        "PIN/PUK retry counts set to {}/{}. Both reset to factory defaults.",
+                        "PIN/PUK retry counts set to {}/{}. Both reset to factory defaults{}.",
                         pin_tries,
-                        puk_tries
+                        puk_tries,
+                        defaults
                     );
                     Ok(())
                 },
@@ -11223,7 +11227,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     // ever grows its own use for it. `--force` on a card listed
                     // without RESET sends one bare RESET and blocks nothing.
                     s.force_reset_if_known_supported(current, *force)?;
-                    outln!("PIV application reset to factory defaults on {}.", serial);
+                    outln!(
+                        "PIV application reset to factory defaults on {}{}.",
+                        serial,
+                        piv_reset_defaults_note(&s.quirks())
+                    );
                     Ok(())
                 },
             )?;
@@ -15112,6 +15120,24 @@ fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn st
 
 /// `fido pin status`'s line: the retry count when a PIN is set (or when the
 /// key doesn't say), else (`None`) that none is set.
+/// What `piv reset` says the card is back to, when keyroost knows: `": PIN
+/// 865362, PUK 86536286 and the factory management key (--mgmt-key
+/// default)"`, or `""`.
+fn piv_reset_defaults_note(
+    quirks: &std::collections::BTreeSet<keyroost_piv::compat::PivQuirk>,
+) -> String {
+    let pin_puk = keyroost_piv::compat::default_pin_puk_text(quirks);
+    let mgmt = keyroost_piv::compat::default_9b_management_key(quirks)
+        .is_some()
+        .then_some("the factory management key (`--mgmt-key default`)");
+    match (pin_puk, mgmt) {
+        (Some(p), Some(m)) => format!(": {p} and {m}"),
+        (Some(p), None) => format!(": {p}"),
+        (None, Some(m)) => format!(": {m}"),
+        (None, None) => String::new(),
+    }
+}
+
 fn pin_status_line(pin_retries: Option<u32>) -> String {
     match pin_retries {
         None => "No FIDO2 PIN is set. Set one with `keyroostctl fido pin set`.".into(),
@@ -16782,6 +16808,31 @@ mod cli_tests {
         assert_eq!(
             json_out::piv_slot_token(keyroost_piv::Slot::retired(20).unwrap()),
             "95"
+        );
+    }
+
+    /// `piv reset` names the defaults the card returned to when keyroost
+    /// knows them (Token2's aren't YubiKey's), and only those it knows.
+    #[test]
+    fn piv_reset_names_the_defaults_it_knows() {
+        use keyroost_piv::compat::resolve_quirks;
+        use keyroost_piv::fingerprint::AppletFingerprint;
+        assert_eq!(
+            piv_reset_defaults_note(&resolve_quirks(AppletFingerprint::Token2, None, None)),
+            ": PIN 865362, PUK 86536286 and the factory management key (`--mgmt-key default`)"
+        );
+        assert_eq!(
+            piv_reset_defaults_note(&resolve_quirks(
+                AppletFingerprint::YubiKey,
+                Some(&[5, 7, 4]),
+                None
+            )),
+            ": PIN 123456, PUK 12345678 and the factory management key (`--mgmt-key default`)"
+        );
+        // IDPrime: only its management key is known.
+        assert_eq!(
+            piv_reset_defaults_note(&resolve_quirks(AppletFingerprint::IdPrime, None, None)),
+            ": the factory management key (`--mgmt-key default`)"
         );
     }
 

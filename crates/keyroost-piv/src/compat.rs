@@ -592,6 +592,19 @@ pub enum PivQuirk {
     /// `IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY` above is already only 16, and a future
     /// row for an AES-256 default must not need this type to change either.
     Default9bManagementKey(&'static [u8]),
+    /// The PIN and PUK this card returns to on a PIV reset, so a front end
+    /// can say what they are after one (a reset on a card whose defaults
+    /// aren't YubiKey's otherwise costs tries finding out). YubiKey: PIN
+    /// 123456, PUK 12345678 (Yubico's PIV introduction). Token2: PIN 865362
+    /// (Token2's own PIV tool, `token2/fido2-manage`,
+    /// token2-piv-gui/src-tauri/src/commands.rs) and PUK 86536286 (a PIN+ R3.4
+    /// reset to it, checked on the key).
+    DefaultPinPuk {
+        /// The default PIN.
+        pin: &'static str,
+        /// The default PUK.
+        puk: &'static str,
+    },
     /// This fingerprint (at the version the entry covers) is known to take
     /// unusually long to complete [`PivExtension::Reset`] — observed at over
     /// a minute on `ArekinathPivApplet::SwissbitIShield1`
@@ -703,6 +716,35 @@ pub fn default_9b_management_key(quirks: &BTreeSet<PivQuirk>) -> Option<&'static
         _ => None,
     })
 }
+
+/// The `(PIN, PUK)` a PIV reset returns this card to, from a resolved quirk
+/// set ([`PivQuirk::DefaultPinPuk`]); `None` when keyroost doesn't know them.
+#[must_use]
+pub fn default_pin_puk(quirks: &BTreeSet<PivQuirk>) -> Option<(&'static str, &'static str)> {
+    quirks.iter().find_map(|q| match q {
+        PivQuirk::DefaultPinPuk { pin, puk } => Some((*pin, *puk)),
+        _ => None,
+    })
+}
+
+/// [`default_pin_puk`] for a message: `"PIN 865362, PUK 86536286"`, shared
+/// by the CLI and the app after a reset or a retry-count change.
+#[must_use]
+pub fn default_pin_puk_text(quirks: &BTreeSet<PivQuirk>) -> Option<String> {
+    default_pin_puk(quirks).map(|(pin, puk)| format!("PIN {pin}, PUK {puk}"))
+}
+
+/// YubiKey's default PIV PIN and PUK (see [`PivQuirk::DefaultPinPuk`]).
+const YUBIKEY_DEFAULT_PIN_PUK: PivQuirk = PivQuirk::DefaultPinPuk {
+    pin: "123456",
+    puk: "12345678",
+};
+
+/// Token2's default PIV PIN and PUK (see [`PivQuirk::DefaultPinPuk`]).
+const TOKEN2_DEFAULT_PIN_PUK: PivQuirk = PivQuirk::DefaultPinPuk {
+    pin: "865362",
+    puk: "86536286",
+};
 
 /// One or more extensions' shared known-support verdicts within one
 /// fingerprint's applet-axis or firmware-axis table — e.g.
@@ -1368,6 +1410,7 @@ const YUBIKEY_APPLET_QUIRKS: &[VersionQuirks] = &[
         version: &[],
         quirks: &[
             PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+            YUBIKEY_DEFAULT_PIN_PUK,
             PivQuirk::NoTouchToGenerateOrImport,
         ],
     },
@@ -1375,6 +1418,7 @@ const YUBIKEY_APPLET_QUIRKS: &[VersionQuirks] = &[
         version: &[3],
         quirks: &[
             PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+            YUBIKEY_DEFAULT_PIN_PUK,
             PivQuirk::SlotTouchPolicyCachedNotSupported,
             PivQuirk::NoTouchToGenerateOrImport,
         ],
@@ -1383,6 +1427,7 @@ const YUBIKEY_APPLET_QUIRKS: &[VersionQuirks] = &[
         version: &[4, 3],
         quirks: &[
             PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+            YUBIKEY_DEFAULT_PIN_PUK,
             PivQuirk::NoTouchToGenerateOrImport,
         ],
     },
@@ -1537,6 +1582,7 @@ const TOKEN2_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
     quirks: &[
         PivQuirk::InsF8SerialIsBcd,
         PivQuirk::Default9bManagementKey(TOKEN2_DEFAULT_MGMT_KEY),
+        TOKEN2_DEFAULT_PIN_PUK,
     ],
 }];
 
@@ -5681,6 +5727,7 @@ mod tests {
                 BTreeSet::from([
                     PivQuirk::InsF8SerialIsBcd,
                     PivQuirk::Default9bManagementKey(TOKEN2_DEFAULT_MGMT_KEY),
+                    TOKEN2_DEFAULT_PIN_PUK,
                 ])
             );
         }
@@ -5698,7 +5745,33 @@ mod tests {
             BTreeSet::from([
                 PivQuirk::InsF8SerialIsBcd,
                 PivQuirk::Default9bManagementKey(TOKEN2_DEFAULT_MGMT_KEY),
+                TOKEN2_DEFAULT_PIN_PUK,
             ])
+        );
+    }
+
+    /// A reset's PIN and PUK are known for YubiKey (every applet version)
+    /// and Token2, and not invented for a card keyroost has no source for.
+    #[test]
+    fn default_pin_and_puk_after_a_reset() {
+        for version in [&[2][..], &[3, 1], &[4, 3, 5], &[5, 7, 4]] {
+            assert_eq!(
+                default_pin_puk(&resolve_quirks(
+                    AppletFingerprint::YubiKey,
+                    Some(version),
+                    None
+                )),
+                Some(("123456", "12345678")),
+                "{version:?}"
+            );
+        }
+        assert_eq!(
+            default_pin_puk(&resolve_quirks(AppletFingerprint::Token2, None, None)),
+            Some(("865362", "86536286"))
+        );
+        assert_eq!(
+            default_pin_puk(&resolve_quirks(AppletFingerprint::IdPrime, None, None)),
+            None
         );
     }
 
