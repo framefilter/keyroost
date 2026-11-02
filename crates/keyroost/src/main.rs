@@ -5023,6 +5023,9 @@ struct App {
         FileTarget,
         std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
     )>,
+    /// File-chooser dialogs asked for this frame, opened at its end
+    /// (`launch_file_dialogs`), where the window they belong to is at hand.
+    file_dialog_queue: Vec<FileDialogRequest>,
     /// Monotonic id handed to each "Save certificate…" request so its dialog
     /// and its parked certificate stay paired. Never reset (not even on a
     /// selection change): an id must not be reused while a dialog opened for
@@ -5095,16 +5098,19 @@ fn take_pending_cert(
     pending.remove(&id)
 }
 
+/// A file-chooser asked for during a frame (see [`App::spawn_file_dialog`]).
+struct FileDialogRequest {
+    target: FileTarget,
+    save: bool,
+    filters: Vec<(String, Vec<String>)>,
+    default_name: Option<String>,
+}
+
 impl App {
-    /// Spawn a native file-chooser for `target`. `save` picks the dialog kind
-    /// (Save… vs open); `filters` is `(name, &[extensions])` rows for the
-    /// type dropdown; `default_name` seeds the filename on save dialogs.
-    ///
-    /// rfd's portal backend is async, so the dialog runs on a throwaway thread
-    /// (driven by `pollster::block_on`) and the result returns over a channel
-    /// drained in `update()` — the egui frame thread is never blocked. The
-    /// frame loop is woken via `request_repaint` once the user dismisses the
-    /// dialog so the picked path lands without waiting for the next input event.
+    /// Ask for a native file-chooser for `target`. `save` picks the dialog
+    /// kind (Save… vs open); `filters` is `(name, &[extensions])` rows for the
+    /// type dropdown; `default_name` seeds the filename on save dialogs. The
+    /// dialog opens at the end of this frame ([`Self::launch_file_dialogs`]).
     fn spawn_file_dialog(
         &mut self,
         target: FileTarget,
@@ -5112,8 +5118,7 @@ impl App {
         filters: &[(&'static str, &'static [&'static str])],
         default_name: Option<&str>,
     ) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let owned_filters: Vec<(String, Vec<String>)> = filters
+        let filters = filters
             .iter()
             .map(|(name, exts)| {
                 (
@@ -5122,31 +5127,62 @@ impl App {
                 )
             })
             .collect();
-        let default_name = default_name.map(str::to_owned);
-        let egui_ctx = self.egui_ctx.clone();
-        std::thread::spawn(move || {
-            let result = pollster::block_on(async move {
-                let mut dialog = rfd::AsyncFileDialog::new();
-                for (name, exts) in &owned_filters {
-                    let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
-                    dialog = dialog.add_filter(name, &ext_refs);
-                }
-                if let Some(name) = &default_name {
-                    dialog = dialog.set_file_name(name);
-                }
-                let handle = if save {
-                    dialog.save_file().await
-                } else {
-                    dialog.pick_file().await
-                };
-                handle.map(|h| h.path().to_path_buf())
-            });
-            let _ = tx.send(result);
-            if let Some(ctx) = egui_ctx {
-                ctx.request_repaint();
-            }
+        self.file_dialog_queue.push(FileDialogRequest {
+            target,
+            save,
+            filters,
+            default_name: default_name.map(str::to_owned),
         });
-        self.pending_files.push((target, rx));
+    }
+
+    /// Open the file-choosers asked for this frame.
+    ///
+    /// On Windows each one is given keyroost's window as its parent: without
+    /// one, Windows may open the dialog (and any message box it shows) behind
+    /// keyroost, where it looks as if the button did nothing.
+    ///
+    /// rfd's portal backend is async, so the dialog runs on a throwaway thread
+    /// (driven by `pollster::block_on`) and the result returns over a channel
+    /// drained in `update()` — the egui frame thread is never blocked. The
+    /// frame loop is woken via `request_repaint` once the user dismisses the
+    /// dialog so the picked path lands without waiting for the next input event.
+    fn launch_file_dialogs(&mut self, frame: &eframe::Frame) {
+        for request in std::mem::take(&mut self.file_dialog_queue) {
+            let FileDialogRequest {
+                target,
+                save,
+                filters,
+                default_name,
+            } = request;
+            let mut dialog = rfd::AsyncFileDialog::new();
+            for (name, exts) in &filters {
+                let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+                dialog = dialog.add_filter(name, &ext_refs);
+            }
+            if let Some(name) = &default_name {
+                dialog = dialog.set_file_name(name);
+            }
+            if cfg!(windows) {
+                dialog = dialog.set_parent(frame);
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let egui_ctx = self.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let result = pollster::block_on(async move {
+                    let handle = if save {
+                        dialog.save_file().await
+                    } else {
+                        dialog.pick_file().await
+                    };
+                    handle.map(|h| h.path().to_path_buf())
+                });
+                let _ = tx.send(result);
+                if let Some(ctx) = egui_ctx {
+                    ctx.request_repaint();
+                }
+            });
+            self.pending_files.push((target, rx));
+        }
     }
 
     /// Drain any resolved file-chooser dialogs and write the picked path into
@@ -16021,7 +16057,7 @@ impl eframe::App for App {
     // are persisted by `App::persist_settings` into `settings.json` instead —
     // see the `settings` module.
 
-    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // eframe 0.35 drives the app through `App::ui` with a root `Ui` rather
         // than the old `update(ctx)`. Our layout is panel-based: the four panels
         // below are shown into `root_ui`, while the dialogs/popovers (which still
@@ -16319,6 +16355,7 @@ impl eframe::App for App {
         if animating {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+        self.launch_file_dialogs(frame);
     }
 }
 
