@@ -22751,6 +22751,13 @@ impl App {
                                     // pair of standalone actions, not a
                                     // labeled field, so they share the
                                     // modal's horizontal center instead.
+                                    // This card's factory-default key, when
+                                    // keyroost knows it and it fits the chosen
+                                    // algorithm (`--new-mgmt-key default` in
+                                    // the CLI).
+                                    let factory = self
+                                        .piv_current_default_mgmt_key()
+                                        .filter(|k| k.len() == alg.key_len());
                                     ui.vertical_centered(|ui| {
                                         // Plain accent-colored `Label` +
                                         // `Sense::click()`, not `ui.link()` —
@@ -22776,6 +22783,33 @@ impl App {
                                             .clicked()
                                         {
                                             self.piv_generate_random_mgmt_key(ui.ctx(), alg);
+                                        }
+                                        if let Some(key) = factory {
+                                            if ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(
+                                                            "Use the factory default",
+                                                        )
+                                                        .font(theme::f_sb(13.0))
+                                                        .color(p.accent),
+                                                    )
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text(
+                                                    "Fill in this key's factory-default \
+                                                     management key, to set it back.",
+                                                )
+                                                .clicked()
+                                            {
+                                                wipe(&mut self.piv.new_mgmt_key_input);
+                                                self.piv
+                                                    .new_mgmt_key_input
+                                                    .push_str(&hex_lower(key));
+                                                // A published value: nothing to hide.
+                                                self.secret_reveal.insert("piv-new-mgmt-key", true);
+                                            }
                                         }
                                     });
                                     // "Allow PIN unlock": whether the new key

@@ -1067,8 +1067,9 @@ enum PivMgmtKeyCmd {
         mgmt_key: Option<SecretSource>,
         /// The new management key (hex): env:NAME reads that environment
         /// variable, stdin reads one line (second line when --mgmt-key stdin is
-        /// also given; hidden when typed at a terminal). With neither, a
-        /// terminal asks.
+        /// also given; hidden when typed at a terminal), default sets the
+        /// factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, display_order = 14)]
         new_mgmt_key: Option<SecretSource>,
         /// Algorithm of the new management key.
@@ -9956,7 +9957,9 @@ const PIV_MGMT_KEY: Spec = Spec::current("management key", "mgmt-key")
 const PIV_OLD_MGMT_KEY: Spec = Spec::current("current management key", "mgmt-key")
     .hex()
     .with_default();
-const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-key").hex();
+const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-key")
+    .hex()
+    .with_default();
 
 fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
@@ -10227,16 +10230,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // The current key first (stdin line 1), then the new one (line 2).
             let (old, new) = pair.read(&mut sec)?;
             let old = old.mgmt(&PIV_OLD_MGMT_KEY)?;
-            let new = new.mgmt_hex(&PIV_NEW_MGMT_KEY)?;
+            let new = new.mgmt(&PIV_NEW_MGMT_KEY)?;
             let new_alg = algorithm.to_alg();
-            if new.len() != new_alg.key_len() {
-                return Err(format!(
-                    "new management key is {} bytes; {} needs {}",
-                    new.len(),
-                    new_alg.label(),
-                    new_alg.key_len()
-                )
-                .into());
+            // A typed key is checked before anything reaches the card; the
+            // factory default is known only once the card is identified.
+            if let MgmtKeyInput::Key(k) = &new {
+                check_new_mgmt_key_len(k, new_alg)?;
             }
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
@@ -10246,6 +10245,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let old = mgmt_key_bytes(&old, &PIV_OLD_MGMT_KEY, s)?;
+                    let new = mgmt_key_bytes(&new, &PIV_NEW_MGMT_KEY, s)?;
+                    check_new_mgmt_key_len(&new, new_alg)?;
                     guard_piv_feature(
                         s,
                         keyroost_piv::compat::PivExtension::SetManagementKey,
@@ -12237,6 +12238,23 @@ fn decode_mgmt_key_hex(spec: &Spec, hex: &str) -> Result<zeroize::Zeroizing<Vec<
 /// The key bytes for `input`; `--mgmt-key default` looks up this device's known
 /// factory default on the open session's fingerprint
 /// ([`keyroost_transport::PivSession::default_management_key`]).
+/// A new management key must be as long as its algorithm's keys.
+fn check_new_mgmt_key_len(
+    key: &[u8],
+    alg: keyroost_piv::MgmtAlg,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if key.len() == alg.key_len() {
+        return Ok(());
+    }
+    Err(format!(
+        "new management key is {} bytes; {} needs {}",
+        key.len(),
+        alg.label(),
+        alg.key_len()
+    )
+    .into())
+}
+
 fn mgmt_key_bytes(
     input: &MgmtKeyInput,
     spec: &Spec,
@@ -12388,13 +12406,6 @@ impl PairValue {
             PairValue::Default => Ok(MgmtKeyInput::Default),
             PairValue::Value(hex) => Ok(MgmtKeyInput::Key(decode_mgmt_key_hex(spec, &hex)?)),
         }
-    }
-    /// A management key that must be given as hex.
-    fn mgmt_hex(
-        self,
-        spec: &Spec,
-    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
-        Ok(decode_mgmt_key_hex(spec, &self.text()?)?)
     }
 }
 
