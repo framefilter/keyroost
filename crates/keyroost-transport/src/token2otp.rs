@@ -272,12 +272,16 @@ fn response_is_sensitive(apdu: &[u8]) -> bool {
     entries || serial
 }
 
-/// True when `apdu`'s *request* body carries a secret and must be redacted from
-/// the send trace. Shared by both transports so nothing sensitive reaches the
-/// trace on either path. Two families:
+/// True when `apdu`'s *request* body carries a secret or an account name and
+/// must be redacted from the send trace. Shared by both transports so nothing
+/// sensitive reaches the trace on either path. Three families:
 ///
 /// * **Seed writes** (`WRITE_SEED` / `WRITE_HOTP_SEED`, spec §1.3): the body is
 ///   the ECDH-sealed seed.
+/// * **Entry reads by name** (`ENUM_CODES` with any subcommand but
+///   `SUB_READ_ALL`): the body names an account. "Read all" carries only a
+///   timestamp and stays visible, so the entry list's request (and its
+///   `6A83`, "no entries", on an empty key) can be read in the trace.
 /// * **PIN material** (`SET_OTP_PIN` / `VERIFY_OTP_PIN` / `CHANGE_OTP_PIN`): the
 ///   body carries the encrypted PIN hash or new-PIN block. `VERIFY_OTP_PIN`
 ///   also has two 1-byte forms that carry no secret — lock (`0x00`) and
@@ -285,14 +289,16 @@ fn response_is_sensitive(apdu: &[u8]) -> bool {
 ///   actual payload (`Lc > 1`). Every PIN command is short-`Lc` (payloads are
 ///   well under 256 bytes), so `apdu[4]` is the length byte.
 fn request_is_sensitive(apdu: &[u8]) -> bool {
-    let seed = matches!(apdu.get(1), Some(0xC5))
-        && matches!(apdu.get(2), Some(0x05) | Some(0x00))
-        && matches!(apdu.get(3), Some(0x02) | Some(0x00));
+    let header = apdu.get(..4);
+    let seed = header == Some(&cmd::WRITE_SEED[..]) || header == Some(&cmd::WRITE_HOTP_SEED[..]);
+    // ENUM_CODES: Lc at [4], the subcommand at [5].
+    let named_read =
+        header == Some(&cmd::ENUM_CODES[..]) && apdu.get(5) != Some(&cmd::SUB_READ_ALL);
     let pin_material = matches!(apdu.get(1), Some(0xC5))
         && matches!(apdu.get(2), Some(0x05))
         && matches!(apdu.get(3), Some(0x05) | Some(0x06) | Some(0x08))
         && matches!(apdu.get(4), Some(&lc) if lc > 1);
-    seed || pin_material
+    seed || named_read || pin_material
 }
 
 /// Render one debug-trace line. Sensitive payloads (seed blobs on the way
@@ -2489,6 +2495,13 @@ mod trace_redaction_tests {
         // The request body carries the ECDH-sealed seed on both write paths.
         assert!(request_is_sensitive(&cmd::WRITE_SEED));
         assert!(request_is_sensitive(&cmd::WRITE_HOTP_SEED));
+        // The entry list: "read all" (a timestamp) is visible, a read by
+        // name is not.
+        let read_all = keyroost_token2otp::build_apdu(cmd::ENUM_CODES, &[cmd::SUB_READ_ALL, 0, 0]);
+        assert!(!request_is_sensitive(&read_all));
+        let read_one = keyroost_token2otp::build_apdu(cmd::ENUM_CODES, &[cmd::SUB_READ_ONE, b'a']);
+        assert!(request_is_sensitive(&read_one));
+        assert!(!request_is_sensitive(&cmd::ENUM_CODES_CONTINUE));
         // A read command's request has no secret and stays in the clear.
         assert!(!request_is_sensitive(&cmd::GET_ECDH_PUBKEY));
         assert!(!request_is_sensitive(&cmd::READ_CONFIG));
