@@ -36,8 +36,8 @@ pub use identity::{
     IdentityReader, KeyAnswer, IDENTITY_READERS,
 };
 pub use names::{
-    apply_names, apply_updates, clear_key_names, name_held_elsewhere, row_serials, serial_tail,
-    set_key_name, KeyLabel, NameSource, NameUpdate, Naming,
+    apply_names, apply_updates, clear_key_names, name_held_elsewhere, row_serials,
+    serial_for_display, serial_tail, set_key_name, KeyLabel, NameSource, NameUpdate, Naming,
 };
 pub use select::{
     device_value, endpoint, list_number, list_order, molto_reader_serial, parse_device_spec,

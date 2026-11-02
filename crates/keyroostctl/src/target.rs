@@ -84,7 +84,10 @@ fn announce_via(d: &Device, via: &str) -> String {
         sanitize_terminal(&d.name.clone().unwrap_or_else(|| d.model_title()))
     );
     if !d.serial.is_empty() {
-        line.push_str(&format!(" \u{b7} serial {}", sanitize_terminal(&d.serial)));
+        line.push_str(&format!(
+            " \u{b7} serial {}",
+            sanitize_terminal(&keyroost_resolve::serial_for_display(&d.serial))
+        ));
     }
     if !via.is_empty() {
         line.push_str(&format!(" \u{b7} {via}"));

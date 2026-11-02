@@ -8763,7 +8763,7 @@ impl App {
                     keyroost_resolve::exclude_unresettable_piv(&mut plan);
                 }
                 let summary = factory_reset_confirm_summary(
-                    &dev.serial,
+                    &keyroost_resolve::serial_for_display(&dev.serial),
                     &dev.model,
                     &plan,
                     piv_preview,
@@ -18518,7 +18518,7 @@ impl App {
                     let serial = if dev.serial.is_empty() {
                         "\u{2014}".to_string()
                     } else {
-                        dev.serial.clone()
+                        keyroost_resolve::serial_for_display(&dev.serial).into_owned()
                     };
                     let mut meta = format!(
                         "{} \u{00B7} #{} \u{00B7} {}",
