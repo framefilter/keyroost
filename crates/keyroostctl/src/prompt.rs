@@ -35,7 +35,7 @@ impl Term for RealTerm {
         )
     }
     fn say(&mut self, line: &str) {
-        eprintln!("{line}");
+        errln!("{line}");
     }
     fn ask(&mut self, prompt: &str) -> std::io::Result<String> {
         let mut err = std::io::stderr();
@@ -450,14 +450,14 @@ pub(crate) const TOUCH_SIGNAL_PROMPT: &str = "touch your key to continue\u{2026}
 /// touch, up front.
 pub(crate) fn touch(msg: &str) {
     TOUCH_PROMPTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    eprintln!("{msg}");
+    errln!("{msg}");
 }
 
 /// The key reported over USB that it is waiting for a touch: say so, unless
 /// this run already printed a touch prompt.
 pub(crate) fn touch_signal() {
     if let Some(line) = touch_signal_line(&TOUCH_PROMPTED) {
-        eprintln!("{line}");
+        errln!("{line}");
     }
 }
 

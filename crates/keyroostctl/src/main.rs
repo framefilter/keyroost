@@ -24,6 +24,33 @@ use std::sync::OnceLock;
 use keyroost_keyring::Keyring;
 use keyroost_resolve::{ccid_readers_if_needed, ccid_serials_for, Need};
 
+/// `println!`, `print!` and `eprintln!` for the CLI's own text: on Windows,
+/// text going to a pipe or a file gets its punctuation in ASCII (see
+/// `output::ascii_punctuation`). Binary output and JSON don't use these.
+macro_rules! outln {
+    () => {
+        $crate::output::out_line(::std::format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::out_line(::std::format_args!($($arg)*))
+    };
+}
+
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::output::out_text(::std::format_args!($($arg)*))
+    };
+}
+
+macro_rules! errln {
+    () => {
+        $crate::output::err_line(::std::format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::err_line(::std::format_args!($($arg)*))
+    };
+}
+
 mod code_import;
 mod json_out;
 mod openpgp_keys;
@@ -731,7 +758,7 @@ fn cert_import_error(
 /// Print the success line of a certificate import plus, when the automatic
 /// choice compressed it, why.
 fn print_cert_stored(line: &str, stored: &keyroost_transport::CertImport) {
-    println!(
+    outln!(
         "{line}{}.",
         stored_compressed_suffix(stored.compressed, stored.stored_len)
     );
@@ -5802,7 +5829,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     if short_glued_after_source(&argv) {
-        eprintln!(
+        errln!(
             "error: unexpected argument after a secret source (not shown, in case it is a \
              secret); give a short flag its value as a separate word (`-s 9a`)"
         );
@@ -5812,7 +5839,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(cli) => cli,
         Err(e) => {
             if let Some(msg) = redacted_parse_error(&e, &argv) {
-                eprintln!("error: {msg}");
+                errln!("error: {msg}");
                 std::process::exit(2);
             }
             e.exit()
@@ -5822,7 +5849,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| molto_slot_missing(cli.command.as_ref()))
         .or_else(|| name_clear_conflict(cli.command.as_ref(), cli.device.as_deref()))
     {
-        eprintln!("error: {msg}");
+        errln!("error: {msg}");
         std::process::exit(2);
     }
     // Capture --device once so target::select() can honor it without threading
@@ -5903,7 +5930,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let name = format!("keyroostctl-{}.1", sub.get_name());
             render(sub, &dir.join(name))?;
         }
-        eprintln!("Wrote man pages to {}.", dir.display());
+        errln!("Wrote man pages to {}.", dir.display());
         return Ok(());
     }
     if let Cmd::Doctor = cmd {
@@ -6106,15 +6133,20 @@ fn run_molto(
             .filter(|(_, b)| *all || b.seed_present || b.title.is_some())
             .collect();
         if shown.is_empty() && sweep_err.is_none() {
-            println!("No occupied or titled slots (use --all to list all 100).");
+            outln!("No occupied or titled slots (use --all to list all 100).");
             return Ok(());
         }
-        println!(
+        outln!(
             "{:>4}  {:>8}  {:<16}  {:<6}  {:>4}  {:>6}",
-            "slot", "occupied", "title", "algo", "step", "digits"
+            "slot",
+            "occupied",
+            "title",
+            "algo",
+            "step",
+            "digits"
         );
         for (i, b) in shown {
-            println!(
+            outln!(
                 "{:>4}  {:>8}  {:<16}  {:<6}  {:>4}  {:>6}",
                 i,
                 if b.seed_present { "yes" } else { "-" },
@@ -6128,7 +6160,7 @@ fn run_molto(
             );
         }
         if let Some((slot, e)) = sweep_err {
-            println!(
+            outln!(
                 "{:>4}  {}",
                 slot,
                 sanitize_terminal(&format!(
@@ -6155,7 +6187,7 @@ fn run_molto(
             .map(sanitize_terminal)
             .unwrap_or_else(|| "(none)".into());
         let occupied = if block.seed_present { "yes" } else { "no" };
-        println!(
+        outln!(
             "{}",
             output::kv_block(&[("Title", title), ("Occupied", occupied.into())])
         );
@@ -6184,12 +6216,12 @@ fn run_molto(
         crate::prompt::confirm_on_held(&dev, *yes, &format!("delete slot #{slot}'s seed"))?;
         match session.delete_seed(*slot)? {
             SeedDeleteOutcome::Deleted => {
-                println!(
+                outln!(
                     "Seed deleted from slot #{}; the title (if any) remains.",
                     slot
                 )
             }
-            SeedDeleteOutcome::AlreadyEmpty => println!("Slot #{} was already empty.", slot),
+            SeedDeleteOutcome::AlreadyEmpty => outln!("Slot #{} was already empty.", slot),
         }
         return Ok(());
     }
@@ -6329,14 +6361,14 @@ fn run_molto(
                 unreachable!("read before authentication")
             };
             session.set_seed(*slot, seed)?;
-            println!("Seed written to slot #{}.", slot);
+            outln!("Seed written to slot #{}.", slot);
         }
         MoltoCmd::Title {
             slot: Some(slot),
             cmd: Some(MoltoTitleCmd::Set { title }),
         } => {
             session.set_title(*slot, title)?;
-            println!("Title set on slot #{}.", slot);
+            outln!("Title set on slot #{}.", slot);
         }
         MoltoCmd::Seed { slot: None, .. }
         | MoltoCmd::Title { slot: None, .. }
@@ -6362,19 +6394,19 @@ fn run_molto(
                 utc_time: unix_now(),
             };
             session.set_config(*slot, &cfg)?;
-            println!("Slot #{} configured.", slot);
+            outln!("Slot #{} configured.", slot);
         }
         MoltoCmd::Sync { slot, all } => {
             if *all {
                 for p in 0..=99u8 {
                     match session.sync_time(p, unix_now()) {
-                        Ok(()) => println!("Time synced on slot #{}.", p),
+                        Ok(()) => outln!("Time synced on slot #{}.", p),
                         Err(e) => output::warn(&format!("time sync failed on slot #{p}: {e}")),
                     }
                 }
             } else if let Some(p) = slot {
                 session.sync_time(*p, unix_now())?;
-                println!("Time synced on slot #{}.", p);
+                outln!("Time synced on slot #{}.", p);
             } else {
                 return Err("sync requires --slot <N> or --all".into());
             }
@@ -6411,7 +6443,7 @@ fn run_molto(
                 *slot,
                 &entry.to_profile_config(unix_now(), display_timeout.to_proto()),
             )?;
-            println!(
+            outln!(
                 "Imported {:?} to slot #{} ({} bytes secret, {:?}, {} digits).",
                 final_title,
                 slot,
@@ -6460,7 +6492,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                     || "(unrecognized serial — not a known Token2 model)".to_owned(),
                     str::to_owned,
                 );
-                println!(
+                outln!(
                     "{}",
                     output::kv_block(&[
                         ("Model", model),
@@ -6508,7 +6540,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             same_prog_token(&seen_serial, &session.read_info()?.serial)?;
             session.authenticate()?;
             session.set_seed(&seed)?;
-            println!("Seed programmed ({} bytes).", seed.len());
+            outln!("Seed programmed ({} bytes).", seed.len());
         }
         ProgCmd::Config {
             cmd:
@@ -6556,7 +6588,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             };
             session.authenticate()?;
             session.set_config(&cfg)?;
-            println!("Config programmed (clock set to {now}).");
+            outln!("Config programmed (clock set to {now}).");
         }
     }
     Ok(())
@@ -6640,7 +6672,7 @@ fn print_no_reader_hints() {
     }
     if let Ok(readers) = keyroost_transport::reader_usb_devices() {
         for card in keyroost_resolve::smart_cards_without_reader(&cards, &readers) {
-            println!("{}", no_reader_hint(&card));
+            outln!("{}", no_reader_hint(&card));
         }
     }
 }
@@ -6649,44 +6681,44 @@ fn print_no_reader_hints() {
 /// inline. Never touches card state and always exits 0 — it's a flashlight,
 /// not a gate.
 fn run_doctor() {
-    println!("keyroost doctor — environment check\n");
+    outln!("keyroost doctor — environment check\n");
 
     // PC/SC service + readers.
     match Session::list_readers() {
         Ok(readers) => {
-            println!("✓ PC/SC service reachable");
+            outln!("✓ PC/SC service reachable");
             if readers.is_empty() {
-                println!("– no smart-card readers present (plug in a key/token to test further)");
+                outln!("– no smart-card readers present (plug in a key/token to test further)");
             } else {
-                println!("✓ {} reader(s):", readers.len());
+                outln!("✓ {} reader(s):", readers.len());
                 for r in &readers {
-                    println!("    {}{}", sanitize_terminal(r), doctor_reader_tag(r));
+                    outln!("    {}{}", sanitize_terminal(r), doctor_reader_tag(r));
                 }
             }
             #[cfg(target_os = "linux")]
             print_no_reader_hints();
         }
         Err(e) => {
-            println!("✗ PC/SC unavailable: {}", e);
+            outln!("✗ PC/SC unavailable: {}", e);
         }
     }
-    println!();
+    outln!();
 
     // FIDO HID devices + node access.
     if !keyroost_hid::hid_supported() {
-        println!("– FIDO HID enumeration not supported on this platform/backend");
+        outln!("– FIDO HID enumeration not supported on this platform/backend");
     } else {
         match keyroost_hid::enumerate() {
             Ok(devices) => {
                 let fido: Vec<_> = devices.iter().filter(|d| d.is_fido()).collect();
                 if fido.is_empty() {
-                    println!("– no FIDO HID devices present");
+                    outln!("– no FIDO HID devices present");
                     if admin_only_fido_key_present() {
-                        println!("  {ADMIN_ONLY_FIDO_NOTE}");
+                        outln!("  {ADMIN_ONLY_FIDO_NOTE}");
                     }
                     for d in &devices {
                         if let Some(label) = d.bootloader_label() {
-                            println!("  note: {} at {} — re-plug it", label, d.path.display());
+                            outln!("  note: {} at {} — re-plug it", label, d.path.display());
                         }
                     }
                 } else {
@@ -6697,7 +6729,7 @@ fn run_doctor() {
                         // On Linux a permission error here is the udev-rules
                         // litmus test.
                         match keyroost_ctap::hid::CtapHidDevice::check_access(&d.path) {
-                            Ok(()) => println!(
+                            Ok(()) => outln!(
                                 "✓ {} ({}) is accessible",
                                 sanitize_terminal(&d.product_name),
                                 d.path.display()
@@ -6705,14 +6737,14 @@ fn run_doctor() {
                             Err(keyroost_ctap::hid::HidTransportError::Io(e))
                                 if e.kind() == std::io::ErrorKind::PermissionDenied =>
                             {
-                                println!(
+                                outln!(
                                     "✗ {} ({}) permission denied{}",
                                     sanitize_terminal(&d.product_name),
                                     d.path.display(),
                                     HID_PERMISSION_HINT
                                 );
                             }
-                            Err(e) => println!(
+                            Err(e) => outln!(
                                 "✗ {} ({}) open failed: {}",
                                 sanitize_terminal(&d.product_name),
                                 d.path.display(),
@@ -6722,25 +6754,25 @@ fn run_doctor() {
                     }
                 }
             }
-            Err(e) => println!("✗ HID enumeration failed: {}", e),
+            Err(e) => outln!("✗ HID enumeration failed: {}", e),
         }
     }
-    println!();
+    outln!();
 
     // udev rules (Linux only; elsewhere access is the OS's department).
     #[cfg(target_os = "linux")]
     {
         let rules = std::path::Path::new("/etc/udev/rules.d/70-keyroost-fido.rules");
         if rules.exists() {
-            println!("✓ udev rules installed ({})", rules.display());
+            outln!("✓ udev rules installed ({})", rules.display());
         } else {
-            println!(
+            outln!(
                 "– udev rules not found at {} — FIDO commands will need them; \
                  PC/SC features work without (see README)",
                 rules.display()
             );
         }
-        println!();
+        outln!();
     }
 
     // Registry file permissions.
@@ -6750,22 +6782,22 @@ fn run_doctor() {
             {
                 use std::os::unix::fs::PermissionsExt;
                 match std::fs::metadata(&path) {
-                    Ok(m) if m.permissions().mode() & 0o077 != 0 => println!(
+                    Ok(m) if m.permissions().mode() & 0o077 != 0 => outln!(
                         "– {} is readable by other users (next save tightens it to 0600)",
                         path.display()
                     ),
-                    Ok(_) => println!("✓ {} is owner-only", path.display()),
-                    Err(e) => println!("✗ cannot stat {}: {}", path.display(), e),
+                    Ok(_) => outln!("✓ {} is owner-only", path.display()),
+                    Err(e) => outln!("✗ cannot stat {}: {}", path.display(), e),
                 }
             }
             #[cfg(not(unix))]
-            println!("✓ registry present at {}", path.display());
+            outln!("✓ registry present at {}", path.display());
         }
-        Some(path) => println!(
+        Some(path) => outln!(
             "– no registry yet ({}) — created on first `name set`",
             path.display()
         ),
-        None => println!("– no config dir resolvable (HOME/XDG unset?)"),
+        None => outln!("– no config dir resolvable (HOME/XDG unset?)"),
     }
 }
 
@@ -6810,36 +6842,36 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
     // `--device` narrows the human output to that one key's correlated row;
     // the raw reader/HID sections (which aren't per-key) are skipped.
     if device.is_none() {
-        println!("PC/SC readers:");
+        outln!("PC/SC readers:");
         match Session::list_readers() {
-            Ok(readers) if readers.is_empty() => println!("  (none)"),
+            Ok(readers) if readers.is_empty() => outln!("  (none)"),
             Ok(readers) => {
                 for r in readers {
-                    println!("  {}", sanitize_terminal(&r));
+                    outln!("  {}", sanitize_terminal(&r));
                 }
             }
-            Err(e) => println!("  (unavailable: {})", e),
+            Err(e) => outln!("  (unavailable: {})", e),
         }
 
-        println!();
-        println!("Applet probe (per reader):");
+        outln!();
+        outln!("Applet probe (per reader):");
     }
     let (probes, probe_ok) = match keyroost_transport::probe_readers() {
         Ok(p) => (p, true),
         Err(e) => {
             if device.is_none() {
-                println!("  (unavailable: {})", e);
+                outln!("  (unavailable: {})", e);
             }
             (Vec::new(), false)
         }
     };
     if device.is_none() {
         if probe_ok && probes.is_empty() {
-            println!("  (no readers)");
+            outln!("  (no readers)");
         } else if probe_ok {
             for p in &probes {
                 if p.is_molto2 {
-                    println!("  {}  [Molto2 token]", sanitize_terminal(&p.reader_name));
+                    outln!("  {}  [Molto2 token]", sanitize_terminal(&p.reader_name));
                     continue;
                 }
                 let mut applets = Vec::new();
@@ -6857,23 +6889,23 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
                 } else {
                     applets.join(", ")
                 };
-                println!("  {}  ->  {}", sanitize_terminal(&p.reader_name), list);
+                outln!("  {}  ->  {}", sanitize_terminal(&p.reader_name), list);
             }
         }
 
-        println!();
+        outln!();
         let header = if all_hid {
             "HID devices:"
         } else {
             "FIDO HID devices:"
         };
-        println!("{}", header);
+        outln!("{}", header);
     }
     let (hids, hids_ok) = match keyroost_hid::enumerate() {
         Ok(d) => (d, true),
         Err(e) => {
             if device.is_none() {
-                println!("  (unavailable: {})", e);
+                outln!("  (unavailable: {})", e);
             }
             (Vec::new(), false)
         }
@@ -6882,12 +6914,12 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
     if device.is_none() && hids_ok {
         let filtered: Vec<_> = hids.iter().filter(|d| all_hid || d.is_fido()).collect();
         if filtered.is_empty() {
-            println!("  (none)");
+            outln!("  (none)");
             if admin_only_fido_key_present() {
-                println!("  {ADMIN_ONLY_FIDO_NOTE}");
+                outln!("  {ADMIN_ONLY_FIDO_NOTE}");
             }
             if let Some(bl) = keyroost_hid::bootloader_device_present() {
-                println!("  note: detected {bl} — re-plug it to return to application mode.");
+                outln!("  note: detected {bl} — re-plug it to return to application mode.");
             }
         } else {
             // CCID attribution only ever applies to FIDO HID nodes (a YubiKey's
@@ -6934,7 +6966,7 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
                 } else {
                     pname
                 };
-                println!(
+                outln!(
                     "  {} {:04x}:{:04x} usage={:04x}:{:04x} {}{}{}{}",
                     d.path.display(),
                     d.vendor_id,
@@ -6955,7 +6987,7 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
     // topology alone can't decide), so the raw sections above and this
     // decision can't disagree.
     if device.is_none() {
-        println!();
+        outln!();
     }
     let debug = crate::target::debug_on();
     let mut devices = keyroost_resolve::correlate_live(&hids, &probes, &keyring, debug);
@@ -7249,7 +7281,7 @@ fn run_factory_reset(
         .into());
     }
 
-    eprintln!(
+    errln!(
         "factory reset steps: {}",
         plan.iter()
             .map(|s| s.label())
@@ -7308,15 +7340,15 @@ fn run_factory_reset(
         };
         let label = step.label();
         match &outcome {
-            StepOutcome::Wiped => println!("{label:<8} wiped"),
+            StepOutcome::Wiped => outln!("{label:<8} wiped"),
             // Device-wide mechanism, not confined to PIV alone — name the
             // whole device instead of just the applet that triggered it.
             StepOutcome::WipedGlobal => {
-                println!("{:<8} wiped", keyroost_resolve::PIV_GLOBAL_RESET_LABEL)
+                outln!("{:<8} wiped", keyroost_resolve::PIV_GLOBAL_RESET_LABEL)
             }
-            StepOutcome::WipedWithWarning(e) => println!("{label:<8} wiped (warning: {e})"),
-            StepOutcome::Failed(e) => println!("{label:<8} failed: {e}"),
-            StepOutcome::Skipped(reason) => println!("{label:<8} skipped: {reason}"),
+            StepOutcome::WipedWithWarning(e) => outln!("{label:<8} wiped (warning: {e})"),
+            StepOutcome::Failed(e) => outln!("{label:<8} failed: {e}"),
+            StepOutcome::Skipped(reason) => outln!("{label:<8} skipped: {reason}"),
         }
         reports.push(StepReport {
             step: *step,
@@ -7325,7 +7357,7 @@ fn run_factory_reset(
     }
 
     let (summary, verdict) = factory_reset_summary(&reports);
-    println!("{summary}");
+    outln!("{summary}");
     verdict.map_err(Into::into)
 }
 
@@ -7795,7 +7827,7 @@ fn fido_reset_after_replug(
     // No Enter to press: the replug itself is the go-ahead. Watching the cheap
     // HID-only scan (no identity reads) keeps the poll light; a run nobody
     // replugs for simply times out with nothing sent to the key.
-    eprintln!(
+    errln!(
         "Unplug {} and plug it back in now (waiting up to {} seconds)\u{2026}",
         sanitize_terminal(label),
         REPLUG_BUDGET.as_secs()
@@ -8265,10 +8297,10 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 return Ok(());
             }
             if creds.is_empty() {
-                println!("(no OATH credentials)");
+                outln!("(no OATH credentials)");
             } else {
                 for c in creds {
-                    println!(
+                    outln!(
                         "{}  [{}/{}]",
                         sanitize_terminal(&c.name),
                         oath_type_str(c.oath_type),
@@ -8326,7 +8358,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 })?;
                 return Ok(());
             }
-            println!("{}", code.code);
+            outln!("{}", code.code);
         }
         OathCmd::Add {
             name,
@@ -8380,7 +8412,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 crate::prompt::touch("Saving \u{2014} touch the key if it blinks\u{2026}");
             }
             session.put(&params)?;
-            println!(
+            outln!(
                 "Added OATH {} credential {:?}.",
                 oath_type_str(oath_type.to_oath()),
                 name
@@ -8442,7 +8474,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // password; without one this sends nothing.
             session.reauthenticate()?;
             session.delete(name)?;
-            println!("Deleted OATH credential {:?}.", name);
+            outln!("Deleted OATH credential {:?}.", name);
         }
         OathCmd::Password {
             cmd: OathPasswordCmd::Set { access, .. },
@@ -8459,14 +8491,14 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let mut session =
                 open_oath_unlocked(&name, current.as_deref().map(String::as_str), debug)?;
             session.set_password(&new_pw)?;
-            println!("OATH password set.");
+            outln!("OATH password set.");
         }
         OathCmd::Password {
             cmd: OathPasswordCmd::Clear { access },
         } => {
             let mut session = open_oath(&mut Secrets::real(), access, debug)?;
             session.clear_password()?;
-            println!("OATH password cleared.");
+            outln!("OATH password cleared.");
         }
         OathCmd::Reset { reader, yes } => {
             let dev = crate::target::select(Need::Oath, reader.as_deref(), None)?;
@@ -8481,7 +8513,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 crate::prompt::touch("Resetting \u{2014} touch the key if it blinks\u{2026}");
             }
             session.factory_reset()?;
-            println!("OATH applet reset: all credentials wiped, access password cleared.");
+            outln!("OATH applet reset: all credentials wiped, access password cleared.");
         }
     }
     Ok(())
@@ -8610,7 +8642,7 @@ fn open_otp_on(
         OtpTarget::HidThenReader(p, r) => match S::open_hid_path(&p, debug) {
             Ok(s) => s,
             Err(hid_err) => {
-                eprintln!(
+                errln!(
                     "{}",
                     sanitize_terminal(&format!(
                         "USB-HID path failed ({hid_err}); trying the same key's \
@@ -8815,7 +8847,7 @@ fn otp_pin_if_needed(
     }; // the probe session is closed here, before any prompt
     if let Err(e) = &pinned {
         if sec.terminal_present() {
-            eprintln!(
+            errln!(
                 "{}",
                 sanitize_terminal(&format!(
                     "could not tell whether this key has an OTP PIN ({e}); asking for it in case"
@@ -8927,7 +8959,7 @@ fn run_otp(
                 );
             }
             let method = session.unlock_fp_or_pin(pin.as_deref().map(|p| p.as_str()), true)?;
-            eprintln!(
+            errln!(
                 "Unlocked with {}.",
                 match method {
                     keyroost_transport::UnlockMethod::Fingerprint => "fingerprint",
@@ -8961,7 +8993,7 @@ fn run_otp(
                         })?;
                         return Ok(());
                     }
-                    println!("{code}");
+                    outln!("{code}");
                 }
                 None => return Err("device did not return a code for that entry".into()),
             }
@@ -9006,7 +9038,7 @@ fn run_otp(
             } else {
                 format!("{app}:{account}")
             };
-            println!("Added OTP entry {label:?}.");
+            outln!("Added OTP entry {label:?}.");
         }
         OtpCmd::Import {
             file,
@@ -9055,7 +9087,7 @@ fn run_otp(
             )?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.delete_entry_pinned(app, account, pin.as_deref().map(|p| p.as_str()))?;
-            println!("Deleted OTP entry {label:?}.");
+            outln!("Deleted OTP entry {label:?}.");
         }
         OtpCmd::Reset { yes } => {
             let dev = select_otp(&sel)?;
@@ -9066,7 +9098,7 @@ fn run_otp(
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             arm_otp_erase_prompt(&mut session);
             session.erase_all()?;
-            println!("Erased all OTP entries.");
+            outln!("Erased all OTP entries.");
         }
         OtpCmd::Serial => {
             let mut session = open_otp(&sel, debug)?;
@@ -9076,7 +9108,7 @@ fn run_otp(
                 emit_json(&json_out::OtpSerialJson { serial: hex })?;
                 return Ok(());
             }
-            println!("{hex}");
+            outln!("{hex}");
         }
         OtpCmd::Button {
             cmd:
@@ -9106,7 +9138,7 @@ fn run_otp(
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.set_button_hotp(*digits, &seed, !*no_enter, *long_touch, *numpad)?;
-            println!("Configured the HOTP-on-button keystroke slot.");
+            outln!("Configured the HOTP-on-button keystroke slot.");
         }
         OtpCmd::Button {
             cmd: OtpButtonCmd::Clear { yes },
@@ -9116,7 +9148,7 @@ fn run_otp(
             crate::prompt::confirm_on(&dev, *yes, "clear the HOTP-on-button seed")?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.delete_button_hotp()?;
-            println!("Cleared the HOTP-on-button keystroke slot.");
+            outln!("Cleared the HOTP-on-button keystroke slot.");
         }
         OtpCmd::Info => {
             let mut session = open_otp(&sel, debug)?;
@@ -9126,8 +9158,8 @@ fn run_otp(
             let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
             output::status(&format!("READ_CONFIG returned {} bytes: {hex}", raw.len()));
             let info = session.read_device_info()?;
-            println!("Device configuration:");
-            println!(
+            outln!("Device configuration:");
+            outln!(
                 "  FIDO interface:         {}",
                 if info.fido_disabled() {
                     "disabled"
@@ -9135,7 +9167,7 @@ fn run_otp(
                     "enabled"
                 }
             );
-            println!(
+            outln!(
                 "  keyboard-HID interface: {}",
                 if info.hotp_keystroke_disabled() {
                     "disabled"
@@ -9143,7 +9175,7 @@ fn run_otp(
                     "enabled"
                 }
             );
-            println!(
+            outln!(
                 "  CCID interface:         {}",
                 if info.ccid_disabled() {
                     "disabled"
@@ -9158,9 +9190,9 @@ fn run_otp(
                 Some(false) => "no",
                 None => "unknown (device returned a short config block)",
             };
-            println!("  on-device OTP support:  {}", cap(OtpFeature::OnDevice));
-            println!("  HOTP-on-touch support:  {}", cap(OtpFeature::ButtonHotp));
-            println!(
+            outln!("  on-device OTP support:  {}", cap(OtpFeature::OnDevice));
+            outln!("  HOTP-on-touch support:  {}", cap(OtpFeature::ButtonHotp));
+            outln!(
                 "  HOTP-on-touch slot:     {}",
                 if !info.has_config_byte() {
                     "unknown (device returned a short config block)"
@@ -9221,9 +9253,9 @@ fn run_otp(
             .collect();
 
             let dev = select_otp(&sel)?;
-            eprintln!("This will reconfigure the key's USB interfaces:");
-            eprintln!("  enable:  {}", enabled.join(", "));
-            eprintln!(
+            errln!("This will reconfigure the key's USB interfaces:");
+            errln!("  enable:  {}", enabled.join(", "));
+            errln!(
                 "  disable: {}",
                 if disabled.is_empty() {
                     "(none)".to_string()
@@ -9231,7 +9263,7 @@ fn run_otp(
                     disabled.join(", ")
                 }
             );
-            eprintln!(
+            errln!(
                 "Disabling an interface removes the matching features until you re-enable it.\n\
                  If you disable the interface you are currently connected over, you may not be\n\
                  able to reach the key to undo this. Proceed with caution."
@@ -9248,7 +9280,7 @@ fn run_otp(
 
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.set_device_type(disable)?;
-            println!("Interface configuration updated. Re-plug the key for it to take effect.");
+            outln!("Interface configuration updated. Re-plug the key for it to take effect.");
         }
         OtpCmd::Pin {
             cmd: OtpPinCmd::Status,
@@ -9268,12 +9300,13 @@ fn run_otp(
                 return Ok(());
             }
             match flag {
-                Some(f) if f.is_set() => println!(
+                Some(f) if f.is_set() => outln!(
                     "OTP PIN: set  (retries left: {}, max: {})",
-                    f.retries_left, f.max_retries
+                    f.retries_left,
+                    f.max_retries
                 ),
-                Some(_) => println!("OTP PIN: not set"),
-                None => println!(
+                Some(_) => outln!("OTP PIN: not set"),
+                None => outln!(
                     "OTP PIN: not offered by this key (the OTP-PIN feature arrived with R3.4)"
                 ),
             }
@@ -9285,7 +9318,7 @@ fn run_otp(
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_pin(pin.as_str())?;
-            println!("OTP PIN set. Codes now require the PIN to read.");
+            outln!("OTP PIN set. Codes now require the PIN to read.");
         }
         OtpCmd::Pin {
             cmd: OtpPinCmd::Verify { pin },
@@ -9294,7 +9327,7 @@ fn run_otp(
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.verify_pin(pin.as_str())?;
-            println!("OTP PIN verified; read window open for this connection.");
+            outln!("OTP PIN verified; read window open for this connection.");
         }
         OtpCmd::Pin {
             cmd: OtpPinCmd::Change { .. },
@@ -9308,7 +9341,7 @@ fn run_otp(
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.change_pin(current.as_str(), new.as_str())?;
-            println!("OTP PIN changed.");
+            outln!("OTP PIN changed.");
         }
         OtpCmd::Pin {
             cmd: OtpPinCmd::Clear { pin },
@@ -9317,7 +9350,7 @@ fn run_otp(
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.remove_pin(current.as_str())?;
-            println!("OTP PIN removed. Codes are readable without a PIN again.");
+            outln!("OTP PIN removed. Codes are readable without a PIN again.");
         }
         OtpCmd::Fingerprint {
             cmd: OtpFingerprintCmd::Status,
@@ -9325,9 +9358,9 @@ fn run_otp(
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             match session.fp_supported()? {
-                Some(true) => println!("Fingerprint-protected OTP: enabled"),
-                Some(false) => println!("Fingerprint-protected OTP: disabled (supported)"),
-                None => println!("Fingerprint-protected OTP: not available on this firmware"),
+                Some(true) => outln!("Fingerprint-protected OTP: enabled"),
+                Some(false) => outln!("Fingerprint-protected OTP: disabled (supported)"),
+                None => outln!("Fingerprint-protected OTP: not available on this firmware"),
             }
         }
         OtpCmd::Fingerprint {
@@ -9337,7 +9370,7 @@ fn run_otp(
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), true)?;
-            println!("Fingerprint protection enabled. Touch the sensor to unlock codes.");
+            outln!("Fingerprint protection enabled. Touch the sensor to unlock codes.");
         }
         OtpCmd::Fingerprint {
             cmd: OtpFingerprintCmd::Disable { pin },
@@ -9346,7 +9379,7 @@ fn run_otp(
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), false)?;
-            println!("Fingerprint protection disabled.");
+            outln!("Fingerprint protection disabled.");
         }
     }
     Ok(())
@@ -9381,7 +9414,7 @@ fn print_otp_entries(
         return emit_json(&json_out::AccountsJson { accounts });
     }
     if entries.is_empty() {
-        println!("(no OTP entries)");
+        outln!("(no OTP entries)");
     }
     for e in entries {
         let label = if e.app_name.is_empty() {
@@ -9392,7 +9425,7 @@ fn print_otp_entries(
         // app/account names come from the device; strip escapes.
         let label = sanitize_terminal(&label);
         let code = e.code.as_deref().unwrap_or("\u{2014}"); // em dash when withheld
-        println!(
+        outln!(
             "{label}  [{}/{}]  {}{}",
             keyroost_transport::otp_type_str(e.otp_type),
             otp_algo_str_t2(e.algorithm),
@@ -9473,17 +9506,17 @@ fn openpgp_sign_input(
 /// Print a public key read from (or freshly generated into) an OpenPGP slot:
 /// RSA prints modulus and exponent, ECC the public point, both in hex.
 fn print_openpgp_public_key(slot_label: &str, attrs: &[u8], key: &keyroost_openpgp::PublicKey) {
-    println!(
+    outln!(
         "{} key ({}):",
         slot_label,
         keyroost_openpgp::describe_algorithm_attributes(attrs)
     );
     match key {
         keyroost_openpgp::PublicKey::Rsa { modulus, exponent } => {
-            println!("  modulus:  {}", hex_encode(modulus));
-            println!("  exponent: {}", hex_encode(exponent));
+            outln!("  modulus:  {}", hex_encode(modulus));
+            outln!("  exponent: {}", hex_encode(exponent));
         }
-        keyroost_openpgp::PublicKey::Ecc { point } => println!("  point:    {}", hex_encode(point)),
+        keyroost_openpgp::PublicKey::Ecc { point } => outln!("  point:    {}", hex_encode(point)),
     }
 }
 
@@ -9542,14 +9575,14 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 return Ok(());
             }
 
-            println!("AID:            {}", hex_encode(&status.aid));
+            outln!("AID:            {}", hex_encode(&status.aid));
             // The serial as GnuPG shows it (a YubiKey's equals its serial
             // elsewhere); a Token2 key's full serial from its OTP applet is
             // shown as printed on the key.
             if let Some(serial) = status.serial_text() {
-                println!("Serial:         {serial}");
+                outln!("Serial:         {serial}");
             }
-            println!(
+            outln!(
                 "Key algorithms: sig={} dec={} aut={}",
                 status.algorithm_label(keyroost_openpgp::KeyCrt::Sign),
                 status.algorithm_label(keyroost_openpgp::KeyCrt::Decrypt),
@@ -9558,13 +9591,15 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             print_fingerprint("Signature  fpr", &status.fingerprint_sig, key_present_sig);
             print_fingerprint("Decryption fpr", &status.fingerprint_dec, key_present_dec);
             print_fingerprint("Auth       fpr", &status.fingerprint_aut, key_present_aut);
-            println!(
+            outln!(
                 "PIN retries:    PW1={} RC={} PW3={}",
-                status.tries_pw1, status.tries_rc, status.tries_pw3
+                status.tries_pw1,
+                status.tries_rc,
+                status.tries_pw3
             );
             match status.signature_count {
-                Some(n) => println!("Signatures:     {}", n),
-                None => println!("Signatures:     (unavailable)"),
+                Some(n) => outln!("Signatures:     {}", n),
+                None => outln!("Signatures:     (unavailable)"),
             }
         }
         OpenpgpCmd::Pin {
@@ -9583,7 +9618,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             session.verify_pin(which.pw_ref(), pin.as_bytes())?;
-            println!("{} PIN verified.", which.label());
+            outln!("{} PIN verified.", which.label());
         }
         OpenpgpCmd::Key {
             cmd: OpenpgpKeyCmd::Show { slot, reader },
@@ -9598,7 +9633,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         } => {
             let mut session = open_openpgp(reader.as_deref(), debug)?;
             match session.supported_algorithms()? {
-                None => println!(
+                None => outln!(
                     "This card does not publish an algorithm list (pre-3.4 OpenPGP card). \
                      Any --algorithm may be tried; the card rejects what it cannot do."
                 ),
@@ -9613,7 +9648,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                             .iter()
                             .map(|a| keyroost_openpgp::describe_algorithm_attributes(a))
                             .collect();
-                        println!("{:<8} {}", format!("{name}:"), labels.join(", "));
+                        outln!("{:<8} {}", format!("{name}:"), labels.join(", "));
                     }
                 }
             }
@@ -9629,7 +9664,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 None => format!("AID {}", hex_encode(&status.aid)),
             };
             session.factory_reset()?;
-            println!(
+            outln!(
                 "OpenPGP applet on {} reset. All keys wiped; PINs restored to defaults.",
                 ident
             );
@@ -9676,8 +9711,8 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // self-consistent.
             let creation_time = unix_now();
             let fpr = session.register_key(slot.to_crt(), creation_time)?;
-            println!("  fingerprint: {}", hex_encode(&fpr));
-            println!("  created:     {} (unix)", creation_time);
+            outln!("  fingerprint: {}", hex_encode(&fpr));
+            outln!("  created:     {} (unix)", creation_time);
         }
         OpenpgpCmd::Key {
             cmd: cmd @ OpenpgpKeyCmd::Import { .. },
@@ -9702,7 +9737,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let mut session = open_openpgp_at(&name, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             session.set_cardholder_name(cardholder.as_bytes())?;
-            println!("Cardholder name set.");
+            outln!("Cardholder name set.");
         }
         OpenpgpCmd::Url {
             cmd:
@@ -9721,7 +9756,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let mut session = open_openpgp_at(&name, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             session.set_url(url.as_bytes())?;
-            println!("Public-key URL set.");
+            outln!("Public-key URL set.");
         }
         OpenpgpCmd::Sign {
             r#in,
@@ -9758,9 +9793,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 Some(path) => {
                     write_private_file(path, &sig, out_mode)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
-                    eprintln!("Wrote {} signature bytes to {}.", sig.len(), path.display());
+                    errln!("Wrote {} signature bytes to {}.", sig.len(), path.display());
                 }
-                None => println!("{}", hex_encode(&sig)),
+                None => outln!("{}", hex_encode(&sig)),
             }
         }
         OpenpgpCmd::Decrypt {
@@ -9816,14 +9851,14 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 Some(path) => {
                     write_private_file(path, &plain, out_mode)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
-                    eprintln!(
+                    errln!(
                         "Wrote {} {} bytes to {}.",
                         plain.len(),
                         noun,
                         path.display()
                     );
                 }
-                None => println!("{}", hex_encode(&plain)),
+                None => outln!("{}", hex_encode(&plain)),
             }
         }
         OpenpgpCmd::Authenticate {
@@ -9863,9 +9898,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 Some(path) => {
                     write_private_file(path, &sig, out_mode)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
-                    eprintln!("Wrote {} signature bytes to {}.", sig.len(), path.display());
+                    errln!("Wrote {} signature bytes to {}.", sig.len(), path.display());
                 }
-                None => println!("{}", hex_encode(&sig)),
+                None => outln!("{}", hex_encode(&sig)),
             }
         }
         OpenpgpCmd::Pin {
@@ -9882,11 +9917,11 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             match pin_kind(*admin) {
                 OpenpgpPinKind::User => {
                     session.change_user_pin(old.as_bytes(), new.as_bytes())?;
-                    println!("User PIN (PW1) changed.");
+                    outln!("User PIN (PW1) changed.");
                 }
                 OpenpgpPinKind::Admin => {
                     session.change_admin_pin(old.as_bytes(), new.as_bytes())?;
-                    println!("Admin PIN (PW3) changed.");
+                    outln!("Admin PIN (PW3) changed.");
                 }
             }
         }
@@ -9903,7 +9938,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // reset_retry_counter verifies PW3 internally, then RESET RETRY
             // COUNTER sets the new user PIN — don't double-verify here.
             session.reset_retry_counter(admin.as_bytes(), new.as_bytes())?;
-            println!("User PIN (PW1) unblocked and reset.");
+            outln!("User PIN (PW1) unblocked and reset.");
         }
     }
     Ok(())
@@ -9987,9 +10022,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         status.applet_name.clone()
                     };
 
-                    println!(
+                    outln!(
                         "Applet:      {} ({})",
-                        applet_name, status.applet_fingerprint
+                        applet_name,
+                        status.applet_fingerprint
                     );
                     // Tolerant of any non-empty GET VERSION reply, not just real
                     // Yubico firmware's 3 bytes — some third-party PIV applets that
@@ -10013,19 +10049,19 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         .filter(|fw| Some(*fw) != status.version.as_deref())
                         .map(|fw| format!(" (FW v{})", keyroost_piv::format_version_bytes(fw)))
                         .unwrap_or_default();
-                    println!("Version:     {version_str}{fw_suffix}");
+                    outln!("Version:     {version_str}{fw_suffix}");
                     match status.serial {
-                        Some(s) => println!("Serial:      {}", keyroost_piv::format_serial_long(s)),
-                        None => println!("Serial:      (unavailable)"),
+                        Some(s) => outln!("Serial:      {}", keyroost_piv::format_serial_long(s)),
+                        None => outln!("Serial:      (unavailable)"),
                     }
                     match status.pin_retries {
-                        Some(0) => println!("PIN retries: 0 (blocked)"),
-                        Some(n) => println!("PIN retries: {}", n),
+                        Some(0) => outln!("PIN retries: 0 (blocked)"),
+                        Some(n) => outln!("PIN retries: {}", n),
                         // `piv info` never verifies the PIN and opens its
                         // own session, so this shows only if the card kept
                         // a verification from elsewhere; still say so.
-                        None if status.pin_verified => println!("PIN retries: (PIN verified)"),
-                        None => println!("PIN retries: (unavailable)"),
+                        None if status.pin_verified => outln!("PIN retries: (PIN verified)"),
+                        None => outln!("PIN retries: (unavailable)"),
                     }
                     match &status.chuid {
                         Some(c) => {
@@ -10034,18 +10070,18 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             // value after the label.
                             let or_empty =
                                 |s: String| if s.is_empty() { "empty".to_string() } else { s };
-                            println!("CHUID:");
-                            println!("  FASC-N:      {}", c.fasc_n_display());
-                            println!("  GUID:        {}", c.guid_display());
-                            println!("  Expiration:  {}", c.expiration_display());
-                            println!("  Signature:   {}", or_empty(c.signature_display()));
-                            println!("  LRC:         {}", or_empty(c.lrc_display()));
+                            outln!("CHUID:");
+                            outln!("  FASC-N:      {}", c.fasc_n_display());
+                            outln!("  GUID:        {}", c.guid_display());
+                            outln!("  Expiration:  {}", c.expiration_display());
+                            outln!("  Signature:   {}", or_empty(c.signature_display()));
+                            outln!("  LRC:         {}", or_empty(c.lrc_display()));
                         }
-                        None => println!("CHUID:       (unavailable)"),
+                        None => outln!("CHUID:       (unavailable)"),
                     }
-                    println!("Slots:");
+                    outln!("Slots:");
                     for s in status.slots.iter().chain(&retired.in_use) {
-                        println!(
+                        outln!(
                             "  {:<26} {}",
                             s.slot.label(),
                             piv_slot_state(
@@ -10060,7 +10096,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     // Said only when every retired slot answered: a key
                     // without them answers none, and then nothing is said.
                     if retired.in_use.is_empty() && retired.all_read {
-                        println!("  {:<26} all empty", "retired keys (82\u{2013}95)");
+                        outln!("  {:<26} all empty", "retired keys (82\u{2013}95)");
                     }
                     Ok(())
                 },
@@ -10081,7 +10117,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     s.change_pin(old.as_bytes(), new.as_bytes())?;
-                    println!("PIN changed.");
+                    outln!("PIN changed.");
                     Ok(())
                 },
             )?;
@@ -10101,7 +10137,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     s.change_puk(old.as_bytes(), new.as_bytes())?;
-                    println!("PUK changed.");
+                    outln!("PUK changed.");
                     Ok(())
                 },
             )?;
@@ -10121,7 +10157,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
-                    println!("PIN unblocked and reset.");
+                    outln!("PIN unblocked and reset.");
                     Ok(())
                 },
             )?;
@@ -10159,9 +10195,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     authenticate_piv(s, &mgmt)?;
                     s.verify_pin(pin.as_bytes())?;
                     s.set_pin_retries(*pin_tries, *puk_tries)?;
-                    println!(
+                    outln!(
                         "PIN/PUK retry counts set to {}/{}. Both reset to factory defaults.",
-                        pin_tries, puk_tries
+                        pin_tries,
+                        puk_tries
                     );
                     Ok(())
                 },
@@ -10271,7 +10308,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         s.set_management_key(current, new_alg, &new, *touch)?;
                         keyroost_transport::PinProtectMaintenance::NotApplicable
                     };
-                    println!(
+                    outln!(
                         "Management key changed to {}{}.",
                         new_alg.label(),
                         if *touch { " (touch required)" } else { "" }
@@ -10281,7 +10318,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         keyroost_transport::PinProtectMaintenance::Ran {
                             printed_data: Ok(()),
                         } => {
-                            println!(
+                            outln!(
                                 "{}",
                                 if *allow_pin_unlock {
                                     "PIN-protected management-key storage enabled: the PIN \
@@ -10400,14 +10437,14 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         pub_mode
                             .write(path, pem.as_bytes())
                             .map_err(|e| format!("write {}: {}", path.display(), e))?;
-                        eprintln!(
+                        errln!(
                     "Wrote key material for {} to {} — pass it to `piv cert request`/`piv cert \
                      generate`'s --pubkey-in if you sign this key from a separate command.",
                     slot.to_slot().label(),
                     path.display()
                 );
                     }
-                    print!("{}", pem);
+                    out!("{}", pem);
                     Ok(())
                 },
             )?;
@@ -10775,13 +10812,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             out_mode.write(path, pem.as_bytes()).map_err(|e| {
                                 crate::prompt::write_error(path, &e, note.as_deref())
                             })?;
-                            eprintln!(
+                            errln!(
                                 "Wrote certificate request for {} to {}.",
                                 slot.to_slot().label(),
                                 path.display()
                             );
                         }
-                        None => print!("{}", pem),
+                        None => out!("{}", pem),
                     }
                     Ok(())
                 },
@@ -10920,7 +10957,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         out_mode
                             .write(path, keyroost_piv::x509::pem_certificate(&der).as_bytes())
                             .map_err(|e| crate::prompt::write_error(path, &e, Some(&note)))?;
-                        eprintln!("PEM copy written to {}.", path.display());
+                        errln!("PEM copy written to {}.", path.display());
                     }
                     Ok(())
                 },
@@ -11036,9 +11073,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         })?;
                     } else {
                         if !cert_tested {
-                            println!("{}", keyroost_pivtest::CARD_KEY_NOTE);
+                            outln!("{}", keyroost_pivtest::CARD_KEY_NOTE);
                         }
-                        println!("{}", keyroost_pivtest::format_report(&results));
+                        outln!("{}", keyroost_pivtest::format_report(&results));
                     }
                     if !all_ok {
                         return Err("one or more self-tests failed".into());
@@ -11081,7 +11118,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
                     s.new_chuid(&guid, &expiration)?;
-                    println!("Wrote a new CHUID (GUID {}).", hex_encode(&guid));
+                    outln!("Wrote a new CHUID (GUID {}).", hex_encode(&guid));
                     Ok(())
                 },
             )?;
@@ -11186,7 +11223,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     // ever grows its own use for it. `--force` on a card listed
                     // without RESET sends one bare RESET and blocks nothing.
                     s.force_reset_if_known_supported(current, *force)?;
-                    println!("PIV application reset to factory defaults on {}.", serial);
+                    outln!("PIV application reset to factory defaults on {}.", serial);
                     Ok(())
                 },
             )?;
@@ -11219,7 +11256,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
                     s.clear_certificate(slot.to_slot())?;
-                    println!(
+                    outln!(
                         "Cleared the certificate in {} (the private key remains).",
                         slot.to_slot().label()
                     );
@@ -11259,7 +11296,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     guard_piv_feature(s, keyroost_piv::compat::PivExtension::DeleteKey, *force)?;
                     authenticate_piv(s, &mgmt)?;
                     s.delete_key(slot.to_slot())?;
-                    println!(
+                    outln!(
                         "Deleted the private key in {} (the certificate object, if any, remains).",
                         slot.to_slot().label()
                     );
@@ -11294,10 +11331,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let dest = to.to_slot();
                     if let Some(note) = piv_move_dest_note(s.slot_key_presence(dest), &dest.label())
                     {
-                        eprintln!("note: {note}");
+                        errln!("note: {note}");
                     }
                     s.move_key(from.to_slot(), dest)?;
-                    println!(
+                    outln!(
                         "Moved the private key {} \u{2192} {}; the certificate remains in {}.",
                         from.to_slot().label(),
                         to.to_slot().label(),
@@ -11862,7 +11899,7 @@ fn report_key_import(
             ),
             stored,
         ),
-        None => println!(
+        None => outln!(
             "Imported the {} key into {}. The file has no certificate for it, so the slot \
              now has none.",
             alg.label(),
@@ -11870,7 +11907,7 @@ fn report_key_import(
         ),
     }
     if tested {
-        println!("{}", keyroost_pivtest::format_report(&report.self_test));
+        outln!("{}", keyroost_pivtest::format_report(&report.self_test));
     }
 }
 
@@ -12124,7 +12161,7 @@ fn inline_generate_key(
         pub_mode
             .write(path, pem.as_bytes())
             .map_err(|e| crate::prompt::write_error(path, &e, Some(&note)))?;
-        eprintln!(
+        errln!(
             "Wrote a copy of {}'s generated public key to {}.",
             slot.label(),
             path.display()
@@ -12681,7 +12718,7 @@ fn load_pubkey_material(
 
 /// Print a key fingerprint, rendering an all-zero (no key) slot as "(none)".
 fn print_fingerprint(label: &str, fpr: &[u8; 20], key_present: Option<bool>) {
-    println!("{}: {}", label, fingerprint_text(fpr, key_present));
+    outln!("{}: {}", label, fingerprint_text(fpr, key_present));
 }
 
 /// The value half of an `openpgp info` fingerprint line. An all-zero
@@ -12933,7 +12970,7 @@ fn name_set(
                 NamePlace::Key => NameSource::Key,
             });
     if unchanged && place == NamePlace::Computer {
-        println!("already named '{shown}'; nothing changed");
+        outln!("already named '{shown}'; nothing changed");
         return Ok(());
     }
     let meta = record_meta_for(&dev, &keyroost_hid::enumerate().unwrap_or_default());
@@ -12943,7 +12980,7 @@ fn name_set(
             let plan = plan_key_label(&dev, Some(name), &v)?;
             let previous = plan.previous.as_ref().map(|l| l.label.as_str());
             if previous == Some(name) {
-                println!("already named '{shown}'; nothing changed");
+                outln!("already named '{shown}'; nothing changed");
                 return Ok(());
             }
             let question = previous.map(|old| {
@@ -12971,8 +13008,8 @@ fn name_set(
                 )
                 .into());
             }
-            println!("Name set on the key: {shown}");
-            eprintln!("The name is stored on the key and is visible to anyone who has the key.");
+            outln!("Name set on the key: {shown}");
+            errln!("The name is stored on the key and is visible to anyone who has the key.");
             Ok(())
         }
     }
@@ -12993,14 +13030,14 @@ fn name_set_local(
         meta,
     )?;
     // Opt-in disclosure: state plainly what is stored, and how to undo it.
-    eprintln!(
+    errln!(
         "This saves a fingerprint of the key (a salted hash of its serial, not the \
          serial itself) with the name in keys.json on this computer; remove it with: \
          keyroostctl name clear {}",
         quoted_name(name)
     );
     let written = keyring.save_default()?;
-    println!("Name set on this computer: {}", sanitize_terminal(name));
+    outln!("Name set on this computer: {}", sanitize_terminal(name));
     output::status(&format!("Saved to {}.", written.display()));
     Ok(())
 }
@@ -13082,7 +13119,7 @@ fn name_clear_by_name(
         match here {
             Some(d) => match &d.naming.on_key {
                 KeyLabel::Present(l) if l == name => {
-                    eprintln!("{}", crate::target::announce_line(d, Need::FidoHid));
+                    errln!("{}", crate::target::announce_line(d, Need::FidoHid));
                     clear_key_label(sec, src, yes, d, name)?;
                 }
                 _ => note = unread_name_note(d),
@@ -13093,14 +13130,14 @@ fn name_clear_by_name(
     let mut keyring = Keyring::load_default()?;
     keyring.remove(name);
     keyring.save_default()?;
-    println!("Removed the name '{shown}'.");
+    outln!("Removed the name '{shown}'.");
     if stays_on_key {
-        eprintln!(
+        errln!(
             "the name stays on the key itself; plug the key in and run this again to remove it there"
         );
     }
     if let Some(n) = note {
-        eprintln!("{n}");
+        errln!("{n}");
     }
     Ok(())
 }
@@ -13129,12 +13166,12 @@ fn name_clear_selected(
     }
     if gone > 0 {
         keyring.save_default()?;
-        println!("Removed this key's name.");
+        outln!("Removed this key's name.");
     } else if cleared_on_key {
-        println!("Removed this key's name.");
+        outln!("Removed this key's name.");
     }
     if let Some(n) = note {
-        eprintln!("{n}");
+        errln!("{n}");
     }
     Ok(())
 }
@@ -13338,7 +13375,7 @@ fn name_list() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     for line in name_list_lines(&rows) {
-        println!("{line}");
+        outln!("{line}");
     }
     Ok(())
 }
@@ -13559,7 +13596,7 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             let force_change = *force_change;
             with_configurator(path.as_deref(), &pin, move |cfg, _info| {
                 cfg.set_min_pin_length(Some(length), &[], force_change)?;
-                println!(
+                outln!(
                     "Minimum PIN length set to {length}.{}",
                     if force_change {
                         " A PIN change is now required on next use."
@@ -13586,7 +13623,7 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             fido_reverify_if_prompted(&sec, &dev)?;
             with_configurator(path.as_deref(), &pin, |cfg, _info| {
                 cfg.force_pin_change()?;
-                println!("A PIN change is now required on next use of this key.");
+                outln!("A PIN change is now required on next use of this key.");
                 Ok(())
             })?;
             Ok(())
@@ -13721,7 +13758,7 @@ fn run_fido_always_uv(
     // wanted state is never asked for its PIN.
     let current = fido_info_before_pin(&dev)?;
     let already = || {
-        println!("\"Always require user verification\" is already {word}; nothing was changed.");
+        outln!("\"Always require user verification\" is already {word}; nothing was changed.");
     };
     if always_uv_pre_pin_step(&current, want_on)? == AlwaysUvStep::AlreadySet {
         already();
@@ -13735,7 +13772,7 @@ fn run_fido_always_uv(
             AlwaysUvStep::AlreadySet => already(),
             AlwaysUvStep::Change => {
                 cfg.toggle_always_uv()?;
-                println!("\"Always require user verification\" is now {word}.");
+                outln!("\"Always require user verification\" is now {word}.");
             }
         }
         Ok(())
@@ -13817,7 +13854,7 @@ fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>
             )?;
             with_configurator(path.as_deref(), &pin, |cfg, _info| {
                 cfg.enable_enterprise_attestation()?;
-                println!("Enterprise attestation enabled. Disabling it again requires a reset.");
+                outln!("Enterprise attestation enabled. Disabling it again requires a reset.");
                 Ok(())
             })?;
             Ok(())
@@ -13977,7 +14014,7 @@ fn run_fido_ssh_cert_list(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (creds, array) = enumerate_ssh_credentials(path, pin)?;
     if creds.is_empty() {
-        println!("No resident SSH credentials (ssh:* relying parties) on this key.");
+        outln!("No resident SSH credentials (ssh:* relying parties) on this key.");
         return Ok(());
     }
     for (rp_id, c) in &creds {
@@ -13986,7 +14023,7 @@ fn run_fido_ssh_cert_list(
             .as_ref()
             .and_then(|k| keyroost_ctap::large_blobs::extract_cert_from_entries(k, &array))
             .is_some();
-        println!(
+        outln!(
             "{}  {}",
             sanitize_terminal(rp_id),
             if has_cert {
@@ -14270,33 +14307,33 @@ fn run_fido_large_blob_list(
     }
     let skipped = array.skipped_count();
     if array.is_empty() && skipped == 0 {
-        println!("(large-blob array is empty)");
+        outln!("(large-blob array is empty)");
     }
     for (i, e) in array.entries().into_iter().enumerate() {
         use keyroost_ctap::large_blobs::EntryKind;
         match e.classify() {
             EntryKind::Note(text) => {
-                println!(
+                outln!(
                     "[{}] {} bytes  note      {}",
                     i,
                     e.orig_size,
                     preview_note(&text)
                 )
             }
-            EntryKind::SshCert { info, .. } => println!(
+            EntryKind::SshCert { info, .. } => outln!(
                 "[{}] {} bytes  ssh-cert  {} ({})",
                 i,
                 e.orig_size,
                 sanitize_terminal(&info.key_id),
                 sanitize_terminal(&info.principals.join(","))
             ),
-            EntryKind::KeyName(l) => println!(
+            EntryKind::KeyName(l) => outln!(
                 "[{}] {} bytes  key name  \"{}\"",
                 i,
                 e.orig_size,
                 sanitize_terminal(&l.label)
             ),
-            EntryKind::Opaque => println!(
+            EntryKind::Opaque => outln!(
                 "[{}] {} bytes  opaque    {}",
                 i,
                 e.orig_size,
@@ -14305,13 +14342,15 @@ fn run_fido_large_blob_list(
         }
     }
     if skipped > 0 {
-        println!("{skipped} element(s) not in the standard format were skipped (kept unchanged)");
+        outln!("{skipped} element(s) not in the standard format were skipped (kept unchanged)");
     }
     let cap = array.capacity(&info);
-    println!();
-    println!(
+    outln!();
+    outln!(
         "Capacity: {} of {} bytes used, {} free",
-        cap.used_bytes, cap.max_bytes, cap.free_bytes
+        cap.used_bytes,
+        cap.max_bytes,
+        cap.free_bytes
     );
     Ok(())
 }
@@ -14340,21 +14379,22 @@ fn run_fido_large_blob_get(
     use keyroost_ctap::large_blobs::EntryKind;
     match classified {
         EntryKind::Note(text) => {
-            println!("Entry {}: keyroost note, {} bytes", index, entry.orig_size);
+            outln!("Entry {}: keyroost note, {} bytes", index, entry.orig_size);
             // A note is arbitrary text written by any app with the PIN; keep its
             // line structure but strip escapes so it can't hijack the terminal.
-            println!("{}", sanitize_multiline(&text));
+            outln!("{}", sanitize_multiline(&text));
         }
         EntryKind::KeyName(l) => {
-            println!("Entry {}: key name, {} bytes", index, entry.orig_size);
-            println!("{}", sanitize_terminal(&l.label));
+            outln!("Entry {}: key name, {} bytes", index, entry.orig_size);
+            outln!("{}", sanitize_terminal(&l.label));
         }
         EntryKind::SshCert { info, .. } => {
-            println!(
+            outln!(
                 "Entry {}: OpenSSH certificate, {} bytes",
-                index, entry.orig_size
+                index,
+                entry.orig_size
             );
-            println!(
+            outln!(
                 "  Type:        {} ({})",
                 sanitize_terminal(&info.key_type),
                 if info.cert_type == keyroost_ctap::ssh_cert::CERT_TYPE_USER {
@@ -14363,9 +14403,9 @@ fn run_fido_large_blob_get(
                     "host"
                 }
             );
-            println!("  Key ID:      {}", sanitize_terminal(&info.key_id));
-            println!("  Serial:      {}", info.serial);
-            println!(
+            outln!("  Key ID:      {}", sanitize_terminal(&info.key_id));
+            outln!("  Serial:      {}", info.serial);
+            outln!(
                 "  Principals:  {}",
                 if info.principals.is_empty() {
                     "(any)".to_string()
@@ -14373,33 +14413,34 @@ fn run_fido_large_blob_get(
                     sanitize_terminal(&info.principals.join(", "))
                 }
             );
-            println!(
+            outln!(
                 "  Valid:       {}",
                 keyroost_ctap::ssh_cert::format_validity(info.valid_after, info.valid_before)
             );
             for (n, v) in &info.critical_options {
                 let n = sanitize_terminal(n);
                 if v.is_empty() {
-                    println!("  Critical:    {n}");
+                    outln!("  Critical:    {n}");
                 } else {
                     let v = sanitize_terminal(v);
-                    println!("  Critical:    {n}={v}");
+                    outln!("  Critical:    {n}={v}");
                 }
             }
             for ext in &info.extensions {
-                println!("  Extension:   {}", sanitize_terminal(ext));
+                outln!("  Extension:   {}", sanitize_terminal(ext));
             }
             output::note(&format!(
                 "export with: keyroostctl fido blob export {index} --out FILE --as-cert"
             ));
         }
         EntryKind::Opaque => {
-            println!(
+            outln!(
                 "Entry {}: opaque (RP-encrypted), {} bytes",
-                index, entry.orig_size
+                index,
+                entry.orig_size
             );
-            println!();
-            print!("{}", hex_ascii_dump(&entry.ciphertext));
+            outln!();
+            out!("{}", hex_ascii_dump(&entry.ciphertext));
         }
     }
     Ok(())
@@ -14463,7 +14504,7 @@ fn run_fido_large_blob_add(
     keyroost_resolve::with_key_names_forgotten(|| {
         keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
     })?;
-    println!("Note added; {} entries now.", updated.len());
+    outln!("Note added; {} entries now.", updated.len());
     Ok(())
 }
 
@@ -14491,7 +14532,7 @@ fn run_fido_large_blob_edit(
     keyroost_resolve::with_key_names_forgotten(|| {
         keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
     })?;
-    println!("Note {} updated.", index);
+    outln!("Note {} updated.", index);
     Ok(())
 }
 
@@ -14550,7 +14591,7 @@ fn run_fido_large_blob_delete(
     keyroost_resolve::with_key_names_forgotten(|| {
         keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
     })?;
-    println!("Entry deleted; {} entries now.", updated.len());
+    outln!("Entry deleted; {} entries now.", updated.len());
     Ok(())
 }
 
@@ -14636,9 +14677,9 @@ fn run_fido_large_blob_clear(
         keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
     })?;
     if kept.is_some() {
-        println!("Large-blob array cleared except the key's name ({total} entries wiped).");
+        outln!("Large-blob array cleared except the key's name ({total} entries wiped).");
     } else {
-        println!("Large-blob array cleared ({total} entries wiped).");
+        outln!("Large-blob array cleared ({total} entries wiped).");
     }
     Ok(())
 }
@@ -14802,14 +14843,14 @@ fn run_fido_info_reader(reader: &str) -> Result<(), Box<dyn std::error::Error>> 
         })?;
         return Ok(());
     }
-    println!(
+    outln!(
         "{}",
         output::kv_block(&[("Device", sanitize_terminal(reader))])
     );
-    println!();
+    outln!();
     match ctap2 {
-        Some(info) => println!("{}", output::kv_block(&fido_info_rows(&info))),
-        None => println!("(device is U2F-only; CTAP2 GetInfo not available)"),
+        Some(info) => outln!("{}", output::kv_block(&fido_info_rows(&info))),
+        None => outln!("(device is U2F-only; CTAP2 GetInfo not available)"),
     }
     Ok(())
 }
@@ -14851,7 +14892,7 @@ fn run_fido_info(
         caps.push("U2F");
     }
     if !json {
-        println!(
+        outln!(
             "{}",
             output::kv_block(&[
                 ("Device", path.display().to_string()),
@@ -14887,8 +14928,8 @@ fn run_fido_info(
             })?;
             return Ok(());
         }
-        println!();
-        println!("(device is U2F-only; CTAP2 GetInfo not available)");
+        outln!();
+        outln!("(device is U2F-only; CTAP2 GetInfo not available)");
         return Ok(());
     };
 
@@ -14905,8 +14946,8 @@ fn run_fido_info(
         return Ok(());
     }
 
-    println!();
-    println!("{}", output::kv_block(&fido_info_rows(&info)));
+    outln!();
+    outln!("{}", output::kv_block(&fido_info_rows(&info)));
     Ok(())
 }
 
@@ -15009,7 +15050,7 @@ fn fido_reset_at(
     }
     // Names read from keys before or during the write are stale.
     keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::reset(&mut dev))?;
-    println!("Reset complete. All credentials wiped, PIN cleared.");
+    outln!("Reset complete. All credentials wiped, PIN cleared.");
     Ok(())
 }
 
@@ -15040,7 +15081,7 @@ fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::E
             }
         },
     )?;
-    println!("Reset complete. All credentials wiped, PIN cleared.");
+    outln!("Reset complete. All credentials wiped, PIN cleared.");
     Ok(())
 }
 
@@ -15064,7 +15105,7 @@ fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn st
             pin_retries,
         })?;
     } else {
-        println!("{}", pin_status_line(pin_retries));
+        outln!("{}", pin_status_line(pin_retries));
     }
     Ok(())
 }
@@ -15085,7 +15126,7 @@ fn run_fido_pin_set(
     let path = crate::target::fido_path(path)?;
     let (mut dev, _) = open_ctap_hid(&path)?;
     keyroost_ctap::client_pin::set_pin(&mut dev, new_pin)?;
-    println!("PIN set.");
+    outln!("PIN set.");
     Ok(())
 }
 
@@ -15097,7 +15138,7 @@ fn run_fido_pin_change(
     let path = crate::target::fido_path(path)?;
     let (mut dev, _) = open_ctap_hid(&path)?;
     keyroost_ctap::client_pin::change_pin(&mut dev, old_pin, new_pin)?;
-    println!("PIN changed.");
+    outln!("PIN changed.");
     Ok(())
 }
 
@@ -15114,9 +15155,10 @@ fn run_fido_creds_metadata(
             })?;
             return Ok(());
         }
-        println!(
+        outln!(
             "{} resident credential(s) stored, room for {} more",
-            meta.existing_count, meta.max_remaining
+            meta.existing_count,
+            meta.max_remaining
         );
         Ok(())
     })
@@ -15156,7 +15198,7 @@ fn run_fido_creds_list(
             return Ok(());
         }
         if rps.is_empty() {
-            println!("(no resident credentials)");
+            outln!("(no resident credentials)");
             return Ok(());
         }
         for rp in &rps {
@@ -15179,7 +15221,7 @@ fn run_fido_creds_list(
             } else {
                 format!("  [{} credential(s)]", creds.len())
             };
-            println!(
+            outln!(
                 "{}{}{}",
                 sanitize_terminal(&rp.id),
                 name_suffix,
@@ -15194,7 +15236,7 @@ fn run_fido_creds_list(
                     Some(d) => format!("  display={:?}", d),
                     None => String::new(),
                 };
-                println!(
+                outln!(
                     "  cred {}: user {:?}{}{}",
                     hex_short(&c.credential_id),
                     String::from_utf8_lossy(&c.user.id),
@@ -15204,9 +15246,9 @@ fn run_fido_creds_list(
                 // Full credentialId on its own line: this is the exact value
                 // `fido credential delete ID` expects (the `cred …` summary
                 // above is truncated for readability and can't be copied).
-                println!("       id={}", hex_encode(&c.credential_id));
+                outln!("       id={}", hex_encode(&c.credential_id));
                 if let Some(alg) = c.algorithm {
-                    println!("       alg={} ({})", alg, cose_algorithm_name(alg));
+                    outln!("       alg={} ({})", alg, cose_algorithm_name(alg));
                 }
             }
         }
@@ -15221,7 +15263,7 @@ fn run_fido_creds_delete(
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_credential_manager(path, pin, |mgr| {
         mgr.delete(cred_id)?;
-        println!("Credential {} deleted.", hex_short(cred_id));
+        outln!("Credential {} deleted.", hex_short(cred_id));
         Ok(())
     })
 }
@@ -15233,10 +15275,10 @@ fn run_fido_fingerprint_list(
     with_bio_enrollment(path, pin, |bio| {
         let list = bio.enumerate()?;
         if list.is_empty() {
-            println!("(no fingerprints enrolled)");
+            outln!("(no fingerprints enrolled)");
             return Ok(());
         }
-        println!("Enrolled fingerprints:");
+        outln!("Enrolled fingerprints:");
         for e in &list {
             // The friendly name is stored on the device; strip escapes.
             let name = e
@@ -15245,7 +15287,7 @@ fn run_fido_fingerprint_list(
                 .map(sanitize_terminal)
                 .unwrap_or_else(|| "(unnamed)".to_string());
             // The hex template ID is what rename/delete take.
-            println!("  id {}   {}", hex_encode(&e.template_id), name);
+            outln!("  id {}   {}", hex_encode(&e.template_id), name);
         }
         output::note("rename or delete one with `fido fingerprint rename ID NAME` or `fido fingerprint delete ID`");
         Ok(())
@@ -15289,7 +15331,7 @@ fn run_fido_fingerprint_enroll(
         if let Some(n) = name {
             bio.set_friendly_name(&template_id, n)?;
         }
-        println!(
+        outln!(
             "Fingerprint enrolled: {}{}",
             hex_encode(&template_id),
             name.map(|n| format!("  ({})", n)).unwrap_or_default()
@@ -15306,7 +15348,7 @@ fn run_fido_fingerprint_rename(
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_bio_enrollment(path, pin, |bio| {
         bio.set_friendly_name(template_id, name)?;
-        println!("Renamed {} to \"{}\".", hex_short(template_id), name);
+        outln!("Renamed {} to \"{}\".", hex_short(template_id), name);
         Ok(())
     })
 }
@@ -15318,7 +15360,7 @@ fn run_fido_fingerprint_delete(
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_bio_enrollment(path, pin, |bio| {
         bio.remove_enrollment(template_id)?;
-        println!("Fingerprint {} deleted.", hex_short(template_id));
+        outln!("Fingerprint {} deleted.", hex_short(template_id));
         Ok(())
     })
 }
@@ -15555,23 +15597,27 @@ fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slo
         match session.transmit_raw(&cmd) {
             Ok((data, sw1, sw2)) => {
                 if let Some(note) = classify(sw1, sw2, data.len()) {
-                    println!(
+                    outln!(
                         "  CLA={:02X} INS={:02X} P1={:02X} P2={:02X} Le=00  →  SW={:02X}{:02X}  ({} bytes)  {}",
                         cla, ins, p1, p2, sw1, sw2, data.len(), note
                     );
                 }
             }
-            Err(e) => eprintln!(
+            Err(e) => errln!(
                 "  CLA={:02X} INS={:02X} P1={:02X} P2={:02X} Le=00  →  transmit error: {}",
-                cla, ins, p1, p2, e
+                cla,
+                ins,
+                p1,
+                p2,
+                e
             ),
         }
     };
 
     let safe = |ins: u8| include_destructive || !DESTRUCTIVE_INS.contains(&ins);
 
-    println!();
-    println!("── Phase 1: CLA 0x80 INS sweep, P1=00 P2=00 Le=00 ──");
+    outln!();
+    outln!("── Phase 1: CLA 0x80 INS sweep, P1=00 P2=00 Le=00 ──");
     for ins in 0u8..=0xFF {
         if !safe(ins) {
             continue;
@@ -15580,8 +15626,8 @@ fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slo
     }
 
     if authed {
-        println!();
-        println!(
+        outln!();
+        outln!(
             "── Phase 2: CLA 0x84 INS sweep, P1=00 P2={:02X} Le=00 ──",
             slot
         );
@@ -15592,8 +15638,8 @@ fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slo
             probe_one(session, CLA_SECURE, ins, 0x00, slot);
         }
 
-        println!();
-        println!(
+        outln!();
+        outln!(
             "── Phase 3: targeted read-back guesses on slot #{} ──",
             slot
         );
@@ -15611,14 +15657,14 @@ fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slo
             (CLA_PLAIN, 0xA4, 0x00, "ISO SELECT FILE"),
         ];
         for (cla, ins, p1, note) in pairs {
-            print!("  [{}] ", note);
+            out!("  [{}] ", note);
             probe_one(session, *cla, *ins, *p1, slot);
         }
     }
 
-    println!();
-    println!("Done. Boring instructions (SW 6D00/6E00) are filtered out.");
-    println!("Any ✓ line is an instruction the firmware recognized and completed.");
+    outln!();
+    outln!("Done. Boring instructions (SW 6D00/6E00) are filtered out.");
+    outln!("Any ✓ line is an instruction the firmware recognized and completed.");
 }
 
 /// Write the Molto2's serial and clock to `w`: stdout for `molto info` (the
@@ -15820,11 +15866,11 @@ fn main() -> ExitCode {
         Ok(Ok(Some(code))) => code,
         Ok(Ok(None)) => ExitCode::SUCCESS,
         Ok(Err(e)) => {
-            eprintln!("error: {}", e);
+            errln!("error: {}", e);
             ExitCode::FAILURE
         }
         Err(_) => {
-            eprintln!("error: worker thread panicked");
+            errln!("error: worker thread panicked");
             ExitCode::FAILURE
         }
     }

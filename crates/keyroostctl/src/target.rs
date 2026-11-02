@@ -227,7 +227,7 @@ pub(crate) fn select(
             &mut picker,
         )
         .map_err(|e| add_admin_hint(e, need, crate::admin_only_fido_key_present))?;
-        eprintln!("{line}");
+        errln!("{line}");
         Ok(dev)
     })
 }
@@ -426,7 +426,7 @@ pub(crate) fn reverify(before: &Device) -> Result<(), Box<dyn Error>> {
         Recheck::Same => Ok(()),
         Recheck::Skip => {
             if debug_on() {
-                eprintln!(
+                errln!(
                     "[target] {label}: not a detected key; not re-checked after waiting for input"
                 );
             }
