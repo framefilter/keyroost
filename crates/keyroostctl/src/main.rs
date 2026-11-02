@@ -11083,7 +11083,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         outln!("{}", keyroost_pivtest::format_report(&results));
                     }
                     if !all_ok {
-                        return Err("one or more self-tests failed".into());
+                        return Err(piv_test_failure(pin.is_some(), &results).into());
                     }
                     Ok(())
                 },
@@ -12238,6 +12238,22 @@ fn decode_mgmt_key_hex(spec: &Spec, hex: &str) -> Result<zeroize::Zeroizing<Vec<
 /// The key bytes for `input`; `--mgmt-key default` looks up this device's known
 /// factory default on the open session's fingerprint
 /// ([`keyroost_transport::PivSession::default_management_key`]).
+/// `piv test`'s error when an operation failed: it asks for no PIN of its
+/// own, so a card refusing for want of one ("needs a management-key auth,
+/// PIN or touch") points at `--pin` when none was given.
+fn piv_test_failure(
+    pin_given: bool,
+    results: &[(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)],
+) -> String {
+    if keyroost_transport::self_test_wanted_pin(results) && !pin_given {
+        "one or more self-tests failed: the card wanted this slot's PIN; run it again with \
+         --pin"
+            .into()
+    } else {
+        "one or more self-tests failed".into()
+    }
+}
+
 /// A new management key must be as long as its algorithm's keys.
 fn check_new_mgmt_key_len(
     key: &[u8],
@@ -16820,6 +16836,23 @@ mod cli_tests {
             json_out::piv_slot_token(keyroost_piv::Slot::retired(20).unwrap()),
             "95"
         );
+    }
+
+    /// A self-test the card refused for want of a PIN points at `--pin`
+    /// when none was given, and only then.
+    #[test]
+    fn piv_test_points_at_the_pin_when_the_card_wanted_one() {
+        use keyroost_pivtest::{Outcome, SelfTest};
+        let refused = [(
+            SelfTest::Sign,
+            Outcome::Failed(
+                keyroost_transport::TransportError::PivSecurityNotSatisfied.to_string(),
+            ),
+        )];
+        assert!(piv_test_failure(false, &refused).contains("--pin"));
+        assert!(!piv_test_failure(true, &refused).contains("--pin"));
+        let mismatch = [(SelfTest::Sign, Outcome::Failed("signature mismatch".into()))];
+        assert!(!piv_test_failure(false, &mismatch).contains("--pin"));
     }
 
     /// `piv reset` names the defaults the card returned to when keyroost

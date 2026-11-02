@@ -12840,6 +12840,7 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         // The worker raises the touch banner when the slot may ask for one.
+        let pin_given = !pin.is_empty();
         self.spawn_piv_job("Running self-test\u{2026}", move || {
             let outcome = run_piv_self_test(&name, slot, pin.as_bytes(), cached_state);
             Box::new(move |app: &mut App| {
@@ -12847,7 +12848,15 @@ impl App {
                 let (all_ok, text) = match &outcome {
                     // Skipped ops don't count as failures.
                     Ok(run) => {
-                        let report = keyroost_pivtest::format_report(&run.results);
+                        let mut report = keyroost_pivtest::format_report(&run.results);
+                        // As `piv test` does: a refusal for want of a PIN
+                        // with the PIN box empty points at the box.
+                        if !pin_given && keyroost_transport::self_test_wanted_pin(&run.results) {
+                            report.push_str(
+                                "\nThe card wanted this slot's PIN: enter it above and run \
+                                 the test again.",
+                            );
+                        }
                         (
                             !run.results.iter().any(|(_, r)| r.is_failure()),
                             if run.cert_tested {

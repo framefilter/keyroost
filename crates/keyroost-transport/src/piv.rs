@@ -7029,6 +7029,21 @@ fn block_crypt(
     }
 }
 
+/// Whether a self-test's results include an operation the card refused for
+/// want of an authorization ([`TransportError::PivSecurityNotSatisfied`]):
+/// with no PIN given, the slot's PIN is what it wanted (a self-test needs no
+/// management key). The CLI's `piv test` and the app's Test dialog both
+/// point at the PIN then.
+#[must_use]
+pub fn self_test_wanted_pin(
+    results: &[(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)],
+) -> bool {
+    let wanted = TransportError::PivSecurityNotSatisfied.to_string();
+    results
+        .iter()
+        .any(|(_, r)| matches!(r, keyroost_pivtest::Outcome::Failed(e) if *e == wanted))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

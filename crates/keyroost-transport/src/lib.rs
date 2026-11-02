@@ -60,10 +60,10 @@ mod recover;
 mod piv;
 pub mod piv_import;
 pub use piv::{
-    random_chuid_guid, random_management_key, CertCompression, CertImport, CertUnreadable,
-    CurrentMgmtAuth, FactoryResetOutcome, FactoryResetPlan, PinProtectMaintenance, PivResetPreview,
-    PivSession, PivSessionState, PivSlotDetail, PivSlotStatus, PivStatus, PivStatusDetailed,
-    SlotKeyPresence,
+    random_chuid_guid, random_management_key, self_test_wanted_pin, CertCompression, CertImport,
+    CertUnreadable, CurrentMgmtAuth, FactoryResetOutcome, FactoryResetPlan, PinProtectMaintenance,
+    PivResetPreview, PivSession, PivSessionState, PivSlotDetail, PivSlotStatus, PivStatus,
+    PivStatusDetailed, SlotKeyPresence,
 };
 
 /// Fuzzing-only entry points for the compressed-certificate reader. Not
