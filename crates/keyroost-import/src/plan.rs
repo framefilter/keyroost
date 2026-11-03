@@ -34,6 +34,11 @@ impl Store {
             Store::Token2Otp => "this Token2 key",
         }
     }
+    /// The store has a per-code touch setting: an OATH account's "require
+    /// touch" property, a Token2 OTP entry's button flag. A Molto2 has none.
+    pub fn takes_touch(self) -> bool {
+        !matches!(self, Store::Molto2)
+    }
 }
 
 /// Which OATH applet the key carries, as far as limits go.
@@ -332,6 +337,9 @@ pub enum Note {
     /// that refuses duplicates removes the old code first; source, not
     /// hardware, says that removal asks for a touch).
     Nitrokey3TouchToReplace,
+    /// A Nitrokey 3 asks for a touch to save a code that requires one (seen
+    /// on firmware 1.9.0; README's Nitrokey 3 row).
+    Nitrokey3TouchToSave,
     /// `n` codes on the key couldn't be listed; a same-name one may still
     /// be refused.
     Hidden(usize),
@@ -357,6 +365,9 @@ impl core::fmt::Display for Note {
             Note::Nitrokey3TouchToReplace => {
                 f.write_str("A Nitrokey 3 may ask for a touch for each code it replaces.")
             }
+            Note::Nitrokey3TouchToSave => f.write_str(
+                "A Nitrokey 3 asks for a touch to save each code that requires one.",
+            ),
             Note::Hidden(n) => write!(
                 f,
                 "{} codes on the key couldn't be listed; the key may still refuse \
@@ -378,9 +389,24 @@ pub struct PlanRow {
     /// The name on the key; `None` when the entry couldn't be named.
     pub name: Option<StoredName>,
     pub verdict: Verdict,
+    /// The code will require a touch on the key to show (set with
+    /// [`Plan::set_touch`]; only on rows that write, to a store that has a
+    /// touch setting).
+    pub touch: bool,
 }
 
 impl PlanRow {
+    /// The row writes a code (Add or Replace).
+    pub fn writes(&self) -> bool {
+        matches!(self.verdict, Verdict::Add | Verdict::Replace)
+    }
+
+    /// Whether `name` names this row: the name it gets on the key (as the
+    /// CLI preview shows it) or the file's own label, exactly.
+    pub fn is_named(&self, name: &str) -> bool {
+        self.label == name || self.name.as_ref().is_some_and(|n| n.to_string() == name)
+    }
+
     /// The row as every list names it: the file's label, with its slot in
     /// front for a Molto2 (`#05 GitHub`).
     pub fn shown_label(&self) -> String {
@@ -466,9 +492,24 @@ impl Plan {
 
     /// Rows that write (Add or Replace), in file order.
     pub fn writes(&self) -> impl Iterator<Item = &PlanRow> {
-        self.rows
-            .iter()
-            .filter(|r| matches!(r.verdict, Verdict::Add | Verdict::Replace))
+        self.rows.iter().filter(|r| r.writes())
+    }
+
+    /// Make the written rows `wants` picks require a touch, and every other
+    /// row not: `oath import` / `otp import --touch` (every row) and
+    /// `--touch-for` (rows by name), the app's box for every row and its
+    /// row boxes. A Molto2 has no touch setting, so nothing changes there.
+    /// A Nitrokey 3, which asks for a touch to save such a code, gets
+    /// [`Note::Nitrokey3TouchToSave`] while any row requires one.
+    pub fn set_touch(&mut self, wants: impl Fn(&PlanRow) -> bool) {
+        let takes = self.store.takes_touch();
+        for row in &mut self.rows {
+            row.touch = takes && row.writes() && wants(row);
+        }
+        self.notes.retain(|n| *n != Note::Nitrokey3TouchToSave);
+        if self.store == Store::Oath(OathFamily::Nitrokey3) && self.rows.iter().any(|r| r.touch) {
+            self.notes.push(Note::Nitrokey3TouchToSave);
+        }
     }
 }
 
@@ -888,6 +929,7 @@ pub fn plan(file: &ImportFile, target: &Target) -> Plan {
             label: item.label.clone(),
             name,
             verdict,
+            touch: false,
         });
     }
 
@@ -1923,6 +1965,23 @@ mod tests {
         assert_eq!(OathFamily::Other.name_limit(), None);
     }
 
+    /// `--touch-for` names a row by the name it gets on the key or by the
+    /// file's own label, exactly.
+    #[test]
+    fn a_row_is_named_by_its_stored_name_or_its_label() {
+        let row = PlanRow {
+            index: 0,
+            label: "A:a".into(),
+            name: Some(StoredName::Oath("60/A:a".into())),
+            verdict: Verdict::Add,
+            touch: false,
+        };
+        assert!(row.is_named("60/A:a"));
+        assert!(row.is_named("A:a"));
+        assert!(!row.is_named("a:a"));
+        assert!(!row.is_named("A"));
+    }
+
     #[test]
     fn verdict_words_and_reasons_are_one_vocabulary() {
         let words: Vec<&str> = [
@@ -1961,6 +2020,7 @@ mod tests {
             label: "GitHub".into(),
             name,
             verdict: Verdict::Add,
+            touch: false,
         };
         assert_eq!(
             row(Some(StoredName::Molto2 {

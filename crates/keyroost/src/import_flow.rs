@@ -10,7 +10,7 @@
 //! `impl App` block wires it to the frame loop, the import thread and the
 //! device worker, the same way `otp_pane` extends `App`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -483,6 +483,14 @@ pub struct ImportDialog {
     /// "Replace codes already on the key that have the same name" (OATH /
     /// Token2 OTP).
     pub replace: bool,
+    /// "Require touch for every code": every code the plan writes, whatever
+    /// it writes after a Replace tick or another key (as `--touch` does).
+    /// Changing one row's box turns it into the explicit list below.
+    pub touch_all: bool,
+    /// The entries (by file index) whose codes will require a touch on the
+    /// key, picked with the row boxes (OATH / Token2 OTP; a Molto2 has no
+    /// touch setting).
+    pub touch: BTreeSet<usize>,
     /// What the chosen key holds, read by the preview job; reused when only
     /// `replace` changes.
     pub existing: Option<KeyContents>,
@@ -535,6 +543,13 @@ impl ImportDialog {
         d.file_name = file_name;
         d.origin = origin;
         d
+    }
+
+    /// Whether `row`'s code should require a touch: every code under "every
+    /// code", else the rows picked one by one. The plan applies it only to
+    /// rows that write ([`Plan::set_touch`]).
+    pub fn wants_touch(&self, row: &PlanRow) -> bool {
+        self.touch_all || self.touch.contains(&row.index)
     }
 
     /// Same rule as #171's bulk dialog: a button never writes `open` inside
@@ -1096,7 +1111,9 @@ impl App {
             _ => match d.contents() {
                 Some((_, ex, version)) => {
                     let store = store_of(dest.store, &dev.vendor, *version);
-                    (Some(plan_for(file, store, 0, ex.clone(), d.replace)), false)
+                    let mut plan = plan_for(file, store, 0, ex.clone(), d.replace);
+                    plan.set_touch(|r| d.wants_touch(r));
+                    (Some(plan), false)
                 }
                 None => (None, false),
             },
@@ -1174,6 +1191,9 @@ impl App {
         };
         let id = d.id;
         let replace = d.replace;
+        // The re-read plan gets the same touch choice, so the re-check
+        // compares like with like.
+        let (touch_all, touch) = (d.touch_all, d.touch.clone());
         let timeout = d.molto_timeout.to_proto();
         let oath_pw = self.import_oath_password(d, &dest);
         let otp_pin = self.import_otp_pin(d, &dest);
@@ -1184,11 +1204,15 @@ impl App {
                 *g = (done, total);
             }
         };
-        // A Nitrokey 3 may ask for a touch for each code it replaces.
-        let label = if shown
-            .notes
-            .contains(&keyroost_import::plan::Note::Nitrokey3TouchToReplace)
-        {
+        // A Nitrokey 3 may ask for a touch for each code it replaces, and
+        // asks for one to save each code that requires a touch.
+        let label = if shown.notes.iter().any(|n| {
+            matches!(
+                n,
+                keyroost_import::plan::Note::Nitrokey3TouchToReplace
+                    | keyroost_import::plan::Note::Nitrokey3TouchToSave
+            )
+        }) {
             format!(
                 "Adding codes to {} \u{2014} touch the key if it blinks\u{2026}",
                 dev.title()
@@ -1269,7 +1293,8 @@ impl App {
                             Ok(ex) => ex,
                             Err(e) => return Added::Failed(e.to_string()),
                         };
-                        let again = plan_for(&file, store, 0, ex.clone(), replace);
+                        let mut again = plan_for(&file, store, 0, ex.clone(), replace);
+                        again.set_touch(|r| touch_all || touch.contains(&r.index));
                         if !again.same_rows(&shown) {
                             return Added::Changed(ex, version);
                         }
@@ -1278,8 +1303,9 @@ impl App {
                             OathFamily::from_vendor(&vendor, version),
                         )
                         .password_hint(OATH_PASSWORD_HINT)
-                        // Replacing deletes the old entry first; a Nitrokey 3
-                        // asks for a touch on every delete.
+                        // A Nitrokey 3 asks for a touch on every delete
+                        // (replacing deletes the old entry first) and to save
+                        // a code that requires one.
                         .touch_wait(|on| {
                             crate::KEY_WANTS_TOUCH.store(on, std::sync::atomic::Ordering::Relaxed);
                         });
@@ -1321,7 +1347,8 @@ impl App {
                             }
                             Err(e) => return Added::Failed(e.to_string()),
                         };
-                        let again = plan_for(&file, Store::Token2Otp, 0, ex.clone(), replace);
+                        let mut again = plan_for(&file, Store::Token2Otp, 0, ex.clone(), replace);
+                        again.set_touch(|r| touch_all || touch.contains(&r.index));
                         if !again.same_rows(&shown) {
                             return Added::Changed(ex, None);
                         }
@@ -1637,6 +1664,33 @@ impl App {
                                 &mut d.replace,
                                 "Replace codes already on the key that have the same name",
                             );
+                            // Every code the plan writes; a dash while only
+                            // some rows have a box ticked. Off until there is
+                            // a preview to apply it to.
+                            let writing: Vec<usize> = view
+                                .plan
+                                .iter()
+                                .flat_map(|plan| plan.writes().map(|r| r.index))
+                                .collect();
+                            let on = writing.iter().filter(|i| d.touch.contains(i)).count();
+                            let mut all =
+                                d.touch_all || (!writing.is_empty() && on == writing.len());
+                            let some = !d.touch_all && on > 0 && on < writing.len();
+                            if ui
+                                .add_enabled(
+                                    !writing.is_empty(),
+                                    egui::Checkbox::new(&mut all, "Require touch for every code")
+                                        .indeterminate(some),
+                                )
+                                .on_hover_text(
+                                    "Each code shows only after a touch on the key. \
+                                     Or pick codes with the boxes in the list below.",
+                                )
+                                .changed()
+                            {
+                                d.touch_all = all;
+                                d.touch.clear();
+                            }
                         }
                         Some(StoreKind::Molto2) => {
                             ui.horizontal(|ui| {
@@ -1692,15 +1746,45 @@ impl App {
                             .id_salt("import-preview")
                             .max_height(8.0 * 20.0)
                             .show(ui, |ui| {
+                                let boxes = plan.store.takes_touch();
                                 for row in &plan.rows {
                                     let color = match row.verdict {
                                         Verdict::Add | Verdict::Replace => p.txt2,
                                         _ => p.txt3,
                                     };
-                                    ui.label(
-                                        egui::RichText::new(plan_row_line(row, plan.store))
-                                            .color(color),
-                                    );
+                                    let text = egui::RichText::new(plan_row_line(row, plan.store))
+                                        .color(color);
+                                    if !boxes {
+                                        ui.label(text);
+                                        continue;
+                                    }
+                                    // A touch box on each code this writes;
+                                    // the rest line up under them.
+                                    ui.horizontal(|ui| {
+                                        if row.writes() {
+                                            let mut on = row.touch;
+                                            if ui
+                                                .checkbox(&mut on, "")
+                                                .on_hover_text("Require touch for this code")
+                                                .changed()
+                                            {
+                                                // Out of "every code": the rows it covered
+                                                // become the list this box then edits.
+                                                if d.touch_all {
+                                                    d.touch_all = false;
+                                                    d.touch.extend(plan.writes().map(|r| r.index));
+                                                }
+                                                if on {
+                                                    d.touch.insert(row.index);
+                                                } else {
+                                                    d.touch.remove(&row.index);
+                                                }
+                                            }
+                                        } else {
+                                            ui.add_space(ui.spacing().icon_width);
+                                        }
+                                        ui.label(text);
+                                    });
                                 }
                             });
                         for note in &plan.notes {
@@ -1987,6 +2071,38 @@ mod tests {
         assert!(d.file.is_none());
         assert!(d.existing.is_none());
         assert!(d.report.is_none());
+    }
+
+    /// "Every code" stays a choice, not a snapshot: a row that only starts
+    /// writing later (a Replace tick, another key) is covered too, and a
+    /// Molto2 plan takes none.
+    #[test]
+    fn every_code_covers_rows_that_write_later() {
+        let file = file_of(vec![
+            entry("A", HashAlg::Sha1, 30),
+            entry("B", HashAlg::Sha1, 30),
+        ]);
+        let mut d = open_dialog();
+        d.touch_all = true;
+        let on_key = Existing {
+            names: vec![StoredName::Oath("A:alice".into())],
+            hidden: 0,
+        };
+        let yk = Store::Oath(OathFamily::YubiKey { version: None });
+        let touched = |replace: bool| {
+            let mut plan = plan_for(&file, yk, 0, on_key.clone(), replace);
+            plan.set_touch(|r| d.wants_touch(r));
+            plan.rows.iter().map(|r| r.touch).collect::<Vec<_>>()
+        };
+        assert_eq!(touched(false), vec![false, true], "A is left as is");
+        assert_eq!(
+            touched(true),
+            vec![true, true],
+            "Replace: A writes, with a touch"
+        );
+        let mut molto = molto_plan(&file, 95, Existing::default());
+        molto.set_touch(|r| d.wants_touch(r));
+        assert!(molto.rows.iter().all(|r| !r.touch));
     }
 
     #[test]
@@ -2613,6 +2729,7 @@ mod tests {
             label: "GitHub".into(),
             name,
             verdict,
+            touch: false,
         };
         let m = Some(StoredName::Molto2 {
             slot: 5,

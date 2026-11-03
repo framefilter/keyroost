@@ -162,6 +162,13 @@ keyroostctl oath import -i export.json --file-password env:EXPORT_PW   # encrypt
       <li><strong>skip</strong>: the key can't store it, and the preview says why. keyroost
         never changes an entry to make it fit.</li>
     </ul>
+    <p>Imported codes can require a touch, as <code>oath add --touch</code> does:
+      <code>--touch</code> for every code the import writes, or <code>--touch-for</code> with
+      a code's name as the preview shows it, repeated for each one. In the app, tick
+      <em>Require touch for every code</em>, or the box on each code's row. The preview marks
+      these codes <em>(touch)</em>. A Nitrokey 3 asks for a touch to save each of them.</p>
+<pre><code>keyroostctl oath import -i export.json --touch                      # every code
+keyroostctl oath import -i export.json --touch-for GitHub:alice     # only this one</code></pre>
     <p>keyroost asks once before writing (a script adds <code>--yes</code>), writes one
       code at a time, and stops at the first error, saying what was added and what wasn't.
       Running the same import again is safe: codes already added show as

@@ -137,8 +137,18 @@ impl<'a> OathImportStore<'a> {
 }
 
 impl CodeStore for OathImportStore<'_> {
-    fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
-        oath_add(self.session, self.family, self.password_hint, name, entry)
+    fn add(
+        &mut self,
+        name: &StoredName,
+        entry: &ImportEntry,
+        touch: bool,
+    ) -> Result<(), StoreError> {
+        // A Nitrokey 3 asks for a touch to save a code that requires one.
+        let asks = touch && self.session.asks_touch_to_save_touch();
+        let (session, family, hint) = (&mut *self.session, self.family, self.password_hint);
+        waiting_for_touch(asks, self.touch_wait.as_mut(), || {
+            oath_add(session, family, hint, name, entry, touch)
+        })
     }
     fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
         let asks = self.session.asks_touch_to_delete();
@@ -172,11 +182,13 @@ fn oath_stored_name(name: &StoredName) -> Result<&str, StoreError> {
     }
 }
 
-/// The PUT for one entry. The plan only lets through what the applet
-/// stores; anything else fails here instead of panicking.
+/// The PUT for one entry, requiring a touch when `touch`. The plan only
+/// lets through what the applet stores; anything else fails here instead
+/// of panicking.
 fn put_params<'a>(
     name: &'a str,
     entry: &'a ImportEntry,
+    touch: bool,
 ) -> Result<oath::PutParams<'a>, StoreError> {
     let algorithm = match entry.hash {
         HashAlg::Sha1 => oath::Algorithm::Sha1,
@@ -198,7 +210,7 @@ fn put_params<'a>(
         oath_type,
         algorithm,
         digits: entry.digits,
-        require_touch: false,
+        require_touch: touch,
         imf,
     })
 }
@@ -248,12 +260,13 @@ fn oath_add<I: OathIo + ?Sized>(
     hint: &str,
     name: &StoredName,
     entry: &ImportEntry,
+    touch: bool,
 ) -> Result<(), StoreError> {
     let n = oath_stored_name(name)?;
     if let Some(refusal) = family.name_refusal(n) {
         return Err(StoreError::Failed(refusal));
     }
-    let params = put_params(n, entry)?;
+    let params = put_params(n, entry, touch)?;
     oath_with_reauth(io, hint, &mut |io| io.put(&params), oath_put_answer)
 }
 
@@ -357,9 +370,14 @@ impl<'a> Token2ImportStore<'a> {
 }
 
 impl CodeStore for Token2ImportStore<'_> {
-    fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
+    fn add(
+        &mut self,
+        name: &StoredName,
+        entry: &ImportEntry,
+        touch: bool,
+    ) -> Result<(), StoreError> {
         let pin = self.pin.as_deref().map(String::as_str);
-        token2_add(self.session, pin, &mut self.pin_proven, name, entry)
+        token2_add(self.session, pin, &mut self.pin_proven, name, entry, touch)
     }
     fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
         let pin = self.pin.as_deref().map(String::as_str);
@@ -400,12 +418,13 @@ fn token2_stored_name(name: &StoredName) -> Result<(&str, &str), StoreError> {
 }
 
 /// The `WRITE_SEED` fields for one entry: the TOTP period as the time step
-/// (30 for HOTP, as `otp add` does), no button press. What the plan keeps
-/// out fails here instead of panicking.
+/// (30 for HOTP, as `otp add` does), and the button press when `touch`.
+/// What the plan keeps out fails here instead of panicking.
 fn token2_write_entry<'a>(
     app: &'a str,
     account: &'a str,
     entry: &'a ImportEntry,
+    touch: bool,
 ) -> Result<keyroost_token2otp::WriteEntry<'a>, StoreError> {
     use keyroost_token2otp::{Algorithm, OtpType};
     let algorithm = match entry.hash {
@@ -431,7 +450,7 @@ fn token2_write_entry<'a>(
         algorithm,
         timestep,
         code_length: entry.digits,
-        button_required: false,
+        button_required: touch,
         app_name: app,
         account_name: account,
         seed: &entry.secret,
@@ -525,9 +544,10 @@ fn token2_add<I: Token2Io + ?Sized>(
     proven: &mut bool,
     name: &StoredName,
     entry: &ImportEntry,
+    touch: bool,
 ) -> Result<(), StoreError> {
     let (app, account) = token2_stored_name(name)?;
-    let w = token2_write_entry(app, account, entry)?;
+    let w = token2_write_entry(app, account, entry, touch)?;
     token2_with_pin(io, pin, proven, &mut |io| io.write(&w, pin))
 }
 
@@ -713,7 +733,13 @@ fn molto_existing_by(
 }
 
 impl CodeStore for MoltoImportStore<'_> {
-    fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
+    /// A Molto2 has no touch setting; the plan never asks for one here.
+    fn add(
+        &mut self,
+        name: &StoredName,
+        entry: &ImportEntry,
+        _touch: bool,
+    ) -> Result<(), StoreError> {
         molto_add(self.session, self.now, self.display_timeout, name, entry)
     }
     fn delete(&mut self, _name: &StoredName) -> Result<(), StoreError> {
@@ -808,13 +834,19 @@ mod tests {
     struct ScriptedStore(ScriptedOath);
 
     impl CodeStore for ScriptedStore {
-        fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
+        fn add(
+            &mut self,
+            name: &StoredName,
+            entry: &ImportEntry,
+            touch: bool,
+        ) -> Result<(), StoreError> {
             oath_add(
                 &mut self.0,
                 OathFamily::Solo2,
                 DEFAULT_PASSWORD_HINT,
                 name,
                 entry,
+                touch,
             )
         }
         fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
@@ -902,7 +934,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            oath_add(&mut io, OathFamily::Other, DEFAULT_PASSWORD_HINT, &name, &e),
+            oath_add(
+                &mut io,
+                OathFamily::Other,
+                DEFAULT_PASSWORD_HINT,
+                &name,
+                &e,
+                false
+            ),
             Ok(())
         );
         assert_eq!(io.calls, vec!["put A:a", "reauth", "put A:a"]);
@@ -913,7 +952,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            oath_add(&mut io, OathFamily::Other, DEFAULT_PASSWORD_HINT, &name, &e),
+            oath_add(
+                &mut io,
+                OathFamily::Other,
+                DEFAULT_PASSWORD_HINT,
+                &name,
+                &e,
+                false
+            ),
             Ok(())
         );
         assert_eq!(io.calls, vec!["put A:a", "reauth", "put A:a"]);
@@ -924,7 +970,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            oath_add(&mut io, OathFamily::Other, DEFAULT_PASSWORD_HINT, &name, &e),
+            oath_add(
+                &mut io,
+                OathFamily::Other,
+                DEFAULT_PASSWORD_HINT,
+                &name,
+                &e,
+                false
+            ),
             Err(StoreError::Failed(
                 "the key asked for its OATH password again and refused it".to_owned()
             ))
@@ -954,7 +1007,8 @@ mod tests {
                 OathFamily::Other,
                 "pass --password env:NAME",
                 &name,
-                &e
+                &e,
+                false
             ),
             Err(StoreError::Failed(
                 "this key's authenticator storage is password-protected; \
@@ -973,14 +1027,28 @@ mod tests {
         let e = entry(OtpKind::Totp { period: 30 });
         let mut io = ScriptedOath::default();
         let long = StoredName::Oath("n".repeat(128));
-        match oath_add(&mut io, OathFamily::Solo2, DEFAULT_PASSWORD_HINT, &long, &e) {
+        match oath_add(
+            &mut io,
+            OathFamily::Solo2,
+            DEFAULT_PASSWORD_HINT,
+            &long,
+            &e,
+            false,
+        ) {
             Err(StoreError::Failed(m)) => assert!(m.contains("127 bytes"), "{m}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert!(io.calls.is_empty());
         let ok = StoredName::Oath("n".repeat(127));
         assert_eq!(
-            oath_add(&mut io, OathFamily::Solo2, DEFAULT_PASSWORD_HINT, &ok, &e),
+            oath_add(
+                &mut io,
+                OathFamily::Solo2,
+                DEFAULT_PASSWORD_HINT,
+                &ok,
+                &e,
+                false
+            ),
             Ok(())
         );
         // Other families keep their own limits (the plan's), not this one.
@@ -990,7 +1058,8 @@ mod tests {
                 OathFamily::Nitrokey3,
                 DEFAULT_PASSWORD_HINT,
                 &long,
-                &e
+                &e,
+                false
             ),
             Ok(())
         );
@@ -1005,13 +1074,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            oath_add(&mut io, OathFamily::Other, DEFAULT_PASSWORD_HINT, &name, &e),
+            oath_add(
+                &mut io,
+                OathFamily::Other,
+                DEFAULT_PASSWORD_HINT,
+                &name,
+                &e,
+                false
+            ),
             Err(StoreError::Failed(
                 "the key refused it (status 6A80)".to_owned()
             ))
         );
         assert_eq!(
-            oath_add(&mut io, OathFamily::Other, DEFAULT_PASSWORD_HINT, &name, &e),
+            oath_add(
+                &mut io,
+                OathFamily::Other,
+                DEFAULT_PASSWORD_HINT,
+                &name,
+                &e,
+                false
+            ),
             Err(StoreError::Full)
         );
     }
@@ -1019,7 +1102,7 @@ mod tests {
     #[test]
     fn oath_put_params_from_entry() {
         let e = entry(OtpKind::Hotp { counter: 5 });
-        let p = put_params("A:a", &e).unwrap();
+        let p = put_params("A:a", &e, false).unwrap();
         assert_eq!(p.oath_type, oath::OathType::Hotp);
         assert_eq!(p.algorithm, oath::Algorithm::Sha256);
         assert_eq!(p.digits, 8);
@@ -1027,14 +1110,34 @@ mod tests {
         assert!(!p.require_touch);
 
         let e = entry(OtpKind::Totp { period: 60 });
-        let p = put_params("60/A:a", &e).unwrap();
+        let p = put_params("60/A:a", &e, false).unwrap();
         assert_eq!((p.oath_type, p.imf), (oath::OathType::Totp, 0));
 
         // Unreachable after `plan`; refused, never truncated.
         let e = entry(OtpKind::Hotp {
             counter: u64::from(u32::MAX) + 1,
         });
-        assert!(put_params("A:a", &e).is_err());
+        assert!(put_params("A:a", &e, false).is_err());
+    }
+
+    /// A code the import marks for a touch is written with the key's own
+    /// setting: an OATH account's require-touch property, a Token2 entry's
+    /// button flag.
+    #[test]
+    fn a_touch_choice_sets_each_keys_flag() {
+        let e = entry(OtpKind::Totp { period: 30 });
+        assert!(put_params("A:a", &e, true).unwrap().require_touch);
+        assert!(!put_params("A:a", &e, false).unwrap().require_touch);
+        assert!(
+            token2_write_entry("Ap", "acc", &e, true)
+                .unwrap()
+                .button_required
+        );
+        assert!(
+            !token2_write_entry("Ap", "acc", &e, false)
+                .unwrap()
+                .button_required
+        );
     }
 
     #[test]
@@ -1128,7 +1231,7 @@ mod tests {
         };
         let e = entry(OtpKind::Totp { period: 30 });
         assert_eq!(
-            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e, false),
             Err(StoreError::Failed(
                 "the key's OTP PIN is blocked".to_owned()
             ))
@@ -1145,7 +1248,7 @@ mod tests {
         };
         let e = entry(OtpKind::Totp { period: 30 });
         assert_eq!(
-            token2_add(&mut io, None, &mut false, &t2name(), &e),
+            token2_add(&mut io, None, &mut false, &t2name(), &e, false),
             Err(StoreError::Full)
         );
     }
@@ -1160,7 +1263,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e, false),
             Ok(())
         );
         assert_eq!(io.calls, vec!["write a", "verify", "write a"]);
@@ -1171,7 +1274,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e, false),
             Err(StoreError::Failed(
                 "the key asked for its OTP PIN again and refused it".to_owned()
             ))
@@ -1188,7 +1291,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                token2_add(&mut io, None, &mut false, &t2name(), &e),
+                token2_add(&mut io, None, &mut false, &t2name(), &e, false),
                 Err(StoreError::Failed(
                     "the key asks for its OTP PIN".to_owned()
                 ))
@@ -1214,7 +1317,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e, false),
             Err(StoreError::Failed(
                 "the key's OTP PIN is blocked".to_owned()
             ))
@@ -1235,7 +1338,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            token2_add(&mut io, Some("0000"), &mut store.pin_proven, &t2name(), &e),
+            token2_add(
+                &mut io,
+                Some("0000"),
+                &mut store.pin_proven,
+                &t2name(),
+                &e,
+                false
+            ),
             Err(StoreError::Failed(TOKEN2_PIN_WINDOW_CLOSED.to_owned()))
         );
         assert_eq!(io.calls, vec!["write a"]);
@@ -1266,7 +1376,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                token2_add(&mut io, Some("0000"), &mut proven, &t2name(), &e),
+                token2_add(&mut io, Some("0000"), &mut proven, &t2name(), &e, false),
                 Err(StoreError::Failed(msg.to_owned()))
             );
             assert_eq!(io.calls, vec!["write a"]);
@@ -1280,7 +1390,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            token2_add(&mut io, Some("0000"), &mut proven, &t2name(), &e),
+            token2_add(&mut io, Some("0000"), &mut proven, &t2name(), &e, false),
             Err(StoreError::Failed(TOKEN2_PIN_WINDOW_CLOSED.to_owned()))
         );
         assert_eq!(
@@ -1295,12 +1405,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e, false),
             Ok(())
         );
         assert!(proven);
         assert_eq!(
-            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e, false),
             Ok(())
         );
         assert_eq!(io.calls, vec!["write a", "write a", "verify", "write a"]);
@@ -1314,7 +1424,7 @@ mod tests {
             digits: 8,
             ..entry(OtpKind::Totp { period: 45 })
         };
-        let w = token2_write_entry("Ap", "acc", &e).unwrap();
+        let w = token2_write_entry("Ap", "acc", &e, false).unwrap();
         let bytes = keyroost_token2otp::serialize_write_entry(&w).unwrap();
         // type TOTP, SHA-256, step 45, 8 digits, no button, "Ap", "acc", seed.
         let want: Vec<u8> = [
@@ -1341,7 +1451,7 @@ mod tests {
             digits: 6,
             ..entry(OtpKind::Hotp { counter: 0 })
         };
-        let w = token2_write_entry("", "acc", &e).unwrap();
+        let w = token2_write_entry("", "acc", &e, false).unwrap();
         assert_eq!(w.otp_type, keyroost_token2otp::OtpType::Hotp);
         assert_eq!(w.algorithm, keyroost_token2otp::Algorithm::Sha1);
         assert_eq!(
@@ -1354,8 +1464,10 @@ mod tests {
             hash: HashAlg::Sha512,
             ..entry(OtpKind::Totp { period: 30 })
         };
-        assert!(token2_write_entry("", "acc", &e).is_err());
-        assert!(token2_write_entry("", "acc", &entry(OtpKind::Totp { period: 70_000 })).is_err());
+        assert!(token2_write_entry("", "acc", &e, false).is_err());
+        assert!(
+            token2_write_entry("", "acc", &entry(OtpKind::Totp { period: 70_000 }), false).is_err()
+        );
     }
 
     // ---- Molto2 ----

@@ -2231,6 +2231,15 @@ enum OathCmd {
         /// new one then fails, the old one is gone.
         #[arg(long)]
         replace: bool,
+        /// Require a touch on the key to compute every code this writes, as
+        /// `oath add --touch` does. A Nitrokey 3 asks for a touch to save
+        /// each one.
+        #[arg(long, conflicts_with = "touch_for")]
+        touch: bool,
+        /// Require a touch for this code only: its name as the preview shows
+        /// it, or the file's own label for it. Repeat for more codes.
+        #[arg(long, value_name = "NAME")]
+        touch_for: Vec<String>,
         /// Show what would be added, replaced or skipped; nothing is written.
         #[arg(long)]
         dry_run: bool,
@@ -3239,6 +3248,15 @@ enum OtpCmd {
         /// account.
         #[arg(long)]
         replace: bool,
+        /// Require a button press on the key to emit every code this writes,
+        /// as `otp add --touch` does.
+        #[arg(long, conflicts_with = "touch_for")]
+        touch: bool,
+        /// Require a button press for this code only: its name as the
+        /// preview shows it, or the file's own label for it. Repeat for more
+        /// codes.
+        #[arg(long, value_name = "NAME")]
+        touch_for: Vec<String>,
         /// Show what would be added, replaced or skipped; nothing is written.
         #[arg(long)]
         dry_run: bool,
@@ -8433,6 +8451,8 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         OathCmd::Import {
             file,
             replace,
+            touch,
+            touch_for,
             dry_run,
             access,
             yes,
@@ -8442,7 +8462,10 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 code_import::CodeDest::Oath(access),
                 file,
                 pair_of(oath_secret_pair(cmd))?,
-                *replace,
+                code_import::How {
+                    replace: *replace,
+                    touch: code_import::TouchPick::new(*touch, touch_for),
+                },
                 *dry_run,
                 *yes,
                 debug,
@@ -9055,6 +9078,8 @@ fn run_otp(
         OtpCmd::Import {
             file,
             replace,
+            touch,
+            touch_for,
             dry_run,
             yes,
             ..
@@ -9063,7 +9088,10 @@ fn run_otp(
                 code_import::CodeDest::Otp(&sel),
                 file,
                 pair_of(otp_secret_pair(cmd))?,
-                *replace,
+                code_import::How {
+                    replace: *replace,
+                    touch: code_import::TouchPick::new(*touch, touch_for),
+                },
                 *dry_run,
                 *yes,
                 debug,
@@ -16937,6 +16965,24 @@ mod cli_tests {
             "No FIDO2 PIN is set. Set one with `keyroostctl fido pin set`."
         );
         assert_eq!(pin_status_line(Some(7)), "7 PIN attempt(s) remaining");
+    }
+
+    /// `--touch` (every code) and `--touch-for` (named codes) are each
+    /// accepted by both imports, `--touch-for` repeatedly, but not together.
+    #[test]
+    fn import_touch_flags_parse() {
+        for group in ["oath", "otp"] {
+            let base = ["keyroostctl", group, "import", "--in", "f.txt"];
+            let with = |extra: &[&str]| {
+                Cli::try_parse_from(base.iter().copied().chain(extra.iter().copied())).is_ok()
+            };
+            assert!(with(&["--touch"]), "{group}");
+            assert!(
+                with(&["--touch-for", "A:a", "--touch-for", "B:b"]),
+                "{group}"
+            );
+            assert!(!with(&["--touch", "--touch-for", "A:a"]), "{group}");
+        }
     }
 
     /// `--new-mgmt-key default` parses to the factory-default source (the

@@ -598,6 +598,10 @@ pub(crate) struct ImportRowJson {
     pub name: Option<String>,
     /// "add", "replace", "exists" or "skip".
     pub plan: &'static str,
+    /// The code will require a touch on the key (`--touch`,
+    /// `--touch-for`); false for a code that isn't written. The name
+    /// `otp list --json` uses for the same fact.
+    pub touch_required: bool,
     /// Why it is skipped or left as is.
     pub reason: Option<String>,
     /// After a run: "added", "replaced", "exists",
@@ -729,6 +733,7 @@ mod tests {
             ("label", "string"),
             ("name", "string|null"),
             ("plan", "string"),
+            ("touch_required", "bool"),
             ("reason", "string|null"),
             ("outcome", "string|null"),
             ("error", "string|null"),
@@ -738,6 +743,7 @@ mod tests {
             label: "entry 1".into(),
             name: None,
             plan: "skip",
+            touch_required: false,
             reason: None,
             outcome: None,
             error: None,
@@ -747,6 +753,7 @@ mod tests {
             label: "A:a".into(),
             name: Some("A:a".into()),
             plan: "add",
+            touch_required: true,
             reason: Some("r".into()),
             outcome: Some("failed"),
             error: Some("e".into()),
