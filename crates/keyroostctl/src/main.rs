@@ -16939,8 +16939,6 @@ mod cli_tests {
         assert_eq!(pin_status_line(Some(7)), "7 PIN attempt(s) remaining");
     }
 
-    /// `piv info` prints slots in capitals ("retired key 9 (8A)"); a slot
-    /// copied from there is accepted as typed.
     /// `--new-mgmt-key default` parses to the factory-default source (the
     /// value `--mgmt-key` takes too); a literal key is still refused.
     #[test]
@@ -16960,6 +16958,8 @@ mod cli_tests {
         assert!(Cli::try_parse_from(args.iter().copied().chain(["0102"])).is_err());
     }
 
+    /// `piv info` prints slots in capitals ("retired key 9 (8A)"); a slot
+    /// copied from there is accepted as typed.
     #[test]
     fn a_piv_slot_is_accepted_in_capitals() {
         for slot in ["8A", "8a", "9C"] {
