@@ -4209,11 +4209,23 @@ mod tests {
         assert!(read_key_labels(&devices, false).is_empty());
     }
 
+    /// Held by every test that opens a HID path. Off Linux each open sets
+    /// hidapi up anew, which isn't safe from two threads at once (the macOS
+    /// CI job crashed with SIGTRAP once two such tests ran in parallel).
+    static HID_OPENS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn one_hid_open_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        HID_OPENS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A key keyroost couldn't open at all (no admin rights, no udev rule,
     /// busy in a browser) keeps FIDO2 as before: the badge, the name read
     /// and the FIDO2 reset step.
     #[test]
     fn not_opened_keeps_fido2_and_reset() {
+        let _one = one_hid_open_at_a_time();
         let path = "/nonexistent/keyroost-test/not-opened";
         let hids = [hid(0x1050, 0x0407, path, None, Some(1), Some(2))];
         let mut cache = FidoProtocolCache::new();
@@ -4241,6 +4253,7 @@ mod tests {
     /// USB name.
     #[test]
     fn a_failed_info_read_settles_the_model() {
+        let _one = one_hid_open_at_a_time();
         let path = "/nonexistent/keyroost-test/model-not-read";
         let hids = [hid(0x1050, 0x0407, path, None, Some(1), Some(2))];
         let mut devices = correlate(&hids, &[], &Keyring::default());
