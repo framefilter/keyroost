@@ -16824,8 +16824,6 @@ mod cli_tests {
         assert_eq!(pin_status_line(Some(7)), "7 PIN attempt(s) remaining");
     }
 
-    /// `piv info` prints slots in capitals ("retired key 9 (8A)"); a slot
-    /// copied from there is accepted as typed.
     /// `--touch` (every code) and `--touch-for` (named codes) are each
     /// accepted by both imports, `--touch-for` repeatedly, but not together.
     #[test]
@@ -16844,6 +16842,8 @@ mod cli_tests {
         }
     }
 
+    /// `piv info` prints slots in capitals ("retired key 9 (8A)"); a slot
+    /// copied from there is accepted as typed.
     #[test]
     fn a_piv_slot_is_accepted_in_capitals() {
         for slot in ["8A", "8a", "9C"] {

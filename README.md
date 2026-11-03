@@ -930,6 +930,12 @@ entry:
   "Solo 2 doesn't take SHA-512 codes"). keyroost never changes an entry to
   make it fit. Steam codes are skipped on every key.
 
+Imported codes can require a touch, as `add --touch` does: `--touch` for
+every code the import writes, or `--touch-for NAME` (repeat it) for the
+codes named as the preview shows them (in the GUI, "Require touch for every
+code" or the box on each code's row). The preview marks them "(touch)". A
+Nitrokey 3 asks for a touch to save each one. A Molto2 has no touch setting.
+
 On a Molto2, entries fill consecutive slots from `--slot`. A slot already in
 use is replaced (**replace**), an entry with no issuer or account is
 skipped without using up a slot, and entries past slot #99 are skipped.

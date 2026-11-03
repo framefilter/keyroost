@@ -1965,6 +1965,23 @@ mod tests {
         assert_eq!(OathFamily::Other.name_limit(), None);
     }
 
+    /// `--touch-for` names a row by the name it gets on the key or by the
+    /// file's own label, exactly.
+    #[test]
+    fn a_row_is_named_by_its_stored_name_or_its_label() {
+        let row = PlanRow {
+            index: 0,
+            label: "A:a".into(),
+            name: Some(StoredName::Oath("60/A:a".into())),
+            verdict: Verdict::Add,
+            touch: false,
+        };
+        assert!(row.is_named("60/A:a"));
+        assert!(row.is_named("A:a"));
+        assert!(!row.is_named("a:a"));
+        assert!(!row.is_named("A"));
+    }
+
     #[test]
     fn verdict_words_and_reasons_are_one_vocabulary() {
         let words: Vec<&str> = [

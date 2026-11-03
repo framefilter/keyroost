@@ -97,7 +97,9 @@ impl<'a> TouchPick<'a> {
     }
 
     /// Refuse a `--touch-for` name that picks no code this import writes,
-    /// before anything is asked: a typo, or a code the import leaves as is.
+    /// before the question (a key's password or PIN is asked first, as the
+    /// names on the key decide what is written): a typo, or a code the
+    /// import leaves as is.
     fn check(self, plan: &Plan) -> Result<(), String> {
         for name in self.names {
             let rows: Vec<_> = plan.rows.iter().filter(|r| r.is_named(name)).collect();
@@ -797,7 +799,7 @@ pub(crate) fn import_json(
                 label: row.label.clone(),
                 name: row.name.as_ref().map(|n| n.to_string()),
                 plan: row.verdict.word(),
-                touch: row.touch,
+                touch_required: row.touch,
                 reason: verdict_reason(&row.verdict, plan.store),
                 outcome: done.as_ref().map(|(o, _)| *o),
                 error: done.and_then(|(_, e)| e),
@@ -914,8 +916,8 @@ mod tests {
             lines[4]
         );
         let json = serde_json::to_value(import_json(&plan, None, true, true)).unwrap();
-        assert_eq!(json["entries"][0]["touch"], true);
-        assert_eq!(json["entries"][1]["touch"], false);
+        assert_eq!(json["entries"][0]["touch_required"], true);
+        assert_eq!(json["entries"][1]["touch_required"], false);
 
         let typo = ["Example:alic".to_owned()];
         let err = TouchPick::new(false, &typo).check(&plan).unwrap_err();
