@@ -2,4 +2,4 @@
   tab read the large-blob store on the window's own thread, so a slow key
   froze the app until it answered, and the read left nothing in the
   Activity log's APDU trace. It now runs in the background like every
-  other read. ([#250])
+  other read. ([#251])
