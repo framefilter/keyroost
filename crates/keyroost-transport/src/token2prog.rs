@@ -152,7 +152,12 @@ impl Token2ProgSession {
         label: &'static str,
     ) -> Result<(Vec<u8>, u8, u8), TransportError> {
         let mut buf = [0u8; 2048];
-        let response = self.card.transmit(apdu, &mut buf)?;
+        let response = self.card.transmit(apdu, &mut buf).inspect_err(|e| {
+            // A request is never left without an answer line.
+            crate::trace::line(self.debug, || {
+                format_line(Dir::Received, label, &format!("PC/SC error: {e}"))
+            });
+        })?;
         if response.len() < 2 {
             return Err(TransportError::ShortResponse {
                 label,

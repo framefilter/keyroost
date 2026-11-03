@@ -84,7 +84,10 @@ fn announce_via(d: &Device, via: &str) -> String {
         sanitize_terminal(&d.name.clone().unwrap_or_else(|| d.model_title()))
     );
     if !d.serial.is_empty() {
-        line.push_str(&format!(" \u{b7} serial {}", sanitize_terminal(&d.serial)));
+        line.push_str(&format!(
+            " \u{b7} serial {}",
+            sanitize_terminal(&keyroost_resolve::serial_for_display(&d.serial))
+        ));
     }
     if !via.is_empty() {
         line.push_str(&format!(" \u{b7} {via}"));
@@ -222,6 +225,9 @@ pub(crate) fn select(
         let (dev, line) = select_from(
             enumerate_without_key_names,
             |devices: &mut Vec<Device>| keyroost_resolve::add_key_names(devices, debug_on()),
+            |dev: &mut Device| {
+                keyroost_resolve::add_fido_models(std::slice::from_mut(dev), debug_on())
+            },
             &sel,
             need,
             &mut picker,
@@ -236,10 +242,14 @@ pub(crate) fn select(
 /// only when the choice could depend on them — the name commands always,
 /// otherwise per [`keyroost_resolve::selection_needs_key_names`] — then
 /// choose. Reading a key's name costs a CTAP round trip per FIDO key, so a
-/// key picked by serial, list number or override skips it.
+/// key picked by serial, list number or override skips it. The chosen key
+/// is then named by its model with `add_model` (one getInfo, unless the
+/// name reads already made it), so its line says what the app's header
+/// says.
 fn select_from(
     scan: impl FnOnce() -> Result<Vec<Device>, Box<dyn Error>>,
     add_names: impl FnOnce(&mut Vec<Device>),
+    add_model: impl FnOnce(&mut Device),
     sel: &Selector<'_>,
     need: Need,
     picker: &mut dyn Picker,
@@ -248,7 +258,18 @@ fn select_from(
     if need == Need::Nameable || keyroost_resolve::selection_needs_key_names(&devices, sel, need) {
         add_names(&mut devices);
     }
-    Ok(choose(&devices, sel, need, picker)?)
+    let (mut dev, line) = choose(&devices, sel, need, picker)?;
+    // A --reader / --path passed through as typed is no detected key.
+    if typed_value(&dev).is_some() {
+        return Ok((dev, line));
+    }
+    let before = dev.model.clone();
+    add_model(&mut dev);
+    if dev.model == before {
+        return Ok((dev, line));
+    }
+    let line = announce_line_for(&dev, need, sel);
+    Ok((dev, line))
 }
 
 /// The exact reader of the selected key (never re-matched as a substring).
@@ -501,6 +522,7 @@ mod tests {
         let got = select_from(
             || Ok(devices),
             |_: &mut Vec<Device>| reads.set(reads.get() + 1),
+            |_: &mut Device| {},
             &sel,
             need,
             &mut NoPicker,
@@ -508,6 +530,52 @@ mod tests {
         .map(|(d, _)| d)
         .map_err(|e| e.to_string());
         (reads.get(), got)
+    }
+
+    /// The chosen key's line names the model `add_model` gives it; only the
+    /// chosen key is named, and a --path passed through as typed isn't.
+    #[test]
+    fn the_chosen_key_is_announced_by_its_model() {
+        let sel = Selector {
+            device: Some("serial:12345678"),
+            reader: None,
+            path: None,
+        };
+        let named = Cell::new(0);
+        let (d, line) = select_from(
+            || Ok(two_fido_keys()),
+            |_: &mut Vec<Device>| {},
+            |d: &mut Device| {
+                named.set(named.get() + 1);
+                d.model = "YubiKey 5 Series with NFC".into();
+            },
+            &sel,
+            Need::FidoHid,
+            &mut NoPicker,
+        )
+        .unwrap();
+        assert_eq!(named.get(), 1);
+        assert_eq!(d.model, "YubiKey 5 Series with NFC");
+        assert!(
+            line.starts_with("\u{2192} YubiKey 5 Series with NFC \u{b7} serial 12345678"),
+            "{line}"
+        );
+
+        let typed = Selector {
+            device: None,
+            reader: None,
+            path: Some(Path::new("/dev/hidraw99")),
+        };
+        let (_, line) = select_from(
+            || Ok(two_fido_keys()),
+            |_: &mut Vec<Device>| {},
+            |_: &mut Device| panic!("a typed path is no key to read"),
+            &typed,
+            Need::FidoHid,
+            &mut NoPicker,
+        )
+        .unwrap();
+        assert!(line.contains("not detected"), "{line}");
     }
 
     #[test]

@@ -249,29 +249,46 @@ enum HidIo {
     Hidapi(hidapi::HidDevice),
 }
 
-/// True when the *response* to `apdu` carries user secrets — account names and
-/// live OTP codes — and so must be redacted from the debug trace.
+/// True when the *response* to `apdu` carries user data — account names and
+/// live OTP codes, or the key's serial — and so must be redacted from the
+/// debug trace.
 ///
-/// Only the `ENUM_CODES` / `ENUM_CODES_CONTINUE` reads (INS `0xC5`, P1 `0x05`,
-/// P2 `0x00`/`0x01`) return entry data. `WRITE_SEED` shares P1 `0x05` but its
-/// request (not response) is the secret-bearing side and answers with a status
-/// word only; every other command returns public config, the public ECDH key,
-/// the serial, or a bare status word. Keyed off the *original* command so a
-/// `61xx` GET-RESPONSE continuation (which resends a different header) still
-/// inherits the correct verdict.
+/// The `ENUM_CODES` / `ENUM_CODES_CONTINUE` reads (INS `0xC5`, P1 `0x05`, P2
+/// `0x00`/`0x01`) return entry data. The serial read (`READ_SERIAL_INS`, INS
+/// `0x33`) returns the key's serial: identifying, so redacted like the FIDO
+/// layer's vendor payloads below it, and as keyroost's probe notes shorten
+/// serials, since people post `--debug` output publicly. `WRITE_SEED` shares
+/// P1 `0x05` but its request (not response) is the secret-bearing side and
+/// answers with a status word only; every other command returns public
+/// config, the public ECDH key, or a bare status word. Keyed off the
+/// *original* command so a `61xx` GET-RESPONSE continuation (which resends a
+/// different header) still inherits the correct verdict.
 fn response_is_sensitive(apdu: &[u8]) -> bool {
-    matches!(
+    let entries = matches!(
         (apdu.get(1), apdu.get(2), apdu.get(3)),
         (Some(&0xC5), Some(&0x05), Some(&0x00) | Some(&0x01))
-    )
+    );
+    entries || reads_serial(apdu)
 }
 
-/// True when `apdu`'s *request* body carries a secret and must be redacted from
-/// the send trace. Shared by both transports so nothing sensitive reaches the
-/// trace on either path. Two families:
+/// Whether `apdu` is the Token2 serial read (`READ_SERIAL_INS`), whose reply
+/// is the serial printed on the key. Every path that sends it keeps that
+/// reply out of the trace: this layer, and PIV and OpenPGP status, which
+/// read it on their own card handle.
+pub(crate) fn reads_serial(apdu: &[u8]) -> bool {
+    apdu.get(..4) == Some(&cmd::READ_SERIAL_INS[..])
+}
+
+/// True when `apdu`'s *request* body carries a secret or an account name and
+/// must be redacted from the send trace. Shared by both transports so nothing
+/// sensitive reaches the trace on either path. Three families:
 ///
 /// * **Seed writes** (`WRITE_SEED` / `WRITE_HOTP_SEED`, spec §1.3): the body is
 ///   the ECDH-sealed seed.
+/// * **Entry reads by name** (`ENUM_CODES` with any subcommand but
+///   `SUB_READ_ALL`): the body names an account. "Read all" carries only a
+///   timestamp and stays visible, so the entry list's request (and its
+///   `6A83`, "no entries", on an empty key) can be read in the trace.
 /// * **PIN material** (`SET_OTP_PIN` / `VERIFY_OTP_PIN` / `CHANGE_OTP_PIN`): the
 ///   body carries the encrypted PIN hash or new-PIN block. `VERIFY_OTP_PIN`
 ///   also has two 1-byte forms that carry no secret — lock (`0x00`) and
@@ -279,14 +296,16 @@ fn response_is_sensitive(apdu: &[u8]) -> bool {
 ///   actual payload (`Lc > 1`). Every PIN command is short-`Lc` (payloads are
 ///   well under 256 bytes), so `apdu[4]` is the length byte.
 fn request_is_sensitive(apdu: &[u8]) -> bool {
-    let seed = matches!(apdu.get(1), Some(0xC5))
-        && matches!(apdu.get(2), Some(0x05) | Some(0x00))
-        && matches!(apdu.get(3), Some(0x02) | Some(0x00));
+    let header = apdu.get(..4);
+    let seed = header == Some(&cmd::WRITE_SEED[..]) || header == Some(&cmd::WRITE_HOTP_SEED[..]);
+    // ENUM_CODES: Lc at [4], the subcommand at [5].
+    let named_read =
+        header == Some(&cmd::ENUM_CODES[..]) && apdu.get(5) != Some(&cmd::SUB_READ_ALL);
     let pin_material = matches!(apdu.get(1), Some(0xC5))
         && matches!(apdu.get(2), Some(0x05))
         && matches!(apdu.get(3), Some(0x05) | Some(0x06) | Some(0x08))
         && matches!(apdu.get(4), Some(&lc) if lc > 1);
-    seed || pin_material
+    seed || named_read || pin_material
 }
 
 /// Render one debug-trace line. Sensitive payloads (seed blobs on the way
@@ -1052,7 +1071,17 @@ impl PcScOtpTransport {
                     to_send = apdu.to_vec();
                     continue;
                 }
-                Err(e) => return Err(OtpTransportError::Pcsc(e)),
+                Err(e) => {
+                    // A request is never left without an answer line.
+                    crate::trace::line(self.debug, || {
+                        format_line(
+                            Dir::Received,
+                            &otp_label("PCSC"),
+                            &format!("PC/SC error: {e}"),
+                        )
+                    });
+                    return Err(OtpTransportError::Pcsc(e));
+                }
             };
             trace_bytes(self.debug, Dir::Received, "PCSC", "", resp, resp_sensitive);
             if resp.len() < 2 {
@@ -2442,13 +2471,22 @@ mod trace_redaction_tests {
 
     #[test]
     fn public_and_status_only_responses_are_not_sensitive() {
-        // ECDH pubkey and device config are public; the serial read and a bare
-        // GET RESPONSE / SELECT return non-secret bytes or a status word.
+        // ECDH pubkey and device config are public; a bare GET RESPONSE /
+        // SELECT returns non-secret bytes or a status word.
         assert!(!response_is_sensitive(&cmd::GET_ECDH_PUBKEY));
         assert!(!response_is_sensitive(&cmd::READ_CONFIG));
-        assert!(!response_is_sensitive(&cmd::READ_SERIAL_INS));
         assert!(!response_is_sensitive(&[0x00, 0xC0, 0x00, 0x00, 0x20])); // GET RESPONSE
         assert!(!response_is_sensitive(&[0x00, 0xA4, 0x04, 0x00])); // SELECT
+    }
+
+    /// The serial read's reply identifies the key: redacted like the FIDO
+    /// layer's vendor payloads, with or without the request's body.
+    #[test]
+    fn the_serial_reply_is_redacted() {
+        assert!(response_is_sensitive(&cmd::READ_SERIAL_INS));
+        let mut with_body = cmd::READ_SERIAL_INS.to_vec();
+        with_body.extend_from_slice(&[0x12, 0xD1, 0x10]);
+        assert!(response_is_sensitive(&with_body));
     }
 
     #[test]
@@ -2464,6 +2502,13 @@ mod trace_redaction_tests {
         // The request body carries the ECDH-sealed seed on both write paths.
         assert!(request_is_sensitive(&cmd::WRITE_SEED));
         assert!(request_is_sensitive(&cmd::WRITE_HOTP_SEED));
+        // The entry list: "read all" (a timestamp) is visible, a read by
+        // name is not.
+        let read_all = keyroost_token2otp::build_apdu(cmd::ENUM_CODES, &[cmd::SUB_READ_ALL, 0, 0]);
+        assert!(!request_is_sensitive(&read_all));
+        let read_one = keyroost_token2otp::build_apdu(cmd::ENUM_CODES, &[cmd::SUB_READ_ONE, b'a']);
+        assert!(request_is_sensitive(&read_one));
+        assert!(!request_is_sensitive(&cmd::ENUM_CODES_CONTINUE));
         // A read command's request has no secret and stays in the clear.
         assert!(!request_is_sensitive(&cmd::GET_ECDH_PUBKEY));
         assert!(!request_is_sensitive(&cmd::READ_CONFIG));

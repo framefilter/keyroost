@@ -451,7 +451,7 @@ const LITERAL_CASES: &[&[&str]] = &[
     &["piv", "puk", "change", "--puk", "STDIN"],
     &["piv", "puk", "change", "--new-puk", "S3CRETVALUE"],
     &["piv", "chuid", "generate", "--mgmt-key", "S3CRETVALUE"],
-    &["piv", "mgmt-key", "change", "--new-mgmt-key", "default"],
+    &["piv", "mgmt-key", "change", "--new-mgmt-key", "S3CRETVALUE"],
     &["openpgp", "name", "set", "x", "--admin-pin", "S3CRETVALUE"],
     &[
         "openpgp",

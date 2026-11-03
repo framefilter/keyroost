@@ -26,6 +26,9 @@ keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.15.0" }
 keyroost-proto = { path = "../keyroost-proto", version = "0.15.0" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.15.0" }
 keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.15.0" }
+# The bundled FIDO metadata (MDS) projection, a JSON list read at startup.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 # Test builds resolve the config dir to a temp dir, never the real one.

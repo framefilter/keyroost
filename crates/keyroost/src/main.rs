@@ -100,6 +100,25 @@ fn is_user_activity(event: &egui::Event) -> bool {
     )
 }
 
+/// What a PIV reset returned the card to, when keyroost knows: `": PIN
+/// 865362, PUK 86536286 and the factory management key (\"Use default
+/// management key\")"`, or `""`. The CLI's `piv reset` says the same, naming
+/// its `--mgmt-key default` instead.
+fn piv_reset_defaults_note(
+    quirks: &std::collections::BTreeSet<keyroost_piv::compat::PivQuirk>,
+) -> String {
+    let pin_puk = keyroost_piv::compat::default_pin_puk_text(quirks);
+    let mgmt = keyroost_piv::compat::default_9b_management_key(quirks)
+        .is_some()
+        .then_some("the factory management key (\"Use default management key\")");
+    match (pin_puk, mgmt) {
+        (Some(p), Some(m)) => format!(": {p} and {m}"),
+        (Some(p), None) => format!(": {p}"),
+        (None, Some(m)) => format!(": {m}"),
+        (None, None) => String::new(),
+    }
+}
+
 /// Keeps text selections out of the X11 / Wayland primary selection (the one
 /// a middle click pastes). egui 0.37 sends every settled selection there,
 /// from text boxes and selectable labels alike; keyroost shows OTP codes and
@@ -4613,7 +4632,7 @@ fn main() -> eframe::Result<()> {
                     devices_dirty,
                     reader_watch: Some(reader_watch),
                     hid_watch,
-                    mds: ui::mds::MdsDb::load_bundled(),
+                    mds: keyroost_resolve::mds::MdsDb::load_bundled(),
                     apdu_trace,
                     ..Default::default()
                 };
@@ -4793,7 +4812,7 @@ struct App {
     /// FIDO security-key view state (CTAP info, PIN session, errors).
     security_keys: SecurityKeysState,
     /// FIDO Metadata Service database (bundled, plus any refreshed download).
-    mds: ui::mds::MdsDb,
+    mds: keyroost_resolve::mds::MdsDb,
     /// Cached icon texture for the selected device's AAGUID, with the AAGUID it
     /// was decoded for so we re-upload only when the device changes.
     mds_icon: Option<(String, egui::TextureHandle)>,
@@ -5792,6 +5811,22 @@ impl App {
     /// lines such as the device-scan count, which every refresh repeats.
     fn log_global_bg_once(&mut self, severity: Severity, text: impl Into<String>) {
         let text = without_home(&text.into());
+        // The same words as the newest line, with traffic of its own (a
+        // Refresh's burst of rescans with "APDU trace" on): the traffic goes
+        // under that line rather than starting a new one, so one Refresh
+        // reads as one scan. Only onto the newest line, so traffic never
+        // lands above a later entry.
+        if let Some(last) = self.log.last_mut() {
+            if last.text == text
+                && matches!(last.kind, LogKind::Background)
+                && std::mem::discriminant(&last.severity) == std::mem::discriminant(&severity)
+            {
+                if let Some(more) = self.pending_trace.take().filter(|t| !t.is_empty()) {
+                    last.trace.get_or_insert_with(Vec::new).extend(more);
+                }
+                return;
+            }
+        }
         // A line that would carry this job's APDU trace is never dropped:
         // the traffic is new even when the words aren't, and dropping the
         // line would only leave the trace to the job's automatic line.
@@ -6378,7 +6413,7 @@ impl App {
                     .security_keys
                     .info
                     .as_ref()
-                    .and_then(|info| ui::aaguid::model_for_aaguid(&info.aaguid))
+                    .and_then(|info| keyroost_resolve::aaguid::model_for_aaguid(&info.aaguid))
                     .map(str::to_string),
             };
             (id, details)
@@ -8326,7 +8361,14 @@ impl App {
                         }
                     }
                 }
+                let listed = result.is_ok();
                 Self::apply_oath_rows(app, result, password);
+                // As the code read does: say it in the pane too, not only in
+                // the log, unless the re-list's own error is showing.
+                if gone && listed {
+                    app.oath.error =
+                        Some("That account was no longer on the key; nothing was deleted.".into());
+                }
             })
         });
     }
@@ -8737,7 +8779,7 @@ impl App {
                     keyroost_resolve::exclude_unresettable_piv(&mut plan);
                 }
                 let summary = factory_reset_confirm_summary(
-                    &dev.serial,
+                    &keyroost_resolve::serial_for_display(&dev.serial),
                     &dev.model,
                     &plan,
                     piv_preview,
@@ -11008,7 +11050,9 @@ impl App {
             Reread::Otp => self.refresh_otp(),
             Reread::Passkeys => self.refresh_credentials(),
             Reread::Fingerprints => self.refresh_fingerprints(),
-            Reread::LargeBlobs => self.load_large_blobs(),
+            Reread::LargeBlobs => {
+                self.load_large_blobs();
+            }
             Reread::FidoInfo => self.fetch_selected_info(),
             Reread::Nothing => {}
         }
@@ -11977,11 +12021,13 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Setting PIV retry counts\u{2026}", move || {
+            let mut defaults = None;
             let result =
                 keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
                     piv_authenticate(s, &mgmt)?;
                     s.verify_pin(pin.as_bytes())?;
                     s.set_pin_retries(pin_tries, puk_tries)?;
+                    defaults = keyroost_piv::compat::default_pin_puk_text(&s.quirks());
                     let status = s.status()?;
                     Ok((status, s.state()))
                 });
@@ -11992,7 +12038,10 @@ impl App {
                 Self::apply_piv_write(
                     app,
                     result,
-                    "Retry counts set; PIN/PUK reset to defaults.".into(),
+                    match defaults {
+                        Some(d) => format!("Retry counts set; PIN/PUK reset to defaults ({d})."),
+                        None => "Retry counts set; PIN/PUK reset to defaults.".into(),
+                    },
                 );
                 Self::apply_piv_cred_result(app);
             })
@@ -12816,6 +12865,7 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         // The worker raises the touch banner when the slot may ask for one.
+        let pin_given = !pin.is_empty();
         self.spawn_piv_job("Running self-test\u{2026}", move || {
             let outcome = run_piv_self_test(&name, slot, pin.as_bytes(), cached_state);
             Box::new(move |app: &mut App| {
@@ -12823,7 +12873,15 @@ impl App {
                 let (all_ok, text) = match &outcome {
                     // Skipped ops don't count as failures.
                     Ok(run) => {
-                        let report = keyroost_pivtest::format_report(&run.results);
+                        let mut report = keyroost_pivtest::format_report(&run.results);
+                        // As `piv test` does: a refusal for want of an
+                        // authorization with the PIN box empty suggests the box.
+                        if !pin_given && keyroost_transport::self_test_wanted_pin(&run.results) {
+                            report.push_str(
+                                "\nThe card may want this slot's PIN: enter it above and run \
+                                 the test again.",
+                            );
+                        }
                         (
                             !run.results.iter().any(|(_, r)| r.is_failure()),
                             if run.cert_tested {
@@ -13294,6 +13352,7 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         let queued = self.spawn_piv_job("Resetting PIV applet\u{2026}", move || {
+            let mut defaults = String::new();
             let result =
                 keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
                     // The PIV pane's "Reset applet" card collects no
@@ -13309,6 +13368,7 @@ impl App {
                     // already the post-reset state; there's nothing left to
                     // clear by hand.
                     s.force_reset_if_known_supported(None, false)?;
+                    defaults = piv_reset_defaults_note(&s.quirks());
                     let status = s.status()?;
                     Ok((status, s.state()))
                 });
@@ -13317,7 +13377,7 @@ impl App {
                 Self::apply_piv_write(
                     app,
                     result,
-                    "PIV application reset to factory defaults.".into(),
+                    format!("PIV application reset to factory defaults{defaults}."),
                 );
             })
         });
@@ -18476,7 +18536,7 @@ impl App {
                     let serial = if dev.serial.is_empty() {
                         "\u{2014}".to_string()
                     } else {
-                        dev.serial.clone()
+                        keyroost_resolve::serial_for_display(&dev.serial).into_owned()
                     };
                     let mut meta = format!(
                         "{} \u{00B7} #{} \u{00B7} {}",
@@ -18655,7 +18715,7 @@ impl App {
         let Some(entry) = self.mds.get(&aaguid).cloned() else {
             return;
         };
-        let key = ui::aaguid::format_aaguid_pub(&aaguid);
+        let key = keyroost_resolve::aaguid::format_aaguid(&aaguid);
         // Live versions reported by the device's authenticatorGetInfo, preferred
         // over the MDS statement's copy since they describe the actual unit.
         let device_versions: Vec<String> = self
@@ -18735,9 +18795,15 @@ impl App {
             if let Some(lvl) = entry.certification_level() {
                 pairs.push(("Certification level", lvl.to_string()));
             }
-            if let Some(date) = &entry.effective_date {
-                let d = date.split(['T', ' ']).next().unwrap_or(date);
-                pairs.push(("Certified since", d.to_string()));
+            if let Some(date) = entry.status_date() {
+                // The date of the latest status, which isn't always a
+                // certification ("Not FIDO Certified", an advisory).
+                let label = if entry.certification_level().is_some() {
+                    "Certified since"
+                } else {
+                    "Status since"
+                };
+                pairs.push((label, date.to_string()));
             }
             if let Some(fam) = &entry.protocol_family {
                 pairs.push(("Protocol family", fam.clone()));
@@ -20251,44 +20317,57 @@ impl App {
 
     /// Read the large-blob array from the selected key (no PIN required) and
     /// cache it. Runs synchronously — a read is one or two small fragments.
-    fn load_large_blobs(&mut self) {
+    /// Read the key's large-blob store on the worker thread, as every other
+    /// read is, so a slow key doesn't freeze the window and the read shows in
+    /// the APDU trace. `false` when another job is running and nothing was
+    /// queued (the caller may try again).
+    fn load_large_blobs(&mut self) -> bool {
         let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
-            return;
+            return true;
         };
-        let result = (|| -> Result<
-            (
-                keyroost_ctap::large_blobs::LargeBlobArray,
-                keyroost_ctap::large_blobs::BlobCapacity,
-            ),
-            String,
-        > {
-            let (mut dev, cbor, _init) = open_fido(&target)?;
-            if !cbor {
-                return Err("device is U2F-only".into());
-            }
-            let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
-            let array =
-                keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
-            let cap = array.capacity(&info);
-            Ok((array, cap))
-        })();
-        match result {
-            Ok((array, cap)) => {
-                let n = array.len();
-                self.security_keys.large_blobs = Some(array);
-                self.security_keys.lb_capacity = Some(cap);
-                self.security_keys.lb_selected = None;
-                self.security_keys.lb_status = Some(format!(
-                    "Loaded {n} entr{}.",
-                    if n == 1 { "y" } else { "ies" }
-                ));
-            }
-            Err(e) => {
-                self.log_bg_once(Severity::Err, format!("Storage: load failed: {e}"));
-                self.security_keys.lb_status = Some(format!("Load failed: {e}"));
-            }
-        }
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Reading large-blob storage\u{2026}", move || {
+            let result = (|| -> Result<
+                (
+                    keyroost_ctap::large_blobs::LargeBlobArray,
+                    keyroost_ctap::large_blobs::BlobCapacity,
+                ),
+                String,
+            > {
+                let (mut dev, cbor, _init) = open_fido(&target)?;
+                if !cbor {
+                    return Err("device is U2F-only".into());
+                }
+                let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+                let array = keyroost_ctap::large_blobs::read(&mut dev, &info)
+                    .map_err(|e| e.to_string())?;
+                let cap = array.capacity(&info);
+                Ok((array, cap))
+            })();
+            Box::new(move |app: &mut App| {
+                // Another key selected meanwhile: this read isn't its store.
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
+                match result {
+                    Ok((array, cap)) => {
+                        let n = array.len();
+                        app.security_keys.large_blobs = Some(array);
+                        app.security_keys.lb_capacity = Some(cap);
+                        app.security_keys.lb_selected = None;
+                        app.security_keys.lb_status = Some(format!(
+                            "Loaded {n} entr{}.",
+                            if n == 1 { "y" } else { "ies" }
+                        ));
+                    }
+                    Err(e) => {
+                        app.log_bg_once(Severity::Err, format!("Storage: load failed: {e}"));
+                        app.security_keys.lb_status = Some(format!("Load failed: {e}"));
+                    }
+                }
+            })
+        })
     }
 
     /// Delete entry `idx`, re-serialize the remaining entries with a fresh
@@ -20509,9 +20588,13 @@ impl App {
         // Auto-load the array the first time this tab is shown, so entries
         // appear on their own. The flag stops a failed read from retrying every
         // frame; the top bar's Refresh reads it again.
-        if !self.security_keys.lb_autoloaded && self.security_keys.large_blobs.is_none() {
+        // Marked only once the read is queued: with another job running it
+        // tries again on a later frame.
+        if !self.security_keys.lb_autoloaded
+            && self.security_keys.large_blobs.is_none()
+            && self.load_large_blobs()
+        {
             self.security_keys.lb_autoloaded = true;
-            self.load_large_blobs();
         }
 
         // Header + Add control.
@@ -22725,6 +22808,13 @@ impl App {
                                     // pair of standalone actions, not a
                                     // labeled field, so they share the
                                     // modal's horizontal center instead.
+                                    // This card's factory-default key, when
+                                    // keyroost knows it and it fits the chosen
+                                    // algorithm (`--new-mgmt-key default` in
+                                    // the CLI).
+                                    let factory = self
+                                        .piv_current_default_mgmt_key()
+                                        .filter(|k| k.len() == alg.key_len());
                                     ui.vertical_centered(|ui| {
                                         // Plain accent-colored `Label` +
                                         // `Sense::click()`, not `ui.link()` —
@@ -22750,6 +22840,33 @@ impl App {
                                             .clicked()
                                         {
                                             self.piv_generate_random_mgmt_key(ui.ctx(), alg);
+                                        }
+                                        if let Some(key) = factory {
+                                            if ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(
+                                                            "Use the factory default",
+                                                        )
+                                                        .font(theme::f_sb(13.0))
+                                                        .color(p.accent),
+                                                    )
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text(
+                                                    "Fill in this key's factory-default \
+                                                     management key, to set it back.",
+                                                )
+                                                .clicked()
+                                            {
+                                                wipe(&mut self.piv.new_mgmt_key_input);
+                                                self.piv
+                                                    .new_mgmt_key_input
+                                                    .push_str(&hex_lower(key));
+                                                // A published value: nothing to hide.
+                                                self.secret_reveal.insert("piv-new-mgmt-key", true);
+                                            }
                                         }
                                     });
                                     // "Allow PIN unlock": whether the new key
@@ -25030,9 +25147,13 @@ impl App {
                                 .custom_formatter(blank_when_unsupported),
                         );
                         ui.label(
-                            egui::RichText::new("PUK tries")
+                            egui::RichText::new("New PUK tries")
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt2),
+                        )
+                        .on_hover_text(
+                            "The count to set, not the key's current one. Setting it also \
+                             resets the PIN and PUK to their defaults.",
                         );
                         ui.add_space(8.0);
                         ui.add_enabled(
@@ -25042,9 +25163,13 @@ impl App {
                                 .custom_formatter(blank_when_unsupported),
                         );
                         ui.label(
-                            egui::RichText::new("PIN tries")
+                            egui::RichText::new("New PIN tries")
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt2),
+                        )
+                        .on_hover_text(
+                            "The count to set, not the key's current one. Setting it also \
+                             resets the PIN and PUK to their defaults.",
                         );
                     },
                 );
@@ -31903,13 +32028,26 @@ mod tests {
                 "device scan: 2 devices found"
             ]
         );
-        // With APDU trace on, each scan's line carries its traffic: kept.
+        // With APDU trace on, a repeat scan's traffic goes under the newest
+        // line rather than a new one: a Refresh's burst reads as one scan,
+        // and no traffic is lost.
         app.pending_trace = Some(vec!["> select".into()]);
         app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        app.pending_trace = Some(vec!["> select again".into()]);
+        app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        assert_eq!(app.log.len(), 4);
         let last = app.log.last().expect("logged");
         assert_eq!(last.text, "device scan: 2 devices found");
-        assert!(last.trace.is_some());
-        assert_eq!(app.log.len(), 5);
+        assert_eq!(
+            last.trace.as_deref(),
+            Some(&["> select".to_string(), "> select again".to_string()][..])
+        );
+        // After another entry, a traced scan is a new line again.
+        app.log(Severity::Info, "a: something else");
+        app.pending_trace = Some(vec!["> select once more".into()]);
+        app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        assert_eq!(app.log.len(), 6);
+        assert!(app.log.last().expect("logged").trace.is_some());
     }
 
     /// A FIDO2 reset run on its own (not a factory reset's last step) writes

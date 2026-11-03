@@ -279,7 +279,7 @@ pub(crate) const SECRET_FLAGS: &[SecretFlag] = &[
     SecretFlag {
         long: "new-mgmt-key",
         what: "the management key",
-        default_ok: false,
+        default_ok: true,
     },
     SecretFlag {
         long: "password",

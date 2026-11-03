@@ -338,7 +338,10 @@ pub(crate) fn key_label(d: &Device) -> String {
     if d.serial.is_empty() {
         who
     } else {
-        format!("{who} (serial {})", sanitize_terminal(&d.serial))
+        format!(
+            "{who} (serial {})",
+            sanitize_terminal(&keyroost_resolve::serial_for_display(&d.serial))
+        )
     }
 }
 

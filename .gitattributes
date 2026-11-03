@@ -1,0 +1,5 @@
+# Every text file is stored and checked out with LF line endings, on Windows
+# too, as the repository already holds them; without this, a Windows
+# checkout with core.autocrlf warns "LF will be replaced by CRLF" on every
+# add. Binary files are detected and left alone.
+* text=auto eol=lf

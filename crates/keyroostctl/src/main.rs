@@ -1067,9 +1067,10 @@ enum PivMgmtKeyCmd {
         mgmt_key: Option<SecretSource>,
         /// The new management key (hex): env:NAME reads that environment
         /// variable, stdin reads one line (second line when --mgmt-key stdin is
-        /// also given; hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, display_order = 14)]
+        /// also given; hidden when typed at a terminal), default sets the
+        /// factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, display_order = 14)]
         new_mgmt_key: Option<SecretSource>,
         /// Algorithm of the new management key.
         #[arg(long, value_enum, default_value = "aes192", display_order = 16)]
@@ -6892,7 +6893,12 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
                     outln!("  {}  [Molto2 token]", sanitize_terminal(&p.reader_name));
                     continue;
                 }
+                // Every applet the reader answered for, in the matched rows'
+                // order (a Token2 PIN+'s OTP applet included).
                 let mut applets = Vec::new();
+                if p.has_fido {
+                    applets.push("FIDO2");
+                }
                 if p.has_oath {
                     applets.push("OATH");
                 }
@@ -6901,6 +6907,9 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
                 }
                 if p.has_piv {
                     applets.push("PIV");
+                }
+                if p.has_otp {
+                    applets.push("OTP");
                 }
                 let list = if applets.is_empty() {
                     "(none detected)".to_string()
@@ -7704,7 +7713,10 @@ fn describe_present(devices: &[keyroost_resolve::Device]) -> String {
             if d.serial.is_empty() {
                 format!("{model} with no serial")
             } else {
-                format!("{model} serial {}", sanitize_terminal(&d.serial))
+                format!(
+                    "{model} serial {}",
+                    sanitize_terminal(&keyroost_resolve::serial_for_display(&d.serial))
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -9185,7 +9197,8 @@ fn run_otp(
             let raw = session.read_config()?;
             let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
             output::status(&format!("READ_CONFIG returned {} bytes: {hex}", raw.len()));
-            let info = session.read_device_info()?;
+            // Parsed from the same read, not a second one.
+            let info = keyroost_token2otp::DeviceInfo::parse(&raw)?;
             outln!("Device configuration:");
             outln!(
                 "  FIDO interface:         {}",
@@ -9984,7 +9997,9 @@ const PIV_MGMT_KEY: Spec = Spec::current("management key", "mgmt-key")
 const PIV_OLD_MGMT_KEY: Spec = Spec::current("current management key", "mgmt-key")
     .hex()
     .with_default();
-const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-key").hex();
+const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-key")
+    .hex()
+    .with_default();
 
 fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
@@ -10223,10 +10238,14 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     authenticate_piv(s, &mgmt)?;
                     s.verify_pin(pin.as_bytes())?;
                     s.set_pin_retries(*pin_tries, *puk_tries)?;
+                    let defaults = keyroost_piv::compat::default_pin_puk_text(&s.quirks())
+                        .map(|t| format!(": {t}"))
+                        .unwrap_or_default();
                     outln!(
-                        "PIN/PUK retry counts set to {}/{}. Both reset to factory defaults.",
+                        "PIN/PUK retry counts set to {}/{}. Both reset to factory defaults{}.",
                         pin_tries,
-                        puk_tries
+                        puk_tries,
+                        defaults
                     );
                     Ok(())
                 },
@@ -10251,16 +10270,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // The current key first (stdin line 1), then the new one (line 2).
             let (old, new) = pair.read(&mut sec)?;
             let old = old.mgmt(&PIV_OLD_MGMT_KEY)?;
-            let new = new.mgmt_hex(&PIV_NEW_MGMT_KEY)?;
+            let new = new.mgmt(&PIV_NEW_MGMT_KEY)?;
             let new_alg = algorithm.to_alg();
-            if new.len() != new_alg.key_len() {
-                return Err(format!(
-                    "new management key is {} bytes; {} needs {}",
-                    new.len(),
-                    new_alg.label(),
-                    new_alg.key_len()
-                )
-                .into());
+            // A typed key is checked before anything reaches the card; the
+            // factory default is known only once the card is identified.
+            if let MgmtKeyInput::Key(k) = &new {
+                check_new_mgmt_key_len(k, new_alg)?;
             }
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
@@ -10270,6 +10285,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let old = mgmt_key_bytes(&old, &PIV_OLD_MGMT_KEY, s)?;
+                    let new = mgmt_key_bytes(&new, &PIV_NEW_MGMT_KEY, s)?;
+                    check_new_mgmt_key_len(&new, new_alg)?;
                     guard_piv_feature(
                         s,
                         keyroost_piv::compat::PivExtension::SetManagementKey,
@@ -11106,7 +11123,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         outln!("{}", keyroost_pivtest::format_report(&results));
                     }
                     if !all_ok {
-                        return Err("one or more self-tests failed".into());
+                        return Err(piv_test_failure(pin.is_some(), &results).into());
                     }
                     Ok(())
                 },
@@ -11251,7 +11268,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     // ever grows its own use for it. `--force` on a card listed
                     // without RESET sends one bare RESET and blocks nothing.
                     s.force_reset_if_known_supported(current, *force)?;
-                    outln!("PIV application reset to factory defaults on {}.", serial);
+                    outln!(
+                        "PIV application reset to factory defaults on {}{}.",
+                        serial,
+                        piv_reset_defaults_note(&s.quirks())
+                    );
                     Ok(())
                 },
             )?;
@@ -12254,6 +12275,40 @@ fn decode_mgmt_key_hex(spec: &Spec, hex: &str) -> Result<zeroize::Zeroizing<Vec<
     Ok(zeroize::Zeroizing::new(key))
 }
 
+/// `piv test`'s error when an operation failed: it asks for no PIN of its
+/// own, so a card refusing for want of an authorization ("needs a
+/// management-key auth, PIN or touch") suggests `--pin` when none was given;
+/// the refusal may also be a missed touch, so it says "may".
+fn piv_test_failure(
+    pin_given: bool,
+    results: &[(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)],
+) -> String {
+    if keyroost_transport::self_test_wanted_pin(results) && !pin_given {
+        "one or more self-tests failed: the card may want this slot's PIN; run it again with \
+         --pin"
+            .into()
+    } else {
+        "one or more self-tests failed".into()
+    }
+}
+
+/// A new management key must be as long as its algorithm's keys.
+fn check_new_mgmt_key_len(
+    key: &[u8],
+    alg: keyroost_piv::MgmtAlg,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if key.len() == alg.key_len() {
+        return Ok(());
+    }
+    Err(format!(
+        "new management key is {} bytes; {} needs {}",
+        key.len(),
+        alg.label(),
+        alg.key_len()
+    )
+    .into())
+}
+
 /// The key bytes for `input`; `--mgmt-key default` looks up this device's known
 /// factory default on the open session's fingerprint
 /// ([`keyroost_transport::PivSession::default_management_key`]).
@@ -12408,13 +12463,6 @@ impl PairValue {
             PairValue::Default => Ok(MgmtKeyInput::Default),
             PairValue::Value(hex) => Ok(MgmtKeyInput::Key(decode_mgmt_key_hex(spec, &hex)?)),
         }
-    }
-    /// A management key that must be given as hex.
-    fn mgmt_hex(
-        self,
-        spec: &Spec,
-    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
-        Ok(decode_mgmt_key_hex(spec, &self.text()?)?)
     }
 }
 
@@ -13448,18 +13496,6 @@ fn record_meta_for(
         },
         vendor: (dev.vendor == "Yubico").then(|| "yubico".to_string()),
     }
-}
-
-fn format_aaguid(aaguid: &[u8; 16]) -> String {
-    // Standard UUID grouping: 8-4-4-4-12.
-    let mut s = String::with_capacity(36);
-    for (i, b) in aaguid.iter().enumerate() {
-        if matches!(i, 4 | 6 | 8 | 10) {
-            s.push('-');
-        }
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
 }
 
 const FIDO_PIN: Spec = Spec::current("PIN", "pin");
@@ -14837,11 +14873,37 @@ fn hex_ascii_dump(bytes: &[u8]) -> String {
     out
 }
 
+/// What keyroost knows about `aaguid`, the facts the app's metadata card
+/// shows: the model name ([`keyroost_resolve::aaguid`], else the metadata's
+/// description) and the FIDO Alliance's metadata ([`keyroost_resolve::mds`]).
+/// `None` when neither knows the AAGUID.
+fn fido_metadata(aaguid: &[u8; 16]) -> Option<json_out::FidoMetadataJson> {
+    let db = keyroost_resolve::mds::MdsDb::load_bundled();
+    let entry = db.get(aaguid);
+    let model = keyroost_resolve::aaguid::model_for_aaguid(aaguid)
+        .map(str::to_owned)
+        .or_else(|| {
+            entry
+                .map(|e| e.description.clone())
+                .filter(|d| !d.is_empty())
+        });
+    if model.is_none() && entry.is_none() {
+        return None;
+    }
+    Some(json_out::FidoMetadataJson {
+        model,
+        certification: entry.and_then(|e| e.certification_label()),
+        status: entry.and_then(|e| e.status.clone()),
+        since: entry.and_then(|e| e.status_date()).map(str::to_owned),
+        protocol_family: entry.and_then(|e| e.protocol_family.clone()),
+    })
+}
+
 fn ctap2_json(info: &keyroost_ctap::AuthenticatorInfo) -> json_out::Ctap2InfoJson {
     json_out::Ctap2InfoJson {
         versions: info.versions.clone(),
         extensions: info.extensions.clone(),
-        aaguid: format_aaguid(&info.aaguid),
+        aaguid: keyroost_resolve::aaguid::format_aaguid(&info.aaguid),
         options: info
             .options
             .iter()
@@ -14868,6 +14930,7 @@ fn run_fido_info_reader(reader: &str) -> Result<(), Box<dyn std::error::Error>> 
         emit_json(&json_out::FidoReaderInfoJson {
             device: reader.to_owned(),
             ctap2: ctap2.as_ref().map(ctap2_json),
+            metadata: ctap2.as_ref().and_then(|i| fido_metadata(&i.aaguid)),
         })?;
         return Ok(());
     }
@@ -14953,6 +15016,7 @@ fn run_fido_info(
                 hid_caps: caps,
                 hid_caps_raw: init.capabilities,
                 ctap2: None,
+                metadata: None,
             })?;
             return Ok(());
         }
@@ -14970,6 +15034,7 @@ fn run_fido_info(
             hid_caps: caps,
             hid_caps_raw: init.capabilities,
             ctap2: Some(ctap2_json(&info)),
+            metadata: fido_metadata(&info.aaguid),
         })?;
         return Ok(());
     }
@@ -14988,7 +15053,25 @@ fn fido_info_rows(info: &keyroost_ctap::AuthenticatorInfo) -> Vec<(&'static str,
     if !info.extensions.is_empty() {
         rows.push(("Extensions", sanitize_terminal(&info.extensions.join(", "))));
     }
-    rows.push(("AAGUID", format_aaguid(&info.aaguid)));
+    rows.push((
+        "AAGUID",
+        keyroost_resolve::aaguid::format_aaguid(&info.aaguid),
+    ));
+    if let Some(m) = fido_metadata(&info.aaguid) {
+        if let Some(model) = m.model {
+            rows.push(("Model", sanitize_terminal(&model)));
+        }
+        if let Some(cert) = m.certification {
+            let cert = match m.since {
+                Some(since) => format!("{cert}, since {since}"),
+                None => cert,
+            };
+            rows.push(("Certification", sanitize_terminal(&cert)));
+        }
+        if let Some(family) = m.protocol_family {
+            rows.push(("Protocol family", sanitize_terminal(&family)));
+        }
+    }
     if !info.options.is_empty() {
         let opts: Vec<String> = info
             .options
@@ -15136,6 +15219,24 @@ fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn st
         outln!("{}", pin_status_line(pin_retries));
     }
     Ok(())
+}
+
+/// What `piv reset` says the card is back to, when keyroost knows: `": PIN
+/// 865362, PUK 86536286 and the factory management key (--mgmt-key
+/// default)"`, or `""`.
+fn piv_reset_defaults_note(
+    quirks: &std::collections::BTreeSet<keyroost_piv::compat::PivQuirk>,
+) -> String {
+    let pin_puk = keyroost_piv::compat::default_pin_puk_text(quirks);
+    let mgmt = keyroost_piv::compat::default_9b_management_key(quirks)
+        .is_some()
+        .then_some("the factory management key (`--mgmt-key default`)");
+    match (pin_puk, mgmt) {
+        (Some(p), Some(m)) => format!(": {p} and {m}"),
+        (Some(p), None) => format!(": {p}"),
+        (None, Some(m)) => format!(": {m}"),
+        (None, None) => String::new(),
+    }
 }
 
 /// `fido pin status`'s line: the retry count when a PIN is set (or when the
@@ -16813,6 +16914,48 @@ mod cli_tests {
         );
     }
 
+    /// A self-test the card refused for want of a PIN points at `--pin`
+    /// when none was given, and only then.
+    #[test]
+    fn piv_test_points_at_the_pin_when_the_card_wanted_one() {
+        use keyroost_pivtest::{Outcome, SelfTest};
+        let refused = [(
+            SelfTest::Sign,
+            Outcome::Failed(
+                keyroost_transport::TransportError::PivSecurityNotSatisfied.to_string(),
+            ),
+        )];
+        assert!(piv_test_failure(false, &refused).contains("--pin"));
+        assert!(!piv_test_failure(true, &refused).contains("--pin"));
+        let mismatch = [(SelfTest::Sign, Outcome::Failed("signature mismatch".into()))];
+        assert!(!piv_test_failure(false, &mismatch).contains("--pin"));
+    }
+
+    /// `piv reset` names the defaults the card returned to when keyroost
+    /// knows them (Token2's aren't YubiKey's), and only those it knows.
+    #[test]
+    fn piv_reset_names_the_defaults_it_knows() {
+        use keyroost_piv::compat::resolve_quirks;
+        use keyroost_piv::fingerprint::AppletFingerprint;
+        assert_eq!(
+            piv_reset_defaults_note(&resolve_quirks(AppletFingerprint::Token2, None, None)),
+            ": PIN 865362, PUK 86536286 and the factory management key (`--mgmt-key default`)"
+        );
+        assert_eq!(
+            piv_reset_defaults_note(&resolve_quirks(
+                AppletFingerprint::YubiKey,
+                Some(&[5, 7, 4]),
+                None
+            )),
+            ": PIN 123456, PUK 12345678 and the factory management key (`--mgmt-key default`)"
+        );
+        // IDPrime: only its management key is known.
+        assert_eq!(
+            piv_reset_defaults_note(&resolve_quirks(AppletFingerprint::IdPrime, None, None)),
+            ": the factory management key (`--mgmt-key default`)"
+        );
+    }
+
     /// `fido pin status` on a key with no PIN says so rather than a retry
     /// count that reads as if one were set.
     #[test]
@@ -16840,6 +16983,25 @@ mod cli_tests {
             );
             assert!(!with(&["--touch", "--touch-for", "A:a"]), "{group}");
         }
+    }
+
+    /// `--new-mgmt-key default` parses to the factory-default source (the
+    /// value `--mgmt-key` takes too); a literal key is still refused.
+    #[test]
+    fn new_mgmt_key_takes_default() {
+        let args = ["keyroostctl", "piv", "mgmt-key", "change", "--new-mgmt-key"];
+        let cli = Cli::try_parse_from(args.iter().copied().chain(["default"])).unwrap();
+        let Some(Cmd::Piv {
+            cmd:
+                PivCmd::MgmtKey {
+                    cmd: PivMgmtKeyCmd::Change { new_mgmt_key, .. },
+                },
+        }) = cli.command
+        else {
+            panic!("not piv mgmt-key change");
+        };
+        assert_eq!(new_mgmt_key, Some(SecretSource::Default));
+        assert!(Cli::try_parse_from(args.iter().copied().chain(["0102"])).is_err());
     }
 
     /// `piv info` prints slots in capitals ("retired key 9 (8A)"); a slot
@@ -24153,10 +24315,11 @@ mod cli_tests {
         let v = serde_json::to_value(json_out::FidoReaderInfoJson {
             device: "Test reader".into(),
             ctap2: None,
+            metadata: None,
         })
         .unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["ctap2", "device"]);
+        assert_eq!(keys, ["ctap2", "device", "metadata"]);
         assert!(v["ctap2"].is_null());
     }
 
@@ -24200,6 +24363,7 @@ mod cli_tests {
                 force_pin_change: Some(false),
                 firmware_version: Some(328706),
             }),
+            metadata: None,
         };
         assert_json_has_keys(
             &f,
@@ -24214,6 +24378,7 @@ mod cli_tests {
             hid_caps: vec!["U2F"],
             hid_caps_raw: 0x08,
             ctap2: None,
+            metadata: None,
         };
         let v = serde_json::to_value(&u).unwrap();
         assert!(v["ctap2"].is_null(), "ctap2 should be null: {v}");

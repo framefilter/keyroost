@@ -592,6 +592,19 @@ pub enum PivQuirk {
     /// `IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY` above is already only 16, and a future
     /// row for an AES-256 default must not need this type to change either.
     Default9bManagementKey(&'static [u8]),
+    /// The PIN and PUK this card returns to on a PIV reset, so a front end
+    /// can say what they are after one (a reset on a card whose defaults
+    /// aren't YubiKey's otherwise costs tries finding out). YubiKey: PIN
+    /// 123456, PUK 12345678 (Yubico's PIV introduction). Token2: PIN 865362
+    /// (Token2's own PIV tool, `token2/fido2-manage`,
+    /// token2-piv-gui/src-tauri/src/commands.rs) and PUK 86536286 (a PIN+ R3.4
+    /// reset to it, checked on the key).
+    DefaultPinPuk {
+        /// The default PIN.
+        pin: &'static str,
+        /// The default PUK.
+        puk: &'static str,
+    },
     /// This fingerprint (at the version the entry covers) is known to take
     /// unusually long to complete [`PivExtension::Reset`] — observed at over
     /// a minute on `ArekinathPivApplet::SwissbitIShield1`
@@ -703,6 +716,39 @@ pub fn default_9b_management_key(quirks: &BTreeSet<PivQuirk>) -> Option<&'static
         _ => None,
     })
 }
+
+/// The `(PIN, PUK)` a PIV reset returns this card to, from a resolved quirk
+/// set ([`PivQuirk::DefaultPinPuk`]); `None` when keyroost doesn't know them.
+#[must_use]
+pub fn default_pin_puk(quirks: &BTreeSet<PivQuirk>) -> Option<(&'static str, &'static str)> {
+    quirks.iter().find_map(|q| match q {
+        PivQuirk::DefaultPinPuk { pin, puk } => Some((*pin, *puk)),
+        _ => None,
+    })
+}
+
+/// [`default_pin_puk`] for a message: `"PIN 865362, PUK 86536286"`, shared
+/// by the CLI and the app after a reset or a retry-count change.
+#[must_use]
+pub fn default_pin_puk_text(quirks: &BTreeSet<PivQuirk>) -> Option<String> {
+    default_pin_puk(quirks).map(|(pin, puk)| format!("PIN {pin}, PUK {puk}"))
+}
+
+/// YubiKey's default PIV PIN and PUK (see [`PivQuirk::DefaultPinPuk`]).
+const YUBIKEY_DEFAULT_PIN_PUK: PivQuirk = PivQuirk::DefaultPinPuk {
+    pin: "123456",
+    puk: "12345678",
+};
+
+/// Token2's default PIV PIN and PUK (see [`PivQuirk::DefaultPinPuk`]). The
+/// PIN is the default Token2's own PIV tool uses (token2/fido2-manage,
+/// `token2-piv-gui`); the PUK was read back from a PIN+ Dual Ace R3.4
+/// (applet 5.112.0) after a PIV reset. On the every-version row, as Token2's
+/// default management key is: no Token2 applet is known to differ.
+const TOKEN2_DEFAULT_PIN_PUK: PivQuirk = PivQuirk::DefaultPinPuk {
+    pin: "865362",
+    puk: "86536286",
+};
 
 /// One or more extensions' shared known-support verdicts within one
 /// fingerprint's applet-axis or firmware-axis table — e.g.
@@ -1368,6 +1414,7 @@ const YUBIKEY_APPLET_QUIRKS: &[VersionQuirks] = &[
         version: &[],
         quirks: &[
             PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+            YUBIKEY_DEFAULT_PIN_PUK,
             PivQuirk::NoTouchToGenerateOrImport,
         ],
     },
@@ -1375,6 +1422,7 @@ const YUBIKEY_APPLET_QUIRKS: &[VersionQuirks] = &[
         version: &[3],
         quirks: &[
             PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+            YUBIKEY_DEFAULT_PIN_PUK,
             PivQuirk::SlotTouchPolicyCachedNotSupported,
             PivQuirk::NoTouchToGenerateOrImport,
         ],
@@ -1383,6 +1431,7 @@ const YUBIKEY_APPLET_QUIRKS: &[VersionQuirks] = &[
         version: &[4, 3],
         quirks: &[
             PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+            YUBIKEY_DEFAULT_PIN_PUK,
             PivQuirk::NoTouchToGenerateOrImport,
         ],
     },
@@ -1422,6 +1471,10 @@ const TOKEN2_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 ///   [`KeyAlg::Rsa1024`]/[`KeyAlg::Rsa2048`]/[`KeyAlg::Rsa3072`]/
 ///   [`KeyAlg::Rsa4096`]/[`KeyAlg::EccP256`]/[`KeyAlg::EccP384`]/
 ///   [`KeyAlg::Ed25519`]/[`KeyAlg::X25519`]`)` — share one row:
+///   [`PivExtension::ImportKey`]`(`[`KeyAlg::EccP256`]`)` joins them: a PIN+
+///   Dual Ace R3.4 reporting applet 5.112.0 imported a P-256 key from a .p12
+///   and passed the slot self-test (no other algorithm's import has been
+///   tried). The row is
 ///   `Verdict::KnownSupported` pinned to applet version 5.112.0, the only
 ///   version keyroost has hardware evidence for — a live unit at this version
 ///   accepts `INS 0xFB`, Yubico's SET PIN RETRIES APDU, GET METADATA, Yubico's
@@ -1482,6 +1535,7 @@ const TOKEN2_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ImportKey(KeyAlg::EccP256),
         ],
         verdicts: &[VersionVerdict {
             version: &[5, 112, 0],
@@ -1537,6 +1591,7 @@ const TOKEN2_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
     quirks: &[
         PivQuirk::InsF8SerialIsBcd,
         PivQuirk::Default9bManagementKey(TOKEN2_DEFAULT_MGMT_KEY),
+        TOKEN2_DEFAULT_PIN_PUK,
     ],
 }];
 
@@ -4583,6 +4638,30 @@ mod tests {
         }
     }
 
+    /// P-256 import is known to work at 5.112.0 (a PIN+ R3.4); the other
+    /// algorithms' imports stay unverified, not claimed.
+    #[test]
+    fn token2_5_112_0_imports_p256() {
+        assert_eq!(
+            resolve(
+                PivExtension::ImportKey(KeyAlg::EccP256),
+                AppletFingerprint::Token2,
+                Some(&[5, 112, 0]),
+                None
+            ),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::ImportKey(KeyAlg::EccP384),
+                AppletFingerprint::Token2,
+                Some(&[5, 112, 0]),
+                None
+            ),
+            FeatureGate::Unverified
+        );
+    }
+
     #[test]
     fn token2_older_versions_are_also_unsupported() {
         // No verdict at or below these versions, so `resolve_in` falls back
@@ -5681,6 +5760,7 @@ mod tests {
                 BTreeSet::from([
                     PivQuirk::InsF8SerialIsBcd,
                     PivQuirk::Default9bManagementKey(TOKEN2_DEFAULT_MGMT_KEY),
+                    TOKEN2_DEFAULT_PIN_PUK,
                 ])
             );
         }
@@ -5698,7 +5778,33 @@ mod tests {
             BTreeSet::from([
                 PivQuirk::InsF8SerialIsBcd,
                 PivQuirk::Default9bManagementKey(TOKEN2_DEFAULT_MGMT_KEY),
+                TOKEN2_DEFAULT_PIN_PUK,
             ])
+        );
+    }
+
+    /// A reset's PIN and PUK are known for YubiKey (every applet version)
+    /// and Token2, and not invented for a card keyroost has no source for.
+    #[test]
+    fn default_pin_and_puk_after_a_reset() {
+        for version in [&[2][..], &[3, 1], &[4, 3, 5], &[5, 7, 4]] {
+            assert_eq!(
+                default_pin_puk(&resolve_quirks(
+                    AppletFingerprint::YubiKey,
+                    Some(version),
+                    None
+                )),
+                Some(("123456", "12345678")),
+                "{version:?}"
+            );
+        }
+        assert_eq!(
+            default_pin_puk(&resolve_quirks(AppletFingerprint::Token2, None, None)),
+            Some(("865362", "86536286"))
+        );
+        assert_eq!(
+            default_pin_puk(&resolve_quirks(AppletFingerprint::IdPrime, None, None)),
+            None
         );
     }
 
@@ -8613,6 +8719,9 @@ mod tests {
                 if slot == FeatureGate::Unsupported {
                     assert_eq!(imp, FeatureGate::Unsupported, "{alg:?} {v:?}");
                     checked += 1;
+                } else if alg == KeyAlg::EccP256 && v >= &[5, 112, 0][..] {
+                    // Known to work from 5.112.0 (a PIN+ R3.4).
+                    assert_eq!(imp, FeatureGate::Supported, "{alg:?} {v:?}");
                 } else {
                     assert_eq!(imp, FeatureGate::Unverified, "{alg:?} {v:?}");
                 }

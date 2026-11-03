@@ -60,10 +60,10 @@ mod recover;
 mod piv;
 pub mod piv_import;
 pub use piv::{
-    random_chuid_guid, random_management_key, CertCompression, CertImport, CertUnreadable,
-    CurrentMgmtAuth, FactoryResetOutcome, FactoryResetPlan, PinProtectMaintenance, PivResetPreview,
-    PivSession, PivSessionState, PivSlotDetail, PivSlotStatus, PivStatus, PivStatusDetailed,
-    SlotKeyPresence,
+    random_chuid_guid, random_management_key, self_test_wanted_pin, CertCompression, CertImport,
+    CertUnreadable, CurrentMgmtAuth, FactoryResetOutcome, FactoryResetPlan, PinProtectMaintenance,
+    PivResetPreview, PivSession, PivSessionState, PivSlotDetail, PivSlotStatus, PivStatus,
+    PivStatusDetailed, SlotKeyPresence,
 };
 
 /// Fuzzing-only entry points for the compressed-certificate reader. Not
@@ -870,7 +870,10 @@ impl Session {
             )
         });
         let mut buf = [0u8; 2048];
-        let response = self.card.transmit(&cmd.apdu, &mut buf)?;
+        let response = self
+            .card
+            .transmit(&cmd.apdu, &mut buf)
+            .inspect_err(|e| trace_pcsc_error(self.debug, cmd.label, e))?;
         trace::line(self.debug, || {
             format_line(Dir::Received, cmd.label, &hex_dump(response))
         });
@@ -909,7 +912,10 @@ impl Session {
             )
         });
         let mut buf = [0u8; 2048];
-        let response = self.card.transmit(&cmd.apdu, &mut buf)?;
+        let response = self
+            .card
+            .transmit(&cmd.apdu, &mut buf)
+            .inspect_err(|e| trace_pcsc_error(self.debug, cmd.label, e))?;
         trace::line(self.debug, || {
             format_line(Dir::Received, cmd.label, &hex_dump(response))
         });
@@ -1289,6 +1295,61 @@ fn probe_note(body: &str) {
     keyroost_proto::trace::emit(probe_trace_on(), || format_line(Dir::Note, "probe", body));
 }
 
+/// A transmit that failed below the card (PC/SC itself: Windows' "access is
+/// denied" on a FIDO applet, a removed card) gets an answer line in the
+/// trace, so a request is never left without one.
+fn trace_pcsc_error(debug: bool, label: &str, e: &pcsc::Error) {
+    trace::line(debug, || {
+        format_line(Dir::Received, label, &format!("PC/SC error: {e}"))
+    });
+}
+
+/// A PIN+ R3.4's printed serial from its last successful read through the OTP
+/// applet, by reader and the 8-digit OpenPGP-AID serial the key also reports:
+/// a scan whose read fails (the key busy, say) keeps the printed serial, so
+/// its row, its id and its name don't flip to the AID number for that scan.
+/// An entry goes with its reader (the key unplugged), as the HID identity
+/// cache's entries go with their plug-in.
+static R34_SERIALS: std::sync::Mutex<Vec<R34Serial>> = std::sync::Mutex::new(Vec::new());
+
+struct R34Serial {
+    reader: String,
+    aid_serial: String,
+    printed: String,
+}
+
+/// The printed serial last read for this reader and AID serial, if any.
+fn remembered_r34_serial(reader: &str, aid_serial: &str) -> Option<String> {
+    let cache = R34_SERIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache
+        .iter()
+        .find(|e| e.reader == reader && e.aid_serial == aid_serial)
+        .map(|e| e.printed.clone())
+}
+
+/// Remember `printed` for this reader and AID serial, replacing an older one.
+fn remember_r34_serial(reader: &str, aid_serial: &str, printed: &str) {
+    let mut cache = R34_SERIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.retain(|e| e.reader != reader);
+    cache.push(R34Serial {
+        reader: reader.to_owned(),
+        aid_serial: aid_serial.to_owned(),
+        printed: printed.to_owned(),
+    });
+}
+
+/// Forget the readers that are gone.
+fn forget_r34_serials_except(readers: &[String]) {
+    let mut cache = R34_SERIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.retain(|e| readers.contains(&e.reader));
+}
+
 /// Probe every connected PC/SC reader in a single pass: one context, the reader
 /// list once, and **at most one card connection per reader**, on which all
 /// applet SELECTs are issued in sequence.
@@ -1312,6 +1373,12 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         .collect();
 
     let tree = reader_devtree_keys(&names);
+    forget_r34_serials_except(
+        &names
+            .iter()
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+    );
     let mut out = Vec::with_capacity(names.len());
     for (name, (tree_key, usb_product)) in names.into_iter().zip(tree) {
         let reader_name = name.to_string_lossy().into_owned();
@@ -1483,6 +1550,8 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             // Token2 device; anything else falls through harmlessly. SELECT is
             // best-effort (some PIN+ firmware answers 6A81 yet switches applets).
             let mut otp_serial_r34 = false;
+            // The OTP-applet serial read was tried (and may have failed).
+            let mut otp_serial_tried = false;
             if probe.has_fido {
                 let _ = transmit_apdu(
                     &card,
@@ -1518,6 +1587,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 // Token2 releases are unverified, so the answer is kept only
                 // when its prefix names an R3.4 model; otherwise the
                 // OpenPGP-AID serial below stays the serial, as before.
+                otp_serial_tried = true;
                 let sn = crate::token2otp::read_otp_applet_serial(|apdu| {
                     exchange_apdu(&card, apdu, 0x61, || vec![0x00, 0xC0, 0x00, 0x00, 0x00])
                 });
@@ -1570,11 +1640,28 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                             probe_note(&format!("openpgp serial (aid) -> {:?}", abbreviate(&sn)));
                         }
                         if probe.serial.is_none() {
-                            probe.serial = Some(sn);
+                            // A PIN+ R3.4 whose printed-serial read failed
+                            // this scan keeps the one read earlier.
+                            match remembered_r34_serial(&probe.reader_name, &sn) {
+                                Some(printed) if otp_serial_tried => {
+                                    if trace {
+                                        probe_note(&format!(
+                                            "token2 full serial: read failed, kept {:?}",
+                                            abbreviate(&printed)
+                                        ));
+                                    }
+                                    probe.serial = Some(printed);
+                                    probe.former_serial = Some(sn);
+                                }
+                                _ => probe.serial = Some(sn),
+                            }
                         } else if otp_serial_r34 && probe.serial.as_deref() != Some(sn.as_str()) {
                             // keyroost 0.15 and earlier knew this key by the
                             // AID serial on Windows; names saved under it
                             // still apply.
+                            if let Some(printed) = probe.serial.as_deref() {
+                                remember_r34_serial(&probe.reader_name, &sn, printed);
+                            }
                             probe.former_serial = Some(sn);
                         }
                     }
@@ -2147,7 +2234,9 @@ pub(crate) fn transmit_applet(
             format_line(Dir::Sent, io.label, &dump_cmd(&to_send, cmd_sensitive))
         });
         let mut buf = [0u8; 4096];
-        let resp = card.transmit(&to_send, &mut buf)?;
+        let resp = card
+            .transmit(&to_send, &mut buf)
+            .inspect_err(|e| trace_pcsc_error(debug, io.label, e))?;
         trace::line(debug, || {
             format_line(Dir::Received, io.label, &dump_resp(resp, resp_sensitive))
         });
@@ -2555,5 +2644,38 @@ mod redaction_tests {
             decode_bcd_serial(0x9999_9999_9999_9999_9999_9999_9999_9999),
             99_999_999_999_999_999_999_999_999_999_999
         );
+    }
+}
+
+#[cfg(test)]
+mod r34_serial_tests {
+    use super::{forget_r34_serials_except, remember_r34_serial, remembered_r34_serial};
+
+    /// A PIN+ R3.4's printed serial is kept per reader and AID serial,
+    /// replaced by a newer read on that reader, and forgotten with the reader.
+    /// (Reader names are unique to this test: the cache is process-wide.)
+    #[test]
+    fn the_r34_printed_serial_is_kept_until_its_reader_goes() {
+        let (a, b) = ("test-r34 reader A", "test-r34 reader B");
+        remember_r34_serial(a, "12345678", "65103697982395");
+        assert_eq!(
+            remembered_r34_serial(a, "12345678").as_deref(),
+            Some("65103697982395")
+        );
+        // Another key in the same reader (another AID serial) gets nothing.
+        assert_eq!(remembered_r34_serial(a, "87654321"), None);
+        assert_eq!(remembered_r34_serial(b, "12345678"), None);
+        // A newer read on the reader replaces the old entry.
+        remember_r34_serial(a, "87654321", "65103000000001");
+        assert_eq!(remembered_r34_serial(a, "12345678"), None);
+        // Gone with its reader; other readers stay.
+        remember_r34_serial(b, "11112222", "65103000000002");
+        forget_r34_serials_except(&[b.to_owned()]);
+        assert_eq!(remembered_r34_serial(a, "87654321"), None);
+        assert_eq!(
+            remembered_r34_serial(b, "11112222").as_deref(),
+            Some("65103000000002")
+        );
+        forget_r34_serials_except(&[]);
     }
 }
