@@ -4209,23 +4209,11 @@ mod tests {
         assert!(read_key_labels(&devices, false).is_empty());
     }
 
-    /// Held by every test that opens a HID path. Off Linux each open sets
-    /// hidapi up anew, which isn't safe from two threads at once (the macOS
-    /// CI job crashed with SIGTRAP once two such tests ran in parallel).
-    static HID_OPENS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn one_hid_open_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-        HID_OPENS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// A key keyroost couldn't open at all (no admin rights, no udev rule,
     /// busy in a browser) keeps FIDO2 as before: the badge, the name read
     /// and the FIDO2 reset step.
     #[test]
     fn not_opened_keeps_fido2_and_reset() {
-        let _one = one_hid_open_at_a_time();
         let path = "/nonexistent/keyroost-test/not-opened";
         let hids = [hid(0x1050, 0x0407, path, None, Some(1), Some(2))];
         let mut cache = FidoProtocolCache::new();
@@ -4248,16 +4236,32 @@ mod tests {
         );
     }
 
-    /// A key whose info read failed during the name read is settled for the
-    /// model step too: it isn't asked again in the same pass, and keeps its
-    /// USB name.
+    /// A key settled with no model (its read failed or its AAGUID names
+    /// none) isn't asked again in the same pass and keeps its USB name. No
+    /// HID path is opened: the path doesn't exist, and a settled key never
+    /// reaches the open.
     #[test]
-    fn a_failed_info_read_settles_the_model() {
-        let _one = one_hid_open_at_a_time();
-        let path = "/nonexistent/keyroost-test/model-not-read";
+    fn a_settled_key_is_not_asked_again() {
+        let path = "/nonexistent/keyroost-test/model-settled";
         let hids = [hid(0x1050, 0x0407, path, None, Some(1), Some(2))];
         let mut devices = correlate(&hids, &[], &Keyring::default());
         let before = devices[0].model.clone();
+        let key = (PathBuf::from(path), devices[0].serial.clone());
+        remember_model(key, std::time::Instant::now(), None);
+        add_fido_models(&mut devices, false);
+        assert_eq!(devices[0].model, before);
+    }
+
+    /// The name read's failed open settles the model step too, so the key
+    /// isn't opened twice in one pass. Linux only: on macOS a second test
+    /// opening a HID path (through hidapi) in one test process crashed the
+    /// CI jobs with SIGTRAP.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_info_read_settles_the_model() {
+        let path = "/nonexistent/keyroost-test/model-not-read";
+        let hids = [hid(0x1050, 0x0407, path, None, Some(1), Some(2))];
+        let devices = correlate(&hids, &[], &Keyring::default());
         assert_eq!(
             read_key_labels(&devices, false).get(&devices[0].id),
             Some(&KeyLabel::ReadFailed)
@@ -4269,8 +4273,6 @@ mod tests {
             .iter()
             .any(|(k, _, m)| *k == key && m.is_none());
         assert!(settled, "the failed read is remembered");
-        add_fido_models(&mut devices, false);
-        assert_eq!(devices[0].model, before);
     }
 
     /// Unplugging forgets an interface's answer, and the same path at a new
