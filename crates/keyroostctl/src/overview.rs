@@ -93,7 +93,7 @@ pub fn overview_lines(rows: &[(usize, &Device)]) -> Vec<String> {
                 sanitize_terminal(&d.vendor),
                 label(d),
                 badge_line(d),
-                short_serial(&d.serial),
+                short_serial(&keyroost_resolve::serial_for_display(&d.serial)),
                 short_transport(&d.transport),
                 wv = wv,
                 wm = wm,

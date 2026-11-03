@@ -18,26 +18,28 @@
 use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey};
 use keyroost_transport::YubiKeyCcid;
 
+pub mod aaguid;
 pub mod device;
 pub mod firmware;
 pub mod identity;
+pub mod mds;
 pub mod names;
 pub mod select;
 pub use device::{
-    add_key_names, correlate, correlate_live, correlate_with, enumerate, enumerate_with,
-    exclude_unresettable_piv, factory_reset_plan, forget_key_names, load_keyring_for_scan,
-    name_from_keys, serial_less_reinsert, serial_less_reset_blockers, smart_cards_without_reader,
-    take_scan_warnings, vendor_name, with_key_names_forgotten, CapState, Caps, Device, DeviceId,
-    DeviceKind, EnumerateOptions, MatchOptions, MatchStep, ResetStep, SerialLessReinsert,
-    StepOutcome, StepReport, PIV_GLOBAL_RESET_LABEL,
+    add_fido_models, add_key_names, correlate, correlate_live, correlate_with, enumerate,
+    enumerate_with, exclude_unresettable_piv, factory_reset_plan, forget_key_names,
+    load_keyring_for_scan, name_from_keys, serial_less_reinsert, serial_less_reset_blockers,
+    smart_cards_without_reader, take_scan_warnings, vendor_name, with_key_names_forgotten,
+    CapState, Caps, Device, DeviceId, DeviceKind, EnumerateOptions, MatchOptions, MatchStep,
+    ResetStep, SerialLessReinsert, StepOutcome, StepReport, PIV_GLOBAL_RESET_LABEL,
 };
 pub use identity::{
     plan_identity_reads, read_identities, CanonicalId, IdScheme, Identities, IdentityPlan,
     IdentityReader, KeyAnswer, IDENTITY_READERS,
 };
 pub use names::{
-    apply_names, apply_updates, clear_key_names, name_held_elsewhere, row_serials, serial_tail,
-    set_key_name, KeyLabel, NameSource, NameUpdate, Naming,
+    apply_names, apply_updates, clear_key_names, name_held_elsewhere, row_serials,
+    serial_for_display, serial_tail, set_key_name, KeyLabel, NameSource, NameUpdate, Naming,
 };
 pub use select::{
     device_value, endpoint, list_number, list_order, molto_reader_serial, parse_device_spec,

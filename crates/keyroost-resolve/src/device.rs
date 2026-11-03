@@ -1229,6 +1229,86 @@ fn cache_label(
     true
 }
 
+/// A key's model as its AAGUID names it ([`crate::aaguid`]), by (HID path,
+/// serial), as read this process; reused for [`LABEL_CACHE_TTL`]. `None`:
+/// the key was asked but gave no model (its AAGUID names none, or the read
+/// failed), so it isn't asked again meanwhile.
+type ModelCache = Vec<((PathBuf, String), std::time::Instant, Option<&'static str>)>;
+static MODEL_CACHE: std::sync::Mutex<ModelCache> = std::sync::Mutex::new(Vec::new());
+
+/// Remember what the key at `key` answered: its AAGUID, or nothing.
+fn remember_model(
+    key: (PathBuf, String),
+    at: std::time::Instant,
+    aaguid: Option<&[u8; 16]>,
+) -> Option<&'static str> {
+    let model = aaguid.and_then(crate::aaguid::model_for_aaguid);
+    if let Ok(mut c) = MODEL_CACHE.lock() {
+        c.retain(|(k, t, _)| *k != key && at.duration_since(*t) < LABEL_CACHE_TTL);
+        c.push((key, at, model));
+    }
+    model
+}
+
+/// A FIDO2 key with a HID path that answers getInfo: one whose model and
+/// stored name can be read.
+fn has_readable_info(d: &Device) -> bool {
+    d.caps.has(Caps::FIDO2)
+        && !d.caps.has(Caps::U2F_ONLY)
+        && !d.caps.has(Caps::FIDO_PROTOCOL_UNKNOWN)
+        && d.hid_path.is_some()
+}
+
+/// Name each FIDO2 key by the model its AAGUID names ("YubiKey 5 Series
+/// with NFC" for a key whose USB name is "YubiKey"), as the app does once it
+/// has read a key, so both name a key the same way. Uses a read this
+/// process already made (a scan that read the names stored on keys made
+/// one), else asks the key for its getInfo (no PIN). A key that can't be
+/// read — on Windows without administrator rights, for one — keeps its USB
+/// name.
+pub fn add_fido_models(devices: &mut [Device], debug: bool) {
+    let now = std::time::Instant::now();
+    for d in devices.iter_mut().filter(|d| has_readable_info(d)) {
+        let Some(path) = d.hid_path.clone() else {
+            continue;
+        };
+        let key = (path.clone(), d.serial.clone());
+        let cached = MODEL_CACHE.lock().ok().and_then(|c| {
+            c.iter()
+                .find(|(k, at, _)| *k == key && now.duration_since(*at) < LABEL_CACHE_TTL)
+                .map(|(_, _, m)| *m)
+        });
+        let model = match cached {
+            Some(m) => m,
+            None => {
+                let read = || -> Result<[u8; 16], String> {
+                    let (mut dev, _) =
+                        keyroost_ctap::CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
+                    Ok(keyroost_ctap::get_info(&mut dev)
+                        .map_err(|e| e.to_string())?
+                        .aaguid)
+                };
+                match read() {
+                    Ok(aaguid) => remember_model(key, now, Some(&aaguid)),
+                    Err(e) => {
+                        emit(debug, || {
+                            format_line(
+                                Dir::Note,
+                                "names",
+                                &format!("{}: model not read: {e}", path.display()),
+                            )
+                        });
+                        remember_model(key, now, None)
+                    }
+                }
+            }
+        };
+        if let Some(m) = model {
+            d.model = m.to_owned();
+        }
+    }
+}
+
 /// For every row with FIDO2 and a HID path: open it, ask getInfo, and read
 /// the name stored on the key (no PIN). A U2F-only key has no getInfo or
 /// name store, and a key that gave no proper INIT answer
@@ -1240,11 +1320,7 @@ fn read_key_labels(devices: &[Device], debug: bool) -> HashMap<DeviceId, KeyLabe
     use keyroost_ctap::device_label::{read_label, LabelState};
     let now = std::time::Instant::now();
     let mut labels = HashMap::new();
-    for d in devices.iter().filter(|d| {
-        d.caps.has(Caps::FIDO2)
-            && !d.caps.has(Caps::U2F_ONLY)
-            && !d.caps.has(Caps::FIDO_PROTOCOL_UNKNOWN)
-    }) {
+    for d in devices.iter().filter(|d| has_readable_info(d)) {
         let Some(path) = d.hid_path.as_deref() else {
             continue;
         };
@@ -1260,9 +1336,23 @@ fn read_key_labels(devices: &[Device], debug: bool) -> HashMap<DeviceId, KeyLabe
         }
         let read_gen = label_generation();
         let read = || -> Result<KeyLabel, String> {
-            let (mut dev, _) =
-                keyroost_ctap::CtapHidDevice::open(path).map_err(|e| e.to_string())?;
-            let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+            // Whatever getInfo gives (or a failure to get it) also settles
+            // the key's model for this pass (see add_fido_models), so a key
+            // that doesn't answer isn't asked twice.
+            let info = keyroost_ctap::CtapHidDevice::open(path)
+                .map_err(|e| e.to_string())
+                .and_then(|(mut dev, _)| {
+                    let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+                    Ok((dev, info))
+                });
+            let (mut dev, info) = match info {
+                Ok(v) => v,
+                Err(e) => {
+                    remember_model(key.clone(), now, None);
+                    return Err(e);
+                }
+            };
+            remember_model(key.clone(), now, Some(&info.aaguid));
             Ok(
                 match read_label(&mut dev, &info).map_err(|e| e.to_string())? {
                     LabelState::Unsupported => KeyLabel::Unsupported,
@@ -1415,6 +1505,8 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// for this session, as on a computer seeing the key for the first time.
 pub fn name_from_keys(devices: &mut [Device], keyring: &Keyring, may_save: bool, debug: bool) {
     let labels = read_key_labels(devices, debug);
+    // From the reads just made: no further key traffic for a read key.
+    add_fido_models(devices, debug);
     let path = if may_save {
         keyroost_keyring::config_path()
     } else {
@@ -4142,6 +4234,45 @@ mod tests {
             read_key_labels(&devices, false).get(&devices[0].id),
             Some(&KeyLabel::ReadFailed)
         );
+    }
+
+    /// A key settled with no model (its read failed or its AAGUID names
+    /// none) isn't asked again in the same pass and keeps its USB name. No
+    /// HID path is opened: the path doesn't exist, and a settled key never
+    /// reaches the open.
+    #[test]
+    fn a_settled_key_is_not_asked_again() {
+        let path = "/nonexistent/keyroost-test/model-settled";
+        let hids = [hid(0x1050, 0x0407, path, None, Some(1), Some(2))];
+        let mut devices = correlate(&hids, &[], &Keyring::default());
+        let before = devices[0].model.clone();
+        let key = (PathBuf::from(path), devices[0].serial.clone());
+        remember_model(key, std::time::Instant::now(), None);
+        add_fido_models(&mut devices, false);
+        assert_eq!(devices[0].model, before);
+    }
+
+    /// The name read's failed open settles the model step too, so the key
+    /// isn't opened twice in one pass. Linux only: on macOS a second test
+    /// opening a HID path (through hidapi) in one test process crashed the
+    /// CI jobs with SIGTRAP.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_info_read_settles_the_model() {
+        let path = "/nonexistent/keyroost-test/model-not-read";
+        let hids = [hid(0x1050, 0x0407, path, None, Some(1), Some(2))];
+        let devices = correlate(&hids, &[], &Keyring::default());
+        assert_eq!(
+            read_key_labels(&devices, false).get(&devices[0].id),
+            Some(&KeyLabel::ReadFailed)
+        );
+        let key = (PathBuf::from(path), devices[0].serial.clone());
+        let settled = MODEL_CACHE
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(k, _, m)| *k == key && m.is_none());
+        assert!(settled, "the failed read is remembered");
     }
 
     /// Unplugging forgets an interface's answer, and the same path at a new

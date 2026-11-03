@@ -243,7 +243,15 @@ impl CtapPcscDevice {
             .card
             .as_mut()
             .ok_or_else(|| CtapError::Transport("card already disconnected".into()))?;
-        let resp = card.transmit(apdu, &mut buf).map_err(transmit_error)?;
+        let resp = card
+            .transmit(apdu, &mut buf)
+            .inspect_err(|e| {
+                // A request is never left without an answer line.
+                trace_line(|| {
+                    format_line(Dir::Received, TRACE_LABEL, &format!("PC/SC error: {e}"))
+                });
+            })
+            .map_err(transmit_error)?;
         if resp.len() < 2 {
             return Err(CtapError::Transport(format!(
                 "APDU response too short ({} bytes)",

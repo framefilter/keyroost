@@ -271,6 +271,20 @@ fn known_serials<'a>(
         .collect()
 }
 
+/// A serial as keyroost shows it: a hex serial (a Nitrokey's, a Solo 2's)
+/// in capitals, as `openpgp info`, GnuPG and the PIV output write them;
+/// anything else as it is. Display only: records, ids and matching keep
+/// the serial as read (`-d serial:` matches either case).
+#[must_use]
+pub fn serial_for_display(serial: &str) -> std::borrow::Cow<'_, str> {
+    let hex = !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_hexdigit());
+    if hex && serial.bytes().any(|b| b.is_ascii_lowercase()) {
+        std::borrow::Cow::Owned(serial.to_ascii_uppercase())
+    } else {
+        std::borrow::Cow::Borrowed(serial)
+    }
+}
+
 /// Every serial `d` may be recorded under: its own, then its FIDO HID
 /// node's when that differs, then its former serial — the serials the
 /// naming pass looks names up by.
@@ -797,6 +811,17 @@ mod tests {
         apply_names(&mut devs, &ring, &HashMap::new());
         assert_eq!(devs[0].name, None);
         assert_eq!(devs[0].naming, Naming::default());
+    }
+
+    #[test]
+    fn hex_serials_show_in_capitals_and_nothing_else_changes() {
+        assert_eq!(serial_for_display("42682ef7"), "42682EF7");
+        assert_eq!(serial_for_display("42682EF7"), "42682EF7");
+        // Decimal serials, and anything that isn't plain hex, as they are.
+        assert_eq!(serial_for_display("37806840"), "37806840");
+        assert_eq!(serial_for_display("65103697982395"), "65103697982395");
+        assert_eq!(serial_for_display("token2-ace"), "token2-ace");
+        assert_eq!(serial_for_display(""), "");
     }
 
     #[test]

@@ -12,7 +12,6 @@
 // rows, hero, capability tabs, and the per-capability panels. Build those in
 // main.rs (or a `screens` submodule) on top of these primitives — see BRANCH.md.
 
-pub mod aaguid;
 pub mod date;
 pub mod device;
 pub mod help;
