@@ -2613,6 +2613,7 @@ mod tests {
             label: "GitHub".into(),
             name,
             verdict,
+            touch: false,
         };
         let m = Some(StoredName::Molto2 {
             slot: 5,

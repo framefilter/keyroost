@@ -111,6 +111,13 @@ impl OathSession {
         self.select_info.asks_touch_to_delete()
     }
 
+    /// True when the applet asks for a touch to save an account that
+    /// requires one (Nitrokey's secrets app); see
+    /// [`keyroost_oath::SelectInfo::asks_touch_to_save_touch`].
+    pub fn asks_touch_to_save_touch(&self) -> bool {
+        self.select_info.asks_touch_to_save_touch()
+    }
+
     /// True when the applet asks for a touch to reset (Nitrokey's secrets
     /// app); see [`keyroost_oath::SelectInfo::asks_touch_to_reset`].
     pub fn asks_touch_to_reset(&self) -> bool {

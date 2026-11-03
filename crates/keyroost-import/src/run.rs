@@ -33,8 +33,15 @@ impl core::fmt::Display for StoreError {
 
 /// One destination's write side (adapters live in keyroost-transport).
 pub trait CodeStore {
-    /// Store one code. Keys that overwrite same-name entries do so here.
-    fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError>;
+    /// Store one code, requiring a touch on the key to show it when
+    /// `touch` ([`PlanRow::touch`]). Keys that overwrite same-name entries
+    /// do so here.
+    fn add(
+        &mut self,
+        name: &StoredName,
+        entry: &ImportEntry,
+        touch: bool,
+    ) -> Result<(), StoreError>;
     /// Remove one code by name.
     fn delete(&mut self, name: &StoredName) -> Result<(), StoreError>;
 }
@@ -223,7 +230,7 @@ fn write_one(
         return fail("this entry is no longer in the file".to_owned());
     };
     let replacing = row.verdict == Verdict::Replace;
-    match store.add(name, entry) {
+    match store.add(name, entry, row.touch) {
         Ok(()) if replacing => (Outcome::Replaced, None),
         Ok(()) => (Outcome::Added, None),
         Err(StoreError::Full) => full(),
@@ -238,7 +245,7 @@ fn write_one(
             if let Err(e) = store.delete(name) {
                 return fail(e.to_string());
             }
-            match store.add(name, entry) {
+            match store.add(name, entry, row.touch) {
                 Ok(()) => (Outcome::Replaced, None),
                 Err(e) => (
                     Outcome::RemovedNotAdded(e.to_string()),
@@ -325,10 +332,16 @@ mod tests {
     }
 
     impl CodeStore for FakeStore {
-        fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
+        fn add(
+            &mut self,
+            name: &StoredName,
+            entry: &ImportEntry,
+            touch: bool,
+        ) -> Result<(), StoreError> {
             assert_eq!(entry.secret.len(), 20);
             let n = name.to_string();
-            self.calls.push(format!("add {}", n));
+            self.calls
+                .push(format!("add {}{}", n, if touch { " (touch)" } else { "" }));
             self.add
                 .get_mut(&n)
                 .and_then(VecDeque::pop_front)
@@ -396,6 +409,55 @@ mod tests {
         let r = go(&f, &p, &mut s);
         assert_eq!(s.calls, vec!["add A:a"]);
         assert_eq!(outcomes(&r), vec![Outcome::Replaced]);
+    }
+
+    /// Each written code goes to the store with its row's touch choice,
+    /// also on the re-add after a replace's delete; a Molto2 plan never
+    /// marks one, and a Nitrokey 3 plan with one says it asks to save it.
+    #[test]
+    fn the_touch_choice_reaches_every_write() {
+        let f = file(&[("A", "a"), ("B", "b"), ("C", "c")]);
+        let nk3 = Store::Oath(OathFamily::Nitrokey3);
+        let mut p = plan_for(&f, nk3, &["A:a", "C:c"], true);
+        p.set_touch(|row| row.label != "B:b");
+        assert!(p.notes.contains(&crate::plan::Note::Nitrokey3TouchToSave));
+        let mut s = FakeStore::default().on_add("A:a", vec![Err(StoreError::Exists), Ok(())]);
+        go(&f, &p, &mut s);
+        assert_eq!(
+            s.calls,
+            vec![
+                "add A:a (touch)",
+                "delete A:a",
+                "add A:a (touch)",
+                "add B:b",
+                "add C:c (touch)"
+            ]
+        );
+
+        // Choosing none again drops the Nitrokey 3 note; codes the import
+        // leaves as is never carry a touch.
+        p.set_touch(|_| false);
+        assert!(!p.notes.contains(&crate::plan::Note::Nitrokey3TouchToSave));
+        let mut kept = plan_for(&f, YK, &["A:a"], false);
+        kept.set_touch(|_| true);
+        let touched: Vec<_> = kept
+            .rows
+            .iter()
+            .map(|r| (r.label.as_str(), r.touch))
+            .collect();
+        assert_eq!(touched, vec![("A:a", false), ("B:b", true), ("C:c", true)]);
+        // Only a Nitrokey 3 asks for a touch to save one.
+        assert!(!kept
+            .notes
+            .contains(&crate::plan::Note::Nitrokey3TouchToSave));
+    }
+
+    #[test]
+    fn a_molto2_plan_takes_no_touch() {
+        let f = file(&[("A", "a")]);
+        let mut p = crate::plan::molto_plan(&f, 95, Existing::default());
+        p.set_touch(|_| true);
+        assert!(p.rows.iter().all(|r| !r.touch));
     }
 
     #[test]

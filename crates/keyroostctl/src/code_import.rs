@@ -53,7 +53,7 @@ pub(crate) fn run_code_import(
     dest: CodeDest<'_>,
     file: &Path,
     pair: SecretPair<'_>,
-    replace: bool,
+    how: How<'_>,
     dry_run: bool,
     yes: bool,
     debug: bool,
@@ -70,16 +70,73 @@ pub(crate) fn run_code_import(
     let import = read_import_file(&mut sec, file, pair.first.1)?;
     let shown = Shown::new(file, &import, dry_run, yes);
     match dest {
-        CodeDest::Oath(access) => to_oath(
-            &mut sec,
-            access,
-            pair.second,
-            &import,
-            &shown,
-            replace,
-            debug,
-        ),
-        CodeDest::Otp(sel) => to_otp(&mut sec, sel, pair.second, &import, &shown, replace, debug),
+        CodeDest::Oath(access) => {
+            to_oath(&mut sec, access, pair.second, &import, &shown, how, debug)
+        }
+        CodeDest::Otp(sel) => to_otp(&mut sec, sel, pair.second, &import, &shown, how, debug),
+    }
+}
+
+/// Which codes an import makes require a touch: every code it writes
+/// (`--touch`), or the codes `--touch-for` names.
+#[derive(Clone, Copy)]
+pub(crate) struct TouchPick<'a> {
+    all: bool,
+    names: &'a [String],
+}
+
+impl<'a> TouchPick<'a> {
+    pub(crate) fn new(all: bool, names: &'a [String]) -> Self {
+        TouchPick { all, names }
+    }
+
+    /// Mark `plan`'s rows: the same choice on the preview's plan and on the
+    /// re-read plan before writing, so the re-check compares like with like.
+    fn apply(self, plan: &mut Plan) {
+        plan.set_touch(|row| self.all || self.names.iter().any(|n| row.is_named(n)));
+    }
+
+    /// Refuse a `--touch-for` name that picks no code this import writes,
+    /// before anything is asked: a typo, or a code the import leaves as is.
+    fn check(self, plan: &Plan) -> Result<(), String> {
+        for name in self.names {
+            let rows: Vec<_> = plan.rows.iter().filter(|r| r.is_named(name)).collect();
+            if rows.is_empty() {
+                return Err(format!(
+                    "--touch-for {}: no code in the file has that name (use the name the \
+                     preview shows; --dry-run lists them)",
+                    sanitize_terminal(name)
+                ));
+            }
+            if !rows.iter().any(|r| r.writes()) {
+                return Err(format!(
+                    "--touch-for {}: this import doesn't write that code ({})",
+                    sanitize_terminal(name),
+                    rows[0]
+                        .verdict
+                        .reason(plan.store)
+                        .unwrap_or_else(|| "left as is".to_owned())
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How an import writes: replacing same-name codes or not (`--replace`),
+/// and which codes require a touch.
+#[derive(Clone, Copy)]
+pub(crate) struct How<'a> {
+    pub replace: bool,
+    pub touch: TouchPick<'a>,
+}
+
+impl How<'_> {
+    /// The plan for `store` with the touch choice marked.
+    fn plan(self, file: &ImportFile, store: Store, existing: Existing) -> Plan {
+        let mut plan = keyroost_import::plan::plan_for(file, store, 0, existing, self.replace);
+        self.touch.apply(&mut plan);
+        plan
     }
 }
 
@@ -342,10 +399,6 @@ pub(crate) fn read_key_secret_given<I: SecretIo>(
 }
 
 /// The plan for `existing` on `store`.
-fn plan_for(file: &ImportFile, store: Store, existing: Existing, replace: bool) -> Plan {
-    keyroost_import::plan::plan_for(file, store, 0, existing, replace)
-}
-
 /// Show the plan and ask. `None` when there is nothing more to do (a dry
 /// run, or nothing to write); otherwise whether the question was shown.
 fn preview_and_ask(
@@ -444,7 +497,7 @@ fn to_oath(
     password: SecondSecret<'_>,
     file: &ImportFile,
     shown: &Shown,
-    replace: bool,
+    how: How<'_>,
     debug: bool,
 ) -> Result<(), Box<dyn Error>> {
     let dev = crate::target::select(Need::Oath, access.reader.as_deref(), None)?;
@@ -460,21 +513,22 @@ fn to_oath(
     }; // closed before the question
     let family = OathFamily::from_vendor(&dev.vendor, version);
     let store = Store::Oath(family);
-    let first = plan_for(file, store, existing, replace);
+    let first = how.plan(file, store, existing);
+    how.touch.check(&first)?;
     let Some(asked) = preview_and_ask(&dev, shown, &first, KeyView::READ)? else {
         return Ok(());
     };
     crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
     let mut session = open_oath_unlocked(&reader, pw, debug)?;
-    let again = plan_for(file, store, read_oath_existing(&mut session)?, replace);
+    let again = how.plan(file, store, read_oath_existing(&mut session)?);
     recheck(&first, &again)?;
-    // Replacing deletes the old entry first; a Nitrokey 3 asks for a touch
-    // on every delete.
+    // A Nitrokey 3 asks for a touch on every delete (replacing deletes the
+    // old entry first) and to save a code that requires one.
     let mut writer = OathImportStore::new(&mut session, family)
         .password_hint(OATH_PASSWORD_HINT)
         .touch_wait(|on| {
             if on {
-                crate::prompt::touch("Replacing \u{2014} touch the key if it blinks\u{2026}");
+                crate::prompt::touch("Writing \u{2014} touch the key if it blinks\u{2026}");
             }
         });
     write_and_report(file, &again, &mut writer)
@@ -489,7 +543,7 @@ fn to_otp(
     pin: SecondSecret<'_>,
     file: &ImportFile,
     shown: &Shown,
-    replace: bool,
+    how: How<'_>,
     debug: bool,
 ) -> Result<(), Box<dyn Error>> {
     let dev = select_otp(sel)?;
@@ -507,7 +561,8 @@ fn to_otp(
         let mut session = open_otp_on(&dev, sel.transport, debug)?;
         read_token2_existing(&mut session, pin_str)?
     }; // closed before the question
-    let first = plan_for(file, Store::Token2Otp, existing, replace);
+    let first = how.plan(file, Store::Token2Otp, existing);
+    how.touch.check(&first)?;
     let Some(asked) = preview_and_ask(&dev, shown, &first, KeyView::READ)? else {
         return Ok(());
     };
@@ -515,7 +570,7 @@ fn to_otp(
     let mut session = open_otp_on(&dev, sel.transport, debug)?;
     ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
     let existing = read_token2_existing(&mut session, pin_str)?;
-    let again = plan_for(file, Store::Token2Otp, existing, replace);
+    let again = how.plan(file, Store::Token2Otp, existing);
     recheck(&first, &again)?;
     let mut writer = Token2ImportStore::new(&mut session, pin.clone());
     write_and_report(file, &again, &mut writer)
@@ -621,7 +676,19 @@ pub(crate) fn preview_lines(
         key,
         store_words(plan.store, view.first_slot)
     )];
-    let names: Vec<String> = plan.rows.iter().map(shown_name).collect();
+    // A code that will require a touch says so after its name.
+    let names: Vec<String> = plan
+        .rows
+        .iter()
+        .map(|row| {
+            let name = shown_name(row);
+            if row.touch {
+                format!("{name} (touch)")
+            } else {
+                name
+            }
+        })
+        .collect();
     let width = names
         .iter()
         .map(|n| n.chars().count())
@@ -730,6 +797,7 @@ pub(crate) fn import_json(
                 label: row.label.clone(),
                 name: row.name.as_ref().map(|n| n.to_string()),
                 plan: row.verdict.word(),
+                touch: row.touch,
                 reason: verdict_reason(&row.verdict, plan.store),
                 outcome: done.as_ref().map(|(o, _)| *o),
                 error: done.and_then(|(_, e)| e),
@@ -767,6 +835,7 @@ mod tests {
             label: name.to_owned(),
             name: Some(StoredName::Oath(name.to_owned())),
             verdict,
+            touch: false,
         }
     }
 
@@ -785,6 +854,7 @@ mod tests {
                     verdict: Verdict::Skip(Skip::Unusable(keyroost_import::Unusable::Type(
                         "steam".into(),
                     ))),
+                    touch: false,
                 },
                 row(5, "Bank:x", Verdict::Skip(Skip::Hash(HashAlg::Sha512))),
             ],
@@ -816,6 +886,54 @@ mod tests {
             "Note: This key doesn't report how many codes it holds; writing stops if it fills up.",
         ];
         assert_eq!(lines, want);
+    }
+
+    /// `--touch-for` marks the codes it names (by the name the preview
+    /// shows), the preview says "(touch)" after them, and the JSON carries
+    /// it; a name the file lacks, or a code the import leaves as is, is
+    /// refused before anything is asked.
+    #[test]
+    fn touch_for_marks_named_codes_and_refuses_the_rest() {
+        let names = ["Example:alice".to_owned(), "Example:old".to_owned()];
+        let pick = TouchPick::new(false, &names);
+        let mut plan = mixed_plan();
+        pick.apply(&mut plan);
+        assert!(pick.check(&plan).is_ok());
+        let touched: Vec<_> = plan
+            .rows
+            .iter()
+            .filter(|r| r.touch)
+            .map(|r| r.index)
+            .collect();
+        assert_eq!(touched, vec![0, 3]);
+        let lines = preview_lines("f", Format::OtpauthList, "k", &plan, KeyView::READ);
+        assert_eq!(lines[1], "  add       Example:alice (touch)");
+        assert!(
+            lines[4].starts_with("  replace   Example:old (touch)"),
+            "{}",
+            lines[4]
+        );
+        let json = serde_json::to_value(import_json(&plan, None, true, true)).unwrap();
+        assert_eq!(json["entries"][0]["touch"], true);
+        assert_eq!(json["entries"][1]["touch"], false);
+
+        let typo = ["Example:alic".to_owned()];
+        let err = TouchPick::new(false, &typo).check(&plan).unwrap_err();
+        assert!(err.contains("no code in the file has that name"), "{err}");
+        let kept = ["Example:dup".to_owned()];
+        let err = TouchPick::new(false, &kept).check(&plan).unwrap_err();
+        assert!(err.contains("already on the key"), "{err}");
+
+        // --touch marks every code the import writes, and nothing else.
+        let mut all = mixed_plan();
+        TouchPick::new(true, &[]).apply(&mut all);
+        let touched: Vec<_> = all
+            .rows
+            .iter()
+            .filter(|r| r.touch)
+            .map(|r| r.index)
+            .collect();
+        assert_eq!(touched, vec![0, 1, 3]);
     }
 
     #[test]
@@ -862,6 +980,7 @@ mod tests {
                 title: label.chars().take(12).collect(),
             }),
             verdict,
+            touch: false,
         }
     }
 
@@ -1088,7 +1207,7 @@ mod tests {
     /// A key that stores everything.
     struct Accepts;
     impl CodeStore for Accepts {
-        fn add(&mut self, _: &StoredName, _: &ImportEntry) -> Result<(), StoreError> {
+        fn add(&mut self, _: &StoredName, _: &ImportEntry, _: bool) -> Result<(), StoreError> {
             Ok(())
         }
         fn delete(&mut self, _: &StoredName) -> Result<(), StoreError> {

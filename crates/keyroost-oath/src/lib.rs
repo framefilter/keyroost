@@ -588,6 +588,14 @@ impl SelectInfo {
         self.serial.is_some()
     }
 
+    /// True when the applet asks for a touch to save an account that
+    /// requires one: Nitrokey's secrets app (recognized as in
+    /// [`Self::more_data`]; seen on a Nitrokey 3 with firmware 1.9.0).
+    #[must_use]
+    pub fn asks_touch_to_save_touch(&self) -> bool {
+        self.serial.is_some()
+    }
+
     /// True when the applet asks for a touch to reset: Nitrokey's secrets
     /// app ("Reset: always confirm with touch button", `fn reset` in
     /// Nitrokey/trussed-secrets-app; seen on a Nitrokey 3). A YubiKey resets
