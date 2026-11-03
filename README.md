@@ -36,7 +36,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   manage resident credentials (list / metadata / delete), set / change the PIN
   and show how many attempts are left, reset a key (USB replug ceremony, or in place for a card in a
   reader). Fingerprint (bio) enrollment — list / enroll / rename / delete — and
-  FIDO Metadata Service (MDS) authenticator identification in the GUI. PIN
+  FIDO Metadata Service (MDS) authenticator identification (the app's
+  Overview tab, `fido info`). PIN
   protocols v1 and v2. CTAP 2.1 security policy over
   `authenticatorConfig` (always-require-UV, minimum PIN length, force a PIN
   change, enterprise attestation) and a largeBlob store for plaintext notes (`fido blob`)

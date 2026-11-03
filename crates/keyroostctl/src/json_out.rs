@@ -153,6 +153,8 @@ pub(crate) struct FidoInfoJson {
     pub hid_caps_raw: u8,
     /// `null` when the device does not speak CTAP2 (U2F-only).
     pub ctap2: Option<Ctap2InfoJson>,
+    /// `null` when keyroost knows nothing about the key's AAGUID.
+    pub metadata: Option<FidoMetadataJson>,
 }
 
 /// `keyroostctl fido --json info --reader` — a card in a smart-card reader has
@@ -162,6 +164,26 @@ pub(crate) struct FidoReaderInfoJson {
     pub device: String,
     /// `null` when the card speaks U2F only.
     pub ctap2: Option<Ctap2InfoJson>,
+    /// `null` when keyroost knows nothing about the card's AAGUID.
+    pub metadata: Option<FidoMetadataJson>,
+}
+
+/// What keyroost knows about a key's AAGUID: its model name and the FIDO
+/// Alliance's published metadata (the app's metadata card). Each field is
+/// `null` when that source says nothing.
+#[derive(Serialize)]
+pub(crate) struct FidoMetadataJson {
+    /// "YubiKey 5 Series with NFC".
+    pub model: Option<String>,
+    /// "FIDO Certified L2", "Not FIDO Certified", or an advisory such as
+    /// "REVOKED".
+    pub certification: Option<String>,
+    /// The status as published ("FIDO_CERTIFIED_L2").
+    pub status: Option<String>,
+    /// The day the status took effect ("2024-12-27").
+    pub since: Option<String>,
+    /// "fido2", "u2f" or "uaf".
+    pub protocol_family: Option<String>,
 }
 
 /// The authenticatorGetInfo payload (CTAP2 devices only).
@@ -864,6 +886,29 @@ mod tests {
     }
 
     #[test]
+    fn fido_metadata_shape() {
+        for known in [true, false] {
+            let v = to_v(&FidoMetadataJson {
+                model: Some("YubiKey 5 Series with NFC".into()),
+                certification: known.then(|| "FIDO Certified L2".into()),
+                status: known.then(|| "FIDO_CERTIFIED_L2".into()),
+                since: known.then(|| "2024-12-27".into()),
+                protocol_family: known.then(|| "fido2".into()),
+            });
+            assert_shape(
+                &v,
+                &[
+                    ("model", "string|null"),
+                    ("certification", "string|null"),
+                    ("status", "string|null"),
+                    ("since", "string|null"),
+                    ("protocol_family", "string|null"),
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn fido_info_shape_u2f_only_and_ctap2() {
         let top = [
             ("device", "string"),
@@ -873,6 +918,7 @@ mod tests {
             ("hid_caps", "array"),
             ("hid_caps_raw", "number"),
             ("ctap2", "object|null"),
+            ("metadata", "object|null"),
         ];
         let inner = [
             ("versions", "array"),
@@ -894,6 +940,7 @@ mod tests {
             hid_caps: vec!["WINK"],
             hid_caps_raw: 1,
             ctap2,
+            metadata: None,
         };
         let v = to_v(&info(None));
         assert_shape(&v, &top);

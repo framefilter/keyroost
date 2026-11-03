@@ -1,16 +1,15 @@
-// crates/keyroost/src/ui/aaguid.rs
-//
-// AAGUID -> authenticator model name, for the FIDO hardware-key vendors keyroost
-// targets (Yubico, Feitian, Nitrokey, SoloKeys/Somu, Token2, Google, OnlyKey).
-//
-// An AAGUID identifies a FIDO authenticator *series/profile*, not an exact SKU,
-// so e.g. every YubiKey 5 with NFC reports "YubiKey 5 Series with NFC" rather
-// than "5C NFC". The 16-byte AAGUID comes from authenticatorGetInfo; we refine
-// a device's model with it once the key is read.
-//
-// Data is taken verbatim from the community-maintained FIDO AAGUID list
-// (passkeydeveloper/passkey-authenticator-aaguids, combined_aaguid.json),
-// filtered to the vendors above. Not exhaustive across all vendors by design.
+//! AAGUID -> authenticator model name, for the FIDO hardware-key vendors
+//! keyroost targets (Yubico, Feitian, Nitrokey, SoloKeys/Somu, Token2, Google,
+//! OnlyKey). Shared so the CLI and the app name a read key the same way.
+//!
+//! An AAGUID identifies a FIDO authenticator *series/profile*, not an exact
+//! SKU, so e.g. every YubiKey 5 with NFC reports "YubiKey 5 Series with NFC"
+//! rather than "5C NFC". The 16-byte AAGUID comes from authenticatorGetInfo; a
+//! device's model is refined with it once the key is read.
+//!
+//! Data is taken verbatim from the community-maintained FIDO AAGUID list
+//! (passkeydeveloper/passkey-authenticator-aaguids, combined_aaguid.json),
+//! filtered to the vendors above. Not exhaustive across all vendors by design.
 
 /// Look up a model name for a 16-byte AAGUID (all-zero AAGUID => `None`).
 pub fn model_for_aaguid(aaguid: &[u8; 16]) -> Option<&'static str> {
@@ -24,14 +23,9 @@ pub fn model_for_aaguid(aaguid: &[u8; 16]) -> Option<&'static str> {
         .map(|&(_, name)| name)
 }
 
-/// Format a 16-byte AAGUID as canonical lowercase `8-4-4-4-12` hex.
-fn format_aaguid(a: &[u8; 16]) -> String {
-    format_aaguid_pub(a)
-}
-
-/// Public canonical AAGUID formatter (lowercase `8-4-4-4-12`), shared with the
-/// MDS lookup so both key on the identical string form.
-pub fn format_aaguid_pub(a: &[u8; 16]) -> String {
+/// Format a 16-byte AAGUID as canonical lowercase `8-4-4-4-12` hex, the form
+/// both this table and the [`crate::mds`] lookup key on.
+pub fn format_aaguid(a: &[u8; 16]) -> String {
     let mut s = String::with_capacity(36);
     for (i, b) in a.iter().enumerate() {
         if matches!(i, 4 | 6 | 8 | 10) {
@@ -147,3 +141,22 @@ static MODELS: &[(&str, &str)] = &[
     ("97e6a830-c952-4740-95fc-7c78dc97ce47", "YubiKey Bio Series - Multi-protocol Edition (Enterprise Profile)"),
     ("58276709-bb4b-4bb3-baf1-60eea99282a7", "YubiKey Bio Series - Multi-protocol Edition 1VDJSN"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_8_4_4_4_12_lowercase_and_names_a_known_key() {
+        let a = [
+            0xea, 0xbb, 0x46, 0xcc, 0xe2, 0x41, 0x80, 0xbf, 0xae, 0x9e, 0x96, 0xfa, 0x6d, 0x29,
+            0x75, 0xcf,
+        ];
+        assert_eq!(format_aaguid(&a), "eabb46cc-e241-80bf-ae9e-96fa6d2975cf");
+        assert_eq!(
+            model_for_aaguid(&a),
+            Some("TOKEN2 PIN Plus Security Key Series")
+        );
+        assert_eq!(model_for_aaguid(&[0; 16]), None);
+    }
+}

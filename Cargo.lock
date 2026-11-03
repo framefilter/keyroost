@@ -2368,6 +2368,8 @@ dependencies = [
  "keyroost-token2otp",
  "keyroost-token2prog",
  "keyroost-transport",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

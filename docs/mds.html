@@ -4,18 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Device metadata — FIDO MDS — keyroost</title>
-<meta name="description" content="What the FIDO Metadata Service publishes about your key — model, icon, certification level — looked up by AAGUID and shown on the Overview tab.">
+<meta name="description" content="What the FIDO Metadata Service publishes about your key — model, icon, certification level — looked up by AAGUID and shown on the Overview tab and by keyroostctl fido info.">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="keyroost">
 <meta property="og:title" content="Device metadata — FIDO MDS — keyroost">
-<meta property="og:description" content="What the FIDO Metadata Service publishes about your key — model, icon, certification level — looked up by AAGUID and shown on the Overview tab.">
+<meta property="og:description" content="What the FIDO Metadata Service publishes about your key — model, icon, certification level — looked up by AAGUID and shown on the Overview tab and by keyroostctl fido info.">
 <meta property="og:url" content="https://framefilter.github.io/keyroost/mds.html">
 <meta property="og:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Device metadata — FIDO MDS — keyroost">
-<meta name="twitter:description" content="What the FIDO Metadata Service publishes about your key — model, icon, certification level — looked up by AAGUID and shown on the Overview tab.">
+<meta name="twitter:description" content="What the FIDO Metadata Service publishes about your key — model, icon, certification level — looked up by AAGUID and shown on the Overview tab and by keyroostctl fido info.">
 <meta name="twitter:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 
 <link rel="icon" type="image/png" href="assets/keyroost-logo.png">
@@ -54,7 +54,7 @@
   <div class="kr-wrap">
     <p class="kr-label">Learn · Device metadata</p>
     <h1>Device metadata</h1>
-    <p class="kr-lede">What the FIDO Alliance publishes about your key — model, icon, certification level and date — looked up by its AAGUID and shown on the Overview tab.</p>
+    <p class="kr-lede">What the FIDO Alliance publishes about your key — model, icon, certification level and date — looked up by its AAGUID and shown on the Overview tab and by <code>keyroostctl fido info</code>.</p>
   </div>
 </section>
 
@@ -84,7 +84,7 @@
       the signed Windows and macOS builds) can be refreshed without rebuilding.</p>
 <pre><code>python3 tools/gen_mds_data.py --out mds_data.json            # downloads the live FIDO BLOB
 python3 tools/gen_mds_data.py --out mds_data.json --blob mds.jwt   # offline, from a local copy</code></pre>
-    <p>Without <code>--out</code> the script writes to <code>crates/keyroost/assets/mds_data.json</code>
+    <p>Without <code>--out</code> the script writes to <code>crates/keyroost-resolve/assets/mds_data.json</code>
       inside a source checkout, which is the copy that gets embedded at build time. Place the
       resulting <code>mds_data.json</code> at any of:
       <code>$KEYROOST_MDS_FILE</code>, <code>~/.config/keyroost/mds_data.json</code> (Linux, or under <code>$XDG_CONFIG_HOME</code>),

@@ -13466,18 +13466,6 @@ fn record_meta_for(
     }
 }
 
-fn format_aaguid(aaguid: &[u8; 16]) -> String {
-    // Standard UUID grouping: 8-4-4-4-12.
-    let mut s = String::with_capacity(36);
-    for (i, b) in aaguid.iter().enumerate() {
-        if matches!(i, 4 | 6 | 8 | 10) {
-            s.push('-');
-        }
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
-}
-
 const FIDO_PIN: Spec = Spec::current("PIN", "pin");
 const FIDO_OLD_PIN: Spec = Spec::current("current PIN", "pin");
 const FIDO_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
@@ -14853,11 +14841,37 @@ fn hex_ascii_dump(bytes: &[u8]) -> String {
     out
 }
 
+/// What keyroost knows about `aaguid`, the facts the app's metadata card
+/// shows: the model name ([`keyroost_resolve::aaguid`], else the metadata's
+/// description) and the FIDO Alliance's metadata ([`keyroost_resolve::mds`]).
+/// `None` when neither knows the AAGUID.
+fn fido_metadata(aaguid: &[u8; 16]) -> Option<json_out::FidoMetadataJson> {
+    let db = keyroost_resolve::mds::MdsDb::load_bundled();
+    let entry = db.get(aaguid);
+    let model = keyroost_resolve::aaguid::model_for_aaguid(aaguid)
+        .map(str::to_owned)
+        .or_else(|| {
+            entry
+                .map(|e| e.description.clone())
+                .filter(|d| !d.is_empty())
+        });
+    if model.is_none() && entry.is_none() {
+        return None;
+    }
+    Some(json_out::FidoMetadataJson {
+        model,
+        certification: entry.and_then(|e| e.certification_label()),
+        status: entry.and_then(|e| e.status.clone()),
+        since: entry.and_then(|e| e.status_date()).map(str::to_owned),
+        protocol_family: entry.and_then(|e| e.protocol_family.clone()),
+    })
+}
+
 fn ctap2_json(info: &keyroost_ctap::AuthenticatorInfo) -> json_out::Ctap2InfoJson {
     json_out::Ctap2InfoJson {
         versions: info.versions.clone(),
         extensions: info.extensions.clone(),
-        aaguid: format_aaguid(&info.aaguid),
+        aaguid: keyroost_resolve::aaguid::format_aaguid(&info.aaguid),
         options: info
             .options
             .iter()
@@ -14884,6 +14898,7 @@ fn run_fido_info_reader(reader: &str) -> Result<(), Box<dyn std::error::Error>> 
         emit_json(&json_out::FidoReaderInfoJson {
             device: reader.to_owned(),
             ctap2: ctap2.as_ref().map(ctap2_json),
+            metadata: ctap2.as_ref().and_then(|i| fido_metadata(&i.aaguid)),
         })?;
         return Ok(());
     }
@@ -14969,6 +14984,7 @@ fn run_fido_info(
                 hid_caps: caps,
                 hid_caps_raw: init.capabilities,
                 ctap2: None,
+                metadata: None,
             })?;
             return Ok(());
         }
@@ -14986,6 +15002,7 @@ fn run_fido_info(
             hid_caps: caps,
             hid_caps_raw: init.capabilities,
             ctap2: Some(ctap2_json(&info)),
+            metadata: fido_metadata(&info.aaguid),
         })?;
         return Ok(());
     }
@@ -15004,7 +15021,25 @@ fn fido_info_rows(info: &keyroost_ctap::AuthenticatorInfo) -> Vec<(&'static str,
     if !info.extensions.is_empty() {
         rows.push(("Extensions", sanitize_terminal(&info.extensions.join(", "))));
     }
-    rows.push(("AAGUID", format_aaguid(&info.aaguid)));
+    rows.push((
+        "AAGUID",
+        keyroost_resolve::aaguid::format_aaguid(&info.aaguid),
+    ));
+    if let Some(m) = fido_metadata(&info.aaguid) {
+        if let Some(model) = m.model {
+            rows.push(("Model", sanitize_terminal(&model)));
+        }
+        if let Some(cert) = m.certification {
+            let cert = match m.since {
+                Some(since) => format!("{cert}, since {since}"),
+                None => cert,
+            };
+            rows.push(("Certification", sanitize_terminal(&cert)));
+        }
+        if let Some(family) = m.protocol_family {
+            rows.push(("Protocol family", sanitize_terminal(&family)));
+        }
+    }
     if !info.options.is_empty() {
         let opts: Vec<String> = info
             .options
@@ -24211,10 +24246,11 @@ mod cli_tests {
         let v = serde_json::to_value(json_out::FidoReaderInfoJson {
             device: "Test reader".into(),
             ctap2: None,
+            metadata: None,
         })
         .unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["ctap2", "device"]);
+        assert_eq!(keys, ["ctap2", "device", "metadata"]);
         assert!(v["ctap2"].is_null());
     }
 
@@ -24258,6 +24294,7 @@ mod cli_tests {
                 force_pin_change: Some(false),
                 firmware_version: Some(328706),
             }),
+            metadata: None,
         };
         assert_json_has_keys(
             &f,
@@ -24272,6 +24309,7 @@ mod cli_tests {
             hid_caps: vec!["U2F"],
             hid_caps_raw: 0x08,
             ctap2: None,
+            metadata: None,
         };
         let v = serde_json::to_value(&u).unwrap();
         assert!(v["ctap2"].is_null(), "ctap2 should be null: {v}");

@@ -4632,7 +4632,7 @@ fn main() -> eframe::Result<()> {
                     devices_dirty,
                     reader_watch: Some(reader_watch),
                     hid_watch,
-                    mds: ui::mds::MdsDb::load_bundled(),
+                    mds: keyroost_resolve::mds::MdsDb::load_bundled(),
                     apdu_trace,
                     ..Default::default()
                 };
@@ -4812,7 +4812,7 @@ struct App {
     /// FIDO security-key view state (CTAP info, PIN session, errors).
     security_keys: SecurityKeysState,
     /// FIDO Metadata Service database (bundled, plus any refreshed download).
-    mds: ui::mds::MdsDb,
+    mds: keyroost_resolve::mds::MdsDb,
     /// Cached icon texture for the selected device's AAGUID, with the AAGUID it
     /// was decoded for so we re-upload only when the device changes.
     mds_icon: Option<(String, egui::TextureHandle)>,
@@ -6413,7 +6413,7 @@ impl App {
                     .security_keys
                     .info
                     .as_ref()
-                    .and_then(|info| ui::aaguid::model_for_aaguid(&info.aaguid))
+                    .and_then(|info| keyroost_resolve::aaguid::model_for_aaguid(&info.aaguid))
                     .map(str::to_string),
             };
             (id, details)
@@ -18715,7 +18715,7 @@ impl App {
         let Some(entry) = self.mds.get(&aaguid).cloned() else {
             return;
         };
-        let key = ui::aaguid::format_aaguid_pub(&aaguid);
+        let key = keyroost_resolve::aaguid::format_aaguid(&aaguid);
         // Live versions reported by the device's authenticatorGetInfo, preferred
         // over the MDS statement's copy since they describe the actual unit.
         let device_versions: Vec<String> = self
@@ -18795,9 +18795,15 @@ impl App {
             if let Some(lvl) = entry.certification_level() {
                 pairs.push(("Certification level", lvl.to_string()));
             }
-            if let Some(date) = &entry.effective_date {
-                let d = date.split(['T', ' ']).next().unwrap_or(date);
-                pairs.push(("Certified since", d.to_string()));
+            if let Some(date) = entry.status_date() {
+                // The date of the latest status, which isn't always a
+                // certification ("Not FIDO Certified", an advisory).
+                let label = if entry.certification_level().is_some() {
+                    "Certified since"
+                } else {
+                    "Status since"
+                };
+                pairs.push((label, date.to_string()));
             }
             if let Some(fam) = &entry.protocol_family {
                 pairs.push(("Protocol family", fam.clone()));

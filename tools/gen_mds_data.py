@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate crates/keyroost/assets/mds_data.json from the live FIDO MDS3 BLOB.
+"""Generate crates/keyroost-resolve/assets/mds_data.json from the live FIDO MDS3 BLOB.
 
 The BLOB is a public JWS at https://mds3.fidoalliance.org/ (no auth token). This
 script downloads it over HTTPS, base64url-decodes the JWS *payload* (it does NOT
@@ -25,7 +25,7 @@ draws the icon at 44x44 points, so 88 px covers a 200% display scaling exactly
 (44 x 2 = 88); icons that already fit are kept byte-for-byte. The GUI decodes
 PNG only, so without this step the SVG-only vendors would show no logo at all.
 
-The output (crates/keyroost/assets/mds_data.json) is embedded at build time, but
+The output (crates/keyroost-resolve/assets/mds_data.json) is embedded at build time, but
 the app ALSO loads a user-supplied copy at runtime if present, so distributed
 binaries (AppImage / .exe / .dmg) can be updated WITHOUT rebuilding. Drop the
 regenerated file at one of:
@@ -44,7 +44,7 @@ import urllib.error
 import urllib.request
 
 MDS_URL = "https://mds3.fidoalliance.org/"
-OUT = "crates/keyroost/assets/mds_data.json"
+OUT = "crates/keyroost-resolve/assets/mds_data.json"
 
 # Optional vendor whitelist (--vendor-filter). Kept for backwards compatibility;
 # the default selection is device-based (see is_hardware_authenticator) so that
