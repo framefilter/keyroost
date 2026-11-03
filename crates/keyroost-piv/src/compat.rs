@@ -1467,6 +1467,10 @@ const TOKEN2_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 ///   [`KeyAlg::Rsa1024`]/[`KeyAlg::Rsa2048`]/[`KeyAlg::Rsa3072`]/
 ///   [`KeyAlg::Rsa4096`]/[`KeyAlg::EccP256`]/[`KeyAlg::EccP384`]/
 ///   [`KeyAlg::Ed25519`]/[`KeyAlg::X25519`]`)` — share one row:
+///   [`PivExtension::ImportKey`]`(`[`KeyAlg::EccP256`]`)` joins them: a PIN+
+///   Dual Ace R3.4 reporting applet 5.112.0 imported a P-256 key from a .p12
+///   and passed the slot self-test (no other algorithm's import has been
+///   tried). The row is
 ///   `Verdict::KnownSupported` pinned to applet version 5.112.0, the only
 ///   version keyroost has hardware evidence for — a live unit at this version
 ///   accepts `INS 0xFB`, Yubico's SET PIN RETRIES APDU, GET METADATA, Yubico's
@@ -1527,6 +1531,7 @@ const TOKEN2_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ImportKey(KeyAlg::EccP256),
         ],
         verdicts: &[VersionVerdict {
             version: &[5, 112, 0],
@@ -4627,6 +4632,30 @@ mod tests {
                 FeatureGate::Unsupported
             );
         }
+    }
+
+    /// P-256 import is known to work at 5.112.0 (a PIN+ R3.4); the other
+    /// algorithms' imports stay unverified, not claimed.
+    #[test]
+    fn token2_5_112_0_imports_p256() {
+        assert_eq!(
+            resolve(
+                PivExtension::ImportKey(KeyAlg::EccP256),
+                AppletFingerprint::Token2,
+                Some(&[5, 112, 0]),
+                None
+            ),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::ImportKey(KeyAlg::EccP384),
+                AppletFingerprint::Token2,
+                Some(&[5, 112, 0]),
+                None
+            ),
+            FeatureGate::Unverified
+        );
     }
 
     #[test]
@@ -8686,6 +8715,9 @@ mod tests {
                 if slot == FeatureGate::Unsupported {
                     assert_eq!(imp, FeatureGate::Unsupported, "{alg:?} {v:?}");
                     checked += 1;
+                } else if alg == KeyAlg::EccP256 && v >= &[5, 112, 0][..] {
+                    // Known to work from 5.112.0 (a PIN+ R3.4).
+                    assert_eq!(imp, FeatureGate::Supported, "{alg:?} {v:?}");
                 } else {
                     assert_eq!(imp, FeatureGate::Unverified, "{alg:?} {v:?}");
                 }
