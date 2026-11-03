@@ -1037,7 +1037,10 @@ impl OpenPgpSession {
             apdu.get(1),
             Some(0x20) | Some(0x24) | Some(0x2C) | Some(0xDB)
         );
-        let resp_sensitive = apdu.get(1..4) == Some(&[0x2A, 0x80, 0x86]);
+        // The Token2 serial read (status's `otp_applet_serial`) answers with
+        // the printed serial, hidden on every path that reads it.
+        let resp_sensitive =
+            apdu.get(1..4) == Some(&[0x2A, 0x80, 0x86]) || crate::token2otp::reads_serial(apdu);
         const IO: crate::AppletIo = crate::AppletIo {
             label: "openpgp",
             more_data_sw: pgp::SW_MORE_DATA,

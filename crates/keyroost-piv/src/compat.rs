@@ -740,7 +740,11 @@ const YUBIKEY_DEFAULT_PIN_PUK: PivQuirk = PivQuirk::DefaultPinPuk {
     puk: "12345678",
 };
 
-/// Token2's default PIV PIN and PUK (see [`PivQuirk::DefaultPinPuk`]).
+/// Token2's default PIV PIN and PUK (see [`PivQuirk::DefaultPinPuk`]). The
+/// PIN is the default Token2's own PIV tool uses (token2/fido2-manage,
+/// `token2-piv-gui`); the PUK was read back from a PIN+ Dual Ace R3.4
+/// (applet 5.112.0) after a PIV reset. On the every-version row, as Token2's
+/// default management key is: no Token2 applet is known to differ.
 const TOKEN2_DEFAULT_PIN_PUK: PivQuirk = PivQuirk::DefaultPinPuk {
     pin: "865362",
     puk: "86536286",

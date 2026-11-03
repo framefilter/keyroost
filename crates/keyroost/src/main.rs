@@ -12874,11 +12874,11 @@ impl App {
                     // Skipped ops don't count as failures.
                     Ok(run) => {
                         let mut report = keyroost_pivtest::format_report(&run.results);
-                        // As `piv test` does: a refusal for want of a PIN
-                        // with the PIN box empty points at the box.
+                        // As `piv test` does: a refusal for want of an
+                        // authorization with the PIN box empty suggests the box.
                         if !pin_given && keyroost_transport::self_test_wanted_pin(&run.results) {
                             report.push_str(
-                                "\nThe card wanted this slot's PIN: enter it above and run \
+                                "\nThe card may want this slot's PIN: enter it above and run \
                                  the test again.",
                             );
                         }

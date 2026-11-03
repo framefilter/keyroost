@@ -1070,7 +1070,7 @@ enum PivMgmtKeyCmd {
         /// also given; hidden when typed at a terminal), default sets the
         /// factory-default management key keyroost knows for this device.
         /// With none of these, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, display_order = 14)]
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, display_order = 14)]
         new_mgmt_key: Option<SecretSource>,
         /// Algorithm of the new management key.
         #[arg(long, value_enum, default_value = "aes192", display_order = 16)]
@@ -7695,7 +7695,10 @@ fn describe_present(devices: &[keyroost_resolve::Device]) -> String {
             if d.serial.is_empty() {
                 format!("{model} with no serial")
             } else {
-                format!("{model} serial {}", sanitize_terminal(&d.serial))
+                format!(
+                    "{model} serial {}",
+                    sanitize_terminal(&keyroost_resolve::serial_for_display(&d.serial))
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -12244,18 +12247,16 @@ fn decode_mgmt_key_hex(spec: &Spec, hex: &str) -> Result<zeroize::Zeroizing<Vec<
     Ok(zeroize::Zeroizing::new(key))
 }
 
-/// The key bytes for `input`; `--mgmt-key default` looks up this device's known
-/// factory default on the open session's fingerprint
-/// ([`keyroost_transport::PivSession::default_management_key`]).
 /// `piv test`'s error when an operation failed: it asks for no PIN of its
-/// own, so a card refusing for want of one ("needs a management-key auth,
-/// PIN or touch") points at `--pin` when none was given.
+/// own, so a card refusing for want of an authorization ("needs a
+/// management-key auth, PIN or touch") suggests `--pin` when none was given;
+/// the refusal may also be a missed touch, so it says "may".
 fn piv_test_failure(
     pin_given: bool,
     results: &[(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)],
 ) -> String {
     if keyroost_transport::self_test_wanted_pin(results) && !pin_given {
-        "one or more self-tests failed: the card wanted this slot's PIN; run it again with \
+        "one or more self-tests failed: the card may want this slot's PIN; run it again with \
          --pin"
             .into()
     } else {
@@ -12280,6 +12281,9 @@ fn check_new_mgmt_key_len(
     .into())
 }
 
+/// The key bytes for `input`; `--mgmt-key default` looks up this device's known
+/// factory default on the open session's fingerprint
+/// ([`keyroost_transport::PivSession::default_management_key`]).
 fn mgmt_key_bytes(
     input: &MgmtKeyInput,
     spec: &Spec,
@@ -15189,8 +15193,6 @@ fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn st
     Ok(())
 }
 
-/// `fido pin status`'s line: the retry count when a PIN is set (or when the
-/// key doesn't say), else (`None`) that none is set.
 /// What `piv reset` says the card is back to, when keyroost knows: `": PIN
 /// 865362, PUK 86536286 and the factory management key (--mgmt-key
 /// default)"`, or `""`.
@@ -15209,6 +15211,8 @@ fn piv_reset_defaults_note(
     }
 }
 
+/// `fido pin status`'s line: the retry count when a PIN is set (or when the
+/// key doesn't say), else (`None`) that none is set.
 fn pin_status_line(pin_retries: Option<u32>) -> String {
     match pin_retries {
         None => "No FIDO2 PIN is set. Set one with `keyroostctl fido pin set`.".into(),
@@ -16937,6 +16941,25 @@ mod cli_tests {
 
     /// `piv info` prints slots in capitals ("retired key 9 (8A)"); a slot
     /// copied from there is accepted as typed.
+    /// `--new-mgmt-key default` parses to the factory-default source (the
+    /// value `--mgmt-key` takes too); a literal key is still refused.
+    #[test]
+    fn new_mgmt_key_takes_default() {
+        let args = ["keyroostctl", "piv", "mgmt-key", "change", "--new-mgmt-key"];
+        let cli = Cli::try_parse_from(args.iter().copied().chain(["default"])).unwrap();
+        let Some(Cmd::Piv {
+            cmd:
+                PivCmd::MgmtKey {
+                    cmd: PivMgmtKeyCmd::Change { new_mgmt_key, .. },
+                },
+        }) = cli.command
+        else {
+            panic!("not piv mgmt-key change");
+        };
+        assert_eq!(new_mgmt_key, Some(SecretSource::Default));
+        assert!(Cli::try_parse_from(args.iter().copied().chain(["0102"])).is_err());
+    }
+
     #[test]
     fn a_piv_slot_is_accepted_in_capitals() {
         for slot in ["8A", "8a", "9C"] {

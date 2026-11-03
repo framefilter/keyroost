@@ -1295,19 +1295,6 @@ fn probe_note(body: &str) {
     keyroost_proto::trace::emit(probe_trace_on(), || format_line(Dir::Note, "probe", body));
 }
 
-/// Probe every connected PC/SC reader in a single pass: one context, the reader
-/// list once, and **at most one card connection per reader**, on which all
-/// applet SELECTs are issued in sequence.
-///
-/// Molto2 (Token2) readers are detected by name and **never connected** —
-/// selecting foreign applets on a Molto2 resets its card and invalidates a held
-/// [`Session`], which is what produced spurious "the smart card has been reset"
-/// failures when a refresh ran between opening the token and authenticating.
-/// The connections we do make are released with `LeaveCard` so they don't reset
-/// other cards either.
-///
-/// PC/SC service failure errors; an individual reader that can't be connected is
-/// returned with all-false capabilities rather than failing the whole scan.
 /// A transmit that failed below the card (PC/SC itself: Windows' "access is
 /// denied" on a FIDO applet, a removed card) gets an answer line in the
 /// trace, so a request is never left without one.
@@ -1363,6 +1350,19 @@ fn forget_r34_serials_except(readers: &[String]) {
     cache.retain(|e| readers.contains(&e.reader));
 }
 
+/// Probe every connected PC/SC reader in a single pass: one context, the reader
+/// list once, and **at most one card connection per reader**, on which all
+/// applet SELECTs are issued in sequence.
+///
+/// Molto2 (Token2) readers are detected by name and **never connected** —
+/// selecting foreign applets on a Molto2 resets its card and invalidates a held
+/// [`Session`], which is what produced spurious "the smart card has been reset"
+/// failures when a refresh ran between opening the token and authenticating.
+/// The connections we do make are released with `LeaveCard` so they don't reset
+/// other cards either.
+///
+/// PC/SC service failure errors; an individual reader that can't be connected is
+/// returned with all-false capabilities rather than failing the whole scan.
 pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
     let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
     let mut buf = [0u8; 4096];

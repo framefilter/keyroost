@@ -1336,10 +1336,22 @@ fn read_key_labels(devices: &[Device], debug: bool) -> HashMap<DeviceId, KeyLabe
         }
         let read_gen = label_generation();
         let read = || -> Result<KeyLabel, String> {
-            let (mut dev, _) =
-                keyroost_ctap::CtapHidDevice::open(path).map_err(|e| e.to_string())?;
-            let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
-            // The same answer names the key's model (see add_fido_models).
+            // Whatever getInfo gives (or a failure to get it) also settles
+            // the key's model for this pass (see add_fido_models), so a key
+            // that doesn't answer isn't asked twice.
+            let info = keyroost_ctap::CtapHidDevice::open(path)
+                .map_err(|e| e.to_string())
+                .and_then(|(mut dev, _)| {
+                    let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+                    Ok((dev, info))
+                });
+            let (mut dev, info) = match info {
+                Ok(v) => v,
+                Err(e) => {
+                    remember_model(key.clone(), now, None);
+                    return Err(e);
+                }
+            };
             remember_model(key.clone(), now, Some(&info.aaguid));
             Ok(
                 match read_label(&mut dev, &info).map_err(|e| e.to_string())? {
@@ -4222,6 +4234,30 @@ mod tests {
             read_key_labels(&devices, false).get(&devices[0].id),
             Some(&KeyLabel::ReadFailed)
         );
+    }
+
+    /// A key whose info read failed during the name read is settled for the
+    /// model step too: it isn't asked again in the same pass, and keeps its
+    /// USB name.
+    #[test]
+    fn a_failed_info_read_settles_the_model() {
+        let path = "/nonexistent/keyroost-test/model-not-read";
+        let hids = [hid(0x1050, 0x0407, path, None, Some(1), Some(2))];
+        let mut devices = correlate(&hids, &[], &Keyring::default());
+        let before = devices[0].model.clone();
+        assert_eq!(
+            read_key_labels(&devices, false).get(&devices[0].id),
+            Some(&KeyLabel::ReadFailed)
+        );
+        let key = (PathBuf::from(path), devices[0].serial.clone());
+        let settled = MODEL_CACHE
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(k, _, m)| *k == key && m.is_none());
+        assert!(settled, "the failed read is remembered");
+        add_fido_models(&mut devices, false);
+        assert_eq!(devices[0].model, before);
     }
 
     /// Unplugging forgets an interface's answer, and the same path at a new

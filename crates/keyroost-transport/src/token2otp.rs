@@ -268,8 +268,15 @@ fn response_is_sensitive(apdu: &[u8]) -> bool {
         (apdu.get(1), apdu.get(2), apdu.get(3)),
         (Some(&0xC5), Some(&0x05), Some(&0x00) | Some(&0x01))
     );
-    let serial = apdu.get(..4) == Some(&cmd::READ_SERIAL_INS[..]);
-    entries || serial
+    entries || reads_serial(apdu)
+}
+
+/// Whether `apdu` is the Token2 serial read (`READ_SERIAL_INS`), whose reply
+/// is the serial printed on the key. Every path that sends it keeps that
+/// reply out of the trace: this layer, and PIV and OpenPGP status, which
+/// read it on their own card handle.
+pub(crate) fn reads_serial(apdu: &[u8]) -> bool {
+    apdu.get(..4) == Some(&cmd::READ_SERIAL_INS[..])
 }
 
 /// True when `apdu`'s *request* body carries a secret or an account name and

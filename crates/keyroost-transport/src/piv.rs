@@ -5978,8 +5978,11 @@ impl<'tx> PivSession<'tx> {
         // encrypted challenge), but the same INS in signing/decrypt mode
         // returns recovered plaintext — redact uniformly so a future caller
         // can't leak through a trace.
-        let resp_sensitive =
-            apdu.get(1) == Some(&0x87) || (pin_protected && apdu.get(1) == Some(&0xCB));
+        // The Token2 serial read (`probe_token2_otp_serial`) answers with the
+        // printed serial, hidden on every path that reads it.
+        let resp_sensitive = apdu.get(1) == Some(&0x87)
+            || (pin_protected && apdu.get(1) == Some(&0xCB))
+            || crate::token2otp::reads_serial(apdu);
         // `describe` makes `transmit_applet` bracket every transmitted APDU —
         // the caller's command and each GET RESPONSE / Le-corrected reissue —
         // with a `>` line naming the command and a `<` line reading its status
@@ -7030,10 +7033,10 @@ fn block_crypt(
 }
 
 /// Whether a self-test's results include an operation the card refused for
-/// want of an authorization ([`TransportError::PivSecurityNotSatisfied`]):
-/// with no PIN given, the slot's PIN is what it wanted (a self-test needs no
-/// management key). The CLI's `piv test` and the app's Test dialog both
-/// point at the PIN then.
+/// want of an authorization ([`TransportError::PivSecurityNotSatisfied`]).
+/// A self-test needs no management key, so with no PIN given the slot's PIN
+/// is the likely want, though a missed touch may answer the same way: the
+/// CLI's `piv test` and the app's Test dialog suggest the PIN, as a "may".
 #[must_use]
 pub fn self_test_wanted_pin(
     results: &[(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)],
