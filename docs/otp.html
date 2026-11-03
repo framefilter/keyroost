@@ -94,6 +94,10 @@ keyroostctl otp import -i export.json             # asks once, then adds the cod
       (<strong>exists</strong>); <code>--replace</code> replaces it. An entry the key can't
       store is <strong>skipped</strong>, with the reason. keyroost asks once, writes one
       code at a time, and stops at the first error, saying what was added and what wasn't.
+      <code>--touch</code> makes every imported code wait for a button press, as
+      <code>otp add --touch</code> does; <code>--touch-for</code> with a code's name as the
+      preview shows it does that for that code only (repeat it for more). In the app, tick
+      <em>Require touch for every code</em>, or the box on each code's row.
       What the OTP storage takes:</p>
     <ul>
       <li>up to 50 codes;</li>

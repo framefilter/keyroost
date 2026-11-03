@@ -234,7 +234,9 @@ Holds 32 codes; 3 on the key; 2 will be added, 0 replaced, 1 left as is, 1 skipp
       password; if your key has a password or PIN, it asks for that too.</p>
     <p>Codes already on the key with the same name are left alone; add
       <code>--replace</code> to overwrite them. Codes the key can't store are skipped,
-      with the reason shown. Running it again is safe.</p>
+      with the reason shown. Running it again is safe. To make the codes require a touch,
+      add <code>--touch</code> (every code) or <code>--touch-for NAME</code> (that code;
+      repeat it for more).</p>
     <p>Other keys work the same way:</p>
 <pre><code>keyroostctl otp import --in aegis-export.json                # a Token2 key's code storage
 keyroostctl molto import --in codes.txt --slot 10            # a Molto2, from slot #10 on</code></pre>
