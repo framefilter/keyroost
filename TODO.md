@@ -119,12 +119,6 @@ plan's two-key manual steps were never executed):
   cannot be satisfied.
 - **Duplicate-serial advisory:** with two same-serial keys connected, the sidebar
   advisory appears and both keys stay separately selectable.
-- **SSH-cert export, zlib-wrapped blobs:** a certificate written by an OLDER
-  libfido2 (pre-~2021) is ZLIB-wrapped (RFC 1950) rather than raw DEFLATE;
-  keyroost's `inflate_raw` reads raw only, while libfido2's own reader
-  (`fido_uncompress`) tries zlib first, then raw. Decide whether to accept
-  both. (The interop check itself passed: a `fido2-token -S -b` certificate
-  exports byte for byte.)
 - **Card-content identity ([#83](https://github.com/framefilter/keyroost/issues/83))** *(no hardware)*: with a Token2 PIN+
   smartcard in a GENERIC reader (Alcor / SCM / Realtek), confirm keyroost shows
   vendor "Token2" and the FULL serial (not the 8-digit one); that it still does

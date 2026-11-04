@@ -778,9 +778,27 @@ pub(crate) fn inflate_raw(compressed: &[u8], orig_size: u64) -> Option<Vec<u8>> 
     (out.len() as u64 == orig_size).then_some(out)
 }
 
+/// A credential's large-blob plaintext as libfido2 reads it: zlib-wrapped
+/// (RFC 1950, what libfido2 wrote before it switched to raw DEFLATE), else
+/// raw DEFLATE ([`inflate_raw`]). libfido2's own reader (`fido_uncompress`)
+/// tries them in that order. Same bounds as [`inflate_raw`]: `orig_size`
+/// capped at [`MAX_BLOB_PLAINTEXT`] before anything is inflated, and the
+/// result must be exactly `orig_size` long.
+pub(crate) fn inflate_blob(compressed: &[u8], orig_size: u64) -> Option<Vec<u8>> {
+    let limit = usize::try_from(orig_size).ok()?;
+    if limit > MAX_BLOB_PLAINTEXT {
+        return None;
+    }
+    miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(compressed, limit)
+        .ok()
+        .filter(|out| out.len() as u64 == orig_size)
+        .or_else(|| inflate_raw(compressed, orig_size))
+}
+
 /// Find and decode this credential's SSH certificate from the largeBlob
 /// array. Trial-decrypts each entry with the credential's largeBlobKey (the
-/// GCM tag identifies the matching entry), inflates the raw-DEFLATE plaintext,
+/// GCM tag identifies the matching entry), inflates the plaintext
+/// (zlib-wrapped or raw DEFLATE, as libfido2 reads it),
 /// and returns the certificate when the result is one, in either stored form
 /// ([`ssh_cert::from_stored`]: OpenSSH's binary form, or a `-cert.pub` file's
 /// text as `fido2-token -S -b` stores it). None when no entry is this
@@ -794,7 +812,7 @@ pub fn extract_cert_from_entries(
         let Some(plain) = gcm_decrypt(large_blob_key, &e.nonce, &e.ciphertext, e.orig_size) else {
             continue; // not this credential's entry (tag failed)
         };
-        let Some(wire) = inflate_raw(&plain, e.orig_size) else {
+        let Some(wire) = inflate_blob(&plain, e.orig_size) else {
             continue; // decrypted but not valid DEFLATE / size mismatch
         };
         if let Some(cert) = ssh_cert::from_stored(&wire) {
@@ -1280,13 +1298,17 @@ mod tests {
     /// An entry encrypted for `key` holding `plain`, as a largeBlob writer
     /// stores it: raw DEFLATE, then AES-256-GCM with AAD "blob" || origSize LE.
     fn sealed_entry(key: &[u8; 32], plain: &[u8]) -> LargeBlobEntry {
+        let compressed = miniz_oxide::deflate::compress_to_vec(plain, 6);
+        sealed_compressed(key, &compressed, plain.len() as u64)
+    }
+
+    /// [`sealed_entry`] with the compressed bytes given (zlib-wrapped, say).
+    fn sealed_compressed(key: &[u8; 32], compressed: &[u8], orig_size: u64) -> LargeBlobEntry {
         use aes_gcm::{
             aead::{Aead, KeyInit, Payload},
             Aes256Gcm, Nonce,
         };
         let nonce = [0x22u8; 12];
-        let orig_size = plain.len() as u64;
-        let compressed = miniz_oxide::deflate::compress_to_vec(plain, 6);
         let mut aad = b"blob".to_vec();
         aad.extend_from_slice(&orig_size.to_le_bytes());
         let ciphertext = Aes256Gcm::new_from_slice(key)
@@ -1294,7 +1316,7 @@ mod tests {
             .encrypt(
                 &Nonce::try_from(&nonce[..]).unwrap(),
                 Payload {
-                    msg: &compressed,
+                    msg: compressed,
                     aad: &aad,
                 },
             )
@@ -1336,6 +1358,12 @@ mod tests {
         assert_eq!(got.cert_pub, crate::ssh_cert::to_cert_pub(&wire).unwrap());
 
         assert!(extract_cert_from_entries(&[0x99u8; 32], &binary).is_none());
+
+        // What an older libfido2 wrote: the same file, zlib-wrapped.
+        let zlib = miniz_oxide::deflate::compress_to_vec_zlib(file.as_bytes(), 6);
+        let old = array_of(vec![sealed_compressed(&key, &zlib, file.len() as u64)]);
+        let got = extract_cert_from_entries(&key, &old).expect("zlib form found");
+        assert_eq!(got.cert_pub, file);
     }
 
     #[test]
