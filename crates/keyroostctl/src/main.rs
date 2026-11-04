@@ -1557,9 +1557,9 @@ enum OpenpgpCmd {
     ///
     /// Runs PSO:CDS. Hashes the input (SHA-256 by default, or SHA-1 via
     /// `--hash`). RSA slots sign a PKCS#1 DigestInfo; ECC slots sign the bare
-    /// digest. Needs the signing PIN (PW1) and, on a YubiKey, a touch. The
-    /// output is the card's raw signature: PKCS#1 for RSA, `r||s` (not DER)
-    /// for ECDSA, `R||S` for Ed25519.
+    /// digest. Needs the signing PIN (PW1), and a touch when the slot's touch
+    /// setting is on. The output is the card's raw signature: PKCS#1 for RSA,
+    /// `r||s` (not DER) for ECDSA, `R||S` for Ed25519.
     Sign {
         /// File whose contents to sign.
         #[arg(long, short = 'i', value_name = "FILE")]
@@ -1611,9 +1611,9 @@ enum OpenpgpCmd {
     ///
     /// Runs INTERNAL AUTHENTICATE. Hashes the input (SHA-256 by default, or
     /// SHA-1 via `--hash`). RSA slots sign a PKCS#1 DigestInfo; ECC slots sign
-    /// the bare digest. Needs the user PIN (PW1) and, on a YubiKey, a touch.
-    /// The output is the card's raw signature: PKCS#1 for RSA, `r||s` (not
-    /// DER) for ECDSA, `R||S` for Ed25519.
+    /// the bare digest. Needs the user PIN (PW1), and a touch when the slot's
+    /// touch setting is on. The output is the card's raw signature: PKCS#1
+    /// for RSA, `r||s` (not DER) for ECDSA, `R||S` for Ed25519.
     Authenticate {
         /// File whose contents to authenticate-sign.
         #[arg(long, short = 'i', value_name = "FILE")]
@@ -1722,10 +1722,11 @@ enum OpenpgpKeyCmd {
     /// Generate a fresh key pair in a slot, replacing any key already there.
     /// Irreversible: asks first (`--yes` to skip).
     ///
-    /// Can switch the slot's algorithm first. Needs the admin PIN (PW3); on a
-    /// YubiKey a touch is also required. Also writes the key's v4 fingerprint
-    /// and a generation timestamp so an OpenPGP tool (e.g. gpg) recognizes the
-    /// key.
+    /// Can switch the slot's algorithm first. Needs the admin PIN (PW3), and a
+    /// touch when the slot's touch setting is on. Also writes the key's v4
+    /// fingerprint and a generation timestamp so an OpenPGP tool (e.g. gpg)
+    /// recognizes the key; GnuPG then builds the matching public key with
+    /// "Existing key from card".
     Generate {
         /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
         #[arg(long, short = 's', value_enum, default_value_t = OpenpgpSlot::Sign)]
@@ -1821,7 +1822,8 @@ enum OpenpgpKeyCmd {
     /// Change when a key set expires and update its public key file.
     ///
     /// Signs new self-signatures with the main key: on the card (needs the
-    /// signing PIN, PW1, and on a YubiKey a touch per signature), or with
+    /// signing PIN, PW1, and a touch per signature when the signing slot's
+    /// touch setting is on), or with
     /// `--backup`, on this computer from the backup (needs its passphrase;
     /// the backup is rewritten too). The keys themselves stay the same.
     /// Share the updated public key again afterward.
@@ -9754,6 +9756,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let fpr = session.register_key(slot.to_crt(), creation_time)?;
             outln!("  fingerprint: {}", hex_encode(&fpr));
             outln!("  created:     {} (unix)", creation_time);
+            outln!("{}", keyroost_pgpkey::keys::GPG_PUBLIC_KEY_HINT);
         }
         OpenpgpCmd::Key {
             cmd: cmd @ OpenpgpKeyCmd::Import { .. },

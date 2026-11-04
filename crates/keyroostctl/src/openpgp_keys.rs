@@ -572,6 +572,7 @@ fn import_rsa_file(
     outln!("  exponent: {}", hex_encode(&k.e));
     outln!("  fingerprint: {}", hex_encode(&fpr));
     outln!("  created:     {} (unix)", creation_time);
+    outln!("{}", keyroost_pgpkey::keys::GPG_PUBLIC_KEY_HINT);
     Ok(())
 }
 

@@ -10232,6 +10232,15 @@ impl App {
         self.openpgp.notice = Some(notice);
     }
 
+    /// A next step added to the pane's notice after [`Self::openpgp_done`],
+    /// kept out of the Activity log line.
+    fn openpgp_notice_hint(&mut self, hint: &str) {
+        if let Some(n) = self.openpgp.notice.as_mut() {
+            n.push_str(". ");
+            n.push_str(hint);
+        }
+    }
+
     /// An OpenPGP operation that failed: the pane's error, and an
     /// activity-log line.
     fn openpgp_failed(&mut self, err: String) {
@@ -10331,6 +10340,7 @@ impl App {
                             slot.label(),
                             hex_lower(&fpr)
                         ));
+                        app.openpgp_notice_hint(keyroost_pgpkey::keys::GPG_PUBLIC_KEY_HINT);
                         wipe(&mut app.openpgp.admin_pin);
                     }
                     Err(e) => {
@@ -10450,6 +10460,7 @@ impl App {
                             slot.label(),
                             hex_lower(&fpr)
                         ));
+                        app.openpgp_notice_hint(keyroost_pgpkey::keys::GPG_PUBLIC_KEY_HINT);
                         app.openpgp.import_path.clear();
                     }
                     Err(e) => app.openpgp_failed(e),
