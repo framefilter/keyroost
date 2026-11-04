@@ -33743,6 +33743,10 @@ mod tests {
     /// A dropped info read is retried once per selection: a read that ends
     /// with nothing set (a job that panicked) isn't started again every
     /// frame. The key's path doesn't exist, so the read fails at once.
+    /// Linux only: the read opens the path, a plain file open there; on
+    /// macOS it goes through hidapi, and a HID open in a test process hung
+    /// the macOS CI jobs.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_dropped_info_read_is_retried_once_per_selection() {
         let mut app = App::default();
