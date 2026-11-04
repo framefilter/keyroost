@@ -171,6 +171,24 @@ const ALGO_RSA: u8 = 1;
 const ALGO_ECDSA: u8 = 19;
 const ALGO_EDDSA: u8 = 22;
 
+/// Why the card's signature key can't sign for a public key whose primary
+/// key has fingerprint `want`, from the fingerprint the card records for
+/// it: `None` when they match. A card that records none (all zeros: the
+/// key was put there without it) can't be told apart from another key, and
+/// says so rather than calling it a different key.
+fn signature_key_refusal(card: &[u8; 20], want: &[u8; 20]) -> Option<&'static str> {
+    if card == want {
+        None
+    } else if card.iter().all(|&b| b == 0) {
+        Some(
+            "This card records no fingerprint for its signature key, so keyroost can't tell \
+             whether it is this public key's primary key.",
+        )
+    } else {
+        Some("This card's signature key is not this public key's primary key.")
+    }
+}
+
 /// Signs with the card's signature key (PSO: COMPUTE DIGITAL SIGNATURE),
 /// so an expiry change never needs the primary key's secret on the host.
 ///
@@ -195,10 +213,8 @@ impl<'s> CardSigner<'s> {
         pin: &[u8],
     ) -> Result<Self, Error> {
         let status = session.status().map_err(card_error)?;
-        if status.fingerprint_sig != cert.primary.fpr {
-            return Err(Error::Refused(
-                "This card's signature key is not this public key's primary key.",
-            ));
+        if let Some(why) = signature_key_refusal(&status.fingerprint_sig, &cert.primary.fpr) {
+            return Err(Error::Refused(why));
         }
         Ok(CardSigner {
             session,
@@ -263,6 +279,19 @@ fn split_signature(algo: u8, sig: Vec<u8>) -> Result<Vec<Vec<u8>>, Error> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A card that records no fingerprint says so; a different one is a
+    /// different key; the same one signs.
+    #[test]
+    fn a_card_without_a_fingerprint_says_so() {
+        let want = [7u8; 20];
+        assert_eq!(signature_key_refusal(&want, &want), None);
+        let none = signature_key_refusal(&[0; 20], &want).unwrap();
+        assert!(none.contains("records no fingerprint"), "{none}");
+        let other = signature_key_refusal(&[9; 20], &want).unwrap();
+        assert!(other.contains("is not this public key"), "{other}");
+    }
+
     use super::*;
     use crate::cert::{create, Expiry, Identity};
     use crate::keys::KeyType;

@@ -99,11 +99,12 @@ items marked *(no hardware)* need a device the maintainer does not have.
 **Device binding and targeting** (deferred from the v0.7.5 security work — the
 plan's two-key manual steps were never executed):
 
-- **Wrong-device bindings, GUI:** with two keys plugged in, switch the selection
-  mid-operation and confirm the stale completion is discarded for Molto2 session
-  open/write, the FIDO advanced dialog (a typed PIN must die with the dialog),
-  OATH delete confirmation, OpenPGP reset modal, fingerprint enroll, and
-  large-blob ops.
+- **Wrong-device bindings, GUI — fingerprint enroll:** with two keys plugged
+  in, switch the selection mid-enrollment and confirm the stale completion is
+  discarded. The other cases (Molto2 session open, the FIDO advanced dialog and
+  its typed PIN, OATH delete confirmation, OpenPGP reset modal, a large-blob
+  write) were checked on a YubiKey, a Token2 PIN+ and a Molto2; enrollment
+  needs a key with a fingerprint sensor.
 - **Armed FIDO reset:** arm for key A, replug key A → fires; arm for key A,
   insert a same-model key B during the window → must NOT fire; a serial-less key
   arms only while it is the only key connected and is refused, naming the keys
@@ -118,19 +119,6 @@ plan's two-key manual steps were never executed):
   cannot be satisfied.
 - **Duplicate-serial advisory:** with two same-serial keys connected, the sidebar
   advisory appears and both keys stay separately selectable.
-- **Linux hidraw bounded reads:** unplug a key mid-`fido info` — the command must
-  error within the read budget, not hang.
-
-**Feature verification:**
-
-- **SSH-cert export, interop proof:** on a YubiKey 5.7, store a cert with
-  `fido2-token -S -b -n ssh:… cert.pub`, export it with `keyroostctl fido
-  ssh export --rp <rp-id>` (and via the GUI), and confirm the output `-cert.pub` is
-  byte-identical to the original — the cross-implementation check a round-trip
-  KAT cannot provide. Also try a cert written by an OLDER libfido2 (pre-~2021),
-  which wrote ZLIB-wrapped (RFC 1950) largeBlob data rather than raw DEFLATE:
-  keyroost's `inflate_raw` accepts raw only, so an old-format blob will not
-  extract. Decide whether to also accept zlib, as libfido2's reader does.
 - **Card-content identity ([#83](https://github.com/framefilter/keyroost/issues/83))** *(no hardware)*: with a Token2 PIN+
   smartcard in a GENERIC reader (Alcor / SCM / Realtek), confirm keyroost shows
   vendor "Token2" and the FULL serial (not the 8-digit one); that it still does
@@ -181,7 +169,8 @@ plan's two-key manual steps were never executed):
   Needs a way to get the token's serial during detection, without logging in
   with the customer key.
 
-- **Speed up the Nix CI build** — the Nix build job
+- **Speed up the Nix CI build** (after v0.16, as a measured trial started from
+  main) — the Nix build job
   ([#144](https://github.com/framefilter/keyroost/pull/144)) is the slowest
   in CI (10–19 minutes against 3–7). A plain cache of the Nix store won't
   help much (checked 2026-10-29): the flake's source is the whole repo

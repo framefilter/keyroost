@@ -236,6 +236,56 @@ pub fn parse_text(s: &str) -> Option<(SshCertInfo, Vec<u8>)> {
     Some((info, wire))
 }
 
+/// A certificate as a key stores it in large-blob storage: OpenSSH's binary
+/// (wire) form, or the text of a `-cert.pub` file, as `fido2-token -S -b`
+/// stores one. `cert_pub` is what to write back out: stored text that is
+/// exactly one plain `-cert.pub` line as it was (comment and all, so a
+/// normal file comes back as it was), otherwise the certificate re-encoded by
+/// [`to_cert_pub`]. The stored bytes come from the key, so nothing beyond
+/// that one checked line is ever written out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCert {
+    pub info: SshCertInfo,
+    pub wire: Vec<u8>,
+    pub cert_pub: String,
+}
+
+/// Recognize a certificate stored in either form ([`StoredCert`]); `None`
+/// when the bytes are neither.
+pub fn from_stored(bytes: &[u8]) -> Option<StoredCert> {
+    if let Some(info) = parse_wire(bytes) {
+        return Some(StoredCert {
+            info,
+            wire: bytes.to_vec(),
+            cert_pub: to_cert_pub(bytes)?,
+        });
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (info, wire) = parse_text(text.trim())?;
+    let cert_pub = match plain_cert_line(text) {
+        Some(line) => format!("{line}\n"),
+        None => to_cert_pub(&wire)?,
+    };
+    Some(StoredCert {
+        info,
+        wire,
+        cert_pub,
+    })
+}
+
+/// `text` as one `-cert.pub` line safe to write back as it is: a single
+/// line (a final newline allowed) of printable ASCII, so a comment can carry
+/// no control, direction or invisible characters and no second line.
+fn plain_cert_line(text: &str) -> Option<&str> {
+    let line = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text);
+    line.bytes()
+        .all(|b| (0x20..0x7f).contains(&b))
+        .then_some(line)
+}
+
 /// Re-encode a wire-format certificate as the body of a `-cert.pub` file:
 /// `<type> <base64>\n`. Returns `None` if the bytes are not a certificate.
 pub fn to_cert_pub(wire: &[u8]) -> Option<String> {
@@ -331,6 +381,34 @@ mod tests {
             format_validity(1767225600, 1798761600),
             "2026-01-01 00:00:00 UTC to 2027-01-01 00:00:00 UTC"
         );
+    }
+
+    /// A stored `-cert.pub` line comes back as it was only when it is one
+    /// plain line; anything else on it is dropped by re-encoding the
+    /// verified certificate.
+    #[test]
+    fn stored_text_comes_back_only_as_one_plain_line() {
+        let cert = tests_fixture::FIXTURE_CERT_PUB.trim();
+        let (_, wire) = parse_text(cert).unwrap();
+        let rebuilt = to_cert_pub(&wire).unwrap();
+        let plain = format!("{cert} kr-test@host\n");
+        assert_eq!(from_stored(plain.as_bytes()).unwrap().cert_pub, plain);
+        let crlf = format!("{cert} kr-test\r\n");
+        assert_eq!(
+            from_stored(crlf.as_bytes()).unwrap().cert_pub,
+            format!("{cert} kr-test\n")
+        );
+        for hostile in [
+            format!("{cert} two\nssh-ed25519 AAAA extra\n"),
+            format!("{cert} bell\u{7}\n"),
+            format!("{cert} rtl\u{202e}gnp.exe\n"),
+        ] {
+            assert_eq!(
+                from_stored(hostile.as_bytes()).unwrap().cert_pub,
+                rebuilt,
+                "{hostile:?}"
+            );
+        }
     }
 
     #[test]

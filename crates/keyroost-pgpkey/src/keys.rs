@@ -37,6 +37,15 @@ pub enum KeyType {
     Cv25519,
 }
 
+/// Said after a key goes onto a card without a public key to go with it
+/// (one slot generated, or a bare RSA key file imported): the card records
+/// the key's fingerprint and creation time, and GnuPG builds the matching
+/// public key from them (its "Existing key from card" uses the card's
+/// creation time). Checked with GnuPG 2.4 on a YubiKey: the public key it
+/// made had the fingerprint keyroost recorded, and signed.
+pub const GPG_PUBLIC_KEY_HINT: &str = "To use it with GnuPG, run \"gpg --card-status\", then \
+     \"gpg --full-gen-key --expert\" and choose \"Existing key from card\".";
+
 impl KeyType {
     /// What to say about how long making these keys on the computer takes,
     /// when it is long enough to mention ("this can take a minute": an

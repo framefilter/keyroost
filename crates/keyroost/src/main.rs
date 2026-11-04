@@ -4893,6 +4893,9 @@ struct App {
     /// Selected device id — stable across refreshes so the pane doesn't jump
     /// when an *unrelated* key is plugged or unplugged.
     selected_device: Option<DeviceId>,
+    /// The selection `retry_dropped_info_read` already retried its info
+    /// read for (once per selection).
+    info_retried_for: Option<DeviceId>,
     /// Which capability pane is showing for the selected key.
     cap_tab: CapTab,
     /// Each device's own last-shown `cap_tab`, so switching to another
@@ -5414,9 +5417,8 @@ impl App {
                                     }
                                     Some(entry) => {
                                         let bytes = match entry.classify() {
-                                            EntryKind::SshCert { wire, .. } => {
-                                                keyroost_ctap::ssh_cert::to_cert_pub(&wire)
-                                                    .map(String::into_bytes)
+                                            EntryKind::SshCert { cert_pub, .. } => {
+                                                Some(cert_pub.into_bytes())
                                             }
                                             _ => Some(entry.ciphertext.clone()),
                                         };
@@ -6474,6 +6476,40 @@ impl App {
             "not authenticated; click Authenticate first",
         );
         false
+    }
+
+    /// Start the selected key's info read when the one its selection
+    /// started never ran: refused because another job was running (switching
+    /// keys while a Molto2 opened, say). Any tab otherwise showed "Reading
+    /// key…" until the next scan; only the FIDO2 tab used to retry. Only on
+    /// the background worker: without one (tests drawing frames) the read
+    /// would run inline every frame and open the key.
+    fn retry_dropped_info_read(&mut self) {
+        if self.worker.is_some() && self.info_retry_due() {
+            self.info_retried_for = self.selected_device.clone();
+            self.fetch_selected_info();
+        }
+    }
+
+    /// Whether [`Self::retry_dropped_info_read`] should start a read now:
+    /// nothing runs, a FIDO2 key is selected that has no info, error or
+    /// U2F-only answer yet, and its selection hasn't had its retry. Once
+    /// per selection, so a read that ends with nothing set (a job that
+    /// panicked) isn't started again every frame.
+    fn info_retry_due(&self) -> bool {
+        if self.busy()
+            || self.selected_fido_target().is_none()
+            || (self.info_retried_for.is_some() && self.info_retried_for == self.selected_device)
+        {
+            return false;
+        }
+        let reads_info = self.selected_device().is_some_and(|d| {
+            matches!(d.kind, DeviceKind::Key)
+                && d.caps.has(Caps::FIDO2)
+                && !d.caps.has(Caps::U2F_ONLY)
+        });
+        let sk = &self.security_keys;
+        reads_info && sk.info.is_none() && sk.error.is_none() && !sk.u2f_only
     }
 
     /// Open the currently-selected hidraw device, run CTAPHID_INIT and
@@ -7690,16 +7726,14 @@ impl App {
         // Read the world-readable array BEFORE any credential-management borrow —
         // matches the CLI's device-ownership ordering (see `enumerate_ssh_credentials`).
         let array = keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
-        let wire = keyroost_ctap::large_blobs::extract_cert_from_entries(large_blob_key, &array)
+        // The stored text comes back as it was stored; a binary certificate
+        // is re-encoded.
+        let cert = keyroost_ctap::large_blobs::extract_cert_from_entries(large_blob_key, &array)
             .ok_or("no certificate is stored for this credential")?;
-        let cert_pub = keyroost_ctap::ssh_cert::to_cert_pub(&wire)
-            .ok_or("stored blob is not a valid OpenSSH certificate")?;
-        // to_cert_pub already parsed the wire, so parse_wire here cannot fail;
-        // fall back to a minimal label rather than erroring if it somehow does.
-        let summary = keyroost_ctap::ssh_cert::parse_wire(&wire)
-            .map(|info| ssh_cert_summary(&info))
-            .unwrap_or_else(|| "OpenSSH certificate".to_string());
-        Ok(PendingSshCert { cert_pub, summary })
+        Ok(PendingSshCert {
+            summary: ssh_cert_summary(&cert.info),
+            cert_pub: cert.cert_pub,
+        })
     }
 
     fn submit_change_pin(&mut self) {
@@ -10232,6 +10266,15 @@ impl App {
         self.openpgp.notice = Some(notice);
     }
 
+    /// A next step added to the pane's notice after [`Self::openpgp_done`],
+    /// kept out of the Activity log line.
+    fn openpgp_notice_hint(&mut self, hint: &str) {
+        if let Some(n) = self.openpgp.notice.as_mut() {
+            n.push_str(". ");
+            n.push_str(hint);
+        }
+    }
+
     /// An OpenPGP operation that failed: the pane's error, and an
     /// activity-log line.
     fn openpgp_failed(&mut self, err: String) {
@@ -10331,6 +10374,7 @@ impl App {
                             slot.label(),
                             hex_lower(&fpr)
                         ));
+                        app.openpgp_notice_hint(keyroost_pgpkey::keys::GPG_PUBLIC_KEY_HINT);
                         wipe(&mut app.openpgp.admin_pin);
                     }
                     Err(e) => {
@@ -10450,6 +10494,11 @@ impl App {
                             slot.label(),
                             hex_lower(&fpr)
                         ));
+                        // A key set's file already comes with its public key;
+                        // a bare RSA key file doesn't.
+                        if !file_is_openpgp {
+                            app.openpgp_notice_hint(keyroost_pgpkey::keys::GPG_PUBLIC_KEY_HINT);
+                        }
                         app.openpgp.import_path.clear();
                     }
                     Err(e) => app.openpgp_failed(e),
@@ -11596,6 +11645,7 @@ impl App {
     /// `cap_tab` pick — everything else this resets is genuinely per-device
     /// UI/session state with nothing worth carrying forward under any id.
     fn on_device_selected(&mut self, previous: Option<DeviceId>) {
+        self.info_retried_for = None;
         if let Some(prev) = previous {
             self.cap_tab_by_device.insert(prev, self.cap_tab);
         }
@@ -16500,6 +16550,7 @@ impl eframe::App for App {
         // Apply any results from background device jobs and the import
         // thread before drawing.
         self.drain_worker();
+        self.retry_dropped_info_read();
         // While a device job is in flight (e.g. fingerprint enrollment writing
         // live progress to a shared cell), keep the frame loop ticking so the UI
         // reflects per-sample updates instead of freezing until the job ends.
@@ -19796,12 +19847,8 @@ impl App {
                 PinSupport::Unknown => {
                     let u2f_only = self.security_keys.u2f_only;
                     let failed = self.security_keys.error.is_some();
-                    // The initial read can be dropped if the worker was busy
-                    // at selection time; retry rather than showing "Reading
-                    // key…" forever.
-                    if !u2f_only && !failed && self.security_keys.info.is_none() && !self.busy() {
-                        self.fetch_selected_info();
-                    }
+                    // A read dropped at selection time is retried every frame
+                    // (`retry_dropped_info_read`), whatever tab is open.
                     ui.label(
                         egui::RichText::new(fido_unread_line(u2f_only, failed))
                             .font(theme::f_reg(13.0))
@@ -33700,6 +33747,34 @@ mod tests {
 
         // No selection at all.
         assert_eq!(App::card_reset_reader(None), None);
+    }
+
+    /// A dropped info read is due once per selection, for a FIDO2 key with
+    /// nothing read yet, never while a job runs or once the read answered
+    /// (with an error, say). Decided without opening anything; the read
+    /// itself only runs on the background worker, which tests don't have.
+    #[test]
+    fn a_dropped_info_read_is_due_once_per_selection() {
+        let mut app = App::default();
+        let mut key = test_key("serial:A", "AAA", None);
+        key.caps.insert(Caps::FIDO2);
+        key.hid_path = Some("/nonexistent/keyroost-test/hidraw".into());
+        app.devices = vec![key];
+        app.selected_device = Some("serial:A".into());
+        assert!(app.info_retry_due());
+
+        // No worker: drawing a frame never reads (opens) the key.
+        app.retry_dropped_info_read();
+        assert!(app.info_retried_for.is_none() && app.security_keys.error.is_none());
+
+        app.busy_jobs = 1;
+        assert!(!app.info_retry_due(), "not while a job runs");
+        app.busy_jobs = 0;
+        app.info_retried_for = Some("serial:A".into());
+        assert!(!app.info_retry_due(), "once per selection");
+        app.info_retried_for = None;
+        app.security_keys.error = Some("failed".into());
+        assert!(!app.info_retry_due(), "the read answered");
     }
 
     #[test]
