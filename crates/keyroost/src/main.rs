@@ -5414,9 +5414,8 @@ impl App {
                                     }
                                     Some(entry) => {
                                         let bytes = match entry.classify() {
-                                            EntryKind::SshCert { wire, .. } => {
-                                                keyroost_ctap::ssh_cert::to_cert_pub(&wire)
-                                                    .map(String::into_bytes)
+                                            EntryKind::SshCert { cert_pub, .. } => {
+                                                Some(cert_pub.into_bytes())
                                             }
                                             _ => Some(entry.ciphertext.clone()),
                                         };
@@ -7690,16 +7689,14 @@ impl App {
         // Read the world-readable array BEFORE any credential-management borrow —
         // matches the CLI's device-ownership ordering (see `enumerate_ssh_credentials`).
         let array = keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
-        let wire = keyroost_ctap::large_blobs::extract_cert_from_entries(large_blob_key, &array)
+        // The stored text comes back as it was stored; a binary certificate
+        // is re-encoded.
+        let cert = keyroost_ctap::large_blobs::extract_cert_from_entries(large_blob_key, &array)
             .ok_or("no certificate is stored for this credential")?;
-        let cert_pub = keyroost_ctap::ssh_cert::to_cert_pub(&wire)
-            .ok_or("stored blob is not a valid OpenSSH certificate")?;
-        // to_cert_pub already parsed the wire, so parse_wire here cannot fail;
-        // fall back to a minimal label rather than erroring if it somehow does.
-        let summary = keyroost_ctap::ssh_cert::parse_wire(&wire)
-            .map(|info| ssh_cert_summary(&info))
-            .unwrap_or_else(|| "OpenSSH certificate".to_string());
-        Ok(PendingSshCert { cert_pub, summary })
+        Ok(PendingSshCert {
+            summary: ssh_cert_summary(&cert.info),
+            cert_pub: cert.cert_pub,
+        })
     }
 
     fn submit_change_pin(&mut self) {

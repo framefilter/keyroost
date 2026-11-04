@@ -14165,15 +14165,16 @@ fn run_fido_ssh_cert_extract(
             sanitize_terminal(rp_id)
         )
     })?;
-    let wire = keyroost_ctap::large_blobs::extract_cert_from_entries(key, &array)
+    // The stored text comes back as it was stored; a binary certificate is
+    // re-encoded.
+    let cert_pub = keyroost_ctap::large_blobs::extract_cert_from_entries(key, &array)
         .ok_or_else(|| {
             format!(
                 "no SSH certificate found in credential '{}'s largeBlob (no matching entry, or the stored blob is not a certificate)",
                 sanitize_terminal(rp_id)
             )
-        })?;
-    let cert_pub = keyroost_ctap::ssh_cert::to_cert_pub(&wire)
-        .ok_or("stored blob is not a valid OpenSSH certificate")?;
+        })?
+        .cert_pub;
 
     // Resolve the output path (default: <sanitized rp-id>-cert.pub). The RP id
     // is device-derived and must be treated as hostile: use the path-safe
@@ -14527,9 +14528,7 @@ fn run_fido_large_blob_export(
         .ok_or_else(|| large_blob_bad_index(index, array.len()))?;
     let bytes: Vec<u8> = if as_cert {
         match entry.classify() {
-            EntryKind::SshCert { wire, .. } => keyroost_ctap::ssh_cert::to_cert_pub(&wire)
-                .ok_or("could not re-encode certificate")?
-                .into_bytes(),
+            EntryKind::SshCert { cert_pub, .. } => cert_pub.into_bytes(),
             _ => {
                 return Err(format!(
                 "entry {index} is not a recognized SSH certificate; drop --as-cert to export raw bytes"

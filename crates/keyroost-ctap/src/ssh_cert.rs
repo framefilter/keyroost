@@ -236,6 +236,41 @@ pub fn parse_text(s: &str) -> Option<(SshCertInfo, Vec<u8>)> {
     Some((info, wire))
 }
 
+/// A certificate as a key stores it in large-blob storage: OpenSSH's binary
+/// (wire) form, or the text of a `-cert.pub` file, as `fido2-token -S -b`
+/// stores one. `cert_pub` is what to write back out: the stored text as it
+/// was (comment and all, so the file comes back byte for byte), or the
+/// binary form re-encoded by [`to_cert_pub`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCert {
+    pub info: SshCertInfo,
+    pub wire: Vec<u8>,
+    pub cert_pub: String,
+}
+
+/// Recognize a certificate stored in either form ([`StoredCert`]); `None`
+/// when the bytes are neither.
+pub fn from_stored(bytes: &[u8]) -> Option<StoredCert> {
+    if let Some(info) = parse_wire(bytes) {
+        return Some(StoredCert {
+            info,
+            wire: bytes.to_vec(),
+            cert_pub: to_cert_pub(bytes)?,
+        });
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (info, wire) = parse_text(text.trim())?;
+    let mut cert_pub = text.to_owned();
+    if !cert_pub.ends_with('\n') {
+        cert_pub.push('\n');
+    }
+    Some(StoredCert {
+        info,
+        wire,
+        cert_pub,
+    })
+}
+
 /// Re-encode a wire-format certificate as the body of a `-cert.pub` file:
 /// `<type> <base64>\n`. Returns `None` if the bytes are not a certificate.
 pub fn to_cert_pub(wire: &[u8]) -> Option<String> {
