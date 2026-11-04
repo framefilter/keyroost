@@ -316,7 +316,11 @@ fn create(
 
     let (pass, admin_secret) = secrets.read_first(sec)?;
     let pass = pass.text()?;
-    output::status(&format!("Making the {} keys…", key_type.label()));
+    let hint = key_type
+        .slow_hint()
+        .map(|h| format!(" ({h})"))
+        .unwrap_or_default();
+    output::status(&format!("Making the {} keys…{hint}", key_type.label()));
     let set = cert::create(key_type, &plan.identity, plan.expiry, now).map_err(plain)?;
     let out = cert::export(&set, pass.as_bytes(), now).map_err(plain)?;
     files::write_new(&paths.secret, &out.secret, true).map_err(plain)?;

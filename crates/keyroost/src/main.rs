@@ -2924,6 +2924,126 @@ fn fido_unread_line(u2f_only: bool, read_failed: bool) -> &'static str {
     }
 }
 
+/// A trace line (`> otp ctaphid           80c5…`, see
+/// `keyroost_proto::trace::format_line`) split for the Activity log: the
+/// direction and label column, kept whole, and the body, which wraps in its
+/// own column. A long hex run in the body gets a space every 4 bytes so it
+/// breaks between bytes; the log's Copy keeps the line as it was.
+fn trace_columns(line: &str) -> (String, String) {
+    // The label column ends at the first run of two spaces past the mark.
+    let Some(gap) = line
+        .get(2..)
+        .and_then(|rest| rest.find("  "))
+        .map(|i| i + 2)
+    else {
+        return (String::new(), line.to_owned());
+    };
+    let body_at = gap + line[gap..].len() - line[gap..].trim_start().len();
+    let body = line[body_at..]
+        .split(' ')
+        .map(|word| {
+            let hex = word.len() > 16 && word.bytes().all(|b| b.is_ascii_hexdigit());
+            if hex {
+                word.as_bytes()
+                    .chunks(8)
+                    .map(|c| std::str::from_utf8(c).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    (line[..body_at].to_owned(), body)
+}
+
+/// The status bar's height: one line of 12 pt text.
+const STATUS_BAR_HEIGHT: f32 = 26.0;
+
+/// A running job's seconds show only after this, so a quick read never
+/// flickers a counter.
+const STATUS_SECONDS_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Buttons that would start a key operation show disabled only once a job
+/// has run this long (see `App::waiting_for`).
+const DISABLE_BUTTONS_AFTER: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How long the status bar keeps an outcome: an error longer, as it is
+/// more likely to need reading.
+const STATUS_NOTE_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+const STATUS_ERROR_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the status bar says after a job: its outcome, until `until`.
+#[derive(Clone, Debug, PartialEq)]
+struct StatusNote {
+    severity: Severity,
+    text: String,
+    until: std::time::Instant,
+    /// A click refused because a job runs ([`App::refuse_if_busy`]): shown
+    /// over the running job's line, as that is when it matters.
+    refusal: bool,
+}
+
+impl StatusNote {
+    fn new(severity: Severity, text: String) -> Self {
+        let for_ = match severity {
+            Severity::Err => STATUS_ERROR_FOR,
+            _ => STATUS_NOTE_FOR,
+        };
+        StatusNote {
+            severity,
+            text,
+            until: std::time::Instant::now() + for_,
+            refusal: false,
+        }
+    }
+
+    /// The note for a click refused because `running` is still going.
+    fn refusal(running: Option<&str>) -> Self {
+        StatusNote {
+            refusal: true,
+            ..StatusNote::new(Severity::Warn, busy_refusal_text(running))
+        }
+    }
+
+    /// The note a new Activity log line puts on the status bar: what the
+    /// person did (any outcome), and any failure, the app's own reads'
+    /// included. The app's other background lines (scans, re-reads) don't.
+    fn for_log_line(severity: Severity, kind: LogKind, text: &str) -> Option<Self> {
+        let shown = match kind {
+            LogKind::User => !matches!(severity, Severity::Info),
+            LogKind::Background => matches!(severity, Severity::Err),
+        };
+        shown.then(|| StatusNote::new(severity, text.to_owned()))
+    }
+}
+
+/// A running job's time on the status bar: "12 s", "1 min 5 s".
+fn status_seconds(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s} s")
+    } else {
+        format!("{} min {} s", s / 60, s % 60)
+    }
+}
+
+/// What the status bar says when a click is refused because a job runs.
+fn busy_refusal_text(running: Option<&str>) -> String {
+    match running {
+        Some(label) => {
+            // An ellipsis only where the label doesn't already end its
+            // sentence ("Making the RSA-4096 keys… (this can take a minute)").
+            let label = label.trim_end();
+            let ended = label.ends_with(['\u{2026}', '.', ')']);
+            let more = if ended { "" } else { "\u{2026}" };
+            format!("Still working on: {label}{more} Try again when it finishes.")
+        }
+        None => "Still working on another key operation. Try again when it finishes.".to_owned(),
+    }
+}
+
 /// Whether a job's status text asks for a touch on the key: a job that knows
 /// it needs (or may need) one says so in its label.
 fn job_waits_for_touch(label: &str) -> bool {
@@ -4934,6 +5054,13 @@ struct App {
     busy_jobs: u32,
     /// Human-readable description of what the worker is currently doing.
     busy_label: Option<String>,
+    /// When the running job started: the status bar counts its seconds.
+    busy_since: Option<std::time::Instant>,
+    /// What the status bar says after a job, until it expires.
+    status_note: Option<StatusNote>,
+    /// A click or key press this frame: a job refused while another runs
+    /// then says so in the status bar (an automatic read never does).
+    user_acted: bool,
     /// Set by the reader or FIDO HID watcher on a hotplug; consumed in `update()` to
     /// trigger a re-enumeration. Shared with the watcher threads.
     devices_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -5511,7 +5638,7 @@ struct LogLine {
     trace: Option<Vec<String>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Severity {
     Info,
     Ok,
@@ -5588,11 +5715,11 @@ impl App {
     where
         F: FnOnce() -> ApplyFn + Send + 'static,
     {
-        // Serialize device access: ignore a new job while one is in flight rather
-        // than queueing overlapping card I/O behind a click the user can't see
-        // landed. (A single worker thread would serialize anyway, but this also
-        // stops a growing backlog of duplicate refreshes from rapid clicks.)
-        if self.busy() {
+        // Serialize device access: refuse a new job while one is in flight rather
+        // than queueing overlapping card I/O behind a click (a single worker
+        // thread would serialize anyway, but this also stops a growing backlog
+        // of duplicate refreshes from rapid clicks). A refused click says so.
+        if self.refuse_if_busy() {
             return false;
         }
         let label: String = label.into();
@@ -5621,6 +5748,8 @@ impl App {
             Some(worker) => {
                 self.busy_jobs += 1;
                 self.busy_label = Some(label);
+                // A chained job continues the run that started it.
+                self.busy_since.get_or_insert_with(std::time::Instant::now);
                 KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 KEY_MAY_ASK_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 if worker.job_tx.send(Box::new(job)).is_err() {
@@ -5668,6 +5797,16 @@ impl App {
             }
             apply(self);
         }
+        // Settled after the applies: a job its apply chained (a scan, then a
+        // re-read) keeps the run's start, so buttons don't flash back on
+        // between the steps and the seconds don't restart; "Still working
+        // on…" ends with the whole run.
+        if self.busy_jobs == 0 {
+            self.busy_since = None;
+            if self.status_note.as_ref().is_some_and(|n| n.refusal) {
+                self.status_note = None;
+            }
+        }
         if disconnected {
             // Last-resort safety net: jobs catch their own panics, so a dead
             // worker means the thread ended some other way. Clear the busy guard
@@ -5676,6 +5815,7 @@ impl App {
             // execution if there's no egui context, e.g. in tests).
             self.busy_jobs = 0;
             self.busy_label = None;
+            self.busy_since = None;
             let apdu_trace = self.apdu_trace.clone();
             self.worker = self
                 .egui_ctx
@@ -5691,6 +5831,37 @@ impl App {
     /// True while any background device job is in flight.
     fn busy(&self) -> bool {
         self.busy_jobs > 0
+    }
+
+    /// What a button that would start a key operation waits for while a job
+    /// runs (its label, "Reading OATH codes…"), for its disabled state and
+    /// hover; `None` when nothing runs.
+    ///
+    /// Only once the job has run past [`DISABLE_BUTTONS_AFTER`], so a short
+    /// background read (the 30-second refresh) doesn't flicker every button;
+    /// a click before then is refused and says so ([`Self::refuse_if_busy`]).
+    fn waiting_for(&self) -> Option<&str> {
+        let long = self
+            .busy_since
+            .is_some_and(|t| t.elapsed() >= DISABLE_BUTTONS_AFTER);
+        (self.busy() && long).then(|| {
+            self.busy_label
+                .as_deref()
+                .unwrap_or("another key operation")
+        })
+    }
+
+    /// `busy()`, and when the person's click or key press is what was
+    /// refused, the status bar says what is still running: a click is never
+    /// dropped silently.
+    fn refuse_if_busy(&mut self) -> bool {
+        if !self.busy() {
+            return false;
+        }
+        if self.user_acted {
+            self.status_note = Some(StatusNote::refusal(self.busy_label.as_deref()));
+        }
+        true
     }
 
     /// True while a bulk-import stage runs on its own thread.
@@ -5879,6 +6050,9 @@ impl App {
         // line that closure produces, then consumed so a later, unrelated log
         // call in the same frame doesn't also claim it.
         let trace = self.pending_trace.take().filter(|t| !t.is_empty());
+        if let Some(note) = StatusNote::for_log_line(severity, kind, &text) {
+            self.status_note = Some(note);
+        }
         self.log.push(LogLine {
             severity,
             kind,
@@ -5909,10 +6083,10 @@ impl App {
 
     /// Take the Molto2 session so a worker job can use it (the apply step
     /// hands it back). `None` — with the reason logged — when not connected;
-    /// silently `None` while another job runs, so a click during a background
-    /// read is dropped *before* any state is consumed.
+    /// `None` while another job runs, before any state is consumed, and a
+    /// refused click says so on the status bar.
     fn take_molto_session(&mut self) -> Option<Session> {
-        if self.busy() {
+        if self.refuse_if_busy() {
             return None;
         }
         if !self.molto_session_usable() {
@@ -6453,7 +6627,7 @@ impl App {
     fn try_unlock(&mut self) {
         // Check busy *before* consuming the typed PIN — spawn_job would drop
         // the job (and the PIN with it) if a background read is in flight.
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -7030,7 +7204,7 @@ impl App {
     /// Writes live progress to a shared cell so the UI can show a wizard with
     /// per-sample quality feedback.
     fn enroll_fingerprint(&mut self) {
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -7185,7 +7359,7 @@ impl App {
 
     /// Delete one fingerprint by template id, then refresh the list.
     fn delete_fingerprint(&mut self, template_id: Vec<u8>) {
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -7220,7 +7394,7 @@ impl App {
 
     /// Rename one fingerprint, then refresh the list.
     fn rename_fingerprint(&mut self, template_id: Vec<u8>, new_name: String) {
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -7291,7 +7465,7 @@ impl App {
     /// Dispatch the pending Advanced action on a worker thread, then refresh the
     /// key's info so the view reflects the new state.
     fn run_advanced_action(&mut self) {
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(dlg) = self.security_keys.advanced.as_ref() else {
@@ -7530,7 +7704,7 @@ impl App {
 
     fn submit_change_pin(&mut self) {
         // Check busy *before* consuming the typed PINs (see try_unlock).
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -7592,7 +7766,7 @@ impl App {
     /// the status flips to "PIN set".
     fn submit_set_pin(&mut self) {
         // Check busy *before* consuming the typed PINs (see try_unlock).
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -8388,6 +8562,7 @@ impl App {
     /// `provision_oath`; the outcome is mirrored back via `apply_oath_rows`. The
     /// secret is wiped on Done/Cancel/✕/Esc.
     fn render_oath_add_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         if !self.oath.add.open {
             return;
         }
@@ -8485,7 +8660,9 @@ impl App {
                                     .color(p.txt2),
                             );
                         } else {
-                            if theme::button(ui, p, BtnKind::Primary, "Add").clicked() {
+                            if theme::key_button(ui, p, BtnKind::Primary, "Add", waiting.as_deref())
+                                .clicked()
+                            {
                                 want_submit = true;
                             }
                             ui.add_space(8.0);
@@ -8505,15 +8682,19 @@ impl App {
             return;
         }
         if want_submit && !busy {
+            // Refused while another job runs before the spinner is set, so the
+            // dialog stays ready for the next try (the status bar says why).
+            if self.refuse_if_busy() {
+                return;
+            }
             // Mark busy first so the modal shows the spinner this frame; the op
             // writes the outcome back via `apply_oath_rows`.
             self.oath.add.busy = true;
             self.oath.add.result = None;
             self.oath.error = None;
             self.provision_oath();
-            // If the op didn't actually queue — the worker was busy (no error
-            // set; retry on the next click) or a client-side guard rejected the
-            // input and stored the reason in `oath.error` — unstick the modal and
+            // If the op didn't queue — a client-side guard rejected the input
+            // and stored the reason in `oath.error` — unstick the modal and
             // surface the guard reason in the dialog rather than the pane.
             if !self.busy() {
                 let guard_err = self.oath.error.take();
@@ -8531,6 +8712,7 @@ impl App {
     /// re-checked, so `delete_oath` can never open a different reader than
     /// the one the user confirmed against (KEY-008).
     fn render_oath_delete_confirm(&mut self, ctx: &egui::Context) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some((for_device, name)) = self.oath.confirm_delete.clone() else {
             return;
         };
@@ -8550,7 +8732,7 @@ impl App {
                 ));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() {
+                    if theme::key_egui_button(ui, "Delete", waiting.as_deref()).clicked() {
                         decision = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -8572,6 +8754,7 @@ impl App {
     /// device binding as the delete confirmation (KEY-008): a stale
     /// confirmation is dropped, never rendered over the new selection.
     fn render_oath_reset_confirm(&mut self, ctx: &egui::Context) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(for_device) = self.oath.confirm_reset.clone() else {
             return;
         };
@@ -8591,7 +8774,7 @@ impl App {
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Reset applet").clicked() {
+                    if theme::key_egui_button(ui, "Reset applet", waiting.as_deref()).clicked() {
                         decision = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -8756,6 +8939,7 @@ impl App {
     /// so a confirmed wipe can only ever land on the key it was opened for
     /// (KEY-008). "Yes, wipe this key" starts the sequential reset job.
     fn render_factory_reset_confirm(&mut self, ctx: &egui::Context, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(FactoryResetConfirmState {
             for_device,
             piv_preview,
@@ -8837,7 +9021,15 @@ impl App {
                     self.factory_reset_confirm_typed.trim() == "reset" && blockers.is_empty();
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(armed, |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Yes, wipe this key").clicked() {
+                        if theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Danger,
+                            "Yes, wipe this key",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                        {
                             decision = Some(true);
                         }
                     });
@@ -9342,8 +9534,14 @@ impl App {
                     } else {
                         "Arm reset"
                     };
+                    let waiting = self.waiting_for().map(str::to_owned);
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(ready, egui::Button::new(go_label)).clicked() {
+                        let go =
+                            ui.add_enabled(ready && waiting.is_none(), egui::Button::new(go_label));
+                        if let Some(w) = &waiting {
+                            go.clone().on_disabled_hover_text(theme::waiting_hover(w));
+                        }
+                        if go.clicked() {
                             arm = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -9485,6 +9683,146 @@ impl App {
     /// was told about times out (#218).
     /// What the touch banner says now, or `None`. The fingerprint dialog
     /// asks for each touch itself, so no banner covers it.
+    /// The status bar along the bottom of the window: what is running (its
+    /// seconds after [`STATUS_SECONDS_AFTER`], an import's progress), then
+    /// for a few seconds what just happened ([`StatusNote`]). Empty when
+    /// nothing is. A job waiting for a touch says so in the touch banner, so
+    /// the bar never asks for one. Clicking it opens the Activity log.
+    fn status_bar(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
+        let now = std::time::Instant::now();
+        if self.status_note.as_ref().is_some_and(|n| n.until <= now) {
+            self.status_note = None;
+        }
+        let running = (self.busy() && self.touch_banner_text().is_none()).then(|| {
+            let label = self.busy_label.clone().unwrap_or_default();
+            let progress = self
+                .import_flow
+                .dialog
+                .as_ref()
+                .and_then(|d| d.running.as_ref())
+                .and_then(|r| r.lock().ok().map(|g| *g))
+                .filter(|(_, total)| *total > 0)
+                .map(|(done, total)| format!("{done} of {total}"));
+            let seconds = self
+                .busy_since
+                .map(|t| now.duration_since(t))
+                .filter(|d| *d >= STATUS_SECONDS_AFTER)
+                .map(status_seconds);
+            (label, progress.or(seconds))
+        });
+        // "Still working on…" only while something is (a Refresh runs as
+        // several jobs in a row, so it isn't cleared when one ends).
+        let note = self
+            .status_note
+            .clone()
+            .filter(|n| !n.refusal || running.is_some());
+        if let Some(n) = &note {
+            root_ui
+                .ctx()
+                .request_repaint_after(n.until.duration_since(now));
+        }
+        if running.is_some() {
+            // The seconds count up while nothing else redraws.
+            root_ui
+                .ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        let mut open_log = false;
+        egui::Panel::bottom("status_bar")
+            .exact_size(STATUS_BAR_HEIGHT)
+            .resizable(false)
+            .frame(panel_frame(p.bar, 14.0, 0.0))
+            .show(root_ui, |ui| {
+                let shows = running.is_some() || note.is_some();
+                let resp = ui.interact(
+                    ui.max_rect(),
+                    ui.scope_id().with("status_bar_click"),
+                    if shows {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    },
+                );
+                if shows {
+                    resp.clone()
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Open the Activity log");
+                }
+                open_log = resp.clicked();
+                // A refused click shows over the running job's line.
+                let refused = running.is_some() && note.as_ref().is_some_and(|n| n.refusal);
+                egui::Sides::new().shrink_left().truncate().show(
+                    ui,
+                    |ui| {
+                        if let (Some((label, after)), false) = (&running, refused) {
+                            ui.add(egui::Spinner::new().size(13.0).color(p.txt3));
+                            ui.add_space(8.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(label)
+                                        .font(theme::f_reg(12.0))
+                                        .color(p.txt2),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                            if let Some(after) = after {
+                                ui.add_space(10.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(after)
+                                            .font(theme::f_reg(12.0))
+                                            .color(p.txt3),
+                                    )
+                                    .selectable(false),
+                                );
+                            }
+                        } else if let Some(n) = &note {
+                            let (mark, color) = match n.severity {
+                                Severity::Ok => ("\u{2713}", p.ok),
+                                Severity::Warn => ("!", p.warn),
+                                Severity::Err => ("\u{2715}", p.err),
+                                Severity::Info => ("\u{b7}", p.txt3),
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(mark)
+                                        .font(theme::f_bold(12.5))
+                                        .color(color),
+                                )
+                                .selectable(false),
+                            );
+                            ui.add_space(8.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&n.text)
+                                        .font(theme::f_reg(12.0))
+                                        .color(p.txt2),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                        }
+                    },
+                    |ui| {
+                        if running.is_some() || note.is_some() {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new("Activity log")
+                                        .font(theme::f_sb(12.0))
+                                        .color(p.accent),
+                                )
+                                .selectable(false),
+                            );
+                        }
+                    },
+                );
+            });
+        if open_log && !self.log_open {
+            self.toggle_activity_log(root_ui.ctx());
+        }
+    }
+
     fn touch_banner_text(&self) -> Option<String> {
         if self.security_keys.fp_progress.is_some() {
             return None;
@@ -10169,13 +10507,10 @@ impl App {
         let paths = files::paths_for(std::path::Path::new(f.save_path.trim()));
         let for_device = self.selected_device.clone();
         self.openpgp.notice = None;
-        let label = if key_type == keyroost_pgpkey::keys::KeyType::Rsa4096 {
-            format!(
-                "Making the {} keys\u{2026} (this can take a minute)",
-                key_type.label()
-            )
-        } else {
-            format!("Making the {} keys\u{2026}", key_type.label())
+        // The CLI's `openpgp key create` says the same.
+        let label = match key_type.slow_hint() {
+            Some(hint) => format!("Making the {} keys\u{2026} ({hint})", key_type.label()),
+            None => format!("Making the {} keys\u{2026}", key_type.label()),
         };
         self.spawn_job(label, move || {
             let result = (|| -> Result<CreatedKeys, String> {
@@ -13553,6 +13888,10 @@ impl App {
 
     /// The person answered the replace/remove question: save on the key.
     fn confirm_key_name_write(&mut self) {
+        // A refused answer (a job runs) keeps the question open.
+        if self.refuse_if_busy() {
+            return;
+        }
         let Some(name) = self
             .rename_target
             .as_mut()
@@ -13572,6 +13911,11 @@ impl App {
         let Some(target) = self.rename_target.clone() else {
             return;
         };
+        // Refused before the typed PIN is taken, so Enter while a job runs
+        // keeps it for the next try.
+        if self.refuse_if_busy() {
+            return;
+        }
         let pin = if self.rename_needs_pin() {
             zeroize::Zeroizing::new(self.rename_pin.clone())
         } else {
@@ -16278,6 +16622,12 @@ impl eframe::App for App {
         // unlocked FIDO session, retained OATH password / OTP PIN, shown
         // codes and typed secrets. The timer wakes the frame loop even when nothing else draws.
         let user_input = ctx.input(|i| i.events.iter().any(is_user_activity));
+        self.user_acted = ctx.input(|i| {
+            i.pointer.any_click()
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+        });
         if let Some(next) = self.idle_lock_tick(std::time::Instant::now(), user_input) {
             ctx.request_repaint_after(next);
         }
@@ -16286,6 +16636,8 @@ impl eframe::App for App {
         }
 
         self.top_bar(root_ui, &p);
+        // Before the sidebar, so it spans the whole window's width.
+        self.status_bar(root_ui, &p);
         self.device_sidebar(root_ui, &p);
         if self.log_open && !self.log_detached {
             self.activity_log(root_ui, &p);
@@ -16983,6 +17335,7 @@ impl App {
     /// clipped and truncated, so even a case the fit did not predict can never
     /// paint one item over another.
     fn top_bar(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let ctx = root_ui.ctx().clone();
         // The bar height must track the zoom factor: at a larger text size the
         // glyph tile, labels and buttons are all scaled up, and a fixed 52px
@@ -17005,9 +17358,6 @@ impl App {
                 let height = ui.available_height();
                 // Copied out so the left closure doesn't borrow `self` while
                 // the right one (Refresh, menu) needs it mutably.
-                let busy = self.busy();
-                let busy_label = self.busy_label.clone();
-                let touch_wait_now = self.touch_banner_text().is_some();
                 egui::Sides::new()
                     .height(height)
                     .spacing(TOPBAR_SIDE_GAP)
@@ -17052,31 +17402,21 @@ impl App {
                             if fit.count_compact {
                                 count.on_hover_text(&count_full);
                             }
-                            // A job waiting for a touch says so in the
-                            // banner over the content (`touch_banner`), so
-                            // the bar shows nothing for it.
-                            let touch_wait = touch_wait_now;
-                            if busy && !touch_wait {
-                                ui.add_space(12.0);
-                                ui.spinner();
-                                if let Some(label) = &busy_label {
-                                    ui.add_space(8.0);
-                                    // Truncated: a long status gives way rather
-                                    // than pushing into the right-hand group.
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(label.as_str())
-                                                .font(theme::f_reg(12.0))
-                                                .color(p.txt3),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
-                            }
+                            // What is running shows in the status bar along
+                            // the bottom (`status_bar`), a touch wait in the
+                            // banner over the content.
                         },
                         |ui| {
                             // Right-to-left: Refresh is the rightmost item.
-                            if theme::button(ui, p, BtnKind::Ghost, "Refresh").clicked() {
+                            if theme::key_button(
+                                ui,
+                                p,
+                                BtnKind::Ghost,
+                                "Refresh",
+                                waiting.as_deref(),
+                            )
+                            .clicked()
+                            {
                                 self.user_refresh();
                             }
                             if !fit.links_in_menu {
@@ -18064,13 +18404,27 @@ impl App {
                     // output — the same formatted lines, captured
                     // verbatim (see `keyroost_transport::trace`) —
                     // indented under the entry they belong to.
+                    // A long line wraps under its own body, not the
+                    // margin, and a long hex run breaks between bytes.
                     if let Some(trace) = line.trace.as_ref() {
                         for apdu in trace {
-                            ui.label(
-                                egui::RichText::new(format!("    {apdu}"))
-                                    .font(theme::f_mono(10.5))
-                                    .color(p.txt3),
-                            );
+                            let (head, body) = trace_columns(apdu);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.label(
+                                    egui::RichText::new(format!("    {head}"))
+                                        .font(theme::f_mono(10.5))
+                                        .color(p.txt3),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(body)
+                                            .font(theme::f_mono(10.5))
+                                            .color(p.txt3),
+                                    )
+                                    .wrap(),
+                                );
+                            });
                         }
                     }
                 }
@@ -18292,6 +18646,12 @@ impl App {
     /// The inline naming field's text box with Save and Cancel, shared by
     /// the security-key and Molto2 heroes. Returns (save, cancel).
     fn rename_field_row(&mut self, ui: &mut egui::Ui, p: &Palette) -> (bool, bool) {
+        // Save writes to the key only for a name kept on the key; a name
+        // kept on this computer waits for nothing.
+        let waiting = self
+            .rename_goes_on_key()
+            .then(|| self.waiting_for().map(str::to_owned))
+            .flatten();
         let held = self
             .rename_target
             .as_ref()
@@ -18312,7 +18672,8 @@ impl App {
             theme::button_disabled(ui, p, "Save");
             false
         } else {
-            theme::button(ui, p, BtnKind::Primary, "Save").clicked() || enter
+            theme::key_button(ui, p, BtnKind::Primary, "Save", waiting.as_deref()).clicked()
+                || enter
         };
         ui.add_space(4.0);
         let cancel = theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked();
@@ -18326,6 +18687,7 @@ impl App {
     /// question, Enter pressed in the PIN field — a save like the name
     /// field's Enter).
     fn rename_details(&mut self, ui: &mut egui::Ui, p: &Palette, what: &str) -> (bool, bool, bool) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let note = |ui: &mut egui::Ui, text: &str| {
             ui.label(
                 egui::RichText::new(text)
@@ -18423,7 +18785,8 @@ impl App {
                         } else {
                             (BtnKind::Danger, "Remove")
                         };
-                        confirm = theme::button(ui, p, kind, label).clicked();
+                        confirm =
+                            theme::key_button(ui, p, kind, label, waiting.as_deref()).clicked();
                         cancel = theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked();
                     });
                 });
@@ -18444,6 +18807,7 @@ impl App {
 
     /// Device hero strip at the top of a key's pane.
     fn device_hero(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let mut open_rename = false;
         let mut do_save = false;
         let mut do_cancel = false;
@@ -18564,7 +18928,15 @@ impl App {
                                 .color(p.txt),
                             );
                             ui.add_space(6.0);
-                            if theme::button(ui, p, BtnKind::Primary, "Write it back").clicked() {
+                            if theme::key_button(
+                                ui,
+                                p,
+                                BtnKind::Primary,
+                                "Write it back",
+                                waiting.as_deref(),
+                            )
+                            .clicked()
+                            {
                                 write_back = Some(WriteBack::Write);
                             }
                             if theme::button(ui, p, BtnKind::Ghost, "Forget")
@@ -18876,6 +19248,7 @@ impl App {
     /// Overview tab: one summary card per capability, each with a `Manage →` jump.
     /// Scrolling comes from the shared capability-pane scroller in `central`.
     fn overview(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        let waiting = self.waiting_for().map(str::to_owned);
         ui.vertical(|ui| {
             self.mds_card(ui, p, dev);
             if dev.caps.has(Caps::U2F_ONLY) {
@@ -18974,7 +19347,10 @@ impl App {
                         for row in self.oath.creds.iter().take(2) {
                             let is_copied =
                                 self.copied.as_ref().is_some_and(|(n, _)| n == &row.name);
-                            if let Some(code) = oath_row(ui, p, row, is_copied, false, false).copy {
+                            if let Some(code) =
+                                oath_row(ui, p, row, is_copied, false, false, waiting.as_deref())
+                                    .copy
+                            {
                                 copy = Some((row.name.clone(), code));
                             }
                             ui.add_space(6.0);
@@ -19307,6 +19683,7 @@ impl App {
     }
 
     fn cap_fido2(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         // Non-admin Windows: if a FIDO key is present but we have no working FIDO
         // access (the HID interface is gated), show the admin-needed card with a
         // link to Windows' settings and an elevate button, instead of the normal
@@ -19486,11 +19863,12 @@ impl App {
                         }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if theme::button(
+                            if theme::key_button(
                                 ui,
                                 p,
                                 BtnKind::Primary,
                                 if setting { "Set PIN" } else { "Change PIN" },
+                                waiting.as_deref(),
                             )
                             .clicked()
                             {
@@ -19580,7 +19958,9 @@ impl App {
                             .hint_text("Enter PIN to unlock this key"),
                     );
                     guard_secret_field(ui.ctx(), &resp);
-                    let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
+                    let submit =
+                        theme::key_button(ui, p, BtnKind::Primary, "Unlock", waiting.as_deref())
+                            .clicked();
                     if submit
                         || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                     {
@@ -19809,8 +20189,14 @@ impl App {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Min),
                                         |ui| {
-                                            if theme::button(ui, p, BtnKind::Ghost, "Remove")
-                                                .clicked()
+                                            if theme::key_button(
+                                                ui,
+                                                p,
+                                                BtnKind::Ghost,
+                                                "Remove",
+                                                waiting.as_deref(),
+                                            )
+                                            .clicked()
                                             {
                                                 delete = Some(c.credential_id.clone());
                                             }
@@ -19824,11 +20210,12 @@ impl App {
                                                 c.large_blob_key.as_ref(),
                                             ) {
                                                 ui.add_space(6.0);
-                                                if theme::button(
+                                                if theme::key_button(
                                                     ui,
                                                     p,
                                                     BtnKind::Ghost,
                                                     "Save certificate\u{2026}",
+                                                    waiting.as_deref(),
                                                 )
                                                 .clicked()
                                                 {
@@ -20014,7 +20401,14 @@ impl App {
                                                     .align(egui::Align2::LEFT_CENTER),
                                             );
                                         }
-                                        if theme::button(ui, p, BtnKind::Primary, "Save").clicked()
+                                        if theme::key_button(
+                                            ui,
+                                            p,
+                                            BtnKind::Primary,
+                                            "Save",
+                                            waiting.as_deref(),
+                                        )
+                                        .clicked()
                                         {
                                             if let Some((rid, buf)) =
                                                 self.security_keys.fp_rename.take()
@@ -20067,7 +20461,15 @@ impl App {
                                 .align(egui::Align2::LEFT_CENTER)
                                 .hint_text("name (optional)"),
                         );
-                        if theme::button(ui, p, BtnKind::Primary, "Enroll new\u{2026}").clicked() {
+                        if theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Primary,
+                            "Enroll new\u{2026}",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                        {
                             do_enroll = true;
                         }
                     });
@@ -20583,6 +20985,7 @@ impl App {
     /// trailer, and writes the whole array back (which needs a PIN, because the
     /// write path requires a token with the Large Blob Write permission).
     fn render_large_blobs(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         ui.add_space(14.0);
 
         // Auto-load the array the first time this tab is shown, so entries
@@ -20592,6 +20995,7 @@ impl App {
         // tries again on a later frame.
         if !self.security_keys.lb_autoloaded
             && self.security_keys.large_blobs.is_none()
+            && !self.busy()
             && self.load_large_blobs()
         {
             self.security_keys.lb_autoloaded = true;
@@ -20727,7 +21131,8 @@ impl App {
                 let unlocked = self.security_keys.session.is_some();
                 let has_text = !self.security_keys.lb_new_text.trim().is_empty();
                 ui.horizontal(|ui| {
-                    let add = theme::button(ui, p, BtnKind::Primary, "Add note");
+                    let add =
+                        theme::key_button(ui, p, BtnKind::Primary, "Add note", waiting.as_deref());
                     if add.clicked() && unlocked && has_text {
                         let text = self.security_keys.lb_new_text.clone();
                         self.add_large_blob_note(text);
@@ -20866,7 +21271,7 @@ impl App {
                     let has_text =
                         !self.security_keys.lb_edit_text.trim().is_empty();
                     ui.horizontal(|ui| {
-                        if theme::button(ui, p, BtnKind::Primary, "Save").clicked()
+                        if theme::key_button(ui, p, BtnKind::Primary, "Save", waiting.as_deref()).clicked()
                             && unlocked
                             && has_text
                         {
@@ -21009,7 +21414,17 @@ impl App {
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Delete entry").clicked() {
+                        if theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Danger,
+                            "Delete entry",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                            // A refused click (a job runs) keeps the question open.
+                            && !self.refuse_if_busy()
+                        {
                             self.security_keys.lb_confirm_delete = None;
                             self.delete_large_blob_entry(idx);
                         }
@@ -21082,7 +21497,17 @@ impl App {
                         };
                         if n == 0 {
                             theme::button_disabled(ui, p, &confirm);
-                        } else if theme::button(ui, p, BtnKind::Danger, &confirm).clicked() {
+                        } else if theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Danger,
+                            &confirm,
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                            // A refused click (a job runs) keeps the question open.
+                            && !self.refuse_if_busy()
+                        {
                             self.security_keys.lb_confirm_clear = false;
                             self.clear_large_blob_storage(keep);
                         }
@@ -21527,6 +21952,7 @@ impl App {
     /// Centered-modal confirmation for deleting a fingerprint (same chrome as
     /// the Settings dialogs). Returns the template id to delete, if confirmed.
     fn render_fp_delete_confirm(&mut self, ctx: &egui::Context, p: &Palette) -> Option<Vec<u8>> {
+        let waiting = self.waiting_for().map(str::to_owned);
         let id = self.security_keys.fp_confirm_delete.clone()?;
         let label = self
             .security_keys
@@ -21548,7 +21974,8 @@ impl App {
             );
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Danger, "Delete").clicked() {
+                if theme::key_button(ui, p, BtnKind::Danger, "Delete", waiting.as_deref()).clicked()
+                {
                     confirm = true;
                 }
                 ui.add_space(8.0);
@@ -21562,7 +21989,8 @@ impl App {
             self.security_keys.fp_confirm_delete = None;
             return None;
         }
-        if confirm {
+        // A refused click (a job runs) keeps the question open.
+        if confirm && !self.refuse_if_busy() {
             self.security_keys.fp_confirm_delete = None;
             return Some(id);
         }
@@ -21570,6 +21998,7 @@ impl App {
     }
 
     fn render_advanced_confirm(&mut self, ctx: &egui::Context, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(dlg) = self.security_keys.advanced.as_ref() else {
             return;
         };
@@ -21688,7 +22117,7 @@ impl App {
                     } else {
                         BtnKind::Primary
                     };
-                    if theme::button(ui, p, kind, "Apply").clicked() {
+                    if theme::key_button(ui, p, kind, "Apply", waiting.as_deref()).clicked() {
                         apply = true;
                     }
                     ui.add_space(8.0);
@@ -22047,6 +22476,7 @@ impl App {
         occupancy: PivOccupancy,
         slot_has_cert: bool,
     ) -> bool {
+        let waiting = self.waiting_for().map(str::to_owned);
         let label_w = chuid_label_width(ui.ctx());
         card_note(ui, p, &format!("Reading {}", self.piv.key_import.path));
         ui.add_space(4.0);
@@ -22077,7 +22507,15 @@ impl App {
                             .font(theme::f_reg(12.5))
                             .color(p.txt2),
                     );
-                } else if theme::button(ui, p, BtnKind::Default, "Open file").clicked() {
+                } else if theme::key_button(
+                    ui,
+                    p,
+                    BtnKind::Default,
+                    "Open file",
+                    waiting.as_deref(),
+                )
+                .clicked()
+                {
                     self.piv_open_key_file();
                 }
             });
@@ -22354,6 +22792,7 @@ impl App {
     /// the pane — the modal only shows a generic success line. Cancel / ✕ / Esc —
     /// and a successful Done — wipe the secret fields.
     fn render_piv_cred_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(kind) = self.piv.cred_modal.as_ref().map(|m| m.kind) else {
             return;
         };
@@ -23242,7 +23681,14 @@ impl App {
                                 // this key can't take it (the dialog says
                                 // why).
                                 theme::button_disabled(ui, p, submit);
-                            } else if theme::button(ui, p, BtnKind::Primary, submit).clicked()
+                            } else if theme::key_button(
+                                ui,
+                                p,
+                                BtnKind::Primary,
+                                submit,
+                                waiting.as_deref(),
+                            )
+                            .clicked()
                                 && mismatch.is_none()
                             {
                                 want_submit = true;
@@ -23264,10 +23710,13 @@ impl App {
             return;
         }
         if want_submit && !busy {
+            // Refused while another job runs before the spinner is set, so the
+            // dialog stays ready for the next try (the status bar says why).
+            if self.refuse_if_busy() {
+                return;
+            }
             // Mark busy first so the modal shows the spinner this frame; the op
-            // writes the result back via `apply_piv_cred_result`. If the worker
-            // is busy (spawn_job returns false implicitly), the op simply no-ops
-            // and the next click retries.
+            // writes the result back via `apply_piv_cred_result`.
             if let Some(m) = self.piv.cred_modal.as_mut() {
                 m.busy = true;
                 m.result = None;
@@ -23292,12 +23741,11 @@ impl App {
                 PivCredKind::NewChuid => self.piv_new_chuid(),
                 PivCredKind::SelfTest => self.piv_self_test(),
             }
-            // If the op didn't actually queue, unstick the modal. This happens
-            // either because the worker was busy (no error set — just retry on
-            // the next click) or because a client-side guard rejected the input
-            // (bad hex, wrong new-key length, empty subject/path) and stored the
-            // reason in `piv.error` — surface that reason in the modal result so
-            // it shows in the dialog rather than scrolling off in the pane.
+            // If the op didn't queue, unstick the modal: a client-side guard
+            // rejected the input (bad hex, wrong new-key length, empty
+            // subject/path) and stored the reason in `piv.error` — surface that
+            // reason in the modal result so it shows in the dialog rather than
+            // scrolling off in the pane.
             if !self.busy() {
                 let guard_err = self.piv.error.clone();
                 if let Some(m) = self.piv.cred_modal.as_mut() {
@@ -23371,6 +23819,7 @@ impl App {
     /// the pane — the modal only shows a generic success line. Cancel / ✕ / Esc —
     /// and a successful Done — wipe the secret fields.
     fn render_openpgp_cred_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(kind) = self.openpgp.cred_modal.as_ref().map(|m| m.kind) else {
             return;
         };
@@ -23540,7 +23989,14 @@ impl App {
                             } else {
                                 BtnKind::Primary
                             };
-                            if theme::button(ui, p, btn, kind.submit_label()).clicked()
+                            if theme::key_button(
+                                ui,
+                                p,
+                                btn,
+                                kind.submit_label(),
+                                waiting.as_deref(),
+                            )
+                            .clicked()
                                 && mismatch.is_none()
                             {
                                 want_submit = true;
@@ -23574,6 +24030,11 @@ impl App {
                 self.openpgp_cred_modal_close();
                 return;
             }
+            // Refused while another job runs before the spinner is set, so the
+            // dialog stays ready for the next try (the status bar says why).
+            if self.refuse_if_busy() {
+                return;
+            }
             // Mark busy first so the modal shows the spinner this frame; the op
             // writes the result back via `apply_openpgp_cred_result`.
             if let Some(m) = self.openpgp.cred_modal.as_mut() {
@@ -23601,11 +24062,10 @@ impl App {
                     self.reset_openpgp();
                 }
             }
-            // If the op didn't actually queue, unstick the modal. Either the
-            // worker was busy (no error set — retry on the next click) or a
-            // client-side guard rejected the input and stored the reason in
-            // `openpgp.error`; surface that in the modal so it shows in the
-            // dialog rather than scrolling off in the pane.
+            // If the op didn't queue, unstick the modal: a client-side guard
+            // rejected the input and stored the reason in `openpgp.error`;
+            // surface that in the modal so it shows in the dialog rather than
+            // scrolling off in the pane.
             if !self.busy() {
                 let guard_err = self.openpgp.error.clone();
                 if let Some(m) = self.openpgp.cred_modal.as_mut() {
@@ -23653,6 +24113,7 @@ impl App {
         p: &Palette,
         kind: OpenPgpCredKind,
     ) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let create = kind == OpenPgpCredKind::CreateWithBackup;
         let busy = self.openpgp.cred_modal.as_ref().is_some_and(|m| m.busy);
         let result = self
@@ -23885,8 +24346,14 @@ impl App {
                                             }
                                         });
                                 });
-                                if f.key_type == Some(keyroost_pgpkey::keys::KeyType::Rsa4096) {
-                                    card_note(ui, p, "Making RSA-4096 keys can take a minute.");
+                                if let Some((t, hint)) =
+                                    f.key_type.and_then(|t| t.slow_hint().map(|h| (t, h)))
+                                {
+                                    card_note(
+                                        ui,
+                                        p,
+                                        &format!("Making {} keys: {hint}.", t.label()),
+                                    );
                                 }
                                 ui.add_space(4.0);
                                 ui.horizontal(|ui| {
@@ -24061,8 +24528,14 @@ impl App {
                             } else {
                                 let clicked = ui
                                     .add_enabled_ui(can_submit, |ui| {
-                                        theme::button(ui, p, BtnKind::Primary, submit_label)
-                                            .clicked()
+                                        theme::key_button(
+                                            ui,
+                                            p,
+                                            BtnKind::Primary,
+                                            submit_label,
+                                            waiting.as_deref(),
+                                        )
+                                        .clicked()
                                     })
                                     .inner;
                                 want_submit = clicked && can_submit;
@@ -24139,6 +24612,11 @@ impl App {
             self.openpgp_cred_modal_close();
             return;
         }
+        // Refused while another job runs before the spinner is set, so the
+        // dialog stays ready for the next try (the status bar says why).
+        if self.refuse_if_busy() {
+            return;
+        }
         if let Some(m) = self.openpgp.cred_modal.as_mut() {
             m.busy = true;
             m.result = None;
@@ -24167,6 +24645,7 @@ impl App {
 
     /// Authenticator / OATH tab — live codes with countdown rings + copy.
     fn cap_oath(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         // Auto-attempt a read once per selection (a hard error won't retry).
         if !self.oath_tried && !self.busy() && self.oath.error.is_none() && !self.oath.locked {
             self.oath_tried = true;
@@ -24230,7 +24709,9 @@ impl App {
                             .password(true),
                     );
                     guard_secret_field(ui.ctx(), &resp);
-                    let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
+                    let submit =
+                        theme::key_button(ui, p, BtnKind::Primary, "Unlock", waiting.as_deref())
+                            .clicked();
                     // Enter in the field submits too, matching the FIDO2 unlock card
                     // and the other inline credential fields in this redesign.
                     if submit
@@ -24255,7 +24736,9 @@ impl App {
         if !self.oath.loaded {
             if self.oath.notice.is_some() && !self.busy() {
                 // Hidden by the idle lock: reading them again is one click.
-                if theme::button(ui, p, BtnKind::Primary, "Show codes").clicked() {
+                if theme::key_button(ui, p, BtnKind::Primary, "Show codes", waiting.as_deref())
+                    .clicked()
+                {
                     self.load_oath_creds();
                 }
                 return;
@@ -24307,7 +24790,15 @@ impl App {
             let n = self.oath.creds.len();
             for (i, row) in self.oath.creds.iter().enumerate() {
                 let is_copied = self.copied.as_ref().is_some_and(|(nm, _)| nm == &row.name);
-                let clicks = oath_row(ui, p, row, is_copied, true, wait_help_open);
+                let clicks = oath_row(
+                    ui,
+                    p,
+                    row,
+                    is_copied,
+                    true,
+                    wait_help_open,
+                    waiting.as_deref(),
+                );
                 if let Some(code) = clicks.copy {
                     copy = Some((row.name.clone(), code));
                 }
@@ -26690,6 +27181,7 @@ impl App {
     /// The Molto2 token's dedicated amber view: hero band · customer-key strip ·
     /// 100-slot rail + editor.
     fn molto_view(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        let waiting = self.waiting_for().map(str::to_owned);
         // Make brand-orange the accent throughout the Molto2 view, so its help
         // dots, links, selection highlights and primary action are all one
         // orange rather than mixing the app's blue accent into the token's
@@ -26845,7 +27337,7 @@ impl App {
                         );
                         self.secret_reveal.insert("customer-key", rev);
                         ui.checkbox(&mut self.customer_key_hex, "hex");
-                        if theme::button(ui, p, BtnKind::Default, "Authenticate").clicked() {
+                        if theme::key_button(ui, p, BtnKind::Default, "Authenticate", waiting.as_deref()).clicked() {
                             self.authenticate();
                         }
                         if self.authenticated {
@@ -26860,7 +27352,7 @@ impl App {
                     );
                     ui.add_space(12.0);
                     ui.horizontal_wrapped(|ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Sync time on all").clicked() {
+                        if theme::key_button(ui, p, BtnKind::Default, "Sync time on all", waiting.as_deref()).clicked() {
                             self.sync_time_all();
                         }
                         ui.add_space(6.0);
@@ -26891,7 +27383,10 @@ impl App {
                                 );
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
-                                    if theme::button(ui, p, BtnKind::Danger, "Yes, factory reset").clicked() {
+                                    if theme::key_button(ui, p, BtnKind::Danger, "Yes, factory reset", waiting.as_deref()).clicked()
+                                        // A refused click (a job runs) keeps the question open.
+                                        && !self.refuse_if_busy()
+                                    {
                                         self.molto_reset_confirm = false;
                                         self.factory_reset();
                                     }
@@ -27112,11 +27607,11 @@ impl App {
                             }
                             ui.add_space(8.0);
                             ui.horizontal_wrapped(|ui| {
-                                if theme::button(ui, p, BtnKind::Primary, "Write to slot").clicked() {
+                                if theme::key_button(ui, p, BtnKind::Primary, "Write to slot", waiting.as_deref()).clicked() {
                                     self.apply_draft();
                                 }
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Default, "Write title only").clicked() {
+                                if theme::key_button(ui, p, BtnKind::Default, "Write title only", waiting.as_deref()).clicked() {
                                     self.apply_title_only();
                                 }
                                 ui.add_space(6.0);
@@ -27136,7 +27631,7 @@ impl App {
                                 }
                                 #[cfg(feature = "qr")]
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Default, "Sync time").clicked() {
+                                if theme::key_button(ui, p, BtnKind::Default, "Sync time", waiting.as_deref()).clicked() {
                                     self.sync_time_selected();
                                 }
                             });
@@ -27157,7 +27652,10 @@ impl App {
                                         );
                                         ui.add_space(8.0);
                                         ui.horizontal(|ui| {
-                                            if theme::button(ui, p, BtnKind::Danger, "Yes, delete seed").clicked() {
+                                            if theme::key_button(ui, p, BtnKind::Danger, "Yes, delete seed", waiting.as_deref()).clicked()
+                                                // A refused click (a job runs) keeps the question open.
+                                                && !self.refuse_if_busy()
+                                            {
                                                 self.molto_delete_confirm = false;
                                                 self.delete_seed_selected();
                                             }
@@ -27179,6 +27677,7 @@ impl App {
     /// and a form to program a seed + configuration. Uses the brand accent like
     /// the Molto2 view.
     fn prog_view(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let mp = Palette {
             accent: p.brand,
             ..*p
@@ -27301,8 +27800,16 @@ impl App {
                 let busy = self.busy();
                 let can_burn = !busy && !self.prog_seed_input.trim().is_empty();
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(can_burn, |ui| {
-                        if theme::button(ui, p, BtnKind::Primary, "Burn seed").clicked() {
+                    ui.add_enabled_ui(can_burn || waiting.is_some(), |ui| {
+                        if theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Primary,
+                            "Burn seed",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                        {
                             self.prog_burn();
                         }
                     });
@@ -27591,6 +28098,7 @@ fn oath_row(
     is_copied: bool,
     with_delete: bool,
     wait_help_open: bool,
+    waiting: Option<&str>,
 ) -> OathRowClicks {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -27656,7 +28164,7 @@ fn oath_row(
                 // overview card doesn't handle the click, so it gets a passive
                 // label instead of a button.
                 if with_delete {
-                    if theme::button(ui, p, BtnKind::Ghost, "Read code").clicked() {
+                    if theme::key_button(ui, p, BtnKind::Ghost, "Read code", waiting).clicked() {
                         read = true;
                     }
                 } else {
@@ -28406,6 +28914,96 @@ mod tests {
         // OATH asks for a touch only on some keys; that step raises the
         // banner itself rather than every key's label asking.
         assert!(!factory_reset_busy_label(&[ResetStep::Oath]).contains("touch"));
+    }
+
+    /// A trace line splits at its label column; a long hex run breaks every
+    /// 4 bytes, short words and other bodies stay as they are.
+    #[test]
+    fn trace_lines_split_at_the_label_column() {
+        let line = keyroost_proto::trace::format_line(
+            keyroost_proto::trace::Dir::Sent,
+            "otp ctaphid",
+            "80c5020041000000000000000000",
+        );
+        let (head, body) = trace_columns(&line);
+        assert_eq!(
+            head.len(),
+            line.len() - "80c5020041000000000000000000".len()
+        );
+        assert!(head.starts_with("> otp ctaphid"));
+        assert_eq!(body, "80c50200 41000000 00000000 0000");
+        let short = keyroost_proto::trace::format_line(
+            keyroost_proto::trace::Dir::Received,
+            "otp ctaphid",
+            "sw=0x6a83 <0 bytes redacted>",
+        );
+        assert_eq!(trace_columns(&short).1, "sw=0x6a83 <0 bytes redacted>");
+        assert_eq!(trace_columns("odd").1, "odd");
+    }
+
+    /// The status bar counts seconds plainly and only past a minute names
+    /// the minutes.
+    #[test]
+    fn status_seconds_read_plainly() {
+        use std::time::Duration;
+        assert_eq!(status_seconds(Duration::from_millis(3400)), "3 s");
+        assert_eq!(status_seconds(Duration::from_secs(59)), "59 s");
+        assert_eq!(status_seconds(Duration::from_secs(65)), "1 min 5 s");
+    }
+
+    /// What the person did shows on the status bar whatever the outcome; the
+    /// app's own background lines only when they failed.
+    #[test]
+    fn status_notes_follow_the_log_lines_that_matter() {
+        let shown = |s, k| StatusNote::for_log_line(s, k, "x").map(|n| n.severity);
+        assert_eq!(shown(Severity::Ok, LogKind::User), Some(Severity::Ok));
+        assert_eq!(shown(Severity::Err, LogKind::User), Some(Severity::Err));
+        assert_eq!(shown(Severity::Info, LogKind::User), None);
+        assert_eq!(shown(Severity::Ok, LogKind::Background), None);
+        assert_eq!(
+            shown(Severity::Err, LogKind::Background),
+            Some(Severity::Err)
+        );
+        let err = StatusNote::new(Severity::Err, "x".into());
+        let ok = StatusNote::new(Severity::Ok, "x".into());
+        assert!(err.until > ok.until, "an error stays longer");
+    }
+
+    /// A job refused while another runs says so on the status bar when a
+    /// click or key press caused it, never for an automatic read.
+    #[test]
+    fn only_a_refused_click_says_still_working() {
+        let mut app = App::default();
+        assert!(!app.refuse_if_busy(), "nothing runs");
+        app.busy_jobs = 1;
+        app.busy_label = Some("Reading OATH codes\u{2026}".into());
+        assert!(app.refuse_if_busy());
+        assert!(app.status_note.is_none(), "no click: an automatic read");
+        app.user_acted = true;
+        assert!(app.refuse_if_busy());
+        let note = app.status_note.as_ref().expect("a click was refused");
+        assert!(note.refusal && note.text.contains("Reading OATH codes"));
+    }
+
+    /// A refused click names what is still running, once, with its ellipsis.
+    #[test]
+    fn a_refused_click_names_the_running_job() {
+        assert_eq!(
+            busy_refusal_text(Some("Reading OATH codes\u{2026}")),
+            "Still working on: Reading OATH codes\u{2026} Try again when it finishes."
+        );
+        assert!(busy_refusal_text(None).starts_with("Still working on another"));
+        assert_eq!(
+            busy_refusal_text(Some(
+                "Making the RSA-4096 keys\u{2026} (this can take a minute)"
+            )),
+            "Still working on: Making the RSA-4096 keys\u{2026} (this can take a minute) \
+             Try again when it finishes."
+        );
+        assert_eq!(
+            busy_refusal_text(Some("Scanning")),
+            "Still working on: Scanning\u{2026} Try again when it finishes."
+        );
     }
 
     #[test]
