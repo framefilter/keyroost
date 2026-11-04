@@ -2924,6 +2924,114 @@ fn fido_unread_line(u2f_only: bool, read_failed: bool) -> &'static str {
     }
 }
 
+/// A trace line (`> otp ctaphid           80c5…`, see
+/// `keyroost_proto::trace::format_line`) split for the Activity log: the
+/// direction and label column, kept whole, and the body, which wraps in its
+/// own column. A long hex run in the body gets a space every 4 bytes so it
+/// breaks between bytes; the log's Copy keeps the line as it was.
+fn trace_columns(line: &str) -> (String, String) {
+    // The label column ends at the first run of two spaces past the mark.
+    let Some(gap) = line
+        .get(2..)
+        .and_then(|rest| rest.find("  "))
+        .map(|i| i + 2)
+    else {
+        return (String::new(), line.to_owned());
+    };
+    let body_at = gap + line[gap..].len() - line[gap..].trim_start().len();
+    let body = line[body_at..]
+        .split(' ')
+        .map(|word| {
+            let hex = word.len() > 16 && word.bytes().all(|b| b.is_ascii_hexdigit());
+            if hex {
+                word.as_bytes()
+                    .chunks(8)
+                    .map(|c| std::str::from_utf8(c).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    (line[..body_at].to_owned(), body)
+}
+
+/// The status bar's height: one line of 12 pt text.
+const STATUS_BAR_HEIGHT: f32 = 26.0;
+
+/// A running job's seconds show only after this, so a quick read never
+/// flickers a counter.
+const STATUS_SECONDS_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Buttons that would start a key operation show disabled only once a job
+/// has run this long (see `App::waiting_for`).
+const DISABLE_BUTTONS_AFTER: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How long the status bar keeps an outcome: an error longer, as it is
+/// more likely to need reading.
+const STATUS_NOTE_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+const STATUS_ERROR_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the status bar says after a job: its outcome, until `until`.
+#[derive(Clone, Debug, PartialEq)]
+struct StatusNote {
+    severity: Severity,
+    text: String,
+    until: std::time::Instant,
+}
+
+impl StatusNote {
+    fn new(severity: Severity, text: String) -> Self {
+        let for_ = match severity {
+            Severity::Err => STATUS_ERROR_FOR,
+            _ => STATUS_NOTE_FOR,
+        };
+        StatusNote {
+            severity,
+            text,
+            until: std::time::Instant::now() + for_,
+        }
+    }
+
+    /// The note a new Activity log line puts on the status bar: what the
+    /// person did (any outcome), and any failure, the app's own reads'
+    /// included. The app's other background lines (scans, re-reads) don't.
+    fn for_log_line(severity: Severity, kind: LogKind, text: &str) -> Option<Self> {
+        let shown = match kind {
+            LogKind::User => !matches!(severity, Severity::Info),
+            LogKind::Background => matches!(severity, Severity::Err),
+        };
+        shown.then(|| StatusNote::new(severity, text.to_owned()))
+    }
+}
+
+/// A running job's time on the status bar: "12 s", "1 min 5 s".
+fn status_seconds(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s} s")
+    } else {
+        format!("{} min {} s", s / 60, s % 60)
+    }
+}
+
+/// What the status bar says when a click is refused because a job runs.
+fn busy_refusal_text(running: Option<&str>) -> String {
+    match running {
+        Some(label) => format!(
+            "Still working on: {} Try again when it finishes.",
+            label
+                .trim_end_matches('\u{2026}')
+                .trim_end_matches('.')
+                .to_owned()
+                + "\u{2026}"
+        ),
+        None => "Still working on another key operation. Try again when it finishes.".to_owned(),
+    }
+}
+
 /// Whether a job's status text asks for a touch on the key: a job that knows
 /// it needs (or may need) one says so in its label.
 fn job_waits_for_touch(label: &str) -> bool {
@@ -4934,6 +5042,13 @@ struct App {
     busy_jobs: u32,
     /// Human-readable description of what the worker is currently doing.
     busy_label: Option<String>,
+    /// When the running job started: the status bar counts its seconds.
+    busy_since: Option<std::time::Instant>,
+    /// What the status bar says after a job, until it expires.
+    status_note: Option<StatusNote>,
+    /// A click or key press this frame: a job refused while another runs
+    /// then says so in the status bar (an automatic read never does).
+    user_acted: bool,
     /// Set by the reader or FIDO HID watcher on a hotplug; consumed in `update()` to
     /// trigger a re-enumeration. Shared with the watcher threads.
     devices_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -5511,7 +5626,7 @@ struct LogLine {
     trace: Option<Vec<String>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Severity {
     Info,
     Ok,
@@ -5588,11 +5703,11 @@ impl App {
     where
         F: FnOnce() -> ApplyFn + Send + 'static,
     {
-        // Serialize device access: ignore a new job while one is in flight rather
-        // than queueing overlapping card I/O behind a click the user can't see
-        // landed. (A single worker thread would serialize anyway, but this also
-        // stops a growing backlog of duplicate refreshes from rapid clicks.)
-        if self.busy() {
+        // Serialize device access: refuse a new job while one is in flight rather
+        // than queueing overlapping card I/O behind a click (a single worker
+        // thread would serialize anyway, but this also stops a growing backlog
+        // of duplicate refreshes from rapid clicks). A refused click says so.
+        if self.refuse_if_busy() {
             return false;
         }
         let label: String = label.into();
@@ -5621,6 +5736,7 @@ impl App {
             Some(worker) => {
                 self.busy_jobs += 1;
                 self.busy_label = Some(label);
+                self.busy_since = Some(std::time::Instant::now());
                 KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 KEY_MAY_ASK_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 if worker.job_tx.send(Box::new(job)).is_err() {
@@ -5663,6 +5779,7 @@ impl App {
             self.busy_jobs = self.busy_jobs.saturating_sub(1);
             if self.busy_jobs == 0 {
                 self.busy_label = None;
+                self.busy_since = None;
                 KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 KEY_MAY_ASK_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
             }
@@ -5676,6 +5793,7 @@ impl App {
             // execution if there's no egui context, e.g. in tests).
             self.busy_jobs = 0;
             self.busy_label = None;
+            self.busy_since = None;
             let apdu_trace = self.apdu_trace.clone();
             self.worker = self
                 .egui_ctx
@@ -5691,6 +5809,38 @@ impl App {
     /// True while any background device job is in flight.
     fn busy(&self) -> bool {
         self.busy_jobs > 0
+    }
+
+    /// What a button that would start a key operation waits for while a job
+    /// runs (its label, "Reading OATH codes…"), for its disabled state and
+    /// hover; `None` when nothing runs.
+    ///
+    /// Only once the job has run past [`DISABLE_BUTTONS_AFTER`], so a short
+    /// background read (the 30-second refresh) doesn't flicker every button;
+    /// a click before then is refused and says so ([`Self::refuse_if_busy`]).
+    fn waiting_for(&self) -> Option<&str> {
+        let long = self
+            .busy_since
+            .is_some_and(|t| t.elapsed() >= DISABLE_BUTTONS_AFTER);
+        (self.busy() && long).then(|| {
+            self.busy_label
+                .as_deref()
+                .unwrap_or("another key operation")
+        })
+    }
+
+    /// `busy()`, and when the person's click or key press is what was
+    /// refused, the status bar says what is still running: a click is never
+    /// dropped silently.
+    fn refuse_if_busy(&mut self) -> bool {
+        if !self.busy() {
+            return false;
+        }
+        if self.user_acted {
+            let text = busy_refusal_text(self.busy_label.as_deref());
+            self.status_note = Some(StatusNote::new(Severity::Warn, text));
+        }
+        true
     }
 
     /// True while a bulk-import stage runs on its own thread.
@@ -5879,6 +6029,9 @@ impl App {
         // line that closure produces, then consumed so a later, unrelated log
         // call in the same frame doesn't also claim it.
         let trace = self.pending_trace.take().filter(|t| !t.is_empty());
+        if let Some(note) = StatusNote::for_log_line(severity, kind, &text) {
+            self.status_note = Some(note);
+        }
         self.log.push(LogLine {
             severity,
             kind,
@@ -9485,6 +9638,130 @@ impl App {
     /// was told about times out (#218).
     /// What the touch banner says now, or `None`. The fingerprint dialog
     /// asks for each touch itself, so no banner covers it.
+    /// The status bar along the bottom of the window: what is running (its
+    /// seconds after [`STATUS_SECONDS_AFTER`], an import's progress), then
+    /// for a few seconds what just happened ([`StatusNote`]). Empty when
+    /// nothing is. A job waiting for a touch says so in the touch banner, so
+    /// the bar never asks for one. Clicking it opens the Activity log.
+    fn status_bar(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
+        let now = std::time::Instant::now();
+        if self.status_note.as_ref().is_some_and(|n| n.until <= now) {
+            self.status_note = None;
+        }
+        let running = (self.busy() && self.touch_banner_text().is_none()).then(|| {
+            let label = self.busy_label.clone().unwrap_or_default();
+            let progress = self
+                .import_flow
+                .dialog
+                .as_ref()
+                .and_then(|d| d.running.as_ref())
+                .and_then(|r| r.lock().ok().map(|g| *g))
+                .filter(|(_, total)| *total > 0)
+                .map(|(done, total)| format!("{done} of {total}"));
+            let seconds = self
+                .busy_since
+                .map(|t| now.duration_since(t))
+                .filter(|d| *d >= STATUS_SECONDS_AFTER)
+                .map(status_seconds);
+            (label, progress.or(seconds))
+        });
+        let note = self.status_note.clone();
+        if let Some(n) = &note {
+            root_ui
+                .ctx()
+                .request_repaint_after(n.until.duration_since(now));
+        }
+        if running.is_some() {
+            // The seconds count up while nothing else redraws.
+            root_ui
+                .ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        let mut open_log = false;
+        egui::Panel::bottom("status_bar")
+            .exact_size(STATUS_BAR_HEIGHT)
+            .resizable(false)
+            .frame(panel_frame(p.bar, 14.0, 0.0))
+            .show(root_ui, |ui| {
+                let shows = running.is_some() || note.is_some();
+                let resp = ui.interact(
+                    ui.max_rect(),
+                    ui.scope_id().with("status_bar_click"),
+                    if shows {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    },
+                );
+                if shows {
+                    resp.clone()
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Open the Activity log");
+                }
+                open_log = resp.clicked();
+                egui::Sides::new().shrink_left().truncate().show(
+                    ui,
+                    |ui| {
+                        if let Some((label, after)) = &running {
+                            ui.add(egui::Spinner::new().size(13.0).color(p.txt3));
+                            ui.add_space(8.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(label)
+                                        .font(theme::f_reg(12.0))
+                                        .color(p.txt2),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                            if let Some(after) = after {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(after)
+                                        .font(theme::f_reg(12.0))
+                                        .color(p.txt3),
+                                );
+                            }
+                        } else if let Some(n) = &note {
+                            let (mark, color) = match n.severity {
+                                Severity::Ok => ("\u{2713}", p.ok),
+                                Severity::Warn => ("!", p.warn),
+                                Severity::Err => ("\u{2715}", p.err),
+                                Severity::Info => ("\u{b7}", p.txt3),
+                            };
+                            ui.label(
+                                egui::RichText::new(mark)
+                                    .font(theme::f_bold(12.5))
+                                    .color(color),
+                            );
+                            ui.add_space(8.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&n.text)
+                                        .font(theme::f_reg(12.0))
+                                        .color(p.txt2),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                        }
+                    },
+                    |ui| {
+                        if running.is_some() || note.is_some() {
+                            ui.label(
+                                egui::RichText::new("Activity log")
+                                    .font(theme::f_sb(12.0))
+                                    .color(p.accent),
+                            );
+                        }
+                    },
+                );
+            });
+        if open_log && !self.log_open {
+            self.toggle_activity_log(root_ui.ctx());
+        }
+    }
+
     fn touch_banner_text(&self) -> Option<String> {
         if self.security_keys.fp_progress.is_some() {
             return None;
@@ -16278,6 +16555,12 @@ impl eframe::App for App {
         // unlocked FIDO session, retained OATH password / OTP PIN, shown
         // codes and typed secrets. The timer wakes the frame loop even when nothing else draws.
         let user_input = ctx.input(|i| i.events.iter().any(is_user_activity));
+        self.user_acted = ctx.input(|i| {
+            i.pointer.any_click()
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+        });
         if let Some(next) = self.idle_lock_tick(std::time::Instant::now(), user_input) {
             ctx.request_repaint_after(next);
         }
@@ -16286,6 +16569,8 @@ impl eframe::App for App {
         }
 
         self.top_bar(root_ui, &p);
+        // Before the sidebar, so it spans the whole window's width.
+        self.status_bar(root_ui, &p);
         self.device_sidebar(root_ui, &p);
         if self.log_open && !self.log_detached {
             self.activity_log(root_ui, &p);
@@ -17005,9 +17290,6 @@ impl App {
                 let height = ui.available_height();
                 // Copied out so the left closure doesn't borrow `self` while
                 // the right one (Refresh, menu) needs it mutably.
-                let busy = self.busy();
-                let busy_label = self.busy_label.clone();
-                let touch_wait_now = self.touch_banner_text().is_some();
                 egui::Sides::new()
                     .height(height)
                     .spacing(TOPBAR_SIDE_GAP)
@@ -17052,27 +17334,9 @@ impl App {
                             if fit.count_compact {
                                 count.on_hover_text(&count_full);
                             }
-                            // A job waiting for a touch says so in the
-                            // banner over the content (`touch_banner`), so
-                            // the bar shows nothing for it.
-                            let touch_wait = touch_wait_now;
-                            if busy && !touch_wait {
-                                ui.add_space(12.0);
-                                ui.spinner();
-                                if let Some(label) = &busy_label {
-                                    ui.add_space(8.0);
-                                    // Truncated: a long status gives way rather
-                                    // than pushing into the right-hand group.
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(label.as_str())
-                                                .font(theme::f_reg(12.0))
-                                                .color(p.txt3),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
-                            }
+                            // What is running shows in the status bar along
+                            // the bottom (`status_bar`), a touch wait in the
+                            // banner over the content.
                         },
                         |ui| {
                             // Right-to-left: Refresh is the rightmost item.
@@ -18064,13 +18328,27 @@ impl App {
                     // output — the same formatted lines, captured
                     // verbatim (see `keyroost_transport::trace`) —
                     // indented under the entry they belong to.
+                    // A long line wraps under its own body, not the
+                    // margin, and a long hex run breaks between bytes.
                     if let Some(trace) = line.trace.as_ref() {
                         for apdu in trace {
-                            ui.label(
-                                egui::RichText::new(format!("    {apdu}"))
-                                    .font(theme::f_mono(10.5))
-                                    .color(p.txt3),
-                            );
+                            let (head, body) = trace_columns(apdu);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.label(
+                                    egui::RichText::new(format!("    {head}"))
+                                        .font(theme::f_mono(10.5))
+                                        .color(p.txt3),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(body)
+                                            .font(theme::f_mono(10.5))
+                                            .color(p.txt3),
+                                    )
+                                    .wrap(),
+                                );
+                            });
                         }
                     }
                 }
@@ -28406,6 +28684,69 @@ mod tests {
         // OATH asks for a touch only on some keys; that step raises the
         // banner itself rather than every key's label asking.
         assert!(!factory_reset_busy_label(&[ResetStep::Oath]).contains("touch"));
+    }
+
+    /// A trace line splits at its label column; a long hex run breaks every
+    /// 4 bytes, short words and other bodies stay as they are.
+    #[test]
+    fn trace_lines_split_at_the_label_column() {
+        let line = keyroost_proto::trace::format_line(
+            keyroost_proto::trace::Dir::Sent,
+            "otp ctaphid",
+            "80c5020041000000000000000000",
+        );
+        let (head, body) = trace_columns(&line);
+        assert_eq!(
+            head.len(),
+            line.len() - "80c5020041000000000000000000".len()
+        );
+        assert!(head.starts_with("> otp ctaphid"));
+        assert_eq!(body, "80c50200 41000000 00000000 0000");
+        let short = keyroost_proto::trace::format_line(
+            keyroost_proto::trace::Dir::Received,
+            "otp ctaphid",
+            "sw=0x6a83 <0 bytes redacted>",
+        );
+        assert_eq!(trace_columns(&short).1, "sw=0x6a83 <0 bytes redacted>");
+        assert_eq!(trace_columns("odd").1, "odd");
+    }
+
+    /// The status bar counts seconds plainly and only past a minute names
+    /// the minutes.
+    #[test]
+    fn status_seconds_read_plainly() {
+        use std::time::Duration;
+        assert_eq!(status_seconds(Duration::from_millis(3400)), "3 s");
+        assert_eq!(status_seconds(Duration::from_secs(59)), "59 s");
+        assert_eq!(status_seconds(Duration::from_secs(65)), "1 min 5 s");
+    }
+
+    /// What the person did shows on the status bar whatever the outcome; the
+    /// app's own background lines only when they failed.
+    #[test]
+    fn status_notes_follow_the_log_lines_that_matter() {
+        let shown = |s, k| StatusNote::for_log_line(s, k, "x").map(|n| n.severity);
+        assert_eq!(shown(Severity::Ok, LogKind::User), Some(Severity::Ok));
+        assert_eq!(shown(Severity::Err, LogKind::User), Some(Severity::Err));
+        assert_eq!(shown(Severity::Info, LogKind::User), None);
+        assert_eq!(shown(Severity::Ok, LogKind::Background), None);
+        assert_eq!(
+            shown(Severity::Err, LogKind::Background),
+            Some(Severity::Err)
+        );
+        let err = StatusNote::new(Severity::Err, "x".into());
+        let ok = StatusNote::new(Severity::Ok, "x".into());
+        assert!(err.until > ok.until, "an error stays longer");
+    }
+
+    /// A refused click names what is still running, once, with its ellipsis.
+    #[test]
+    fn a_refused_click_names_the_running_job() {
+        assert_eq!(
+            busy_refusal_text(Some("Reading OATH codes\u{2026}")),
+            "Still working on: Reading OATH codes\u{2026} Try again when it finishes."
+        );
+        assert!(busy_refusal_text(None).starts_with("Still working on another"));
     }
 
     #[test]

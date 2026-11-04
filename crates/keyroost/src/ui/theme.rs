@@ -449,6 +449,22 @@ pub fn button(ui: &mut egui::Ui, p: &Palette, kind: BtnKind, label: &str) -> Res
     resp
 }
 
+/// A [`button`] that starts a key operation: while another one runs
+/// (`waiting` is its label, from `App::waiting_for`) it shows disabled, and
+/// hovering it says what it waits for. Never clicked then.
+pub fn key_button(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    kind: BtnKind,
+    label: &str,
+    waiting: Option<&str>,
+) -> Response {
+    match waiting {
+        Some(w) => button_disabled(ui, p, label).on_hover_text(format!("Waiting for: {w}")),
+        None => button(ui, p, kind, label),
+    }
+}
+
 /// A visibly disabled sibling of [`button`]: same footprint and rounded shape,
 /// painted muted, with no hover-lift, no pressed state, and no click sense — but
 /// it still senses hover, so the caller can hang an `.on_hover_text(…)` that
