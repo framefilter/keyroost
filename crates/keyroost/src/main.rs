@@ -6481,15 +6481,27 @@ impl App {
     /// Start the selected key's info read when the one its selection
     /// started never ran: refused because another job was running (switching
     /// keys while a Molto2 opened, say). Any tab otherwise showed "Reading
-    /// key…" until the next scan; only the FIDO2 tab used to retry. Once per
-    /// selection, so a read that ends with nothing set (a job that panicked)
-    /// isn't started again every frame.
+    /// key…" until the next scan; only the FIDO2 tab used to retry. Only on
+    /// the background worker: without one (tests drawing frames) the read
+    /// would run inline every frame and open the key.
     fn retry_dropped_info_read(&mut self) {
+        if self.worker.is_some() && self.info_retry_due() {
+            self.info_retried_for = self.selected_device.clone();
+            self.fetch_selected_info();
+        }
+    }
+
+    /// Whether [`Self::retry_dropped_info_read`] should start a read now:
+    /// nothing runs, a FIDO2 key is selected that has no info, error or
+    /// U2F-only answer yet, and its selection hasn't had its retry. Once
+    /// per selection, so a read that ends with nothing set (a job that
+    /// panicked) isn't started again every frame.
+    fn info_retry_due(&self) -> bool {
         if self.busy()
             || self.selected_fido_target().is_none()
             || (self.info_retried_for.is_some() && self.info_retried_for == self.selected_device)
         {
-            return;
+            return false;
         }
         let reads_info = self.selected_device().is_some_and(|d| {
             matches!(d.kind, DeviceKind::Key)
@@ -6497,10 +6509,7 @@ impl App {
                 && !d.caps.has(Caps::U2F_ONLY)
         });
         let sk = &self.security_keys;
-        if reads_info && sk.info.is_none() && sk.error.is_none() && !sk.u2f_only {
-            self.info_retried_for = self.selected_device.clone();
-            self.fetch_selected_info();
-        }
+        reads_info && sk.info.is_none() && sk.error.is_none() && !sk.u2f_only
     }
 
     /// Open the currently-selected hidraw device, run CTAPHID_INIT and
@@ -33740,35 +33749,32 @@ mod tests {
         assert_eq!(App::card_reset_reader(None), None);
     }
 
-    /// A dropped info read is retried once per selection: a read that ends
-    /// with nothing set (a job that panicked) isn't started again every
-    /// frame. The key's path doesn't exist, so the read fails at once.
-    /// Linux only: the read opens the path, a plain file open there; on
-    /// macOS it goes through hidapi, and a HID open in a test process hung
-    /// the macOS CI jobs.
-    #[cfg(target_os = "linux")]
+    /// A dropped info read is due once per selection, for a FIDO2 key with
+    /// nothing read yet, never while a job runs or once the read answered
+    /// (with an error, say). Decided without opening anything; the read
+    /// itself only runs on the background worker, which tests don't have.
     #[test]
-    fn a_dropped_info_read_is_retried_once_per_selection() {
+    fn a_dropped_info_read_is_due_once_per_selection() {
         let mut app = App::default();
         let mut key = test_key("serial:A", "AAA", None);
         key.caps.insert(Caps::FIDO2);
         key.hid_path = Some("/nonexistent/keyroost-test/hidraw".into());
         app.devices = vec![key];
         app.selected_device = Some("serial:A".into());
+        assert!(app.info_retry_due());
 
+        // No worker: drawing a frame never reads (opens) the key.
         app.retry_dropped_info_read();
-        assert!(app.security_keys.error.is_some(), "the retry ran");
-        // As a panicked job leaves it: no info, no error.
-        app.security_keys.error = None;
-        app.retry_dropped_info_read();
-        assert!(
-            app.security_keys.error.is_none(),
-            "not again for this selection"
-        );
-        // A new selection may retry again.
+        assert!(app.info_retried_for.is_none() && app.security_keys.error.is_none());
+
+        app.busy_jobs = 1;
+        assert!(!app.info_retry_due(), "not while a job runs");
+        app.busy_jobs = 0;
+        app.info_retried_for = Some("serial:A".into());
+        assert!(!app.info_retry_due(), "once per selection");
         app.info_retried_for = None;
-        app.retry_dropped_info_read();
-        assert!(app.security_keys.error.is_some());
+        app.security_keys.error = Some("failed".into());
+        assert!(!app.info_retry_due(), "the read answered");
     }
 
     #[test]
