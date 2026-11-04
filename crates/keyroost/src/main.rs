@@ -4893,6 +4893,9 @@ struct App {
     /// Selected device id — stable across refreshes so the pane doesn't jump
     /// when an *unrelated* key is plugged or unplugged.
     selected_device: Option<DeviceId>,
+    /// The selection `retry_dropped_info_read` already retried its info
+    /// read for (once per selection).
+    info_retried_for: Option<DeviceId>,
     /// Which capability pane is showing for the selected key.
     cap_tab: CapTab,
     /// Each device's own last-shown `cap_tab`, so switching to another
@@ -6475,15 +6478,17 @@ impl App {
         false
     }
 
-    /// Open the currently-selected hidraw device, run CTAPHID_INIT and
-    /// authenticatorGetInfo, and cache the result. Blocks the UI briefly —
-    /// CTAP GetInfo typically completes in a few milliseconds.
     /// Start the selected key's info read when the one its selection
     /// started never ran: refused because another job was running (switching
     /// keys while a Molto2 opened, say). Any tab otherwise showed "Reading
-    /// key…" until the next scan; only the FIDO2 tab used to retry.
+    /// key…" until the next scan; only the FIDO2 tab used to retry. Once per
+    /// selection, so a read that ends with nothing set (a job that panicked)
+    /// isn't started again every frame.
     fn retry_dropped_info_read(&mut self) {
-        if self.busy() || self.selected_fido_target().is_none() {
+        if self.busy()
+            || self.selected_fido_target().is_none()
+            || (self.info_retried_for.is_some() && self.info_retried_for == self.selected_device)
+        {
             return;
         }
         let reads_info = self.selected_device().is_some_and(|d| {
@@ -6493,10 +6498,14 @@ impl App {
         });
         let sk = &self.security_keys;
         if reads_info && sk.info.is_none() && sk.error.is_none() && !sk.u2f_only {
+            self.info_retried_for = self.selected_device.clone();
             self.fetch_selected_info();
         }
     }
 
+    /// Open the currently-selected hidraw device, run CTAPHID_INIT and
+    /// authenticatorGetInfo, and cache the result. Blocks the UI briefly —
+    /// CTAP GetInfo typically completes in a few milliseconds.
     fn fetch_selected_info(&mut self) {
         self.security_keys.info = None;
         self.security_keys.init = None;
@@ -10476,7 +10485,11 @@ impl App {
                             slot.label(),
                             hex_lower(&fpr)
                         ));
-                        app.openpgp_notice_hint(keyroost_pgpkey::keys::GPG_PUBLIC_KEY_HINT);
+                        // A key set's file already comes with its public key;
+                        // a bare RSA key file doesn't.
+                        if !file_is_openpgp {
+                            app.openpgp_notice_hint(keyroost_pgpkey::keys::GPG_PUBLIC_KEY_HINT);
+                        }
                         app.openpgp.import_path.clear();
                     }
                     Err(e) => app.openpgp_failed(e),
@@ -11623,6 +11636,7 @@ impl App {
     /// `cap_tab` pick — everything else this resets is genuinely per-device
     /// UI/session state with nothing worth carrying forward under any id.
     fn on_device_selected(&mut self, previous: Option<DeviceId>) {
+        self.info_retried_for = None;
         if let Some(prev) = previous {
             self.cap_tab_by_device.insert(prev, self.cap_tab);
         }
@@ -33724,6 +33738,33 @@ mod tests {
 
         // No selection at all.
         assert_eq!(App::card_reset_reader(None), None);
+    }
+
+    /// A dropped info read is retried once per selection: a read that ends
+    /// with nothing set (a job that panicked) isn't started again every
+    /// frame. The key's path doesn't exist, so the read fails at once.
+    #[test]
+    fn a_dropped_info_read_is_retried_once_per_selection() {
+        let mut app = App::default();
+        let mut key = test_key("serial:A", "AAA", None);
+        key.caps.insert(Caps::FIDO2);
+        key.hid_path = Some("/nonexistent/keyroost-test/hidraw".into());
+        app.devices = vec![key];
+        app.selected_device = Some("serial:A".into());
+
+        app.retry_dropped_info_read();
+        assert!(app.security_keys.error.is_some(), "the retry ran");
+        // As a panicked job leaves it: no info, no error.
+        app.security_keys.error = None;
+        app.retry_dropped_info_read();
+        assert!(
+            app.security_keys.error.is_none(),
+            "not again for this selection"
+        );
+        // A new selection may retry again.
+        app.info_retried_for = None;
+        app.retry_dropped_info_read();
+        assert!(app.security_keys.error.is_some());
     }
 
     #[test]

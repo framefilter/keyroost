@@ -239,8 +239,8 @@ pub fn parse_text(s: &str) -> Option<(SshCertInfo, Vec<u8>)> {
 /// A certificate as a key stores it in large-blob storage: OpenSSH's binary
 /// (wire) form, or the text of a `-cert.pub` file, as `fido2-token -S -b`
 /// stores one. `cert_pub` is what to write back out: stored text that is
-/// exactly one plain `-cert.pub` line as it was (comment and all, so the
-/// file comes back byte for byte), otherwise the certificate re-encoded by
+/// exactly one plain `-cert.pub` line as it was (comment and all, so a
+/// normal file comes back as it was), otherwise the certificate re-encoded by
 /// [`to_cert_pub`]. The stored bytes come from the key, so nothing beyond
 /// that one checked line is ever written out.
 #[derive(Debug, Clone, PartialEq, Eq)]
