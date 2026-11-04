@@ -6478,6 +6478,25 @@ impl App {
     /// Open the currently-selected hidraw device, run CTAPHID_INIT and
     /// authenticatorGetInfo, and cache the result. Blocks the UI briefly —
     /// CTAP GetInfo typically completes in a few milliseconds.
+    /// Start the selected key's info read when the one its selection
+    /// started never ran: refused because another job was running (switching
+    /// keys while a Molto2 opened, say). Any tab otherwise showed "Reading
+    /// key…" until the next scan; only the FIDO2 tab used to retry.
+    fn retry_dropped_info_read(&mut self) {
+        if self.busy() || self.selected_fido_target().is_none() {
+            return;
+        }
+        let reads_info = self.selected_device().is_some_and(|d| {
+            matches!(d.kind, DeviceKind::Key)
+                && d.caps.has(Caps::FIDO2)
+                && !d.caps.has(Caps::U2F_ONLY)
+        });
+        let sk = &self.security_keys;
+        if reads_info && sk.info.is_none() && sk.error.is_none() && !sk.u2f_only {
+            self.fetch_selected_info();
+        }
+    }
+
     fn fetch_selected_info(&mut self) {
         self.security_keys.info = None;
         self.security_keys.init = None;
@@ -16508,6 +16527,7 @@ impl eframe::App for App {
         // Apply any results from background device jobs and the import
         // thread before drawing.
         self.drain_worker();
+        self.retry_dropped_info_read();
         // While a device job is in flight (e.g. fingerprint enrollment writing
         // live progress to a shared cell), keep the frame loop ticking so the UI
         // reflects per-sample updates instead of freezing until the job ends.
@@ -19804,12 +19824,8 @@ impl App {
                 PinSupport::Unknown => {
                     let u2f_only = self.security_keys.u2f_only;
                     let failed = self.security_keys.error.is_some();
-                    // The initial read can be dropped if the worker was busy
-                    // at selection time; retry rather than showing "Reading
-                    // key…" forever.
-                    if !u2f_only && !failed && self.security_keys.info.is_none() && !self.busy() {
-                        self.fetch_selected_info();
-                    }
+                    // A read dropped at selection time is retried every frame
+                    // (`retry_dropped_info_read`), whatever tab is open.
                     ui.label(
                         egui::RichText::new(fido_unread_line(u2f_only, failed))
                             .font(theme::f_reg(13.0))
