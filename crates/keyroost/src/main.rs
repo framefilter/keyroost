@@ -3032,14 +3032,14 @@ fn status_seconds(d: std::time::Duration) -> String {
 /// What the status bar says when a click is refused because a job runs.
 fn busy_refusal_text(running: Option<&str>) -> String {
     match running {
-        Some(label) => format!(
-            "Still working on: {} Try again when it finishes.",
-            label
-                .trim_end_matches('\u{2026}')
-                .trim_end_matches('.')
-                .to_owned()
-                + "\u{2026}"
-        ),
+        Some(label) => {
+            // An ellipsis only where the label doesn't already end its
+            // sentence ("Making the RSA-4096 keys… (this can take a minute)").
+            let label = label.trim_end();
+            let ended = label.ends_with(['\u{2026}', '.', ')']);
+            let more = if ended { "" } else { "\u{2026}" };
+            format!("Still working on: {label}{more} Try again when it finishes.")
+        }
         None => "Still working on another key operation. Try again when it finishes.".to_owned(),
     }
 }
@@ -5748,7 +5748,8 @@ impl App {
             Some(worker) => {
                 self.busy_jobs += 1;
                 self.busy_label = Some(label);
-                self.busy_since = Some(std::time::Instant::now());
+                // A chained job continues the run that started it.
+                self.busy_since.get_or_insert_with(std::time::Instant::now);
                 KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 KEY_MAY_ASK_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 if worker.job_tx.send(Box::new(job)).is_err() {
@@ -5791,11 +5792,20 @@ impl App {
             self.busy_jobs = self.busy_jobs.saturating_sub(1);
             if self.busy_jobs == 0 {
                 self.busy_label = None;
-                self.busy_since = None;
                 KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 KEY_MAY_ASK_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             apply(self);
+        }
+        // Settled after the applies: a job its apply chained (a scan, then a
+        // re-read) keeps the run's start, so buttons don't flash back on
+        // between the steps and the seconds don't restart; "Still working
+        // on…" ends with the whole run.
+        if self.busy_jobs == 0 {
+            self.busy_since = None;
+            if self.status_note.as_ref().is_some_and(|n| n.refusal) {
+                self.status_note = None;
+            }
         }
         if disconnected {
             // Last-resort safety net: jobs catch their own panics, so a dead
@@ -8672,15 +8682,19 @@ impl App {
             return;
         }
         if want_submit && !busy {
+            // Refused while another job runs before the spinner is set, so the
+            // dialog stays ready for the next try (the status bar says why).
+            if self.refuse_if_busy() {
+                return;
+            }
             // Mark busy first so the modal shows the spinner this frame; the op
             // writes the outcome back via `apply_oath_rows`.
             self.oath.add.busy = true;
             self.oath.add.result = None;
             self.oath.error = None;
             self.provision_oath();
-            // If the op didn't actually queue — the worker was busy (no error
-            // set; retry on the next click) or a client-side guard rejected the
-            // input and stored the reason in `oath.error` — unstick the modal and
+            // If the op didn't queue — a client-side guard rejected the input
+            // and stored the reason in `oath.error` — unstick the modal and
             // surface the guard reason in the dialog rather than the pane.
             if !self.busy() {
                 let guard_err = self.oath.error.take();
@@ -9754,10 +9768,13 @@ impl App {
                             );
                             if let Some(after) = after {
                                 ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new(after)
-                                        .font(theme::f_reg(12.0))
-                                        .color(p.txt3),
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(after)
+                                            .font(theme::f_reg(12.0))
+                                            .color(p.txt3),
+                                    )
+                                    .selectable(false),
                                 );
                             }
                         } else if let Some(n) = &note {
@@ -9767,10 +9784,13 @@ impl App {
                                 Severity::Err => ("\u{2715}", p.err),
                                 Severity::Info => ("\u{b7}", p.txt3),
                             };
-                            ui.label(
-                                egui::RichText::new(mark)
-                                    .font(theme::f_bold(12.5))
-                                    .color(color),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(mark)
+                                        .font(theme::f_bold(12.5))
+                                        .color(color),
+                                )
+                                .selectable(false),
                             );
                             ui.add_space(8.0);
                             ui.add(
@@ -9786,10 +9806,13 @@ impl App {
                     },
                     |ui| {
                         if running.is_some() || note.is_some() {
-                            ui.label(
-                                egui::RichText::new("Activity log")
-                                    .font(theme::f_sb(12.0))
-                                    .color(p.accent),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new("Activity log")
+                                        .font(theme::f_sb(12.0))
+                                        .color(p.accent),
+                                )
+                                .selectable(false),
                             );
                         }
                     },
@@ -13865,6 +13888,10 @@ impl App {
 
     /// The person answered the replace/remove question: save on the key.
     fn confirm_key_name_write(&mut self) {
+        // A refused answer (a job runs) keeps the question open.
+        if self.refuse_if_busy() {
+            return;
+        }
         let Some(name) = self
             .rename_target
             .as_mut()
@@ -20968,6 +20995,7 @@ impl App {
         // tries again on a later frame.
         if !self.security_keys.lb_autoloaded
             && self.security_keys.large_blobs.is_none()
+            && !self.busy()
             && self.load_large_blobs()
         {
             self.security_keys.lb_autoloaded = true;
@@ -21394,6 +21422,8 @@ impl App {
                             waiting.as_deref(),
                         )
                         .clicked()
+                            // A refused click (a job runs) keeps the question open.
+                            && !self.refuse_if_busy()
                         {
                             self.security_keys.lb_confirm_delete = None;
                             self.delete_large_blob_entry(idx);
@@ -21475,6 +21505,8 @@ impl App {
                             waiting.as_deref(),
                         )
                         .clicked()
+                            // A refused click (a job runs) keeps the question open.
+                            && !self.refuse_if_busy()
                         {
                             self.security_keys.lb_confirm_clear = false;
                             self.clear_large_blob_storage(keep);
@@ -21957,7 +21989,8 @@ impl App {
             self.security_keys.fp_confirm_delete = None;
             return None;
         }
-        if confirm {
+        // A refused click (a job runs) keeps the question open.
+        if confirm && !self.refuse_if_busy() {
             self.security_keys.fp_confirm_delete = None;
             return Some(id);
         }
@@ -23677,10 +23710,13 @@ impl App {
             return;
         }
         if want_submit && !busy {
+            // Refused while another job runs before the spinner is set, so the
+            // dialog stays ready for the next try (the status bar says why).
+            if self.refuse_if_busy() {
+                return;
+            }
             // Mark busy first so the modal shows the spinner this frame; the op
-            // writes the result back via `apply_piv_cred_result`. If the worker
-            // is busy (spawn_job returns false implicitly), the op simply no-ops
-            // and the next click retries.
+            // writes the result back via `apply_piv_cred_result`.
             if let Some(m) = self.piv.cred_modal.as_mut() {
                 m.busy = true;
                 m.result = None;
@@ -23705,12 +23741,11 @@ impl App {
                 PivCredKind::NewChuid => self.piv_new_chuid(),
                 PivCredKind::SelfTest => self.piv_self_test(),
             }
-            // If the op didn't actually queue, unstick the modal. This happens
-            // either because the worker was busy (no error set — just retry on
-            // the next click) or because a client-side guard rejected the input
-            // (bad hex, wrong new-key length, empty subject/path) and stored the
-            // reason in `piv.error` — surface that reason in the modal result so
-            // it shows in the dialog rather than scrolling off in the pane.
+            // If the op didn't queue, unstick the modal: a client-side guard
+            // rejected the input (bad hex, wrong new-key length, empty
+            // subject/path) and stored the reason in `piv.error` — surface that
+            // reason in the modal result so it shows in the dialog rather than
+            // scrolling off in the pane.
             if !self.busy() {
                 let guard_err = self.piv.error.clone();
                 if let Some(m) = self.piv.cred_modal.as_mut() {
@@ -23995,6 +24030,11 @@ impl App {
                 self.openpgp_cred_modal_close();
                 return;
             }
+            // Refused while another job runs before the spinner is set, so the
+            // dialog stays ready for the next try (the status bar says why).
+            if self.refuse_if_busy() {
+                return;
+            }
             // Mark busy first so the modal shows the spinner this frame; the op
             // writes the result back via `apply_openpgp_cred_result`.
             if let Some(m) = self.openpgp.cred_modal.as_mut() {
@@ -24022,11 +24062,10 @@ impl App {
                     self.reset_openpgp();
                 }
             }
-            // If the op didn't actually queue, unstick the modal. Either the
-            // worker was busy (no error set — retry on the next click) or a
-            // client-side guard rejected the input and stored the reason in
-            // `openpgp.error`; surface that in the modal so it shows in the
-            // dialog rather than scrolling off in the pane.
+            // If the op didn't queue, unstick the modal: a client-side guard
+            // rejected the input and stored the reason in `openpgp.error`;
+            // surface that in the modal so it shows in the dialog rather than
+            // scrolling off in the pane.
             if !self.busy() {
                 let guard_err = self.openpgp.error.clone();
                 if let Some(m) = self.openpgp.cred_modal.as_mut() {
@@ -24571,6 +24610,11 @@ impl App {
             self.selected_device.as_ref(),
         ) {
             self.openpgp_cred_modal_close();
+            return;
+        }
+        // Refused while another job runs before the spinner is set, so the
+        // dialog stays ready for the next try (the status bar says why).
+        if self.refuse_if_busy() {
             return;
         }
         if let Some(m) = self.openpgp.cred_modal.as_mut() {
@@ -27339,7 +27383,10 @@ impl App {
                                 );
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
-                                    if theme::key_button(ui, p, BtnKind::Danger, "Yes, factory reset", waiting.as_deref()).clicked() {
+                                    if theme::key_button(ui, p, BtnKind::Danger, "Yes, factory reset", waiting.as_deref()).clicked()
+                                        // A refused click (a job runs) keeps the question open.
+                                        && !self.refuse_if_busy()
+                                    {
                                         self.molto_reset_confirm = false;
                                         self.factory_reset();
                                     }
@@ -27605,7 +27652,10 @@ impl App {
                                         );
                                         ui.add_space(8.0);
                                         ui.horizontal(|ui| {
-                                            if theme::key_button(ui, p, BtnKind::Danger, "Yes, delete seed", waiting.as_deref()).clicked() {
+                                            if theme::key_button(ui, p, BtnKind::Danger, "Yes, delete seed", waiting.as_deref()).clicked()
+                                                // A refused click (a job runs) keeps the question open.
+                                                && !self.refuse_if_busy()
+                                            {
                                                 self.molto_delete_confirm = false;
                                                 self.delete_seed_selected();
                                             }
@@ -28943,6 +28993,17 @@ mod tests {
             "Still working on: Reading OATH codes\u{2026} Try again when it finishes."
         );
         assert!(busy_refusal_text(None).starts_with("Still working on another"));
+        assert_eq!(
+            busy_refusal_text(Some(
+                "Making the RSA-4096 keys\u{2026} (this can take a minute)"
+            )),
+            "Still working on: Making the RSA-4096 keys\u{2026} (this can take a minute) \
+             Try again when it finishes."
+        );
+        assert_eq!(
+            busy_refusal_text(Some("Scanning")),
+            "Still working on: Scanning\u{2026} Try again when it finishes."
+        );
     }
 
     #[test]
