@@ -460,9 +460,24 @@ pub fn key_button(
     waiting: Option<&str>,
 ) -> Response {
     match waiting {
-        Some(w) => button_disabled(ui, p, label).on_hover_text(format!("Waiting for: {w}")),
+        Some(w) => button_disabled(ui, p, label).on_hover_text(waiting_hover(w)),
         None => button(ui, p, kind, label),
     }
+}
+
+/// [`key_button`] for the plain egui button of the small confirmation
+/// windows: the same disabled state and hover while another job runs.
+pub fn key_egui_button(ui: &mut egui::Ui, label: &str, waiting: Option<&str>) -> Response {
+    let resp = ui.add_enabled(waiting.is_none(), egui::Button::new(label));
+    match waiting {
+        Some(w) => resp.on_disabled_hover_text(waiting_hover(w)),
+        None => resp,
+    }
+}
+
+/// The hover of a key button waiting for `job` to finish.
+pub fn waiting_hover(job: &str) -> String {
+    format!("Waiting for: {job}")
 }
 
 /// A visibly disabled sibling of [`button`]: same footprint and rounded shape,

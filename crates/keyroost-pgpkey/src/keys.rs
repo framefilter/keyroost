@@ -38,6 +38,14 @@ pub enum KeyType {
 }
 
 impl KeyType {
+    /// What to say about how long making these keys on the computer takes,
+    /// when it is long enough to mention ("this can take a minute": an
+    /// RSA-4096 prime search). The CLI's progress line and the app's form
+    /// and status bar use the same words.
+    pub fn slow_hint(self) -> Option<&'static str> {
+        matches!(self, KeyType::Rsa4096).then_some("this can take a minute")
+    }
+
     /// Every key type, in menu order.
     pub const ALL: [KeyType; 8] = [
         KeyType::Rsa2048,
@@ -752,6 +760,15 @@ fn ecc_material(
 
 #[cfg(test)]
 mod tests {
+
+    /// Only RSA-4096 takes long enough on the computer to say so.
+    #[test]
+    fn only_rsa_4096_is_slow_to_make() {
+        for t in KeyType::ALL {
+            assert_eq!(t.slow_hint().is_some(), t == KeyType::Rsa4096, "{t:?}");
+        }
+    }
+
     use super::*;
     use keyroost_openpgp::{Curve, EccKind, KeyCrt};
 

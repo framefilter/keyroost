@@ -1317,6 +1317,7 @@ impl App {
 
     /// Render the set / change / remove PIN modal when open.
     fn render_pin_dialog(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let kind = match &self.otp.pin_dialog {
             Some(d) => d.kind(),
             None => return,
@@ -1408,7 +1409,8 @@ impl App {
                     PinDialogKind::Change => "Change PIN",
                     PinDialogKind::Remove => "Remove PIN",
                 };
-                if theme::button(ui, p, BtnKind::Primary, action).clicked() {
+                if theme::key_button(ui, p, BtnKind::Primary, action, waiting.as_deref()).clicked()
+                {
                     submit = true;
                 }
                 if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
@@ -1543,6 +1545,7 @@ impl App {
 
     /// Render the OTP tab.
     pub(crate) fn cap_otp(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         // Auto-read once per selection (a hard error won't auto-retry).
         if !self.otp_tried && !self.busy() && self.otp.error.is_none() {
             self.otp_tried = true;
@@ -1894,11 +1897,21 @@ impl App {
                 let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Primary, "Unlock").clicked() || entered {
+                    if theme::key_button(ui, p, BtnKind::Primary, "Unlock", waiting.as_deref())
+                        .clicked()
+                        || entered
+                    {
                         do_unlock = true;
                     }
                     if fp_on
-                        && theme::button(ui, p, BtnKind::Default, "Touch fingerprint").clicked()
+                        && theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Default,
+                            "Touch fingerprint",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
                     {
                         do_fp = true;
                     }
@@ -1915,6 +1928,11 @@ impl App {
             if do_fp {
                 self.unlock_otp_fingerprint();
             } else if do_unlock && !self.otp.pin_input.trim().is_empty() {
+                // Refused while a job runs, before the typed PIN is taken: the
+                // prompt stays for the next try.
+                if self.refuse_if_busy() {
+                    return;
+                }
                 self.otp.pin = Some(zeroize::Zeroizing::new(
                     self.otp.pin_input.trim().to_owned(),
                 ));
@@ -2026,9 +2044,15 @@ impl App {
                                             .color(p.txt),
                                     );
                                 } else if row.button_required {
-                                    if theme::button(ui, p, BtnKind::Default, "Read")
-                                        .on_hover_text("Touch the key to read this code")
-                                        .clicked()
+                                    if theme::key_button(
+                                        ui,
+                                        p,
+                                        BtnKind::Default,
+                                        "Read",
+                                        waiting.as_deref(),
+                                    )
+                                    .on_hover_text("Touch the key to read this code")
+                                    .clicked()
                                     {
                                         read_touch = Some(rkey);
                                     }
@@ -2076,6 +2100,7 @@ impl App {
 
     /// The add-entry form, shown inline when `add.open`.
     fn render_otp_add_form(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         if !self.otp.add.open {
             return;
         }
@@ -2163,7 +2188,7 @@ impl App {
                 });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Primary, "Add").clicked() {
+                if theme::key_button(ui, p, BtnKind::Primary, "Add", waiting.as_deref()).clicked() {
                     submit = true;
                 }
                 ui.add_space(6.0);
@@ -2184,6 +2209,7 @@ impl App {
     /// The touch-HOTP form, shown inline when `button_hotp.open`. Configures the
     /// single HOTP-on-touch keystroke slot.
     fn render_button_hotp_form(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         if !self.otp.button_hotp.open {
             return;
         }
@@ -2319,7 +2345,8 @@ impl App {
                 });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Primary, "Save").clicked() {
+                if theme::key_button(ui, p, BtnKind::Primary, "Save", waiting.as_deref()).clicked()
+                {
                     submit = true;
                 }
                 ui.add_space(6.0);
@@ -2327,7 +2354,9 @@ impl App {
                     cancel = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Danger, "Clear slot").clicked() {
+                    if theme::key_button(ui, p, BtnKind::Danger, "Clear slot", waiting.as_deref())
+                        .clicked()
+                    {
                         clear = true;
                     }
                 });
@@ -2349,6 +2378,7 @@ impl App {
     /// Mirrors the CLI's `interface` confirmation: this reconfigures the hardware,
     /// so the user must type an exact phrase before it applies.
     fn render_keyboard_confirm(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(tog) = self.otp.kbd_confirm.as_ref() else {
             return;
         };
@@ -2395,7 +2425,9 @@ impl App {
                 .is_some_and(|t| t.typed.trim() == PHRASE);
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(matched, |ui| {
-                    if theme::button(ui, p, BtnKind::Danger, "Apply").clicked() {
+                    if theme::key_button(ui, p, BtnKind::Danger, "Apply", waiting.as_deref())
+                        .clicked()
+                    {
                         apply = true;
                     }
                 });
@@ -2416,6 +2448,7 @@ impl App {
 
     /// Confirmation dialog for delete / erase-all.
     fn render_otp_delete_confirm(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some((app_name, account_name)) = self.otp.confirm_delete.clone() else {
             return;
         };
@@ -2445,7 +2478,7 @@ impl App {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let label = if erase_all { "Erase all" } else { "Delete" };
-                if theme::button(ui, p, BtnKind::Danger, label).clicked() {
+                if theme::key_button(ui, p, BtnKind::Danger, label, waiting.as_deref()).clicked() {
                     confirm = true;
                 }
                 ui.add_space(6.0);

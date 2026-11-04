@@ -2980,6 +2980,9 @@ struct StatusNote {
     severity: Severity,
     text: String,
     until: std::time::Instant,
+    /// A click refused because a job runs ([`App::refuse_if_busy`]): shown
+    /// over the running job's line, as that is when it matters.
+    refusal: bool,
 }
 
 impl StatusNote {
@@ -2992,6 +2995,15 @@ impl StatusNote {
             severity,
             text,
             until: std::time::Instant::now() + for_,
+            refusal: false,
+        }
+    }
+
+    /// The note for a click refused because `running` is still going.
+    fn refusal(running: Option<&str>) -> Self {
+        StatusNote {
+            refusal: true,
+            ..StatusNote::new(Severity::Warn, busy_refusal_text(running))
         }
     }
 
@@ -5837,8 +5849,7 @@ impl App {
             return false;
         }
         if self.user_acted {
-            let text = busy_refusal_text(self.busy_label.as_deref());
-            self.status_note = Some(StatusNote::new(Severity::Warn, text));
+            self.status_note = Some(StatusNote::refusal(self.busy_label.as_deref()));
         }
         true
     }
@@ -6062,10 +6073,10 @@ impl App {
 
     /// Take the Molto2 session so a worker job can use it (the apply step
     /// hands it back). `None` — with the reason logged — when not connected;
-    /// silently `None` while another job runs, so a click during a background
-    /// read is dropped *before* any state is consumed.
+    /// `None` while another job runs, before any state is consumed, and a
+    /// refused click says so on the status bar.
     fn take_molto_session(&mut self) -> Option<Session> {
-        if self.busy() {
+        if self.refuse_if_busy() {
             return None;
         }
         if !self.molto_session_usable() {
@@ -6606,7 +6617,7 @@ impl App {
     fn try_unlock(&mut self) {
         // Check busy *before* consuming the typed PIN — spawn_job would drop
         // the job (and the PIN with it) if a background read is in flight.
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -7183,7 +7194,7 @@ impl App {
     /// Writes live progress to a shared cell so the UI can show a wizard with
     /// per-sample quality feedback.
     fn enroll_fingerprint(&mut self) {
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -7338,7 +7349,7 @@ impl App {
 
     /// Delete one fingerprint by template id, then refresh the list.
     fn delete_fingerprint(&mut self, template_id: Vec<u8>) {
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -7373,7 +7384,7 @@ impl App {
 
     /// Rename one fingerprint, then refresh the list.
     fn rename_fingerprint(&mut self, template_id: Vec<u8>, new_name: String) {
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -7444,7 +7455,7 @@ impl App {
     /// Dispatch the pending Advanced action on a worker thread, then refresh the
     /// key's info so the view reflects the new state.
     fn run_advanced_action(&mut self) {
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(dlg) = self.security_keys.advanced.as_ref() else {
@@ -7683,7 +7694,7 @@ impl App {
 
     fn submit_change_pin(&mut self) {
         // Check busy *before* consuming the typed PINs (see try_unlock).
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -7745,7 +7756,7 @@ impl App {
     /// the status flips to "PIN set".
     fn submit_set_pin(&mut self) {
         // Check busy *before* consuming the typed PINs (see try_unlock).
-        if self.busy() {
+        if self.refuse_if_busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
@@ -8541,6 +8552,7 @@ impl App {
     /// `provision_oath`; the outcome is mirrored back via `apply_oath_rows`. The
     /// secret is wiped on Done/Cancel/✕/Esc.
     fn render_oath_add_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         if !self.oath.add.open {
             return;
         }
@@ -8638,7 +8650,9 @@ impl App {
                                     .color(p.txt2),
                             );
                         } else {
-                            if theme::button(ui, p, BtnKind::Primary, "Add").clicked() {
+                            if theme::key_button(ui, p, BtnKind::Primary, "Add", waiting.as_deref())
+                                .clicked()
+                            {
                                 want_submit = true;
                             }
                             ui.add_space(8.0);
@@ -8684,6 +8698,7 @@ impl App {
     /// re-checked, so `delete_oath` can never open a different reader than
     /// the one the user confirmed against (KEY-008).
     fn render_oath_delete_confirm(&mut self, ctx: &egui::Context) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some((for_device, name)) = self.oath.confirm_delete.clone() else {
             return;
         };
@@ -8703,7 +8718,7 @@ impl App {
                 ));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() {
+                    if theme::key_egui_button(ui, "Delete", waiting.as_deref()).clicked() {
                         decision = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -8725,6 +8740,7 @@ impl App {
     /// device binding as the delete confirmation (KEY-008): a stale
     /// confirmation is dropped, never rendered over the new selection.
     fn render_oath_reset_confirm(&mut self, ctx: &egui::Context) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(for_device) = self.oath.confirm_reset.clone() else {
             return;
         };
@@ -8744,7 +8760,7 @@ impl App {
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Reset applet").clicked() {
+                    if theme::key_egui_button(ui, "Reset applet", waiting.as_deref()).clicked() {
                         decision = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -8909,6 +8925,7 @@ impl App {
     /// so a confirmed wipe can only ever land on the key it was opened for
     /// (KEY-008). "Yes, wipe this key" starts the sequential reset job.
     fn render_factory_reset_confirm(&mut self, ctx: &egui::Context, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(FactoryResetConfirmState {
             for_device,
             piv_preview,
@@ -8990,7 +9007,15 @@ impl App {
                     self.factory_reset_confirm_typed.trim() == "reset" && blockers.is_empty();
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(armed, |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Yes, wipe this key").clicked() {
+                        if theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Danger,
+                            "Yes, wipe this key",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                        {
                             decision = Some(true);
                         }
                     });
@@ -9495,8 +9520,14 @@ impl App {
                     } else {
                         "Arm reset"
                     };
+                    let waiting = self.waiting_for().map(str::to_owned);
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(ready, egui::Button::new(go_label)).clicked() {
+                        let go =
+                            ui.add_enabled(ready && waiting.is_none(), egui::Button::new(go_label));
+                        if let Some(w) = &waiting {
+                            go.clone().on_disabled_hover_text(theme::waiting_hover(w));
+                        }
+                        if go.clicked() {
                             arm = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -9665,7 +9696,12 @@ impl App {
                 .map(status_seconds);
             (label, progress.or(seconds))
         });
-        let note = self.status_note.clone();
+        // "Still working on…" only while something is (a Refresh runs as
+        // several jobs in a row, so it isn't cleared when one ends).
+        let note = self
+            .status_note
+            .clone()
+            .filter(|n| !n.refusal || running.is_some());
         if let Some(n) = &note {
             root_ui
                 .ctx()
@@ -9699,10 +9735,12 @@ impl App {
                         .on_hover_text("Open the Activity log");
                 }
                 open_log = resp.clicked();
+                // A refused click shows over the running job's line.
+                let refused = running.is_some() && note.as_ref().is_some_and(|n| n.refusal);
                 egui::Sides::new().shrink_left().truncate().show(
                     ui,
                     |ui| {
-                        if let Some((label, after)) = &running {
+                        if let (Some((label, after)), false) = (&running, refused) {
                             ui.add(egui::Spinner::new().size(13.0).color(p.txt3));
                             ui.add_space(8.0);
                             ui.add(
@@ -10446,13 +10484,10 @@ impl App {
         let paths = files::paths_for(std::path::Path::new(f.save_path.trim()));
         let for_device = self.selected_device.clone();
         self.openpgp.notice = None;
-        let label = if key_type == keyroost_pgpkey::keys::KeyType::Rsa4096 {
-            format!(
-                "Making the {} keys\u{2026} (this can take a minute)",
-                key_type.label()
-            )
-        } else {
-            format!("Making the {} keys\u{2026}", key_type.label())
+        // The CLI's `openpgp key create` says the same.
+        let label = match key_type.slow_hint() {
+            Some(hint) => format!("Making the {} keys\u{2026} ({hint})", key_type.label()),
+            None => format!("Making the {} keys\u{2026}", key_type.label()),
         };
         self.spawn_job(label, move || {
             let result = (|| -> Result<CreatedKeys, String> {
@@ -13849,6 +13884,11 @@ impl App {
         let Some(target) = self.rename_target.clone() else {
             return;
         };
+        // Refused before the typed PIN is taken, so Enter while a job runs
+        // keeps it for the next try.
+        if self.refuse_if_busy() {
+            return;
+        }
         let pin = if self.rename_needs_pin() {
             zeroize::Zeroizing::new(self.rename_pin.clone())
         } else {
@@ -17268,6 +17308,7 @@ impl App {
     /// clipped and truncated, so even a case the fit did not predict can never
     /// paint one item over another.
     fn top_bar(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let ctx = root_ui.ctx().clone();
         // The bar height must track the zoom factor: at a larger text size the
         // glyph tile, labels and buttons are all scaled up, and a fixed 52px
@@ -17340,7 +17381,15 @@ impl App {
                         },
                         |ui| {
                             // Right-to-left: Refresh is the rightmost item.
-                            if theme::button(ui, p, BtnKind::Ghost, "Refresh").clicked() {
+                            if theme::key_button(
+                                ui,
+                                p,
+                                BtnKind::Ghost,
+                                "Refresh",
+                                waiting.as_deref(),
+                            )
+                            .clicked()
+                            {
                                 self.user_refresh();
                             }
                             if !fit.links_in_menu {
@@ -18570,6 +18619,12 @@ impl App {
     /// The inline naming field's text box with Save and Cancel, shared by
     /// the security-key and Molto2 heroes. Returns (save, cancel).
     fn rename_field_row(&mut self, ui: &mut egui::Ui, p: &Palette) -> (bool, bool) {
+        // Save writes to the key only for a name kept on the key; a name
+        // kept on this computer waits for nothing.
+        let waiting = self
+            .rename_goes_on_key()
+            .then(|| self.waiting_for().map(str::to_owned))
+            .flatten();
         let held = self
             .rename_target
             .as_ref()
@@ -18590,7 +18645,8 @@ impl App {
             theme::button_disabled(ui, p, "Save");
             false
         } else {
-            theme::button(ui, p, BtnKind::Primary, "Save").clicked() || enter
+            theme::key_button(ui, p, BtnKind::Primary, "Save", waiting.as_deref()).clicked()
+                || enter
         };
         ui.add_space(4.0);
         let cancel = theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked();
@@ -18604,6 +18660,7 @@ impl App {
     /// question, Enter pressed in the PIN field — a save like the name
     /// field's Enter).
     fn rename_details(&mut self, ui: &mut egui::Ui, p: &Palette, what: &str) -> (bool, bool, bool) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let note = |ui: &mut egui::Ui, text: &str| {
             ui.label(
                 egui::RichText::new(text)
@@ -18701,7 +18758,8 @@ impl App {
                         } else {
                             (BtnKind::Danger, "Remove")
                         };
-                        confirm = theme::button(ui, p, kind, label).clicked();
+                        confirm =
+                            theme::key_button(ui, p, kind, label, waiting.as_deref()).clicked();
                         cancel = theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked();
                     });
                 });
@@ -18722,6 +18780,7 @@ impl App {
 
     /// Device hero strip at the top of a key's pane.
     fn device_hero(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let mut open_rename = false;
         let mut do_save = false;
         let mut do_cancel = false;
@@ -18842,7 +18901,15 @@ impl App {
                                 .color(p.txt),
                             );
                             ui.add_space(6.0);
-                            if theme::button(ui, p, BtnKind::Primary, "Write it back").clicked() {
+                            if theme::key_button(
+                                ui,
+                                p,
+                                BtnKind::Primary,
+                                "Write it back",
+                                waiting.as_deref(),
+                            )
+                            .clicked()
+                            {
                                 write_back = Some(WriteBack::Write);
                             }
                             if theme::button(ui, p, BtnKind::Ghost, "Forget")
@@ -19154,6 +19221,7 @@ impl App {
     /// Overview tab: one summary card per capability, each with a `Manage →` jump.
     /// Scrolling comes from the shared capability-pane scroller in `central`.
     fn overview(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        let waiting = self.waiting_for().map(str::to_owned);
         ui.vertical(|ui| {
             self.mds_card(ui, p, dev);
             if dev.caps.has(Caps::U2F_ONLY) {
@@ -19252,7 +19320,10 @@ impl App {
                         for row in self.oath.creds.iter().take(2) {
                             let is_copied =
                                 self.copied.as_ref().is_some_and(|(n, _)| n == &row.name);
-                            if let Some(code) = oath_row(ui, p, row, is_copied, false, false).copy {
+                            if let Some(code) =
+                                oath_row(ui, p, row, is_copied, false, false, waiting.as_deref())
+                                    .copy
+                            {
                                 copy = Some((row.name.clone(), code));
                             }
                             ui.add_space(6.0);
@@ -19585,6 +19656,7 @@ impl App {
     }
 
     fn cap_fido2(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         // Non-admin Windows: if a FIDO key is present but we have no working FIDO
         // access (the HID interface is gated), show the admin-needed card with a
         // link to Windows' settings and an elevate button, instead of the normal
@@ -19764,11 +19836,12 @@ impl App {
                         }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if theme::button(
+                            if theme::key_button(
                                 ui,
                                 p,
                                 BtnKind::Primary,
                                 if setting { "Set PIN" } else { "Change PIN" },
+                                waiting.as_deref(),
                             )
                             .clicked()
                             {
@@ -19858,7 +19931,9 @@ impl App {
                             .hint_text("Enter PIN to unlock this key"),
                     );
                     guard_secret_field(ui.ctx(), &resp);
-                    let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
+                    let submit =
+                        theme::key_button(ui, p, BtnKind::Primary, "Unlock", waiting.as_deref())
+                            .clicked();
                     if submit
                         || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                     {
@@ -20087,8 +20162,14 @@ impl App {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Min),
                                         |ui| {
-                                            if theme::button(ui, p, BtnKind::Ghost, "Remove")
-                                                .clicked()
+                                            if theme::key_button(
+                                                ui,
+                                                p,
+                                                BtnKind::Ghost,
+                                                "Remove",
+                                                waiting.as_deref(),
+                                            )
+                                            .clicked()
                                             {
                                                 delete = Some(c.credential_id.clone());
                                             }
@@ -20102,11 +20183,12 @@ impl App {
                                                 c.large_blob_key.as_ref(),
                                             ) {
                                                 ui.add_space(6.0);
-                                                if theme::button(
+                                                if theme::key_button(
                                                     ui,
                                                     p,
                                                     BtnKind::Ghost,
                                                     "Save certificate\u{2026}",
+                                                    waiting.as_deref(),
                                                 )
                                                 .clicked()
                                                 {
@@ -20292,7 +20374,14 @@ impl App {
                                                     .align(egui::Align2::LEFT_CENTER),
                                             );
                                         }
-                                        if theme::button(ui, p, BtnKind::Primary, "Save").clicked()
+                                        if theme::key_button(
+                                            ui,
+                                            p,
+                                            BtnKind::Primary,
+                                            "Save",
+                                            waiting.as_deref(),
+                                        )
+                                        .clicked()
                                         {
                                             if let Some((rid, buf)) =
                                                 self.security_keys.fp_rename.take()
@@ -20345,7 +20434,15 @@ impl App {
                                 .align(egui::Align2::LEFT_CENTER)
                                 .hint_text("name (optional)"),
                         );
-                        if theme::button(ui, p, BtnKind::Primary, "Enroll new\u{2026}").clicked() {
+                        if theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Primary,
+                            "Enroll new\u{2026}",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                        {
                             do_enroll = true;
                         }
                     });
@@ -20861,6 +20958,7 @@ impl App {
     /// trailer, and writes the whole array back (which needs a PIN, because the
     /// write path requires a token with the Large Blob Write permission).
     fn render_large_blobs(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         ui.add_space(14.0);
 
         // Auto-load the array the first time this tab is shown, so entries
@@ -21005,7 +21103,8 @@ impl App {
                 let unlocked = self.security_keys.session.is_some();
                 let has_text = !self.security_keys.lb_new_text.trim().is_empty();
                 ui.horizontal(|ui| {
-                    let add = theme::button(ui, p, BtnKind::Primary, "Add note");
+                    let add =
+                        theme::key_button(ui, p, BtnKind::Primary, "Add note", waiting.as_deref());
                     if add.clicked() && unlocked && has_text {
                         let text = self.security_keys.lb_new_text.clone();
                         self.add_large_blob_note(text);
@@ -21144,7 +21243,7 @@ impl App {
                     let has_text =
                         !self.security_keys.lb_edit_text.trim().is_empty();
                     ui.horizontal(|ui| {
-                        if theme::button(ui, p, BtnKind::Primary, "Save").clicked()
+                        if theme::key_button(ui, p, BtnKind::Primary, "Save", waiting.as_deref()).clicked()
                             && unlocked
                             && has_text
                         {
@@ -21287,7 +21386,15 @@ impl App {
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Delete entry").clicked() {
+                        if theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Danger,
+                            "Delete entry",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                        {
                             self.security_keys.lb_confirm_delete = None;
                             self.delete_large_blob_entry(idx);
                         }
@@ -21360,7 +21467,15 @@ impl App {
                         };
                         if n == 0 {
                             theme::button_disabled(ui, p, &confirm);
-                        } else if theme::button(ui, p, BtnKind::Danger, &confirm).clicked() {
+                        } else if theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Danger,
+                            &confirm,
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                        {
                             self.security_keys.lb_confirm_clear = false;
                             self.clear_large_blob_storage(keep);
                         }
@@ -21805,6 +21920,7 @@ impl App {
     /// Centered-modal confirmation for deleting a fingerprint (same chrome as
     /// the Settings dialogs). Returns the template id to delete, if confirmed.
     fn render_fp_delete_confirm(&mut self, ctx: &egui::Context, p: &Palette) -> Option<Vec<u8>> {
+        let waiting = self.waiting_for().map(str::to_owned);
         let id = self.security_keys.fp_confirm_delete.clone()?;
         let label = self
             .security_keys
@@ -21826,7 +21942,8 @@ impl App {
             );
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Danger, "Delete").clicked() {
+                if theme::key_button(ui, p, BtnKind::Danger, "Delete", waiting.as_deref()).clicked()
+                {
                     confirm = true;
                 }
                 ui.add_space(8.0);
@@ -21848,6 +21965,7 @@ impl App {
     }
 
     fn render_advanced_confirm(&mut self, ctx: &egui::Context, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(dlg) = self.security_keys.advanced.as_ref() else {
             return;
         };
@@ -21966,7 +22084,7 @@ impl App {
                     } else {
                         BtnKind::Primary
                     };
-                    if theme::button(ui, p, kind, "Apply").clicked() {
+                    if theme::key_button(ui, p, kind, "Apply", waiting.as_deref()).clicked() {
                         apply = true;
                     }
                     ui.add_space(8.0);
@@ -22325,6 +22443,7 @@ impl App {
         occupancy: PivOccupancy,
         slot_has_cert: bool,
     ) -> bool {
+        let waiting = self.waiting_for().map(str::to_owned);
         let label_w = chuid_label_width(ui.ctx());
         card_note(ui, p, &format!("Reading {}", self.piv.key_import.path));
         ui.add_space(4.0);
@@ -22355,7 +22474,15 @@ impl App {
                             .font(theme::f_reg(12.5))
                             .color(p.txt2),
                     );
-                } else if theme::button(ui, p, BtnKind::Default, "Open file").clicked() {
+                } else if theme::key_button(
+                    ui,
+                    p,
+                    BtnKind::Default,
+                    "Open file",
+                    waiting.as_deref(),
+                )
+                .clicked()
+                {
                     self.piv_open_key_file();
                 }
             });
@@ -22632,6 +22759,7 @@ impl App {
     /// the pane — the modal only shows a generic success line. Cancel / ✕ / Esc —
     /// and a successful Done — wipe the secret fields.
     fn render_piv_cred_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(kind) = self.piv.cred_modal.as_ref().map(|m| m.kind) else {
             return;
         };
@@ -23520,7 +23648,14 @@ impl App {
                                 // this key can't take it (the dialog says
                                 // why).
                                 theme::button_disabled(ui, p, submit);
-                            } else if theme::button(ui, p, BtnKind::Primary, submit).clicked()
+                            } else if theme::key_button(
+                                ui,
+                                p,
+                                BtnKind::Primary,
+                                submit,
+                                waiting.as_deref(),
+                            )
+                            .clicked()
                                 && mismatch.is_none()
                             {
                                 want_submit = true;
@@ -23649,6 +23784,7 @@ impl App {
     /// the pane — the modal only shows a generic success line. Cancel / ✕ / Esc —
     /// and a successful Done — wipe the secret fields.
     fn render_openpgp_cred_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let Some(kind) = self.openpgp.cred_modal.as_ref().map(|m| m.kind) else {
             return;
         };
@@ -23818,7 +23954,14 @@ impl App {
                             } else {
                                 BtnKind::Primary
                             };
-                            if theme::button(ui, p, btn, kind.submit_label()).clicked()
+                            if theme::key_button(
+                                ui,
+                                p,
+                                btn,
+                                kind.submit_label(),
+                                waiting.as_deref(),
+                            )
+                            .clicked()
                                 && mismatch.is_none()
                             {
                                 want_submit = true;
@@ -23931,6 +24074,7 @@ impl App {
         p: &Palette,
         kind: OpenPgpCredKind,
     ) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let create = kind == OpenPgpCredKind::CreateWithBackup;
         let busy = self.openpgp.cred_modal.as_ref().is_some_and(|m| m.busy);
         let result = self
@@ -24163,8 +24307,14 @@ impl App {
                                             }
                                         });
                                 });
-                                if f.key_type == Some(keyroost_pgpkey::keys::KeyType::Rsa4096) {
-                                    card_note(ui, p, "Making RSA-4096 keys can take a minute.");
+                                if let Some((t, hint)) =
+                                    f.key_type.and_then(|t| t.slow_hint().map(|h| (t, h)))
+                                {
+                                    card_note(
+                                        ui,
+                                        p,
+                                        &format!("Making {} keys: {hint}.", t.label()),
+                                    );
                                 }
                                 ui.add_space(4.0);
                                 ui.horizontal(|ui| {
@@ -24339,8 +24489,14 @@ impl App {
                             } else {
                                 let clicked = ui
                                     .add_enabled_ui(can_submit, |ui| {
-                                        theme::button(ui, p, BtnKind::Primary, submit_label)
-                                            .clicked()
+                                        theme::key_button(
+                                            ui,
+                                            p,
+                                            BtnKind::Primary,
+                                            submit_label,
+                                            waiting.as_deref(),
+                                        )
+                                        .clicked()
                                     })
                                     .inner;
                                 want_submit = clicked && can_submit;
@@ -24445,6 +24601,7 @@ impl App {
 
     /// Authenticator / OATH tab — live codes with countdown rings + copy.
     fn cap_oath(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
         // Auto-attempt a read once per selection (a hard error won't retry).
         if !self.oath_tried && !self.busy() && self.oath.error.is_none() && !self.oath.locked {
             self.oath_tried = true;
@@ -24508,7 +24665,9 @@ impl App {
                             .password(true),
                     );
                     guard_secret_field(ui.ctx(), &resp);
-                    let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
+                    let submit =
+                        theme::key_button(ui, p, BtnKind::Primary, "Unlock", waiting.as_deref())
+                            .clicked();
                     // Enter in the field submits too, matching the FIDO2 unlock card
                     // and the other inline credential fields in this redesign.
                     if submit
@@ -24533,7 +24692,9 @@ impl App {
         if !self.oath.loaded {
             if self.oath.notice.is_some() && !self.busy() {
                 // Hidden by the idle lock: reading them again is one click.
-                if theme::button(ui, p, BtnKind::Primary, "Show codes").clicked() {
+                if theme::key_button(ui, p, BtnKind::Primary, "Show codes", waiting.as_deref())
+                    .clicked()
+                {
                     self.load_oath_creds();
                 }
                 return;
@@ -24585,7 +24746,15 @@ impl App {
             let n = self.oath.creds.len();
             for (i, row) in self.oath.creds.iter().enumerate() {
                 let is_copied = self.copied.as_ref().is_some_and(|(nm, _)| nm == &row.name);
-                let clicks = oath_row(ui, p, row, is_copied, true, wait_help_open);
+                let clicks = oath_row(
+                    ui,
+                    p,
+                    row,
+                    is_copied,
+                    true,
+                    wait_help_open,
+                    waiting.as_deref(),
+                );
                 if let Some(code) = clicks.copy {
                     copy = Some((row.name.clone(), code));
                 }
@@ -26968,6 +27137,7 @@ impl App {
     /// The Molto2 token's dedicated amber view: hero band · customer-key strip ·
     /// 100-slot rail + editor.
     fn molto_view(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        let waiting = self.waiting_for().map(str::to_owned);
         // Make brand-orange the accent throughout the Molto2 view, so its help
         // dots, links, selection highlights and primary action are all one
         // orange rather than mixing the app's blue accent into the token's
@@ -27123,7 +27293,7 @@ impl App {
                         );
                         self.secret_reveal.insert("customer-key", rev);
                         ui.checkbox(&mut self.customer_key_hex, "hex");
-                        if theme::button(ui, p, BtnKind::Default, "Authenticate").clicked() {
+                        if theme::key_button(ui, p, BtnKind::Default, "Authenticate", waiting.as_deref()).clicked() {
                             self.authenticate();
                         }
                         if self.authenticated {
@@ -27138,7 +27308,7 @@ impl App {
                     );
                     ui.add_space(12.0);
                     ui.horizontal_wrapped(|ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Sync time on all").clicked() {
+                        if theme::key_button(ui, p, BtnKind::Default, "Sync time on all", waiting.as_deref()).clicked() {
                             self.sync_time_all();
                         }
                         ui.add_space(6.0);
@@ -27169,7 +27339,7 @@ impl App {
                                 );
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
-                                    if theme::button(ui, p, BtnKind::Danger, "Yes, factory reset").clicked() {
+                                    if theme::key_button(ui, p, BtnKind::Danger, "Yes, factory reset", waiting.as_deref()).clicked() {
                                         self.molto_reset_confirm = false;
                                         self.factory_reset();
                                     }
@@ -27390,11 +27560,11 @@ impl App {
                             }
                             ui.add_space(8.0);
                             ui.horizontal_wrapped(|ui| {
-                                if theme::button(ui, p, BtnKind::Primary, "Write to slot").clicked() {
+                                if theme::key_button(ui, p, BtnKind::Primary, "Write to slot", waiting.as_deref()).clicked() {
                                     self.apply_draft();
                                 }
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Default, "Write title only").clicked() {
+                                if theme::key_button(ui, p, BtnKind::Default, "Write title only", waiting.as_deref()).clicked() {
                                     self.apply_title_only();
                                 }
                                 ui.add_space(6.0);
@@ -27414,7 +27584,7 @@ impl App {
                                 }
                                 #[cfg(feature = "qr")]
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Default, "Sync time").clicked() {
+                                if theme::key_button(ui, p, BtnKind::Default, "Sync time", waiting.as_deref()).clicked() {
                                     self.sync_time_selected();
                                 }
                             });
@@ -27435,7 +27605,7 @@ impl App {
                                         );
                                         ui.add_space(8.0);
                                         ui.horizontal(|ui| {
-                                            if theme::button(ui, p, BtnKind::Danger, "Yes, delete seed").clicked() {
+                                            if theme::key_button(ui, p, BtnKind::Danger, "Yes, delete seed", waiting.as_deref()).clicked() {
                                                 self.molto_delete_confirm = false;
                                                 self.delete_seed_selected();
                                             }
@@ -27457,6 +27627,7 @@ impl App {
     /// and a form to program a seed + configuration. Uses the brand accent like
     /// the Molto2 view.
     fn prog_view(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        let waiting = self.waiting_for().map(str::to_owned);
         let mp = Palette {
             accent: p.brand,
             ..*p
@@ -27579,8 +27750,16 @@ impl App {
                 let busy = self.busy();
                 let can_burn = !busy && !self.prog_seed_input.trim().is_empty();
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(can_burn, |ui| {
-                        if theme::button(ui, p, BtnKind::Primary, "Burn seed").clicked() {
+                    ui.add_enabled_ui(can_burn || waiting.is_some(), |ui| {
+                        if theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Primary,
+                            "Burn seed",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                        {
                             self.prog_burn();
                         }
                     });
@@ -27869,6 +28048,7 @@ fn oath_row(
     is_copied: bool,
     with_delete: bool,
     wait_help_open: bool,
+    waiting: Option<&str>,
 ) -> OathRowClicks {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -27934,7 +28114,7 @@ fn oath_row(
                 // overview card doesn't handle the click, so it gets a passive
                 // label instead of a button.
                 if with_delete {
-                    if theme::button(ui, p, BtnKind::Ghost, "Read code").clicked() {
+                    if theme::key_button(ui, p, BtnKind::Ghost, "Read code", waiting).clicked() {
                         read = true;
                     }
                 } else {
@@ -28737,6 +28917,22 @@ mod tests {
         let err = StatusNote::new(Severity::Err, "x".into());
         let ok = StatusNote::new(Severity::Ok, "x".into());
         assert!(err.until > ok.until, "an error stays longer");
+    }
+
+    /// A job refused while another runs says so on the status bar when a
+    /// click or key press caused it, never for an automatic read.
+    #[test]
+    fn only_a_refused_click_says_still_working() {
+        let mut app = App::default();
+        assert!(!app.refuse_if_busy(), "nothing runs");
+        app.busy_jobs = 1;
+        app.busy_label = Some("Reading OATH codes\u{2026}".into());
+        assert!(app.refuse_if_busy());
+        assert!(app.status_note.is_none(), "no click: an automatic read");
+        app.user_acted = true;
+        assert!(app.refuse_if_busy());
+        let note = app.status_note.as_ref().expect("a click was refused");
+        assert!(note.refusal && note.text.contains("Reading OATH codes"));
     }
 
     /// A refused click names what is still running, once, with its ellipsis.
