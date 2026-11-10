@@ -14557,6 +14557,16 @@ fn run_fido_large_blob_export(
     let bytes: Vec<u8> = if as_cert {
         match entry.classify() {
             EntryKind::SshCert { cert_pub, .. } => cert_pub.into_bytes(),
+            // What `fido2-token -S -b` stores for an SSH credential is
+            // encrypted under that credential's key, so it reads as opaque
+            // here; only the PIN-backed command can open it.
+            EntryKind::Opaque => {
+                return Err(format!(
+                    "entry {index} is not a recognized SSH certificate; drop --as-cert to export raw bytes. \
+                     A certificate stored for an SSH credential is encrypted: save it with `keyroostctl fido ssh export`"
+                )
+                .into())
+            }
             _ => {
                 return Err(format!(
                 "entry {index} is not a recognized SSH certificate; drop --as-cert to export raw bytes"
