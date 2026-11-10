@@ -60,17 +60,19 @@ const MAX_SHORT_DATA: usize = 255;
 /// PC/SC receive buffer (large-blob reads can return a few KB per APDU).
 const RECV_BUF: usize = 4096;
 
+/// What a FIDO2 command through a reader fails with on Windows when the
+/// program isn't running as administrator (see `transmit_error`). A front
+/// end that already tells the person so can recognize the refusal by it.
+pub const WINDOWS_NEEDS_ADMIN: &str = "Windows lets only a program running as administrator \
+     reach a key's FIDO2 side, through its smart-card reader too";
+
 /// The error for a failed `SCardTransmit`. On Windows a program that isn't
 /// running as administrator gets `SCARD_E_NO_ACCESS` ("Access is denied to
 /// this file") for the FIDO applet `SELECT`, where an administrator's reaches
 /// the card: say that instead of the raw PC/SC text.
 fn transmit_error(e: pcsc::Error) -> CtapError {
     if cfg!(windows) && e == pcsc::Error::NoAccess {
-        return CtapError::Transport(
-            "Windows lets only a program running as administrator reach a key's \
-             FIDO2 side, through its smart-card reader too"
-                .into(),
-        );
+        return CtapError::Transport(WINDOWS_NEEDS_ADMIN.into());
     }
     CtapError::Transport(format!("APDU transmit failed: {e}"))
 }

@@ -6608,7 +6608,16 @@ impl App {
                         app.apply_key_details();
                     }
                     Err(e) => {
-                        app.log_bg_once(Severity::Err, format!("FIDO2: {e}"));
+                        // Windows without administrator rights: every read
+                        // ends this way, and the Overview and the FIDO2 tab
+                        // say so and what to do. A plain line, then, not an
+                        // error on the status bar each time a key is selected.
+                        let severity = if e.contains(keyroost_transport::WINDOWS_NEEDS_ADMIN) {
+                            Severity::Info
+                        } else {
+                            Severity::Err
+                        };
+                        app.log_bg_once(severity, format!("FIDO2: {e}"));
                         app.security_keys.error = Some(e);
                     }
                 }
