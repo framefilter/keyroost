@@ -160,6 +160,28 @@ impl Palette {
         tint(self.err, 36)
     }
 
+    /// Make the box of an unticked checkbox show in a dialog, whose
+    /// background is `pop`. In the dark palette the idle widget fill and
+    /// outline (`raised2`, `line`) are within a shade of `pop`, so the box
+    /// couldn't be seen there and the option read as plain text. The box
+    /// takes whichever of the two raised fills stands out more from `pop`
+    /// (`raised` in the dark palette, as text boxes have; `raised2`, as
+    /// before, in the light one).
+    pub fn checkboxes_on_pop(&self, ui: &mut egui::Ui) {
+        let apart = |c: Color32| {
+            let d = |a: u8, b: u8| (i32::from(a) - i32::from(b)).abs();
+            d(c.r(), self.pop.r()) + d(c.g(), self.pop.g()) + d(c.b(), self.pop.b())
+        };
+        let fill = if apart(self.raised) > apart(self.raised2) {
+            self.raised
+        } else {
+            self.raised2
+        };
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.bg_fill = fill;
+        w.hovered.bg_fill = fill;
+    }
+
     /// Push the palette into egui Visuals so built-in widgets/text inherit it.
     /// Call whenever Mode/accent changes (cheap enough to call every frame).
     pub fn apply(&self, ctx: &egui::Context, mode: Mode) {

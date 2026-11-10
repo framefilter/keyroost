@@ -21944,6 +21944,7 @@ impl App {
                     });
                 });
                 ui.add_space(12.0);
+                p.checkboxes_on_pop(ui);
                 body(ui);
             });
         (closed, help_resp)
@@ -22143,6 +22144,7 @@ impl App {
             })
             .show(ctx, |ui| {
                 ui.set_max_width(300.0);
+                p.checkboxes_on_pop(ui);
                 // Custom title at the button font size (the default window title
                 // bar is dropped via title_bar(false), so render our own).
                 self.adaptive_row(
