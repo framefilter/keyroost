@@ -4896,6 +4896,10 @@ struct App {
     /// The selection `retry_dropped_info_read` already retried its info
     /// read for (once per selection).
     info_retried_for: Option<DeviceId>,
+    /// The key a finished job ran on, set only while its outcome is applied
+    /// after another key was selected ([`Self::apply_piv_job`]): log lines
+    /// then name this key, not the selected one.
+    outcome_for: Option<DeviceId>,
     /// Which capability pane is showing for the selected key.
     cap_tab: CapTab,
     /// Each device's own last-shown `cap_tab`, so switching to another
@@ -5954,11 +5958,27 @@ impl App {
         // name so the log stays legible when a session touches several keys.
         // Fleet-level lines (device-scan counts, "selection moved on" reset
         // notices) go through `log_global`, which skips the prefix.
-        let text = match self.selected_device() {
-            Some(d) => format!("{}: {}", d.title(), text.into()),
-            None => text.into(),
-        };
+        let text = self.with_key_name(text.into());
         self.push_log(severity, kind, text);
+    }
+
+    /// `text` under the name of the key it is about: the selected one, or
+    /// the key a late outcome ran on (`outcome_for`; "a key" when that one
+    /// was unplugged meanwhile).
+    fn with_key_name(&self, text: String) -> String {
+        let key = match &self.outcome_for {
+            Some(id) => Some(
+                self.devices
+                    .iter()
+                    .find(|d| &d.id == id)
+                    .map_or_else(|| "a key".to_string(), |d| d.title().into_owned()),
+            ),
+            None => self.selected_device().map(|d| d.title().into_owned()),
+        };
+        match key {
+            Some(key) => format!("{key}: {text}"),
+            None => text,
+        }
     }
 
     /// Log without the selected-token prefix `log_kind` adds — for entries that
@@ -5973,10 +5993,7 @@ impl App {
     /// the same, so a failure that persists is logged once rather than
     /// pushing everything else out of the log.
     fn log_bg_once(&mut self, severity: Severity, text: impl Into<String>) {
-        let text = match self.selected_device() {
-            Some(d) => format!("{}: {}", d.title(), text.into()),
-            None => text.into(),
-        };
+        let text = self.with_key_name(text.into());
         self.log_global_bg_once(severity, text);
     }
 
@@ -11884,17 +11901,36 @@ impl App {
     where
         F: FnOnce() -> ApplyFn + Send + 'static,
     {
+        let for_device = self.selected_device.clone();
         let queued = self.spawn_job(label, move || {
             let apply = job();
-            Box::new(move |app: &mut App| {
-                app.piv.inflight = false;
-                apply(app);
-            }) as ApplyFn
+            Box::new(move |app: &mut App| Self::apply_piv_job(app, for_device, apply)) as ApplyFn
         });
         if queued {
             self.piv.inflight = true;
         }
         queued
+    }
+
+    /// Apply a finished PIV job's outcome (`apply`) for the key it ran on.
+    ///
+    /// A slow one (an RSA key takes up to a minute to generate) can finish
+    /// after another key was selected, and the pane then shows that key. Its
+    /// outcome is still logged, under the key it ran on (`outcome_for`), and
+    /// what is remembered per key is kept, but the pane on screen is not
+    /// this job's to change: `apply` runs against a pane of its own, and
+    /// nothing is re-read for it ([`Self::load_piv_status_with_cache`]).
+    fn apply_piv_job(app: &mut App, for_device: Option<DeviceId>, apply: ApplyFn) {
+        if for_device.is_none() || for_device == app.selected_device {
+            app.piv.inflight = false;
+            apply(app);
+            return;
+        }
+        let shown = std::mem::take(&mut app.piv);
+        app.outcome_for = for_device;
+        apply(app);
+        app.outcome_for = None;
+        app.piv = shown;
     }
 
     /// The selected device's cached [`keyroost_transport::PivSessionState`]
@@ -12047,6 +12083,12 @@ impl App {
     /// actually reached the card, "PIV status cache validated" when every
     /// value came out of the reused state with none.
     fn load_piv_status_with_cache(&mut self, kind: LogKind, cache: PivCache) {
+        // A re-read that follows a write which finished after another key
+        // was selected: that key's pane isn't on screen, and the selected
+        // one didn't change.
+        if self.outcome_for.is_some() {
+            return;
+        }
         self.piv.error = None;
         let Some(reader) = self.selected_oath_reader() else {
             return;
@@ -32153,6 +32195,41 @@ mod tests {
         let status = keyroost_transport::PivStatus::default();
         App::apply_piv_write(&mut app, Ok(status), "did a thing".into());
         assert_eq!(app.piv.selected_slot, PivSlotSel::KeyMgmt);
+    }
+
+    /// A PIV job that finishes after another key was selected (an RSA key
+    /// takes a while to generate) logs its outcome under the key it ran on,
+    /// and leaves the pane on screen, now another key's, alone.
+    #[test]
+    fn a_piv_outcome_after_switching_keys_names_its_own_key() {
+        let mut app = App {
+            devices: vec![
+                test_key("serial:A", "1", Some("key-a")),
+                test_key("serial:B", "2", Some("key-b")),
+            ],
+            selected_device: Some("serial:B".into()),
+            ..Default::default()
+        };
+        let outcome: ApplyFn = Box::new(|app: &mut App| {
+            let status = keyroost_transport::PivStatus::default();
+            App::apply_piv_write(app, Ok(status), "Generated RSA-4096 key.".into());
+        });
+        App::apply_piv_job(&mut app, Some("serial:A".into()), outcome);
+        assert_eq!(app.log.len(), 1);
+        assert_eq!(app.log[0].text, "key-a: Generated RSA-4096 key.");
+        assert!(app.piv.status.is_none() && app.piv.notice.is_none());
+        assert!(app.outcome_for.is_none());
+
+        // The key it ran on is still the one shown: its pane takes it.
+        app.piv.inflight = true;
+        let outcome: ApplyFn = Box::new(|app: &mut App| {
+            let status = keyroost_transport::PivStatus::default();
+            App::apply_piv_write(app, Ok(status), "PIN changed.".into());
+        });
+        App::apply_piv_job(&mut app, Some("serial:B".into()), outcome);
+        assert_eq!(app.log[1].text, "key-b: PIN changed.");
+        assert_eq!(app.piv.notice.as_deref(), Some("PIN changed."));
+        assert!(!app.piv.inflight);
     }
 
     /// The management-key-gated flows declare they collect the current
