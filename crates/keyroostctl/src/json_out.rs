@@ -400,7 +400,8 @@ pub(crate) struct OtpSerialJson {
 }
 
 /// `keyroostctl oath --json list` — one stored OATH credential. Mirrors the
-/// human line `<name>  [<type>/<algorithm>]`.
+/// human line `<name>  [<type>/<algorithm>]`, with `  (touch)` after it when
+/// `touch_required`.
 #[derive(Serialize)]
 pub(crate) struct OathCredentialJson {
     pub name: String,
@@ -409,6 +410,9 @@ pub(crate) struct OathCredentialJson {
     pub oath_type: &'static str,
     /// "sha1" / "sha256" / "sha512" (lowercase, like `molto list`).
     pub algorithm: &'static str,
+    /// The key says this account needs a touch to compute. False when the
+    /// key doesn't tell (an HOTP account on a YubiKey).
+    pub touch_required: bool,
 }
 
 /// `keyroostctl oath --json code` — the calculated code. The human handler
@@ -1152,6 +1156,7 @@ mod tests {
                 name: "a".into(),
                 oath_type: "TOTP",
                 algorithm: "sha1",
+                touch_required: true,
             }],
         });
         assert_shape(&v, &[("accounts", "array")]);
@@ -1161,6 +1166,7 @@ mod tests {
                 ("name", "string"),
                 ("type", "string"),
                 ("algorithm", "string"),
+                ("touch_required", "bool"),
             ],
         );
         assert_eq!(v["accounts"][0]["algorithm"], "sha1");

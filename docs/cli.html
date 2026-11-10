@@ -196,9 +196,10 @@ keyroostctl fido fingerprint list</code></pre>
 keyroostctl oath code GitHub:alice      # today's code for one account
 keyroostctl oath add GitHub:alice       # asks for the setup key (hidden)
 keyroostctl oath delete GitHub:alice    # asks first</code></pre>
-    <p><code>oath list</code> shows each account and its type:</p>
+    <p><code>oath list</code> shows each account and its type, and marks the ones that
+      need a touch on the key to show their code:</p>
 <pre><code>GitHub:alice  [TOTP/SHA1]
-Mail:demo@example.com  [TOTP/SHA1]</code></pre>
+Mail:demo@example.com  [TOTP/SHA1]  (touch)</code></pre>
     <p>The setup key is the text a website shows next to its QR code. To add many codes at
       once, <a href="#import">import them from your app</a>.</p>
     <p>Token2 keys with their own code storage use <code>otp</code> instead:</p>

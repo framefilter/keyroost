@@ -8315,7 +8315,28 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                     if listing.skipped == 1 { "is" } else { "are" },
                 ));
             }
-            let creds = listing.credentials;
+            // A YubiKey's listing doesn't say which accounts need a touch;
+            // its CALCULATE ALL does, without waiting for one (and without
+            // computing an HOTP code, so no counter moves). Asked only when
+            // there is a TOTP account it could flag; a key that refuses it
+            // still gets its listing.
+            let has_totp = listing
+                .credentials
+                .iter()
+                .any(|c| matches!(c.oath_type, keyroost_oath::OathType::Totp));
+            let all = if has_totp {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_secs();
+                session
+                    .reauthenticate()
+                    .ok()
+                    .and_then(|_| session.calculate_all(now).ok())
+            } else {
+                None
+            };
+            let creds = &listing.credentials;
             if json_output() {
                 let accounts: Vec<json_out::OathCredentialJson> = creds
                     .iter()
@@ -8323,6 +8344,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                         name: c.name.clone(),
                         oath_type: oath_type_str(c.oath_type),
                         algorithm: oath_algo_json(c.algorithm),
+                        touch_required: oath_needs_touch(&listing, all.as_ref(), &c.name),
                     })
                     .collect();
                 emit_json(&json_out::AccountsJson { accounts })?;
@@ -8333,10 +8355,16 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             } else {
                 for c in creds {
                     outln!(
-                        "{}  [{}/{}]",
+                        "{}  [{}/{}]{}",
                         sanitize_terminal(&c.name),
                         oath_type_str(c.oath_type),
-                        oath_algo_str(c.algorithm)
+                        oath_algo_str(c.algorithm),
+                        // The same mark as `otp list`.
+                        if oath_needs_touch(&listing, all.as_ref(), &c.name) {
+                            "  (touch)"
+                        } else {
+                            ""
+                        },
                     );
                 }
             }
@@ -24720,8 +24748,9 @@ mod cli_tests {
             name: "example".into(),
             oath_type: "TOTP",
             algorithm: "SHA1",
+            touch_required: false,
         };
-        assert_json_has_keys(&c, &["name", "type", "algorithm"]);
+        assert_json_has_keys(&c, &["name", "type", "algorithm", "touch_required"]);
         // `oath list` emits one object whose `accounts` array holds these.
         let doc = serde_json::to_string(&json_out::AccountsJson { accounts: vec![c] }).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
