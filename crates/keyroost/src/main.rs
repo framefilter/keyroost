@@ -9771,11 +9771,11 @@ impl App {
             (label, progress.or(seconds))
         });
         // "Still working on…" only while something is (a Refresh runs as
-        // several jobs in a row, so it isn't cleared when one ends).
-        let note = self
-            .status_note
-            .clone()
-            .filter(|n| !n.refusal || running.is_some());
+        // several jobs in a row, so it isn't cleared when one ends). A job
+        // waiting for a touch counts: the banner asks for the touch, and the
+        // bar still has to say why a click or Enter did nothing.
+        let busy = self.busy();
+        let note = self.status_note.clone().filter(|n| !n.refusal || busy);
         if let Some(n) = &note {
             root_ui
                 .ctx()
@@ -9810,7 +9810,7 @@ impl App {
                 }
                 open_log = resp.clicked();
                 // A refused click shows over the running job's line.
-                let refused = running.is_some() && note.as_ref().is_some_and(|n| n.refusal);
+                let refused = busy && note.as_ref().is_some_and(|n| n.refusal);
                 egui::Sides::new().shrink_left().truncate().show(
                     ui,
                     |ui| {
