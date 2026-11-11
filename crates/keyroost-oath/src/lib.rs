@@ -885,9 +885,11 @@ pub struct Listing {
     /// card holds credentials this crate cannot show, and callers should say
     /// so before any destructive operation (e.g. a reset).
     pub skipped: usize,
-    /// Names of the credentials the card says need a touch to compute. Only
-    /// a [`parse_list_with_properties`] listing fills it; empty otherwise.
-    pub touch_required: Vec<String>,
+    /// Names of the credentials the card says need a touch to compute, when
+    /// the listing carries that ([`parse_list_with_properties`]); `None` for
+    /// a plain listing, which doesn't say (a YubiKey's: its `CALCULATE ALL`
+    /// does).
+    pub touch_required: Option<Vec<String>>,
 }
 
 impl Listing {
@@ -974,7 +976,7 @@ fn parse_name_list(buf: &[u8], with_properties: bool) -> Result<Listing, ParseEr
     Ok(Listing {
         credentials: out,
         skipped,
-        touch_required,
+        touch_required: with_properties.then_some(touch_required),
     })
 }
 
@@ -1548,12 +1550,15 @@ mod tests {
             .map(|c| c.name.as_str())
             .collect();
         assert_eq!(names, ["abc", "tch", "ho"]);
-        assert_eq!(listing.touch_required, ["tch", "ho"]);
-        // A plain listing never reports touch.
+        assert_eq!(
+            listing.touch_required,
+            Some(vec!["tch".to_string(), "ho".to_string()])
+        );
+        // A plain listing doesn't say which accounts need a touch.
         assert!(parse_list(&[0x72, 0x03, 0x21, b'a', b'b'])
             .unwrap()
             .touch_required
-            .is_empty());
+            .is_none());
     }
 
     #[test]
@@ -1751,7 +1756,7 @@ mod tests {
                 algorithm: Algorithm::Sha1,
             }],
             skipped,
-            touch_required: Vec::new(),
+            touch_required: None,
         };
         assert!(!listing(0).lacks("GitHub:alice"));
         assert!(listing(0).lacks("GitHub:bob"));

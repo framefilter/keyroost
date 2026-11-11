@@ -197,7 +197,8 @@ keyroostctl oath code GitHub:alice      # today's code for one account
 keyroostctl oath add GitHub:alice       # asks for the setup key (hidden)
 keyroostctl oath delete GitHub:alice    # asks first</code></pre>
     <p><code>oath list</code> shows each account and its type, and marks the ones that
-      need a touch on the key to show their code:</p>
+      need a touch on the key to show their code (a YubiKey doesn't say for an HOTP
+      account, so those are never marked):</p>
 <pre><code>GitHub:alice  [TOTP/SHA1]
 Mail:demo@example.com  [TOTP/SHA1]  (touch)</code></pre>
     <p>The setup key is the text a website shows next to its QR code. To add many codes at

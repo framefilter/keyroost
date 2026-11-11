@@ -8285,20 +8285,28 @@ fn oath_missing_error(name: &str, nothing_was: Option<&str>) -> String {
     msg
 }
 
-/// Whether the account `name` needs a touch to compute: the listing says so
-/// (Nitrokey's secrets app lists the property), or the card's CALCULATE ALL
-/// left it out for a touch (YubiKey).
+/// Whether the account `name` needs a touch to compute, as far as the key
+/// says: its listing's properties (Nitrokey's secrets app), else its
+/// CALCULATE ALL (YubiKey), which leaves a touch account out with TOUCH and
+/// computes the others. `None` when neither answers for this account: an
+/// HOTP account on a YubiKey (CALCULATE ALL skips it whatever its setting),
+/// or a key that refused CALCULATE ALL.
 fn oath_needs_touch(
     listing: &keyroost_oath::Listing,
     all: Option<&keyroost_oath::CalculateAll>,
     name: &str,
-) -> bool {
-    listing.touch_required.iter().any(|n| n == name)
-        || all.is_some_and(|all| {
-            all.entries.iter().any(|e| {
-                e.name == name && matches!(e.result, keyroost_oath::CalculateAllResult::Touch)
-            })
-        })
+) -> Option<bool> {
+    use keyroost_oath::CalculateAllResult;
+    if let Some(touch) = &listing.touch_required {
+        return Some(touch.iter().any(|n| n == name));
+    }
+    let entry = all?.entries.iter().find(|e| e.name == name)?;
+    match entry.result {
+        CalculateAllResult::Touch => Some(true),
+        CalculateAllResult::Code(_) => Some(false),
+        // HOTP, and anything a later answer adds: the key didn't say.
+        _ => None,
+    }
 }
 
 fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -8322,12 +8330,14 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // A YubiKey's listing doesn't say which accounts need a touch;
             // its CALCULATE ALL does, without waiting for one (and without
             // computing an HOTP code, so no counter moves). Asked only when
-            // there is a TOTP account it could flag; a key that refuses it
-            // still gets its listing.
-            let has_totp = listing
-                .credentials
-                .iter()
-                .any(|c| matches!(c.oath_type, keyroost_oath::OathType::Totp));
+            // the listing didn't say (a Nitrokey's does, and it has no
+            // CALCULATE ALL) and there is a TOTP account it could flag; a
+            // key that refuses it still gets its listing.
+            let has_totp = listing.touch_required.is_none()
+                && listing
+                    .credentials
+                    .iter()
+                    .any(|c| matches!(c.oath_type, keyroost_oath::OathType::Totp));
             let all = if has_totp {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -8364,7 +8374,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                         oath_type_str(c.oath_type),
                         oath_algo_str(c.algorithm),
                         // The same mark as `otp list`.
-                        if oath_needs_touch(&listing, all.as_ref(), &c.name) {
+                        if oath_needs_touch(&listing, all.as_ref(), &c.name) == Some(true) {
                             "  (touch)"
                         } else {
                             ""
@@ -8406,7 +8416,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 session.reauthenticate()?;
                 session.calculate_all(now).ok()
             };
-            if oath_needs_touch(&listing, all.as_ref(), name) {
+            if oath_needs_touch(&listing, all.as_ref(), name) == Some(true) {
                 crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
             }
             session.reauthenticate()?;
@@ -8531,8 +8541,13 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 .unwrap_or(0);
             let needs_touch = session.asks_touch_to_delete()
                 || listing.as_ref().is_some_and(|listing| {
-                    let all = session.calculate_all(now).ok();
-                    oath_needs_touch(listing, all.as_ref(), name)
+                    // Only a listing that doesn't say needs CALCULATE ALL.
+                    let all = listing
+                        .touch_required
+                        .is_none()
+                        .then(|| session.calculate_all(now).ok())
+                        .flatten();
+                    oath_needs_touch(listing, all.as_ref(), name) == Some(true)
                 });
             if needs_touch {
                 crate::prompt::touch("Deleting \u{2014} touch the key if it blinks\u{2026}");
@@ -16203,10 +16218,10 @@ mod cli_tests {
         use keyroost_oath::{
             CalculateAll, CalculateAllEntry, CalculateAllResult, Listing, OtpCode,
         };
-        let listing = |touch: &[&str]| Listing {
+        let listing = |touch: Option<&[&str]>| Listing {
             credentials: Vec::new(),
             skipped: 0,
-            touch_required: touch.iter().map(|n| n.to_string()).collect(),
+            touch_required: touch.map(|t| t.iter().map(|n| n.to_string()).collect()),
         };
         let entry = |name: &str, result| CalculateAllEntry {
             name: name.into(),
@@ -16226,14 +16241,19 @@ mod cli_tests {
             ],
             skipped: 0,
         };
-        // Nitrokey's secrets app: the listing names its touch accounts.
-        assert!(oath_needs_touch(&listing(&["nk-touch"]), None, "nk-touch"));
-        assert!(!oath_needs_touch(&listing(&["nk-touch"]), None, "nk-plain"));
-        // YubiKey: CALCULATE ALL leaves a touch account out with TOUCH.
-        assert!(oath_needs_touch(&listing(&[]), Some(&all), "yk-touch"));
-        assert!(!oath_needs_touch(&listing(&[]), Some(&all), "yk-plain"));
-        assert!(!oath_needs_touch(&listing(&[]), Some(&all), "yk-hotp"));
-        assert!(!oath_needs_touch(&listing(&[]), None, "yk-touch"));
+        // Nitrokey's secrets app: the listing names its touch accounts, and
+        // answers for every account.
+        let nk = listing(Some(&["nk-touch"]));
+        assert_eq!(oath_needs_touch(&nk, None, "nk-touch"), Some(true));
+        assert_eq!(oath_needs_touch(&nk, None, "nk-plain"), Some(false));
+        // YubiKey: CALCULATE ALL leaves a touch account out with TOUCH and
+        // computes the others; it skips HOTP whatever its setting, so an
+        // HOTP account is unknown, as is everything when it was refused.
+        let yk = listing(None);
+        assert_eq!(oath_needs_touch(&yk, Some(&all), "yk-touch"), Some(true));
+        assert_eq!(oath_needs_touch(&yk, Some(&all), "yk-plain"), Some(false));
+        assert_eq!(oath_needs_touch(&yk, Some(&all), "yk-hotp"), None);
+        assert_eq!(oath_needs_touch(&yk, None, "yk-touch"), None);
     }
 
     #[test]
@@ -24648,7 +24668,7 @@ mod cli_tests {
             name: "example".into(),
             oath_type: "TOTP",
             algorithm: "SHA1",
-            touch_required: false,
+            touch_required: Some(false),
         };
         assert_json_has_keys(&c, &["name", "type", "algorithm", "touch_required"]);
         // `oath list` emits one object whose `accounts` array holds these.

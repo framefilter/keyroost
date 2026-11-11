@@ -410,9 +410,9 @@ pub(crate) struct OathCredentialJson {
     pub oath_type: &'static str,
     /// "sha1" / "sha256" / "sha512" (lowercase, like `molto list`).
     pub algorithm: &'static str,
-    /// The key says this account needs a touch to compute. False when the
-    /// key doesn't tell (an HOTP account on a YubiKey).
-    pub touch_required: bool,
+    /// Whether the account needs a touch to compute, as the key says it;
+    /// `null` when the key doesn't say (an HOTP account on a YubiKey).
+    pub touch_required: Option<bool>,
 }
 
 /// `keyroostctl oath --json code` — the calculated code. The human handler
@@ -1134,7 +1134,7 @@ mod tests {
                 name: "a".into(),
                 oath_type: "TOTP",
                 algorithm: "sha1",
-                touch_required: true,
+                touch_required: Some(true),
             }],
         });
         assert_shape(&v, &[("accounts", "array")]);
@@ -1144,10 +1144,22 @@ mod tests {
                 ("name", "string"),
                 ("type", "string"),
                 ("algorithm", "string"),
-                ("touch_required", "bool"),
+                ("touch_required", "bool|null"),
             ],
         );
         assert_eq!(v["accounts"][0]["algorithm"], "sha1");
+        // Unknown is null, and the key is still present.
+        let v = to_v(&AccountsJson {
+            accounts: vec![OathCredentialJson {
+                name: "h".into(),
+                oath_type: "HOTP",
+                algorithm: "sha1",
+                touch_required: None,
+            }],
+        });
+        assert!(v["accounts"][0]
+            .get("touch_required")
+            .is_some_and(serde_json::Value::is_null));
     }
 
     #[test]

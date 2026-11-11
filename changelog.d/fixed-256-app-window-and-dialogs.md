@@ -4,4 +4,5 @@
   instead of leaving its buttons cut off until the mouse moved. The PIV
   reset confirmation no longer says it only works with the PIN and PUK
   already blocked: keyroost blocks them first where the key needs that.
-  ([#256])
+  In the dark theme, an unticked checkbox in a dialog ("Require touch",
+  "Use default management key") shows its box. ([#256])

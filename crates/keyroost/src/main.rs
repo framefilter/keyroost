@@ -8130,7 +8130,7 @@ impl App {
         // already says need a touch (Nitrokey's secrets app).
         let all = session.calculate_all(now).ok();
         let mut touch = touch.to_vec();
-        touch.extend(listing.touch_required);
+        touch.extend(listing.touch_required.unwrap_or_default());
         let rows =
             Self::oath_rows_from(listing.credentials, all.as_ref(), &touch, |name, period| {
                 session
@@ -9803,7 +9803,9 @@ impl App {
         // "Still working on…" only while something is (a Refresh runs as
         // several jobs in a row, so it isn't cleared when one ends). A job
         // waiting for a touch counts: the banner asks for the touch, and the
-        // bar still has to say why a click or Enter did nothing.
+        // bar still has to say why a click or Enter did nothing. Its text
+        // quotes the running job's label, which for a touch job is that
+        // job's own touch prompt ("Still working on: Touch your key…").
         let busy = self.busy();
         let note = self.status_note.clone().filter(|n| !n.refusal || busy);
         if let Some(n) = &note {
@@ -11959,8 +11961,10 @@ impl App {
     /// what is remembered per key is kept, but the pane on screen is not
     /// this job's to change: `apply` runs against a pane of its own, and
     /// nothing is re-read for it ([`Self::load_piv_status_with_cache`]).
+    /// A job whose key isn't known is treated as moved on, as
+    /// [`completion_still_valid`] does for every pane.
     fn apply_piv_job(app: &mut App, for_device: Option<DeviceId>, apply: ApplyFn) {
-        if for_device.is_none() || for_device == app.selected_device {
+        if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
             app.piv.inflight = false;
             apply(app);
             return;

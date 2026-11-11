@@ -164,22 +164,26 @@ impl Palette {
     /// background is `pop`. In the dark palette the idle widget fill and
     /// outline (`raised2`, `line`) are within a shade of `pop`, so the box
     /// couldn't be seen there and the option read as plain text. The box
-    /// takes whichever of the two raised fills stands out more from `pop`
-    /// (`raised` in the dark palette, as text boxes have; `raised2`, as
-    /// before, in the light one).
+    /// gets a fill a little lighter than `pop` there. Not `raised`: a
+    /// scrollbar's handle is drawn in this same fill over a track of
+    /// `raised`, so that choice hid the handle of a dialog that scrolls.
+    /// The light palette keeps `raised2`, which already shows on white.
     pub fn checkboxes_on_pop(&self, ui: &mut egui::Ui) {
-        let apart = |c: Color32| {
-            let d = |a: u8, b: u8| (i32::from(a) - i32::from(b)).abs();
-            d(c.r(), self.pop.r()) + d(c.g(), self.pop.g()) + d(c.b(), self.pop.b())
-        };
-        let fill = if apart(self.raised) > apart(self.raised2) {
-            self.raised
-        } else {
-            self.raised2
-        };
+        let (fill, hover) = self.checkbox_fills_on_pop();
         let w = &mut ui.visuals_mut().widgets;
         w.inactive.bg_fill = fill;
-        w.hovered.bg_fill = fill;
+        w.hovered.bg_fill = hover;
+    }
+
+    /// The idle and hovered fill [`Self::checkboxes_on_pop`] uses.
+    fn checkbox_fills_on_pop(&self) -> (Color32, Color32) {
+        let dark =
+            u16::from(self.pop.r()) + u16::from(self.pop.g()) + u16::from(self.pop.b()) < 3 * 128;
+        if dark {
+            (lighten(self.pop, 0.10), lighten(self.pop, 0.16))
+        } else {
+            (self.raised2, self.raised2)
+        }
     }
 
     /// Push the palette into egui Visuals so built-in widgets/text inherit it.
@@ -803,5 +807,25 @@ mod zoom_tests {
         assert_ne!(load(&save(1.5)), ZOOM_DEFAULT);
         // Corrupt/missing storage still falls back to the default.
         assert_eq!(load("not-a-float"), ZOOM_DEFAULT);
+    }
+
+    /// A dialog's unticked checkbox shows against the dialog, and a
+    /// dialog's scrollbar handle (drawn in the same fill) shows against its
+    /// track (`extreme_bg_color`, which is `raised`).
+    #[test]
+    fn dialog_checkboxes_and_scrollbars_stay_visible() {
+        let apart = |a: Color32, b: Color32| {
+            let d = |x: u8, y: u8| (i32::from(x) - i32::from(y)).abs();
+            d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b())
+        };
+        for (name, mode) in [("dark", Mode::Dark), ("light", Mode::Light)] {
+            let p = Palette::new(mode, Palette::ACCENTS[0], false);
+            let (fill, _) = p.checkbox_fills_on_pop();
+            assert!(apart(fill, p.pop) >= 30, "{name}: box vs dialog {fill:?}");
+            assert!(
+                apart(fill, p.raised) >= 15,
+                "{name}: handle vs track {fill:?}"
+            );
+        }
     }
 }
