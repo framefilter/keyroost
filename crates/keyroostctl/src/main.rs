@@ -3107,11 +3107,11 @@ enum LargeBlobCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Save one entry's bytes to a file (read-only; no PIN needed).
+    /// Save one entry's raw stored bytes to a file (read-only; no PIN
+    /// needed).
     ///
-    /// By default writes the entry's raw stored bytes. With --as-cert, a
-    /// recognized OpenSSH certificate entry is written as a `-cert.pub` text
-    /// line instead (the format `ssh` and `ssh-keygen` consume).
+    /// An SSH certificate stored for a credential is encrypted under that
+    /// credential; save it as a `-cert.pub` file with `fido ssh export`.
     Export {
         /// Zero-based entry index as printed by `fido blob list`.
         index: usize,
@@ -3120,9 +3120,6 @@ enum LargeBlobCmd {
         out: std::path::PathBuf,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
-        /// Write a recognized SSH certificate in `-cert.pub` text form.
-        #[arg(long)]
-        as_cert: bool,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -4332,6 +4329,13 @@ struct RetiredFlag {
 /// clap only hands us the flag name, never its value or the next token, so
 /// nothing a user typed can leak through these messages.
 const RETIRED_FLAGS: &[RetiredFlag] = &[
+    RetiredFlag {
+        flag: "--as-cert",
+        words: &["fido", "blob", "export"],
+        msg: "--as-cert was removed: a certificate stored for an SSH credential is encrypted \
+              under that credential, so save it with `keyroostctl fido ssh export`",
+        now: &[],
+    },
     RetiredFlag {
         flag: "--admin-pin-env",
         words: &["openpgp", "pin", "change", "--admin"],
@@ -14001,11 +14005,10 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             index,
             out,
             overwrite,
-            as_cert,
             path,
         } => {
             let [out_mode] = crate::prompt::check_overwrites([Some(out.as_path())], *overwrite)?;
-            run_fido_large_blob_export(path.as_deref(), *index, out, out_mode, *as_cert)
+            run_fido_large_blob_export(path.as_deref(), *index, out, out_mode)
         }
         LargeBlobCmd::Clear {
             yes,
@@ -14254,50 +14257,15 @@ fn open_and_read_large_blobs(
 /// Classification results shaped for both the human and JSON views.
 fn large_blob_kind(
     entry: &keyroost_ctap::large_blobs::LargeBlobEntry,
-) -> (
-    &'static str,
-    Option<json_out::FidoLargeBlobSshCertJson>,
-    keyroost_ctap::large_blobs::EntryKind,
-) {
+) -> (&'static str, keyroost_ctap::large_blobs::EntryKind) {
     use keyroost_ctap::large_blobs::EntryKind;
     let kind = entry.classify();
-    match &kind {
-        EntryKind::Note(_) => ("note", None, kind),
-        EntryKind::KeyName(_) => ("key-name", None, kind),
-        EntryKind::Opaque => ("opaque", None, kind),
-        EntryKind::SshCert { info, .. } => {
-            let cert = json_out::FidoLargeBlobSshCertJson {
-                key_type: info.key_type.clone(),
-                serial: info.serial.to_string(),
-                cert_type: if info.cert_type == keyroost_ctap::ssh_cert::CERT_TYPE_USER {
-                    "user"
-                } else {
-                    "host"
-                },
-                key_id: info.key_id.clone(),
-                principals: info.principals.clone(),
-                valid_after: info.valid_after,
-                valid_before: info.valid_before,
-                validity: keyroost_ctap::ssh_cert::format_validity(
-                    info.valid_after,
-                    info.valid_before,
-                ),
-                critical_options: info
-                    .critical_options
-                    .iter()
-                    .map(|(n, v)| {
-                        if v.is_empty() {
-                            n.clone()
-                        } else {
-                            format!("{n}={v}")
-                        }
-                    })
-                    .collect(),
-                extensions: info.extensions.clone(),
-            };
-            ("ssh-cert", Some(cert), kind)
-        }
-    }
+    let name = match &kind {
+        EntryKind::Note(_) => "note",
+        EntryKind::KeyName(_) => "key-name",
+        EntryKind::Opaque => "opaque",
+    };
+    (name, kind)
 }
 
 /// An entry's text for JSON: a note's text, or the key's name.
@@ -14370,14 +14338,13 @@ fn large_blob_list_json(
         .into_iter()
         .enumerate()
         .map(|(index, e)| {
-            let (kind, ssh_cert, _) = large_blob_kind(e);
+            let (kind, _) = large_blob_kind(e);
             json_out::FidoLargeBlobEntryJson {
                 index,
                 size: e.orig_size,
                 is_note: e.is_kr_note(),
                 text: large_blob_text(e),
                 kind,
-                ssh_cert,
             }
         })
         .collect();
@@ -14416,13 +14383,6 @@ fn run_fido_large_blob_list(
                     preview_note(&text)
                 )
             }
-            EntryKind::SshCert { info, .. } => outln!(
-                "[{}] {} bytes  ssh-cert  {} ({})",
-                i,
-                e.orig_size,
-                sanitize_terminal(&info.key_id),
-                sanitize_terminal(&info.principals.join(","))
-            ),
             EntryKind::KeyName(l) => outln!(
                 "[{}] {} bytes  key name  \"{}\"",
                 i,
@@ -14459,7 +14419,7 @@ fn run_fido_large_blob_get(
     let entry = array
         .entry(index)
         .ok_or_else(|| large_blob_bad_index(index, array.len()))?;
-    let (kind, ssh_cert, classified) = large_blob_kind(entry);
+    let (kind, classified) = large_blob_kind(entry);
     if json_output() {
         emit_json(&json_out::FidoLargeBlobGetJson {
             index,
@@ -14467,7 +14427,6 @@ fn run_fido_large_blob_get(
             is_note: entry.is_kr_note(),
             text: large_blob_text(entry),
             kind,
-            ssh_cert,
             hex: hex_encode(&entry.ciphertext),
         })?;
         return Ok(());
@@ -14483,51 +14442,6 @@ fn run_fido_large_blob_get(
         EntryKind::KeyName(l) => {
             outln!("Entry {}: key name, {} bytes", index, entry.orig_size);
             outln!("{}", sanitize_terminal(&l.label));
-        }
-        EntryKind::SshCert { info, .. } => {
-            outln!(
-                "Entry {}: OpenSSH certificate, {} bytes",
-                index,
-                entry.orig_size
-            );
-            outln!(
-                "  Type:        {} ({})",
-                sanitize_terminal(&info.key_type),
-                if info.cert_type == keyroost_ctap::ssh_cert::CERT_TYPE_USER {
-                    "user"
-                } else {
-                    "host"
-                }
-            );
-            outln!("  Key ID:      {}", sanitize_terminal(&info.key_id));
-            outln!("  Serial:      {}", info.serial);
-            outln!(
-                "  Principals:  {}",
-                if info.principals.is_empty() {
-                    "(any)".to_string()
-                } else {
-                    sanitize_terminal(&info.principals.join(", "))
-                }
-            );
-            outln!(
-                "  Valid:       {}",
-                keyroost_ctap::ssh_cert::format_validity(info.valid_after, info.valid_before)
-            );
-            for (n, v) in &info.critical_options {
-                let n = sanitize_terminal(n);
-                if v.is_empty() {
-                    outln!("  Critical:    {n}");
-                } else {
-                    let v = sanitize_terminal(v);
-                    outln!("  Critical:    {n}={v}");
-                }
-            }
-            for ext in &info.extensions {
-                outln!("  Extension:   {}", sanitize_terminal(ext));
-            }
-            output::note(&format!(
-                "export with: keyroostctl fido blob export {index} --out FILE --as-cert"
-            ));
         }
         EntryKind::Opaque => {
             outln!(
@@ -14547,38 +14461,14 @@ fn run_fido_large_blob_export(
     index: usize,
     output: &std::path::Path,
     out_mode: crate::prompt::OutMode,
-    as_cert: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use keyroost_ctap::large_blobs::EntryKind;
     let (_dev, _info, array) = open_and_read_large_blobs(path)?;
     let entry = array
         .entry(index)
         .ok_or_else(|| large_blob_bad_index(index, array.len()))?;
-    let bytes: Vec<u8> = if as_cert {
-        match entry.classify() {
-            EntryKind::SshCert { cert_pub, .. } => cert_pub.into_bytes(),
-            // What `fido2-token -S -b` stores for an SSH credential is
-            // encrypted under that credential's key, so it reads as opaque
-            // here; only the PIN-backed command can open it.
-            EntryKind::Opaque => {
-                return Err(format!(
-                    "entry {index} is not a recognized SSH certificate; drop --as-cert to export raw bytes. \
-                     A certificate stored for an SSH credential is encrypted: save it with `keyroostctl fido ssh export`"
-                )
-                .into())
-            }
-            _ => {
-                return Err(format!(
-                "entry {index} is not a recognized SSH certificate; drop --as-cert to export raw bytes"
-            )
-                .into())
-            }
-        }
-    } else {
-        entry.ciphertext.clone()
-    };
+    let bytes = &entry.ciphertext;
     out_mode
-        .write(output, &bytes)
+        .write(output, bytes)
         .map_err(|e| format!("write {}: {}", output.display(), e))?;
     output::status(&format!(
         "Wrote {} bytes to {}.",
@@ -25018,14 +24908,12 @@ mod cli_tests {
         assert_eq!(shaped.entries[0].text.as_deref(), Some("hello"));
         assert_eq!(shaped.entries[0].size, "hello".len() as u64);
         assert_eq!(shaped.entries[0].kind, "note");
-        assert!(shaped.entries[0].ssh_cert.is_none());
 
         // [1] is opaque: is_note false, no text.
         assert_eq!(shaped.entries[1].index, 1);
         assert!(!shaped.entries[1].is_note);
         assert!(shaped.entries[1].text.is_none());
         assert_eq!(shaped.entries[1].kind, "opaque");
-        assert!(shaped.entries[1].ssh_cert.is_none());
 
         // The array's capacity is computed against the given AuthenticatorInfo
         // (spec-minimum 1024 bytes here, since max_serialized_large_blob_array
@@ -25037,27 +24925,24 @@ mod cli_tests {
             shaped.capacity.max_bytes - shaped.capacity.used_bytes
         );
 
-        // The opaque entry's text is null in the JSON, and so is a note's
-        // ssh_cert; both keys are present.
+        // The opaque entry's text is null in the JSON; the key is present.
         let s = serde_json::to_string(&shaped).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let arr = v.get("entries").unwrap().as_array().unwrap();
         assert_eq!(arr[0]["text"], "hello");
         assert!(arr[1].get("text").is_some_and(|t| t.is_null()));
-        assert!(arr[0].get("ssh_cert").is_some_and(|c| c.is_null()));
     }
 
     #[test]
     fn large_blob_get_json_carries_hex_for_opaque() {
         let entry = opaque_entry();
-        let (kind, ssh_cert, _) = large_blob_kind(&entry);
+        let (kind, _) = large_blob_kind(&entry);
         let g = json_out::FidoLargeBlobGetJson {
             index: 0,
             size: entry.orig_size,
             is_note: entry.is_kr_note(),
             text: entry.as_text(),
             kind,
-            ssh_cert,
             hex: hex_encode(&entry.ciphertext),
         };
         assert!(!g.is_note);
@@ -25073,14 +24958,13 @@ mod cli_tests {
     #[test]
     fn large_blob_get_json_includes_note_text() {
         let entry = LargeBlobEntry::from_text("a note");
-        let (kind, ssh_cert, _) = large_blob_kind(&entry);
+        let (kind, _) = large_blob_kind(&entry);
         let g = json_out::FidoLargeBlobGetJson {
             index: 3,
             size: entry.orig_size,
             is_note: entry.is_kr_note(),
             text: entry.as_text(),
             kind,
-            ssh_cert,
             hex: hex_encode(&entry.ciphertext),
         };
         assert!(g.is_note);
@@ -25092,21 +24976,17 @@ mod cli_tests {
 
     #[test]
     fn large_blob_kind_classifies_note_and_opaque() {
-        // Note entries classify as "note" with no ssh_cert payload.
         let note = LargeBlobEntry::from_text("hello");
-        let (kind, ssh_cert, classified) = large_blob_kind(&note);
+        let (kind, classified) = large_blob_kind(&note);
         assert_eq!(kind, "note");
-        assert!(ssh_cert.is_none());
         assert!(matches!(
             classified,
             keyroost_ctap::large_blobs::EntryKind::Note(t) if t == "hello"
         ));
 
-        // Unrecognized bytes classify as "opaque" with no ssh_cert payload.
         let opaque = opaque_entry();
-        let (kind, ssh_cert, classified) = large_blob_kind(&opaque);
+        let (kind, classified) = large_blob_kind(&opaque);
         assert_eq!(kind, "opaque");
-        assert!(ssh_cert.is_none());
         assert!(matches!(
             classified,
             keyroost_ctap::large_blobs::EntryKind::Opaque
@@ -25189,7 +25069,14 @@ mod cli_tests {
             "/tmp/out-cert.pub",
             "--as-cert"
         ])
-        .is_ok());
+        .is_err());
+        // The removed --as-cert says where certificates are saved now.
+        let argv: Vec<String> = ["keyroostctl", "fido", "blob", "export", "0", "--as-cert"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hint = retired_flag_hint("--as-cert", &argv).expect("a hint");
+        assert!(hint.contains("fido ssh export"), "{hint}");
     }
 
     #[test]

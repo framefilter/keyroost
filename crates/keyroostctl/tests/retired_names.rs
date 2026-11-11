@@ -695,6 +695,18 @@ const CASES: &[(&[&str], &str)] = &[
         "--customer-key env:VAR --customer-key-encoding ascii",
     ),
     (
+        &[
+            "fido",
+            "blob",
+            "export",
+            "0",
+            "--out",
+            "S3CRETVALUE",
+            "--as-cert",
+        ],
+        "keyroostctl fido ssh export",
+    ),
+    (
         &["molto", "customer-key", "change", "--hex", "S3CRETVALUE"],
         "--new-customer-key env:NAME (hex is the default encoding)",
     ),

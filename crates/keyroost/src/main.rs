@@ -5405,7 +5405,6 @@ impl App {
                                 self.piv_export_cert();
                             }
                             FileTarget::LbExport(idx) => {
-                                use keyroost_ctap::large_blobs::EntryKind;
                                 // The array may have been reloaded, cleared, or
                                 // shrunk between the Export click and the dialog
                                 // resolving — fail loudly instead of writing the
@@ -5419,26 +5418,13 @@ impl App {
                                     None => {
                                         format!("Export failed: entry {idx} no longer exists")
                                     }
-                                    Some(entry) => {
-                                        let bytes = match entry.classify() {
-                                            EntryKind::SshCert { cert_pub, .. } => {
-                                                Some(cert_pub.into_bytes())
-                                            }
-                                            _ => Some(entry.ciphertext.clone()),
-                                        };
-                                        match bytes {
-                                            None => "Export failed: could not re-encode \
-                                                     certificate"
-                                                .into(),
-                                            Some(bytes) => match std::fs::write(&path, &bytes) {
-                                                Ok(()) => format!(
-                                                    "Exported entry {idx} ({} bytes) to {text}",
-                                                    bytes.len()
-                                                ),
-                                                Err(e) => format!("Export failed: {e}"),
-                                            },
-                                        }
-                                    }
+                                    Some(entry) => match std::fs::write(&path, &entry.ciphertext) {
+                                        Ok(()) => format!(
+                                            "Exported entry {idx} ({} bytes) to {text}",
+                                            entry.ciphertext.len()
+                                        ),
+                                        Err(e) => format!("Export failed: {e}"),
+                                    },
                                 });
                             }
                             FileTarget::SshCertSave(id) => {
@@ -21293,10 +21279,6 @@ impl App {
                         let meta = match &classification {
                             EntryKind::Note(_) => "keyroost text note".to_string(),
                             EntryKind::KeyName(l) => device::key_name_row_text(&l.label),
-                            EntryKind::SshCert { .. } => format!(
-                                "ssh-cert \u{00b7} {} bytes \u{00b7} relying-party data",
-                                entry.ciphertext.len(),
-                            ),
                             EntryKind::Opaque => format!(
                                 "{} bytes ciphertext \u{00b7} {}-byte nonce \u{00b7} origSize {} \u{00b7} relying-party data",
                                 entry.ciphertext.len(),
@@ -21335,13 +21317,7 @@ impl App {
                         // Export is read-only, so it's always available
                         // regardless of session lock state.
                         if theme::button(ui, p, BtnKind::Ghost, "Export\u{2026}").clicked() {
-                            let is_cert =
-                                matches!(classification, EntryKind::SshCert { .. });
-                            let default_name = if is_cert {
-                                format!("entry-{idx}-cert.pub")
-                            } else {
-                                format!("large-blob-entry-{idx}.bin")
-                            };
+                            let default_name = format!("large-blob-entry-{idx}.bin");
                             app.spawn_file_dialog(
                                 FileTarget::LbExport(idx),
                                 true,
@@ -21352,8 +21328,8 @@ impl App {
                     },
                 );
                 // keyroost notes: inline editor when editing this entry, else
-                // the decoded text read-only. SSH certificates get a parsed
-                // field-by-field view; anything else (opaque RP data) shows
+                // the decoded text read-only. Anything else (opaque RP data,
+                // which includes an SSH credential's certificate) shows
                 // nothing extra here — its bytes remain available via "View
                 // bytes" below.
                 if editing == Some(idx) {
@@ -21393,63 +21369,6 @@ impl App {
                             .font(theme::f_reg(12.5))
                             .color(p.txt),
                     );
-                } else if let EntryKind::SshCert { info, .. } = &classification {
-                    ui.add_space(6.0);
-                    egui::Grid::new(format!("lb_cert_{idx}"))
-                        .num_columns(2)
-                        .spacing([12.0, 2.0])
-                        .show(ui, |ui| {
-                            let row = |ui: &mut egui::Ui, k: &str, v: String| {
-                                ui.label(
-                                    egui::RichText::new(k).font(theme::f_reg(11.5)).color(p.txt3),
-                                );
-                                ui.label(
-                                    egui::RichText::new(v).font(theme::f_reg(11.5)).color(p.txt),
-                                );
-                                ui.end_row();
-                            };
-                            let kind = if info.cert_type
-                                == keyroost_ctap::ssh_cert::CERT_TYPE_USER
-                            {
-                                "user"
-                            } else {
-                                "host"
-                            };
-                            row(ui, "Type", format!("{} ({kind})", info.key_type));
-                            row(ui, "Key ID", info.key_id.clone());
-                            row(ui, "Serial", info.serial.to_string());
-                            row(
-                                ui,
-                                "Principals",
-                                if info.principals.is_empty() {
-                                    "(any)".to_string()
-                                } else {
-                                    info.principals.join(", ")
-                                },
-                            );
-                            row(
-                                ui,
-                                "Valid",
-                                keyroost_ctap::ssh_cert::format_validity(
-                                    info.valid_after,
-                                    info.valid_before,
-                                ),
-                            );
-                            for (n, v) in &info.critical_options {
-                                row(
-                                    ui,
-                                    "Critical",
-                                    if v.is_empty() {
-                                        n.clone()
-                                    } else {
-                                        format!("{n}={v}")
-                                    },
-                                );
-                            }
-                            for ext in &info.extensions {
-                                row(ui, "Extension", ext.clone());
-                            }
-                        });
                 }
                 if selected == Some(idx) {
                     ui.add_space(8.0);
