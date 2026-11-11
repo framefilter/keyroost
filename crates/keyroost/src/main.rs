@@ -3167,16 +3167,44 @@ const WINDOW_SIZE: [f32; 2] = [1180.0, 760.0];
 /// The smallest the window may get, in points.
 const WINDOW_MIN_SIZE: [f32; 2] = [900.0, 560.0];
 
+/// Points kept free at the bottom of the screen for a taskbar (Windows 11's
+/// is 48 at every display scaling).
+const SCREEN_BAR: f32 = 48.0;
+/// Points a title bar takes above the window's contents.
+const TITLE_BAR: f32 = 32.0;
+
 /// The size to shrink a window of `inner` points to so it fits a screen of
 /// `monitor` points with room for a taskbar and the title bar, or `None`
 /// when it already fits. Never below [`WINDOW_MIN_SIZE`].
 fn window_size_for_screen(inner: egui::Vec2, monitor: egui::Vec2) -> Option<egui::Vec2> {
-    let room = egui::vec2(monitor.x * 0.95, monitor.y * 0.88);
+    let room = egui::vec2(monitor.x * 0.95, monitor.y - SCREEN_BAR - TITLE_BAR);
     if inner.x <= room.x && inner.y <= room.y {
         return None;
     }
     let min = egui::Vec2::from(WINDOW_MIN_SIZE);
     Some(inner.min(room).max(min))
+}
+
+/// Where to move a window whose frame is `outer` so it sits wholly on a
+/// screen of `monitor` points, above the taskbar, or `None` when it already
+/// does. The system picks the start-up position without knowing the size the
+/// window ends up with, so a window that fits can still start with its
+/// bottom edge under the taskbar. A window whose corner is outside this
+/// screen is on another one and is left alone: only this screen's size is
+/// known.
+fn window_pos_for_screen(outer: egui::Rect, monitor: egui::Vec2) -> Option<egui::Pos2> {
+    if !egui::Rect::from_min_size(egui::Pos2::ZERO, monitor).contains(outer.min) {
+        return None;
+    }
+    let pos = egui::pos2(
+        outer.min.x.min(monitor.x - outer.width()).max(0.0),
+        outer
+            .min
+            .y
+            .min(monitor.y - SCREEN_BAR - outer.height())
+            .max(0.0),
+    );
+    (pos != outer.min).then_some(pos)
 }
 
 fn touch_prompt(
@@ -6516,11 +6544,24 @@ impl App {
         if self.window_fit_frames == u8::MAX {
             return;
         }
-        let (monitor, inner) = ctx.input(|i| (i.viewport().monitor_size, i.viewport().inner_rect));
+        let (monitor, inner, outer) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.monitor_size, v.inner_rect, v.outer_rect)
+        });
         if let (Some(monitor), Some(inner)) = (monitor, inner) {
             self.window_fit_frames = u8::MAX;
-            if let Some(size) = window_size_for_screen(inner.size(), monitor) {
+            let size = window_size_for_screen(inner.size(), monitor);
+            if let Some(size) = size {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+            // The frame (title bar, borders) keeps its size through the resize.
+            if let Some(outer) = outer {
+                let frame = outer.size() - inner.size();
+                let fitted =
+                    egui::Rect::from_min_size(outer.min, size.unwrap_or(inner.size()) + frame);
+                if let Some(pos) = window_pos_for_screen(fitted, monitor) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                }
             }
         } else if self.window_fit_frames >= 30 {
             self.window_fit_frames = u8::MAX;
@@ -31376,7 +31417,7 @@ mod tests {
         let default = egui::Vec2::from(WINDOW_SIZE);
         let fitted = window_size_for_screen(default, egui::vec2(1024.0, 640.0)).expect("shrinks");
         assert!(fitted.x <= 1024.0 * 0.95 && fitted.y <= 640.0, "{fitted:?}");
-        assert_eq!(fitted, egui::vec2(972.8, 563.2));
+        assert_eq!(fitted, egui::vec2(972.8, 560.0));
         assert_eq!(
             window_size_for_screen(default, egui::vec2(1920.0, 1080.0)),
             None
@@ -31385,6 +31426,34 @@ mod tests {
         assert_eq!(
             window_size_for_screen(default, egui::vec2(800.0, 500.0)),
             Some(egui::Vec2::from(WINDOW_MIN_SIZE))
+        );
+        // 1280×800 at 100%: the height leaves the taskbar and title bar free.
+        assert_eq!(
+            window_size_for_screen(default, egui::vec2(1280.0, 800.0)),
+            Some(egui::vec2(1180.0, 720.0))
+        );
+    }
+
+    /// Windows opens the window 26 pixels down; with its frame the fitted
+    /// window then ended 10 pixels under the taskbar on a 1280×800 screen.
+    /// It moves up just enough, stays put when it is on screen already, and
+    /// a window on a second screen is not pulled onto this one.
+    #[test]
+    fn the_window_moves_up_from_under_the_taskbar() {
+        let screen = egui::vec2(1280.0, 800.0);
+        let frame =
+            |x: f32, y: f32| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(1196.0, 743.0));
+        assert_eq!(
+            window_pos_for_screen(frame(26.0, 26.0), screen),
+            Some(egui::pos2(26.0, 9.0))
+        );
+        assert_eq!(window_pos_for_screen(frame(26.0, 9.0), screen), None);
+        assert_eq!(window_pos_for_screen(frame(1400.0, 26.0), screen), None);
+        // Taller than the screen can hold: the top edge stays on screen.
+        let tall = egui::Rect::from_min_size(egui::pos2(26.0, 26.0), egui::vec2(1196.0, 790.0));
+        assert_eq!(
+            window_pos_for_screen(tall, screen),
+            Some(egui::pos2(26.0, 0.0))
         );
     }
 
