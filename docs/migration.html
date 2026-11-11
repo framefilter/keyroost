@@ -61,6 +61,103 @@
 
 <main class="kr-wrap">
 
+  <section class="kr-section" id="v0-16-0">
+    <h2>v0.16.0</h2>
+    <p>One flag is removed: <code>fido blob export --as-cert</code> (use
+      <code>fido ssh export</code>). A few JSON values change and one field is
+      deprecated. Building from source needs Rust 1.89 for the library crates
+      and the CLI (was 1.87) and Rust 1.95 for the app (was 1.92); packaged
+      builds are unaffected. Library consumers: several public structs gain
+      fields, and one enum variant, one trait method and two functions change
+      (see the table at the end).</p>
+    <h3>CLI</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td><code>keyroostctl fido blob export 1 --out id-cert.pub --as-cert</code></td>
+        <td><code>keyroostctl fido ssh export --rp ssh:demo --out id-cert.pub</code>.
+          A certificate stored for an SSH credential is encrypted under that
+          credential, so only the PIN-backed command can read it;
+          <code>--as-cert</code> now stops with that pointer.</td></tr>
+      <tr><td>A Nitrokey's hex serial in lower case on the key line
+          (<code>42682ef7</code>)</td>
+        <td>Capitals, as <code>openpgp info</code> and GnuPG show it
+          (<code>42682EF7</code>). <code>-d serial:</code> matches either case.</td></tr>
+      <tr><td>The <code>→</code> key line and <code>list</code> named a FIDO2 key
+          by its USB name (<code>YubiKey</code>)</td>
+        <td>By the model its FIDO2 info identifies (<code>YubiKey 5 Series
+          with NFC</code>), as the app does; the USB name where the key can't
+          be read (Windows without administrator rights).</td></tr>
+    </table>
+    </div>
+    <h3>JSON output</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td><code>openpgp --json info</code>: <code>"serial"</code> the card's
+          four serial bytes as one decimal number (<code>"931162176"</code> for
+          YubiKey 37806840, <code>"1114124023"</code> for Nitrokey&nbsp;3
+          42682EF7)</td>
+        <td>The serial as the key names it and GnuPG prints it
+          (<code>"37806840"</code>, <code>"42682EF7"</code>). A Token2 key's
+          full serial is unchanged.</td></tr>
+      <tr><td><code>fido pin status --json</code>: only
+          <code>"pin_retries"</code>, a number even on a key with no PIN</td>
+        <td>Also <code>"pin_set"</code>; <code>"pin_retries"</code> is
+          <code>null</code> when no PIN is set.</td></tr>
+      <tr><td><code>piv --json info</code>: <code>"version_firmware"</code></td>
+        <td><code>"firmware"</code>, as in <code>fido --json info</code>.
+          <code>"version_firmware"</code> still carries the same value but is
+          deprecated.</td></tr>
+      <tr><td><code>fido blob --json list</code> / <code>show</code>:
+          <code>"kind"</code> could be <code>"ssh-cert"</code>, with an
+          <code>"ssh_cert"</code> object</td>
+        <td><code>"kind"</code> is <code>"note"</code>,
+          <code>"key-name"</code> or <code>"opaque"</code>; no
+          <code>"ssh_cert"</code> field.</td></tr>
+      <tr><td><code>list --json</code>: a FIDO2 key's <code>"model"</code> its
+          USB name</td>
+        <td>The model from its FIDO2 info, as on the text line above.</td></tr>
+    </table>
+    </div>
+    <h3>Library (crates.io) API changes</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Crate</th><th>Change</th></tr>
+      <tr><td><code>keyroost-ctap</code></td>
+        <td><code>large_blobs::EntryKind::SshCert</code> is removed: an entry
+          holding an unencrypted certificate classifies as
+          <code>Opaque</code>. <code>extract_cert_from_entries</code> returns
+          <code>Option&lt;ssh_cert::StoredCert&gt;</code> (was
+          <code>Option&lt;Vec&lt;u8&gt;&gt;</code>), carrying the parsed
+          certificate, its binary form and the <code>-cert.pub</code> text, and
+          reads both the binary and the text form a client may store. New:
+          <code>ssh_cert::from_stored</code>.</td></tr>
+      <tr><td><code>keyroost-oath</code></td>
+        <td><code>Listing::touch_required</code> is
+          <code>Option&lt;Vec&lt;String&gt;&gt;</code> (was
+          <code>Vec&lt;String&gt;</code>): <code>None</code> for a plain
+          listing, which doesn't say which accounts need a touch.</td></tr>
+      <tr><td><code>keyroost-import</code></td>
+        <td><code>PlanRow</code> gains <code>touch: bool</code>, and
+          <code>CodeStore::add</code> takes a third parameter,
+          <code>touch: bool</code> (write the code as requiring a touch). New:
+          <code>Plan::set_touch</code>.</td></tr>
+      <tr><td><code>keyroost-resolve</code></td>
+        <td><code>Device</code> gains <code>former_serial:
+          Option&lt;String&gt;</code> (struct literals need the new
+          field).</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td><code>ReaderProbe</code> gains <code>former_serial:
+          Option&lt;String&gt;</code>. <code>trace::begin</code> and
+          <code>trace::take</code> moved to <code>keyroost_proto::trace</code>,
+          which every transport now records into.</td></tr>
+      <tr><td><code>keyroost-pgpkey</code></td>
+        <td>New: <code>keys::GPG_PUBLIC_KEY_HINT</code>.</td></tr>
+    </table>
+    </div>
+  </section>
+
   <section class="kr-section" id="v0-15-0">
     <h2>v0.15.0</h2>
     <p>No command or flag is renamed or removed (<code>piv key import</code>
