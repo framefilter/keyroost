@@ -3162,6 +3162,23 @@ fn oath_delete_label(applet_asks: bool, touch_account: bool) -> &'static str {
 /// job's own label when it asks for a touch, else a plain prompt once the key
 /// itself reports it is waiting for one, else a hedged one while the job
 /// runs a step the card may ask a touch for ([`KEY_MAY_ASK_TOUCH`]).
+/// The window's size at start-up, in points.
+const WINDOW_SIZE: [f32; 2] = [1180.0, 760.0];
+/// The smallest the window may get, in points.
+const WINDOW_MIN_SIZE: [f32; 2] = [900.0, 560.0];
+
+/// The size to shrink a window of `inner` points to so it fits a screen of
+/// `monitor` points with room for a taskbar and the title bar, or `None`
+/// when it already fits. Never below [`WINDOW_MIN_SIZE`].
+fn window_size_for_screen(inner: egui::Vec2, monitor: egui::Vec2) -> Option<egui::Vec2> {
+    let room = egui::vec2(monitor.x * 0.95, monitor.y * 0.88);
+    if inner.x <= room.x && inner.y <= room.y {
+        return None;
+    }
+    let min = egui::Vec2::from(WINDOW_MIN_SIZE);
+    Some(inner.min(room).max(min))
+}
+
 fn touch_prompt(
     label: Option<&str>,
     busy: bool,
@@ -4673,8 +4690,8 @@ fn main() -> eframe::Result<()> {
         let apdu_trace = apdu_trace.clone();
         let mut options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([1180.0, 760.0])
-                .with_min_inner_size([900.0, 560.0])
+                .with_inner_size(WINDOW_SIZE)
+                .with_min_inner_size(WINDOW_MIN_SIZE)
                 .with_title("keyroost")
                 .with_icon(window_icon()),
             ..Default::default()
@@ -4896,6 +4913,9 @@ struct App {
     /// The selection `retry_dropped_info_read` already retried its info
     /// read for (once per selection).
     info_retried_for: Option<DeviceId>,
+    /// Frames spent waiting to learn the screen's size at start-up, for
+    /// [`App::fit_window_to_screen`]; `u8::MAX` once that is settled.
+    window_fit_frames: u8,
     /// The key a finished job ran on, set only while its outcome is applied
     /// after another key was selected ([`Self::apply_piv_job`]): log lines
     /// then name this key, not the selected one.
@@ -6055,16 +6075,18 @@ impl App {
         // line that closure produces, then consumed so a later, unrelated log
         // call in the same frame doesn't also claim it.
         let trace = self.pending_trace.take().filter(|t| !t.is_empty());
+        // A file path in a message (a backup's, an import's) names the
+        // person's home folder; the log is meant to be pasted into bug
+        // reports, so that part shows as `~`, and the status bar's note
+        // matches the log line it repeats.
+        let text = without_home(&text);
         if let Some(note) = StatusNote::for_log_line(severity, kind, &text) {
             self.status_note = Some(note);
         }
         self.log.push(LogLine {
             severity,
             kind,
-            // A file path in a message (a backup's, an import's) names the
-            // person's home folder; the log is meant to be pasted into bug
-            // reports, so that part shows as `~`.
-            text: without_home(&text),
+            text,
             trace,
         });
         // Keep the log bounded; oldest entries are least interesting.
@@ -6479,6 +6501,28 @@ impl App {
             "not authenticated; click Authenticate first",
         );
         false
+    }
+
+    /// Shrink the window at start-up when it opened larger than the screen:
+    /// its size is in points, so display scaling (125% on a 1280×800 screen)
+    /// can make the default bigger than the screen. Waits a few frames for
+    /// the screen's size, which not every system reports at once (Wayland
+    /// never does), then leaves the window to the person.
+    fn fit_window_to_screen(&mut self, ctx: &egui::Context) {
+        if self.window_fit_frames == u8::MAX {
+            return;
+        }
+        let (monitor, inner) = ctx.input(|i| (i.viewport().monitor_size, i.viewport().inner_rect));
+        if let (Some(monitor), Some(inner)) = (monitor, inner) {
+            self.window_fit_frames = u8::MAX;
+            if let Some(size) = window_size_for_screen(inner.size(), monitor) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+        } else if self.window_fit_frames >= 30 {
+            self.window_fit_frames = u8::MAX;
+        } else {
+            self.window_fit_frames += 1;
+        }
     }
 
     /// Start the selected key's info read when the one its selection
@@ -11129,7 +11173,7 @@ impl App {
             ctx,
             "Reset PIV applet?",
             "This wipes ALL PIV keys, certificates, and PINs.",
-            &["Only works when the PIN and PUK are already blocked."],
+            &["keyroost blocks the PIN and PUK first where the key needs that."],
             &mut self.piv.confirm_reset,
         ) && self.piv_reset()
         {
@@ -16588,6 +16632,7 @@ impl eframe::App for App {
         // thread before drawing.
         self.drain_worker();
         self.retry_dropped_info_read();
+        self.fit_window_to_screen(ctx);
         // While a device job is in flight (e.g. fingerprint enrollment writing
         // live progress to a shared cell), keep the frame loop ticking so the UI
         // reflects per-sample updates instead of freezing until the job ends.
@@ -31303,6 +31348,52 @@ mod tests {
 
     /// The home folder in a log line shows as `~`, only where it is a whole
     /// path part: a home of `/home/al` leaves `/home/alice` alone.
+    /// At 125% a 1280×800 screen is 1024×640 points: the default window
+    /// (1180×760) shrinks to fit, not below its minimum; on a big screen it
+    /// stays as it is.
+    #[test]
+    fn the_window_shrinks_to_fit_a_small_screen() {
+        let default = egui::Vec2::from(WINDOW_SIZE);
+        let fitted = window_size_for_screen(default, egui::vec2(1024.0, 640.0)).expect("shrinks");
+        assert!(fitted.x <= 1024.0 * 0.95 && fitted.y <= 640.0, "{fitted:?}");
+        assert_eq!(fitted, egui::vec2(972.8, 563.2));
+        assert_eq!(
+            window_size_for_screen(default, egui::vec2(1920.0, 1080.0)),
+            None
+        );
+        // A screen smaller than the minimum gets the minimum.
+        assert_eq!(
+            window_size_for_screen(default, egui::vec2(800.0, 500.0)),
+            Some(egui::Vec2::from(WINDOW_MIN_SIZE))
+        );
+    }
+
+    /// The status bar's note repeats its log line as the log shows it,
+    /// home folder as `~`.
+    #[test]
+    fn the_status_note_shows_the_home_folder_as_a_tilde() {
+        let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .ok()
+            .filter(|h| h.trim_end_matches(['/', '\\']).len() > 1);
+        let Some(home) = home else {
+            return; // no usable home folder in this environment
+        };
+        let sep = if cfg!(windows) { '\\' } else { '/' };
+        let home = home.trim_end_matches(['/', '\\']);
+        let mut app = App::default();
+        app.log_global(
+            Severity::Ok,
+            LogKind::User,
+            format!("Saved the backup to {home}{sep}kr-test.asc"),
+        );
+        let note = app.status_note.as_ref().expect("a user line makes a note");
+        assert_eq!(note.text, format!("Saved the backup to ~{sep}kr-test.asc"));
+        assert_eq!(
+            app.log.last().map(|l| l.text.as_str()),
+            Some(note.text.as_str())
+        );
+    }
+
     #[test]
     fn log_lines_show_the_home_folder_as_a_tilde() {
         assert_eq!(

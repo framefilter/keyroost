@@ -496,6 +496,8 @@ pub struct ImportDialog {
     pub existing: Option<KeyContents>,
     /// The preview job is reading the key.
     pub reading: bool,
+    /// The window's size last frame: a change asks for one more frame.
+    pub last_size: Option<egui::Vec2>,
     /// A preview should be read as soon as no device job runs.
     pub preview_wanted: bool,
     /// About the chosen key (couldn't read it, wrong password, changed).
@@ -1551,7 +1553,7 @@ impl App {
         let mut do_auth = false;
         let mut do_unlock = false;
         let mut picked: Option<DestKey> = None;
-        egui::Window::new("Import authenticator codes")
+        let shown = egui::Window::new("Import authenticator codes")
             .open(&mut open)
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -1899,6 +1901,17 @@ impl App {
                     );
                 }
             });
+        // The window sizes itself to last frame's contents, and they grow
+        // when the file's entries or the key's preview arrive from a
+        // background job. Draw again until the size holds, so the buttons
+        // aren't left cut off until the mouse moves.
+        if let Some(shown) = shown {
+            let size = shown.response.rect.size();
+            if d.last_size != Some(size) {
+                d.last_size = Some(size);
+                ctx.request_repaint();
+            }
+        }
 
         // Apply Close and [X] only now, after the window is drawn; every
         // route wipes both secrets and drops the entries. A running import
