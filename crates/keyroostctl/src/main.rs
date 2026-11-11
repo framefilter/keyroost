@@ -1584,8 +1584,8 @@ enum OpenpgpCmd {
     },
     /// Decrypt a file with the key in the decryption slot.
     ///
-    /// Runs PSO:DECIPHER. Needs the user PIN (PW1) and, on a YubiKey, a
-    /// touch.
+    /// Runs PSO:DECIPHER. Needs the user PIN (PW1), and a touch when the
+    /// slot's touch setting is on.
     Decrypt {
         /// For an RSA slot `--in` is the raw cryptogram; for an ECDH slot it is
         /// the sender's ephemeral public point (`04||X||Y`, or 32 raw bytes for

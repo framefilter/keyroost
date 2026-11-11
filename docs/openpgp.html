@@ -150,6 +150,12 @@
 gpg --card-status             # links the card's keys to it</code></pre>
     <p>Alternatively, on an offline machine you trust, <code>gpg --import NAME.asc</code>
       (it asks for the passphrase) to hold the secret keys in GnuPG itself.</p>
+    <p>A key generated on the card, or imported from a bare RSA key file, comes with no
+      public key file. keyroost records the key's fingerprint and creation time on the
+      card, so GnuPG can build the matching public key: run <code>gpg --card-status</code>,
+      then <code>gpg --full-gen-key --expert</code> and choose <strong>Existing key from
+      card</strong>. GnuPG asks for the card's user PIN, not the admin PIN. keyroost says
+      this after each such key.</p>
     <h3>From the command line</h3>
 <pre><code>keyroostctl openpgp key import --generate --backup alice --name "Alice Example" --email alice@example.com --algorithm ed25519 --expires 3y
 keyroostctl openpgp key import --in alice.asc          # restore onto a card</code></pre>
@@ -213,12 +219,12 @@ keyroostctl openpgp key expiry --set never --public alice.pub.asc --backup alice
         a PIN without changing anything; <strong>generate</strong> keys on-card in any
         algorithm the card accepts — RSA 2048/3072/4096, Ed25519, X25519, NIST P-256/384/521,
         secp256k1, brainpool — the choice offered from the card's own algorithm list
-        (<code>keyroostctl openpgp key algorithms</code>), or <strong>import</strong> keys &mdash; an RSA key file (PKCS#1/PKCS#8 PEM/DER, 2048 to 4096 bits) or a backup (see <a href="#backup">Keys with a backup</a>) &mdash; for the sign, decrypt, or
+        (<code>keyroostctl openpgp key algorithms</code>), or <strong>import</strong> keys &mdash; an RSA key file (PKCS#1/PKCS#8 PEM/DER, 2048, 3072 or 4096 bits) or a backup (see <a href="#backup">Keys with a backup</a>) &mdash; for the sign, decrypt, or
         <strong>auth</strong> slot (<code>--slot decrypt</code>, <code>--slot auth</code>);
         <strong>sign</strong> (SHA-256 or
         SHA-1), <strong>decrypt</strong>, and <strong>authenticate</strong> (client/SSH
-        signature with the Authentication key); set cardholder name / URL; register a key for
-        GnuPG; <strong>change the user or admin PIN</strong> and <strong>unblock a
+        signature with the Authentication key); set cardholder name / URL; record each key's
+        fingerprint and creation time when it is written, so GnuPG recognizes it; <strong>change the user or admin PIN</strong> and <strong>unblock a
         locked PIN</strong> (via the admin PIN / PW3); and factory-reset the applet. The
         output of <code>sign</code>/<code>authenticate</code> is the card's raw signature:
         PKCS#1 for RSA, <code>r||s</code> (not DER) for ECDSA, <code>R||S</code> for

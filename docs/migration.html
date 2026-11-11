@@ -68,8 +68,8 @@
       deprecated. Building from source needs Rust 1.89 for the library crates
       and the CLI (was 1.87) and Rust 1.95 for the app (was 1.92); packaged
       builds are unaffected. Library consumers: several public structs gain
-      fields, and one enum variant, one trait method and two functions change
-      (see the table at the end).</p>
+      fields, one field changes type, one enum variant is removed, and one trait
+      method and one function change signature (see the table at the end).</p>
     <h3>CLI</h3>
     <div class="kr-table-wrap">
     <table class="kr-table">
@@ -88,6 +88,16 @@
         <td>By the model its FIDO2 info identifies (<code>YubiKey 5 Series
           with NFC</code>), as the app does; the USB name where the key can't
           be read (Windows without administrator rights).</td></tr>
+      <tr><td><code>piv cert generate --generate-key</code> /
+          <code>piv cert request --generate-key</code> with a key type, PIN
+          policy or touch policy keyroost's list marks unsupported for the key:
+          sent to the card</td>
+        <td>Refused before the management key is sent, unless
+          <code>--force</code>, as <code>piv key generate</code> does.</td></tr>
+      <tr><td><code>oath delete NAME</code> on a Solo&nbsp;2, for a name the key
+          doesn't hold: reported done (exit 0)</td>
+        <td>Stops with <code>no OATH credential named "NAME" on this key;
+          nothing was deleted</code>, as on other keys.</td></tr>
     </table>
     </div>
     <h3>JSON output</h3>
@@ -99,8 +109,9 @@
           YubiKey 37806840, <code>"1114124023"</code> for Nitrokey&nbsp;3
           42682EF7)</td>
         <td>The serial as the key names it and GnuPG prints it
-          (<code>"37806840"</code>, <code>"42682EF7"</code>). A Token2 key's
-          full serial is unchanged.</td></tr>
+          (<code>"37806840"</code>, <code>"42682EF7"</code>); the text line
+          changes the same way. A Token2 key's full serial, read from its OTP
+          applet, is unchanged.</td></tr>
       <tr><td><code>fido pin status --json</code>: only
           <code>"pin_retries"</code>, a number even on a key with no PIN</td>
         <td>Also <code>"pin_set"</code>; <code>"pin_retries"</code> is
@@ -150,8 +161,15 @@
       <tr><td><code>keyroost-transport</code></td>
         <td><code>ReaderProbe</code> gains <code>former_serial:
           Option&lt;String&gt;</code>. <code>trace::begin</code> and
-          <code>trace::take</code> moved to <code>keyroost_proto::trace</code>,
-          which every transport now records into.</td></tr>
+          <code>trace::take</code> now live in <code>keyroost_proto::trace</code>,
+          which every transport records into; <code>keyroost_transport::trace</code>
+          still re-exports them, so existing calls compile.</td></tr>
+      <tr><td><code>keyroost-piv</code></td>
+        <td><code>PivQuirk</code> (<code>#[non_exhaustive]</code>) gains
+          <code>DefaultPinPuk</code>, <code>NoTouchToGenerateOrImport</code> and
+          <code>NeverAsksForTouch</code>, which shifts the derived
+          <code>PartialOrd</code>/<code>Ord</code> order of the variants after
+          them.</td></tr>
       <tr><td><code>keyroost-pgpkey</code></td>
         <td>New: <code>keys::GPG_PUBLIC_KEY_HINT</code>.</td></tr>
     </table>

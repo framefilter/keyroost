@@ -110,14 +110,16 @@
       <div class="kr-callout-title note">The management key</div>
       <p>Separate from the PIN, a third credential — the <em>management key</em> — gates
         administrative changes: generating keys, importing certificates, and changing retry
-        counts. Most cards ship with a well-known factory default
-        (<code>010203…0708</code>, repeated to fill the key), so anyone can administer a
-        fresh card. If you rely on PIV day-to-day, change it — keyroost can change it to a
-        new key you supply (generate a random one and keep it somewhere safe, such as a
-        password manager). Lose a changed key and
-        no admin changes are possible until a full applet reset. On the command line,
-        <code>--mgmt-key default</code> uses the card's factory default when keyroost knows
-        it for that card.</p>
+        counts. Most cards ship with a well-known factory default (on a YubiKey
+        <code>010203…0708</code>, repeated to fill the key; some vendors, such as Token2
+        and Feitian, use their own), so anyone can administer a fresh card. If you rely on
+        PIV day-to-day, change it — keyroost can change it to a new key you supply, or the
+        app can generate a random one (keep it somewhere safe, such as a password manager).
+        Lose a changed key and no admin changes are possible until a full applet reset. On
+        the command line, <code>--mgmt-key default</code> uses the card's factory default
+        when keyroost knows it for that card, and <code>piv mgmt-key change --new-mgmt-key
+        default</code> sets it back to that default; in the app, the change dialog's
+        <strong>Use the factory default</strong> link does the same.</p>
     </div>
   </section>
 
@@ -167,8 +169,8 @@ keyroostctl piv pin change                             # asks for the current PI
       <code>--in</code>.</p>
     <p>Both <code>cert</code> commands take <code>--generate-key</code> to generate the
       slot's key in the same step (with the same <code>--algorithm</code>,
-      <code>--pin-policy</code> and <code>--touch-policy</code> options as <code>key
-      generate</code>), which spares cards without GET METADATA the
+      <code>--pin-policy</code>, <code>--touch-policy</code> and <code>--force</code>
+      options as <code>key generate</code>), which spares cards without GET METADATA the
       <code>--pubkey-out</code> / <code>--pubkey-in</code> detour.</p>
     <span id="certificates"></span>
     <span id="slot-states"></span>
@@ -235,7 +237,8 @@ keyroostctl piv key move --from 82 --to 9d   # bring it back</code></pre>
     <span id="test"></span>
     <p><strong>Testing a slot's key.</strong> <code>test</code> proves a slot's private key
       still works end to end, without changing anything on the card. keyroost reads the
-      slot's certificate, takes its public key, and builds a fixed challenge from it; the
+      slot's certificate (or, without one, the public key the card reports for the slot),
+      takes its public key, and builds a fixed challenge from it; the
       card then runs every private-key operation the key's algorithm supports and keyroost
       verifies each result against that same public key. The operations depend on the key
       type — <strong>decrypt</strong> for RSA, <strong>key-agree</strong> (ECDH) for
@@ -262,12 +265,12 @@ keyroostctl --json piv test --slot 9c --pin env:PIV_PIN</code></pre>
       <code>Decrypt: passed</code>, <code>Sign: FAILED — …</code>,
       <code>Key Agree: skipped — not supported for …</code> — and exits non-zero if any
       operation failed. With <code>--json</code> it emits
-      <code>{ slot, slot_name, algorithm, ok, operations: [ { operation, result, detail } … ] }</code>
+      <code>{ slot, slot_name, algorithm, cert_tested, ok, operations: [ { operation, result, detail } … ] }</code>
       instead: <code>slot</code> is the <code>--slot</code> value (<code>"9a"</code>),
       <code>slot_name</code> its label, and <code>detail</code> is the reason when the
       result is <code>failed</code>, otherwise <code>null</code>.
-      A slot with no certificate, or a key type keyroost can't verify, is an error — nothing
-      is tested.</p>
+      A slot with no key, a slot with neither a certificate nor a public key the card
+      reports, or a key type keyroost can't verify, is an error — nothing is tested.</p>
     <span id="new-chuid"></span>
     <p><strong>Writing a new CHUID.</strong> <code>chuid generate</code> writes a fresh Card Holder
       Unique Identifier with a randomly-generated GUID (or one you supply with
@@ -324,7 +327,8 @@ keyroostctl piv cert generate --slot 9a --subject "CN=Alice" --no-compress</code
       If the key can't do something, it just refuses. Reset isn't included: on the command
       line, <code>piv reset --force</code> sends a single reset without blocking the PIN or
       PUK. On the command
-      line, <code>key generate</code>, <code>mgmt-key change</code>,
+      line, <code>key generate</code>, <code>--generate-key</code> on <code>cert
+      generate</code> and <code>cert request</code>, <code>mgmt-key change</code>,
       <code>key move</code>, <code>key delete</code> and <code>reset</code> refuse such a
       feature unless you add <code>--force</code>, which also sends those reads. Each read
       skipped or sent anyway leaves a line in the <code>--debug</code> output and the app's

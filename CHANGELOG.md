@@ -285,8 +285,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fingerprint for it, so keyroost can't tell whether it is that key.
   ([#254])
 - **OpenPGP help no longer says a YubiKey always needs a touch.**
-  `openpgp sign`, `authenticate`, `key generate` and `key expiry` said
-  so; a touch is needed when the slot's touch setting is on. ([#254])
+  `openpgp sign`, `decrypt`, `authenticate`, `key generate` and
+  `key expiry` said so; a touch is needed when the slot's touch setting
+  is on. ([#254])
 - **A key selected while another was busy no longer stays on "Reading
   key…".** Its first read was refused while the other key's step ran, and
   only the FIDO2 tab tried again, so the Overview kept "Reading key…"

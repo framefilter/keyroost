@@ -54,8 +54,8 @@
   <div class="kr-wrap">
     <p class="kr-label">Learn · Token2 Molto2</p>
     <h1>Token2 Molto2</h1>
-    <p class="kr-lede">A programmable hardware TOTP token: it shows rolling 6-digit codes on a
-      little screen, with no app, no battery anxiety, and no network — the original device
+    <p class="kr-lede">A programmable hardware TOTP token: it shows rolling one-time codes (6 digits by
+      default) on a little screen, with no app, no battery anxiety, and no network — the original device
       keyroost was built to program.</p>
   </div>
 </section>
@@ -157,8 +157,9 @@ keyroostctl molto import -i export.json --file-password env:EXPORT_PW   # encryp
       Molto2 tokens connected, a terminal shows a numbered list to pick from and a script
       names one with <code>--device</code> (the number <code>keyroostctl list</code> shows,
       or either serial keyroost shows for the token: the one in <code>keyroostctl
-      list</code> or the one <code>molto info</code> prints) or <code>--reader</code>; keyroost never uses the first one it finds. Molto2 tokens
-      can't be given a friendly name yet.</p>
+      list</code> or the one <code>molto info</code> prints) or <code>--reader</code>; keyroost never uses the first one it finds. On the command line, Molto2
+      tokens can't be given a friendly name yet; in the app, open the token and use
+      <strong>Name this token</strong> in its header.</p>
   </section>
 
   <section class="kr-section" id="single-profile">
