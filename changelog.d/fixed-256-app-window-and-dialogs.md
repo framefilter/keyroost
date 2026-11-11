@@ -5,4 +5,6 @@
   reset confirmation no longer says it only works with the PIN and PUK
   already blocked: keyroost blocks them first where the key needs that.
   In the dark theme, an unticked checkbox in a dialog ("Require touch",
-  "Use default management key") shows its box. ([#256])
+  "Use default management key") shows its box. The "touch your key"
+  banner sits under the key's name and tabs instead of over them.
+  ([#256])

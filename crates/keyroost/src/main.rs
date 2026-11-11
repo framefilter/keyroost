@@ -4916,6 +4916,10 @@ struct App {
     /// Frames spent waiting to learn the screen's size at start-up, for
     /// [`App::fit_window_to_screen`]; `u8::MAX` once that is settled.
     window_fit_frames: u8,
+    /// Where this frame's touch banner goes: the top middle of the key's
+    /// pane, just under its name and tabs ([`App::touch_banner`]). `None`
+    /// when no key's pane was drawn this frame.
+    touch_banner_at: Option<egui::Pos2>,
     /// The key a finished job ran on, set only while its outcome is applied
     /// after another key was selected ([`Self::apply_piv_job`]): log lines
     /// then name this key, not the selected one.
@@ -9931,36 +9935,41 @@ impl App {
         let Some(label) = self.touch_banner_text() else {
             return;
         };
-        egui::Area::new(egui::Id::unique("touch_banner"))
+        let area = egui::Area::new(egui::Id::unique("touch_banner"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame {
-                    inner_margin: egui::Margin::symmetric(18, 12),
-                    corner_radius: egui::CornerRadius::same(10),
-                    fill: p.pop,
-                    stroke: egui::Stroke::new(1.5, p.accent),
-                    shadow: egui::epaint::Shadow {
-                        offset: [0, 8],
-                        blur: 28,
-                        spread: 0,
-                        color: egui::Color32::from_black_alpha(90),
-                    },
-                    ..Default::default()
-                }
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(18.0).color(p.accent));
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(label)
-                                .font(theme::f_sb(15.0))
-                                .color(p.txt),
-                        );
-                    });
+            .interactable(false);
+        // Under the key's name and tabs when a key's pane is on screen;
+        // near the top of the window otherwise.
+        let area = match self.touch_banner_at {
+            Some(at) => area.pivot(egui::Align2::CENTER_TOP).fixed_pos(at),
+            None => area.anchor(egui::Align2::CENTER_TOP, [0.0, 64.0]),
+        };
+        area.show(ctx, |ui| {
+            egui::Frame {
+                inner_margin: egui::Margin::symmetric(18, 12),
+                corner_radius: egui::CornerRadius::same(10),
+                fill: p.pop,
+                stroke: egui::Stroke::new(1.5, p.accent),
+                shadow: egui::epaint::Shadow {
+                    offset: [0, 8],
+                    blur: 28,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(90),
+                },
+                ..Default::default()
+            }
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(18.0).color(p.accent));
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(label)
+                            .font(theme::f_sb(15.0))
+                            .color(p.txt),
+                    );
                 });
             });
+        });
     }
 
     /// Report a FIDO2 reset that will not happen, where it will be read.
@@ -16637,6 +16646,7 @@ impl eframe::App for App {
         self.drain_worker();
         self.retry_dropped_info_read();
         self.fit_window_to_screen(ctx);
+        self.touch_banner_at = None;
         // While a device job is in flight (e.g. fingerprint enrollment writing
         // live progress to a shared cell), keep the frame loop ticking so the UI
         // reflects per-sample updates instead of freezing until the job ends.
@@ -18593,6 +18603,12 @@ impl App {
                             .show(ui, |ui| {
                                 self.device_hero(ui, p, &dev);
                                 self.cap_tabs(ui, p, &dev);
+                                // The touch banner sits here, under the key's
+                                // name and tabs, so it covers neither.
+                                self.touch_banner_at = Some(egui::pos2(
+                                    ui.max_rect().center().x,
+                                    ui.cursor().top() + 8.0,
+                                ));
                                 ui.add_space(16.0);
                                 // Hero + tabs stay pinned; the active pane scrolls.
                                 // This is the one place every capability pane gets
