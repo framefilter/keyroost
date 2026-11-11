@@ -14,8 +14,8 @@ exclude = ["tests/"]
 workspace = true
 
 [dependencies]
-keyroost-proto = { path = "../keyroost-proto", version = "0.15.0" }
-keyroost-piv = { path = "../keyroost-piv", version = "0.15.0" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.16.0" }
+keyroost-piv = { path = "../keyroost-piv", version = "0.16.0" }
 # Legacy PKCS#12 files encrypt with 40-bit RC2 / 3DES under a SHA-1 KDF and
 # MAC; modern ones use PBES2 (PBKDF2 + AES-CBC). `rc2` is the one crate here
 # that is new to the workspace tree; it is pinned to the `cipher 0.5` line the
@@ -37,4 +37,4 @@ x25519-dalek = "3"
 # fixed a panic on a prime equal to 1.
 rsa = "0.9.10"
 zeroize = "1"
-keyroost-oath = { path = "../keyroost-oath", version = "0.15.0" }
+keyroost-oath = { path = "../keyroost-oath", version = "0.16.0" }

@@ -17,19 +17,19 @@ match-test-switch = []
 workspace = true
 
 [dependencies]
-keyroost-keyring = { path = "../keyroost-keyring", version = "0.15.0" }
-keyroost-hid = { path = "../keyroost-hid", version = "0.15.0" }
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.16.0" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.16.0" }
 # Reads the name a key stores on itself (large-blob label entry) during a scan.
-keyroost-ctap = { path = "../keyroost-ctap", version = "0.15.0" }
-keyroost-transport = { path = "../keyroost-transport", version = "0.15.0" }
-keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.15.0" }
-keyroost-proto = { path = "../keyroost-proto", version = "0.15.0" }
-keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.15.0" }
-keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.15.0" }
+keyroost-ctap = { path = "../keyroost-ctap", version = "0.16.0" }
+keyroost-transport = { path = "../keyroost-transport", version = "0.16.0" }
+keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.16.0" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.16.0" }
+keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.16.0" }
+keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.16.0" }
 # The bundled FIDO metadata (MDS) projection, a JSON list read at startup.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
 # Test builds resolve the config dir to a temp dir, never the real one.
-keyroost-keyring = { path = "../keyroost-keyring", version = "0.15.0", features = ["test-isolation"] }
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.16.0", features = ["test-isolation"] }

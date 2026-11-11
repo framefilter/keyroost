@@ -20,7 +20,7 @@ workspace = true
 jpeg-decoder = { version = "0.3.2", default-features = false }
 # `encrypted`: `open_file` decrypts Aegis vaults (scrypt + AES-GCM, the
 # same scoped exception keyroost-import already carries for the CLI/GUI).
-keyroost-import = { path = "../keyroost-import", version = "0.15.0", features = ["encrypted"] }
+keyroost-import = { path = "../keyroost-import", version = "0.16.0", features = ["encrypted"] }
 png = "0.18.1"
 rqrr = { version = "0.11.0", default-features = false }
 # Same scoped exception as the rest of the workspace: decoded QR payloads

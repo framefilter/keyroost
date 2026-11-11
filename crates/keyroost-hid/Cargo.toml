@@ -21,7 +21,7 @@ hidapi-backend = ["dep:hidapi"]
 
 [dependencies]
 # In-tree, dependency-free: the shared `--debug` trace line format.
-keyroost-proto = { path = "../keyroost-proto", version = "0.15.0" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.16.0" }
 # Optional so a default Linux build pulls nothing (the vendored sysfs backend
 # stays dependency-free); enabled by the `hidapi-backend` feature for testing.
 hidapi = { version = "2.6", optional = true, default-features = false, features = [
@@ -41,4 +41,4 @@ hidapi = { version = "2.6", default-features = false, features = [
 # Windows device-tree lookups (the unsafe cfgmgr32/winscard FFI lives there, so
 # this crate keeps forbid(unsafe_code)). Inert elsewhere, so not pulled in.
 [target.'cfg(windows)'.dependencies]
-keyroost-windevtree = { path = "../keyroost-windevtree", version = "0.15.0" }
+keyroost-windevtree = { path = "../keyroost-windevtree", version = "0.16.0" }
