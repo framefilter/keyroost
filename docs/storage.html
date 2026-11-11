@@ -156,10 +156,10 @@ keyroostctl fido blob delete 1 --pin stdin --yes          # in a script: piped P
 
   <section class="kr-section" id="ssh">
     <h2>SSH certificates</h2>
-    <p>The commonest real occupant of the large-blob array is an <strong>OpenSSH
-      certificate</strong>: tools like <code>ssh-keygen</code> and <code>fido2-token</code>
-      store the certificate for a resident SSH credential here so it travels with the key
-      instead of living in a file you have to carry. keyroost can read one back out.</p>
+    <p>One use of the large-blob array is an <strong>OpenSSH certificate</strong>:
+      libfido2's <code>fido2-token -S -b</code> stores the certificate for a resident SSH
+      credential here so it travels with the key instead of living in a file you have to
+      carry. keyroost can read one back out.</p>
     <p>Each such entry is encrypted under a per-credential <em>largeBlobKey</em> that only the
       key can hand over, so extraction goes through credential management and needs your PIN
       (no touch). It is <strong>read-only</strong> — keyroost never writes or rewrites a

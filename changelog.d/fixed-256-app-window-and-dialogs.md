@@ -1,6 +1,7 @@
 - **App details from the Windows test round.** The window no longer opens
   larger than a small screen with display scaling (1280×800 at 125%) or
-  under the taskbar; it shrinks or moves to fit. The import dialog draws
+  under the taskbar; it shrinks or moves to fit (where the system says
+  where the window is: not on Wayland). The import dialog draws
   again until its size settles, instead of leaving its buttons cut off
   until the mouse moved. The PIV reset confirmation no longer says it
   only works with the PIN and PUK already blocked: keyroost blocks them

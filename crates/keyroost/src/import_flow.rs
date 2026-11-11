@@ -1905,9 +1905,14 @@ impl App {
         // when the file's entries or the key's preview arrive from a
         // background job. Draw again until the size holds, so the buttons
         // aren't left cut off until the mouse moves.
+        // A change under half a point is rounding, not growth: redrawing for
+        // it could go on every frame.
         if let Some(shown) = shown {
             let size = shown.response.rect.size();
-            if d.last_size != Some(size) {
+            let moved = d
+                .last_size
+                .is_none_or(|last| (last - size).abs().max_elem() >= 0.5);
+            if moved {
                 d.last_size = Some(size);
                 ctx.request_repaint();
             }

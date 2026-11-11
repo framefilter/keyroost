@@ -3042,8 +3042,8 @@ enum SshCertCmd {
 /// first so existing RP entries are never clobbered by stale state.
 #[derive(Subcommand)]
 enum LargeBlobCmd {
-    /// List every entry: index, size, type (note, key name, SSH certificate or
-    /// opaque), and a short preview.
+    /// List every entry: index, size, type (note, key name or opaque), and a
+    /// short preview.
     List {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -8289,8 +8289,10 @@ fn oath_missing_error(name: &str, nothing_was: Option<&str>) -> String {
 /// says: its listing's properties (Nitrokey's secrets app), else its
 /// CALCULATE ALL (YubiKey), which leaves a touch account out with TOUCH and
 /// computes the others. `None` when neither answers for this account: an
-/// HOTP account on a YubiKey (CALCULATE ALL skips it whatever its setting),
-/// or a key that refused CALCULATE ALL.
+/// HOTP account on a YubiKey (CALCULATE ALL skips it whatever its setting:
+/// on a YubiKey 5 with firmware 5.7.4 an HOTP account that requires a touch
+/// came back with the same no-code tag as one that doesn't), or a key that
+/// refused CALCULATE ALL.
 fn oath_needs_touch(
     listing: &keyroost_oath::Listing,
     all: Option<&keyroost_oath::CalculateAll>,
@@ -8410,14 +8412,21 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // after the listing; without a password this sends nothing.
             // CALCULATE ALL never computes an HOTP code, so it can't advance
             // the counter; here it only says whether the account needs a touch.
-            let all = if is_hotp {
+            // Not asked when the listing already said (a Nitrokey's does).
+            let all = if is_hotp || listing.touch_required.is_some() {
                 None
             } else {
                 session.reauthenticate()?;
                 session.calculate_all(now).ok()
             };
-            if oath_needs_touch(&listing, all.as_ref(), name) == Some(true) {
-                crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
+            match oath_needs_touch(&listing, all.as_ref(), name) {
+                Some(true) => crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT),
+                Some(false) => {}
+                // The key didn't say (an HOTP account on a YubiKey): it may
+                // wait for a touch, so say so before it does.
+                None => crate::prompt::touch(
+                    "Reading the code \u{2014} touch the key if it blinks\u{2026}",
+                ),
             }
             session.reauthenticate()?;
             let code = if is_hotp {

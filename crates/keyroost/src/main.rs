@@ -3158,10 +3158,6 @@ fn oath_delete_label(applet_asks: bool, touch_account: bool) -> &'static str {
     }
 }
 
-/// What the touch banner says while a job runs, or `None` for no banner: the
-/// job's own label when it asks for a touch, else a plain prompt once the key
-/// itself reports it is waiting for one, else a hedged one while the job
-/// runs a step the card may ask a touch for ([`KEY_MAY_ASK_TOUCH`]).
 /// The window's size at start-up, in points.
 const WINDOW_SIZE: [f32; 2] = [1180.0, 760.0];
 /// The smallest the window may get, in points.
@@ -3175,38 +3171,39 @@ const TITLE_BAR: f32 = 32.0;
 
 /// The size to shrink a window of `inner` points to so it fits a screen of
 /// `monitor` points with room for a taskbar and the title bar, or `None`
-/// when it already fits. Never below [`WINDOW_MIN_SIZE`].
+/// when it already fits. Never below [`WINDOW_MIN_SIZE`], and never larger
+/// than it was (a zoomed window can be smaller than that minimum).
 fn window_size_for_screen(inner: egui::Vec2, monitor: egui::Vec2) -> Option<egui::Vec2> {
     let room = egui::vec2(monitor.x * 0.95, monitor.y - SCREEN_BAR - TITLE_BAR);
     if inner.x <= room.x && inner.y <= room.y {
         return None;
     }
-    let min = egui::Vec2::from(WINDOW_MIN_SIZE);
+    let min = egui::Vec2::from(WINDOW_MIN_SIZE).min(inner);
     Some(inner.min(room).max(min))
 }
 
-/// Where to move a window whose frame is `outer` so it sits wholly on a
-/// screen of `monitor` points, above the taskbar, or `None` when it already
-/// does. The system picks the start-up position without knowing the size the
-/// window ends up with, so a window that fits can still start with its
-/// bottom edge under the taskbar. A window whose corner is outside this
-/// screen is on another one and is left alone: only this screen's size is
-/// known.
+/// Where to move a window just shrunk to a frame of `outer` so its bottom
+/// edge clears the taskbar of a screen of `monitor` points, or `None` when
+/// it already does. The system picks the start-up position before the
+/// window is shrunk, so a window that now fits can still start with its
+/// bottom edge under the taskbar. Only upward, and by no more than a
+/// taskbar and a title bar: only this screen's size is known, not where it
+/// sits among several, so a larger move could carry the window onto
+/// another screen. A window whose corner is outside this screen's size is
+/// on another one and is left alone.
 fn window_pos_for_screen(outer: egui::Rect, monitor: egui::Vec2) -> Option<egui::Pos2> {
     if !egui::Rect::from_min_size(egui::Pos2::ZERO, monitor).contains(outer.min) {
         return None;
     }
-    let pos = egui::pos2(
-        outer.min.x.min(monitor.x - outer.width()).max(0.0),
-        outer
-            .min
-            .y
-            .min(monitor.y - SCREEN_BAR - outer.height())
-            .max(0.0),
-    );
-    (pos != outer.min).then_some(pos)
+    let under = outer.max.y - (monitor.y - SCREEN_BAR);
+    let up = under.min(outer.min.y).clamp(0.0, SCREEN_BAR + TITLE_BAR);
+    (up > 0.0).then(|| egui::pos2(outer.min.x, outer.min.y - up))
 }
 
+/// What the touch banner says while a job runs, or `None` for no banner: the
+/// job's own label when it asks for a touch, else a plain prompt once the key
+/// itself reports it is waiting for one, else a hedged one while the job
+/// runs a step the card may ask a touch for ([`KEY_MAY_ASK_TOUCH`]).
 fn touch_prompt(
     label: Option<&str>,
     busy: bool,
@@ -6538,8 +6535,10 @@ impl App {
     /// Shrink the window at start-up when it opened larger than the screen:
     /// its size is in points, so display scaling (125% on a 1280×800 screen)
     /// can make the default bigger than the screen. Waits a few frames for
-    /// the screen's size, which not every system reports at once (Wayland
-    /// never does), then leaves the window to the person.
+    /// the screen's size and the window's place, which not every system
+    /// reports (Wayland never gives the place, so nothing happens there),
+    /// then leaves the window to the person. A maximized or full-screen
+    /// window is the system's to size.
     fn fit_window_to_screen(&mut self, ctx: &egui::Context) {
         if self.window_fit_frames == u8::MAX {
             return;
@@ -6548,17 +6547,24 @@ impl App {
             let v = i.viewport();
             (v.monitor_size, v.inner_rect, v.outer_rect)
         });
+        let filled = ctx.input(|i| {
+            let v = i.viewport();
+            v.maximized == Some(true) || v.fullscreen == Some(true)
+        });
+        if filled {
+            self.window_fit_frames = u8::MAX;
+            return;
+        }
         if let (Some(monitor), Some(inner)) = (monitor, inner) {
             self.window_fit_frames = u8::MAX;
-            let size = window_size_for_screen(inner.size(), monitor);
-            if let Some(size) = size {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            }
+            let Some(size) = window_size_for_screen(inner.size(), monitor) else {
+                return;
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             // The frame (title bar, borders) keeps its size through the resize.
             if let Some(outer) = outer {
                 let frame = outer.size() - inner.size();
-                let fitted =
-                    egui::Rect::from_min_size(outer.min, size.unwrap_or(inner.size()) + frame);
+                let fitted = egui::Rect::from_min_size(outer.min, size + frame);
                 if let Some(pos) = window_pos_for_screen(fitted, monitor) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 }
@@ -31407,8 +31413,6 @@ mod tests {
         );
     }
 
-    /// The home folder in a log line shows as `~`, only where it is a whole
-    /// path part: a home of `/home/al` leaves `/home/alice` alone.
     /// At 125% a 1280×800 screen is 1024×640 points: the default window
     /// (1180×760) shrinks to fit, not below its minimum; on a big screen it
     /// stays as it is.
@@ -31432,6 +31436,12 @@ mod tests {
             window_size_for_screen(default, egui::vec2(1280.0, 800.0)),
             Some(egui::vec2(1180.0, 720.0))
         );
+        // Never grows: a window already under the minimum (a zoomed one)
+        // only shrinks to the room.
+        assert_eq!(
+            window_size_for_screen(egui::vec2(700.0, 900.0), egui::vec2(1280.0, 800.0)),
+            Some(egui::vec2(700.0, 720.0))
+        );
     }
 
     /// Windows opens the window 26 pixels down; with its frame the fitted
@@ -31454,6 +31464,21 @@ mod tests {
         assert_eq!(
             window_pos_for_screen(tall, screen),
             Some(egui::pos2(26.0, 0.0))
+        );
+        // Never sideways: a window on a wider screen to the right (x past
+        // this one's width would be left alone; x within it, as here, stays).
+        assert_eq!(
+            window_pos_for_screen(frame(1000.0, 26.0), screen).map(|p| p.x),
+            Some(1000.0)
+        );
+        // On a screen stacked below a taller one (y past this one's
+        // height) nothing moves; within it, no more than a taskbar and a
+        // title bar.
+        assert_eq!(window_pos_for_screen(frame(26.0, 900.0), screen), None);
+        let low = egui::Rect::from_min_size(egui::pos2(26.0, 600.0), egui::vec2(1196.0, 743.0));
+        assert_eq!(
+            window_pos_for_screen(low, screen),
+            Some(egui::pos2(26.0, 600.0 - SCREEN_BAR - TITLE_BAR))
         );
     }
 
@@ -31483,6 +31508,8 @@ mod tests {
         );
     }
 
+    /// The home folder in a log line shows as `~`, only where it is a whole
+    /// path part: a home of `/home/al` leaves `/home/alice` alone.
     #[test]
     fn log_lines_show_the_home_folder_as_a_tilde() {
         assert_eq!(

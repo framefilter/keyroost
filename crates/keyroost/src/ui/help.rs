@@ -186,7 +186,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "large_blobs" => &Help {
             title: "Large blob storage",
-            body: "A key-global area where relying parties store opaque, RP-encrypted data (e.g. SSH certificates). Anyone holding the key can read it, so it is not a place for plaintext secrets. keyroost shows each stored entry as hex and ASCII; you can also keep your own plaintext notes here (add, edit, delete). Writing rewrites the whole array with a fresh checksum and needs your PIN. keyroost recognizes its own notes and OpenSSH certificates and shows a capacity meter; anything else is relying-party data, displayed raw and never modified. Any entry can be exported to a file.",
+            body: "A key-global area where relying parties store opaque, RP-encrypted data (e.g. SSH certificates). Anyone holding the key can read it, so it is not a place for plaintext secrets. keyroost shows each stored entry as hex and ASCII; you can also keep your own plaintext notes here (add, edit, delete). Writing rewrites the whole array with a fresh checksum and needs your PIN. keyroost recognizes its own notes and the key's name, and shows a capacity meter; anything else is relying-party data, displayed raw and never modified. Any entry can be exported to a file as it is stored; an SSH credential's certificate is saved with “Save certificate…” on the Passkeys tab.",
             slug: "/storage",
         },
         _ => return None,
