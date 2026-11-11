@@ -101,19 +101,20 @@ fi
 #    against itself. Re-resolve from the release asset's recorded digest
 #    (`gh api repos/linuxdeploy/linuxdeploy/releases/tags/continuous`), then
 #    confirm the bytes actually served hash to that same value before pinning.
-#    Pins last moved 2026-10-02, after upstream's scheduled CI rebuilt both
-#    tools on 2026-10-01 from the SAME commits as the prior pins (linuxdeploy
-#    07333c6, plugin 536b0687). AppImage builds are not byte-reproducible, so
-#    the rebuild alone changed both digests with no source change; recorded
-#    and computed digests agreed for both. Upstream has rebuilt on the 1st of
-#    each month (2026-08-01, 09-01, 10-01), so expect these to drift monthly.
+#    linuxdeploy's pin last moved 2026-11-11, after upstream's scheduled CI
+#    rebuilt it on 2026-11-01 from the SAME commit as the prior pin
+#    (07333c6); the plugin's (commit 536b0687) last moved 2026-10-02 and was
+#    not rebuilt in November. AppImage builds are not byte-reproducible, so a
+#    rebuild alone changes the digest with no source change; the recorded and
+#    computed digests agreed. Upstream has rebuilt on the 1st of each month
+#    (2026-08-01, 09-01, 10-01, 11-01), so expect these to drift monthly.
 # ---------------------------------------------------------------------------
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 LD_BASE="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous"
 LDP_BASE="https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous"
 # pinned-verified: sha256 checked below before chmod +x / execution
-LD_SHA256="8aea8da0f7f7039d2a2cecb14657d752a222a5e1d3825caeef186c82f751cdd1"
+LD_SHA256="df908b19f1ed1cdafa79508d415aa12d6c56ce4d56d4149aa8c09286718706e5"
 # pinned-verified: sha256 checked below before chmod +x / execution
 LDP_SHA256="49d6a17160675a6bd1781699aae6bdf7692d98552e02a3671d2183d10547842e"
 fetch() { # url dest sha256
