@@ -1325,6 +1325,8 @@ impl App {
         let mut submit = false;
         let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
+            // Span the pane like the entry list below it.
+            ui.set_min_width(ui.available_width());
             let title = match kind {
                 PinDialogKind::Set => "Set OTP PIN",
                 PinDialogKind::Change => "Change OTP PIN",
@@ -1381,16 +1383,17 @@ impl App {
                 }
             }
             ui.add_space(6.0);
-            // Advice, not a rule: the key decides what it accepts and says so.
-            ui.label(
-                egui::RichText::new(
-                    "Keys typically want 6+ digits (no trivial sequences), or \
-                     10+ characters if the PIN isn't all digits.",
-                )
-                .font(theme::f_reg(11.0))
-                .color(p.txt3),
-            );
             if matches!(kind, PinDialogKind::Set | PinDialogKind::Change) {
+                // Advice for choosing one, not a rule: the key decides what it
+                // accepts and says so. Nothing is chosen when removing it.
+                ui.label(
+                    egui::RichText::new(
+                        "Keys typically want 6+ digits (no trivial sequences), or \
+                         10+ characters if the PIN isn't all digits.",
+                    )
+                    .font(theme::f_reg(11.0))
+                    .color(p.txt3),
+                );
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
@@ -1842,6 +1845,7 @@ impl App {
         // transport error above.
         if self.otp.totp_supported == Some(false) {
             theme::card_frame(p).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.label(
                     egui::RichText::new("This key does not have on-device OTP.")
                         .font(theme::f_sb(13.5))
@@ -1870,6 +1874,7 @@ impl App {
             let mut do_fp = false;
             let fp_on = self.otp.fp_enabled == Some(true);
             theme::card_frame(p).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.label(
                     egui::RichText::new("This key's OTP codes are protected")
                         .font(theme::f_sb(13.5))
