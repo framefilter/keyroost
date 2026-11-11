@@ -89,9 +89,12 @@
           keyroost reaches their OTP applet through the FIDO interface over USB, or over
           CCID. Keys running the R3.4+ OTP applet can put codes behind an OTP PIN; keys
           without it answer the capability probe with "no such command" and are
-          unaffected. See <a href="otp.html#otp-pin">On-device OTP</a>. The OATH /
-          OpenPGP / PIV applets are handled by the standard byte layers but not yet
-          exercised on PIN+ hardware by this project (experimental).</td></tr>
+          unaffected. See <a href="otp.html#otp-pin">On-device OTP</a>. PIV management
+          was exercised on Token2 hardware by episource, and a PIN+ Dual Ace R3.4
+          imports P-256 keys and passes the self-test; imports of other key types on
+          Token2 aren't verified yet. The OATH / OpenPGP applets are handled by the
+          standard byte layers but not yet exercised on PIN+ hardware by this project
+          (experimental).</td></tr>
       <tr><td><strong>YubiKey</strong> (5 series)</td>
         <td>FIDO2, OATH (incl. import), OpenPGP, PIV</td>
         <td>Built and verified against a YubiKey 5.7.</td></tr>
@@ -102,19 +105,26 @@
           specifies 8, so its HOTP codes won't verify against standards-compliant
           servers. TOTP is unaffected.</td></tr>
       <tr><td><strong>Nitrokey 3</strong></td>
-        <td>FIDO2, OATH (incl. import), PIV; OpenPGP detected</td>
+        <td>FIDO2, OATH (incl. import), OpenPGP, PIV</td>
         <td>Built around the same Trussed firmware core as Solo 2, but the final
           firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2
           does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3),
-          contributed by episource. The OpenPGP applet is detected but not yet
-          exercised by this project.</td></tr>
-      <tr><td><strong>Swissbit iShield Key 2 Pro</strong></td>
+          contributed by episource. Importing an RSA-2048 key and certificate from
+          a .p12 / .pfx file is verified on firmware 1.9.1. OATH is verified on
+          firmware 1.9.0, including touch-required accounts, which also need a
+          touch to save; deleting an account or resetting the Authenticator also
+          needs a touch. OpenPGP key generation, signing and reset are exercised on
+          firmware 1.9.1.</td></tr>
+      <tr><td><strong>Swissbit iShield Key 2 Pro</strong> (and iShield Key 1)</td>
         <td>PIV (partial)</td>
         <td>Key generation and certificate handling verified by episource on
           their own card. keyroost doesn't take a slot's key type or PIN/touch
           policy from this card's GET METADATA reply (#113). Answers the Yubico version
           extension with four bytes instead of three; keyroost keeps the reply
-          as sent. Other applets not yet exercised by this project.</td></tr>
+          as sent. On the iShield Key 1 and 2, keyroost reads the serial and device
+          name from Swissbit's own management applications (and, on the Key 1, the
+          firmware version), contributed by episource. Other applets not yet
+          exercised by this project.</td></tr>
     </table>
     </div>
   </section>
@@ -128,9 +138,9 @@
       app's badges and in <code>keyroostctl list</code>. The feature is still
       offered and works normally if present; the mark only means "not confirmed
       by the device yet". <code>FIDO2?</code> means a FIDO key opened but didn't
-      properly answer keyroost's first question, or is reached only through a reader
-      whose FIDO applet doesn't report FIDO2; no name is read and no FIDO2 reset is
-      offered until it answers. A plain badge means the device answered for itself
+      properly answer keyroost's first question (then no name is read and no FIDO2
+      reset is offered until it answers), or is reached only through a reader whose
+      FIDO applet doesn't say it speaks FIDO2 (its FIDO2 reset is still offered). A plain badge means the device answered for itself
       (a FIDO key keyroost can't open at all also keeps a plain FIDO2).</p>
   </section>
 

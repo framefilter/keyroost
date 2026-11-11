@@ -81,7 +81,7 @@
     <p>First check that <code>keyroostctl</code> is installed and that your computer can
       see your key. If it isn't installed yet, see
       <a href="index.html#install">Install keyroost</a>.</p>
-<pre><code>keyroostctl --version   # prints the version, e.g. keyroostctl 0.15.0
+<pre><code>keyroostctl --version   # prints the version, e.g. keyroostctl 0.16.0
 keyroostctl doctor      # checks this computer; never touches a key
 keyroostctl             # shows the keys that are plugged in</code></pre>
     <p>With no command, <code>keyroostctl</code> lists your keys with a number each:</p>
@@ -110,8 +110,8 @@ keyroostctl oath import --help</code></pre>
 <pre><code>→ Work key · serial 12345678 · Yubico YubiKey OTP+FIDO+CCID 00 00</code></pre>
     <p>With several keys plugged in, keyroost asks which one you mean:</p>
 <pre><code>2 connected keys qualify (key with OATH):
-   1) Work key, YubiKey 5 NFC, serial 12345678 Yubico YubiKey OTP+FIDO+CCID 00 00
-   2) Backup key, YubiKey 5 NFC, serial 87654321 Yubico YubiKey OTP+FIDO+CCID 01 00
+   1) Work key, YubiKey 5 Series with NFC, serial 12345678 Yubico YubiKey OTP+FIDO+CCID 00 00
+   2) Backup key, YubiKey 5 Series with NFC, serial 87654321 Yubico YubiKey OTP+FIDO+CCID 01 00
 Select [1/2]:</code></pre>
     <p>To skip the question, say which key with <code>-d</code> (short for
       <code>--device</code>). It takes the number from the list, a serial number, or a
@@ -263,10 +263,11 @@ keyroostctl piv key import --slot 9a --in alice.p12        # or a key + certific
       slot needs the management key, a separate secret. If you never changed it, add
       <code>--mgmt-key default</code>.</p>
 <pre><code>keyroostctl piv key move --from 9a --to 82   # move a key to another slot
-keyroostctl piv test --slot 9a               # check the key matches its certificate</code></pre>
+keyroostctl piv test --slot 9a               # check the key works (against its certificate)</code></pre>
     <p><code>piv test</code> changes nothing: it asks the card to use the key and checks
-      the answer against the certificate, then reports each check as passed, failed or
-      skipped. Moving a key needs a key that supports it (for example YubiKey 5.7 and
+      the answer against the slot's certificate, or, in a slot with no certificate,
+      against the public key the card reports for it (for example on a YubiKey 5.3 or
+      later). It reports each check as passed, failed or skipped. Moving a key needs a key that supports it (for example YubiKey 5.7 and
       later). More in <a href="piv.html">PIV</a>.</p>
   </section>
 
@@ -278,14 +279,16 @@ keyroostctl piv test --slot 9a               # check the key matches its certifi
 keyroostctl openpgp key import --generate --backup alice --name "Alice Example"
                                                            # new keys, saved first, then put on the card
 keyroostctl openpgp key import --in alice.asc              # restore a backup onto a card
-keyroostctl openpgp key expiry --set 2y --public alice.pub.asc     # two more years
+keyroostctl openpgp key expiry --set 2y --public alice.pub.asc     # expires two years from today
 keyroostctl openpgp key generate --slot sign --algorithm ed25519   # a key made on the card (no backup)
 keyroostctl openpgp key import --slot decrypt --in my-key.pem      # an existing RSA key
 keyroostctl openpgp sign --in contract.pdf --out contract.sig      # sign a file
 keyroostctl openpgp url set https://example.com/alice.asc          # where your public key lives</code></pre>
     <p>There are three slots: <code>sign</code>, <code>decrypt</code> and
       <code>auth</code> (for logging in). Making or importing a key needs the admin PIN; using
-      it needs the user PIN. A YubiKey also wants a touch. <code>import --generate</code>
+      it needs the user PIN, and a touch when the slot's touch setting is on. A key made
+      on the card with <code>key generate</code> has no public key file; keyroost says how
+      to get one with GnuPG's "Existing key from card". <code>import --generate</code>
       makes all three keys on this computer and writes three files before it touches the card:
       <code>alice.asc</code> (the backup, protected by a passphrase you choose),
       <code>alice.pub.asc</code> (the public key to share) and <code>alice.rev.asc</code> (a

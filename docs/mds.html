@@ -96,9 +96,10 @@ python3 tools/gen_mds_data.py --out mds_data.json --blob mds.jwt   # offline, fr
 
   <section class="kr-section">
     <h2>Why a key might show no metadata</h2>
-    <p>The AAGUID isn't in the bundled snapshot (regenerate with <code>--all</code> to
-      include more vendors), or the key reports an all-zero AAGUID — some U2F-only or
-      privacy modes — which has no MDS entry.</p>
+    <p>The AAGUID isn't in the bundled snapshot (a model newer than the snapshot:
+      regenerate it as above, which keeps every hardware authenticator in the FIDO
+      list), or the key reports an all-zero AAGUID — some U2F-only or privacy modes —
+      which has no MDS entry.</p>
   </section>
 
   <section class="kr-section kr-res-section">
