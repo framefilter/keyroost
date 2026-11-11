@@ -259,8 +259,12 @@ jobs:
 
       - name: Install dependencies (Arch)
         if: matrix.distro == 'arch'
+        # -Syu, never -Sy: Arch doesn't support partial upgrades. With -Sy a
+        # package rebuilt against a new library (openssl 4) installs next to
+        # the image's older packages that need the old one, and pacman
+        # refuses the transaction.
         run: |
-          pacman -Sy --noconfirm --needed git gcc pkgconf \
+          pacman -Syu --noconfirm --needed git gcc pkgconf \
             pcsclite ccid \
             libxkbcommon libxcb wayland mesa \
             rust
