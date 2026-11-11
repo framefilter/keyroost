@@ -196,9 +196,11 @@ keyroostctl fido fingerprint list</code></pre>
 keyroostctl oath code GitHub:alice      # today's code for one account
 keyroostctl oath add GitHub:alice       # asks for the setup key (hidden)
 keyroostctl oath delete GitHub:alice    # asks first</code></pre>
-    <p><code>oath list</code> shows each account and its type:</p>
+    <p><code>oath list</code> shows each account and its type, and marks the ones that
+      need a touch on the key to show their code (a YubiKey doesn't say for an HOTP
+      account, so those are never marked):</p>
 <pre><code>GitHub:alice  [TOTP/SHA1]
-Mail:demo@example.com  [TOTP/SHA1]</code></pre>
+Mail:demo@example.com  [TOTP/SHA1]  (touch)</code></pre>
     <p>The setup key is the text a website shows next to its QR code. To add many codes at
       once, <a href="#import">import them from your app</a>.</p>
     <p>Token2 keys with their own code storage use <code>otp</code> instead:</p>
@@ -472,12 +474,12 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl fido config attestation</code></td><td>Enterprise attestation: lets a managed deployment&#x27;s sign-in prove which exact key is used</td></tr>
       <tr><td><code>keyroostctl fido config attestation enable</code></td><td>Enable enterprise attestation. One-way: asks first (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl fido blob</code></td><td>Read and write the key&#x27;s large-blob store (notes, SSH certificates)</td></tr>
-      <tr><td><code>keyroostctl fido blob list</code></td><td>List every entry: index, size, type (note, key name, SSH certificate or opaque), and a short preview</td></tr>
+      <tr><td><code>keyroostctl fido blob list</code></td><td>List every entry: index, size, type (note, key name or opaque), and a short preview</td></tr>
       <tr><td><code>keyroostctl fido blob show</code></td><td>Show one entry in full by its index (from <code>fido blob list</code>)</td></tr>
       <tr><td><code>keyroostctl fido blob add</code></td><td>Append a keyroost text note</td></tr>
       <tr><td><code>keyroostctl fido blob edit</code></td><td>Replace the text of an existing keyroost note by its index</td></tr>
       <tr><td><code>keyroostctl fido blob delete</code></td><td>Delete a single entry by its index. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
-      <tr><td><code>keyroostctl fido blob export</code></td><td>Save one entry&#x27;s bytes to a file (read-only; no PIN needed)</td></tr>
+      <tr><td><code>keyroostctl fido blob export</code></td><td>Save one entry&#x27;s raw stored bytes to a file (read-only; no PIN needed)</td></tr>
       <tr><td><code>keyroostctl fido blob clear</code></td><td>Erase the ENTIRE large-blob array, including any RP-owned entries. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl fido ssh</code></td><td>List SSH credentials and export their certificates</td></tr>
       <tr><td><code>keyroostctl fido ssh list</code></td><td>List resident SSH credentials (ssh:* RP IDs) and whether each has a certificate stored in its largeBlob</td></tr>

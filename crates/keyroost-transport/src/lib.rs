@@ -45,7 +45,7 @@ mod oath;
 pub use oath::OathSession;
 
 mod ctap_pcsc;
-pub use ctap_pcsc::CtapPcscDevice;
+pub use ctap_pcsc::{CtapPcscDevice, WINDOWS_NEEDS_ADMIN};
 
 mod token2prog;
 pub use token2prog::Token2ProgSession;

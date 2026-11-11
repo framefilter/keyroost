@@ -400,7 +400,8 @@ pub(crate) struct OtpSerialJson {
 }
 
 /// `keyroostctl oath --json list` — one stored OATH credential. Mirrors the
-/// human line `<name>  [<type>/<algorithm>]`.
+/// human line `<name>  [<type>/<algorithm>]`, with `  (touch)` after it when
+/// `touch_required`.
 #[derive(Serialize)]
 pub(crate) struct OathCredentialJson {
     pub name: String,
@@ -409,6 +410,9 @@ pub(crate) struct OathCredentialJson {
     pub oath_type: &'static str,
     /// "sha1" / "sha256" / "sha512" (lowercase, like `molto list`).
     pub algorithm: &'static str,
+    /// Whether the account needs a touch to compute, as the key says it;
+    /// `null` when the key doesn't say (an HOTP account on a YubiKey).
+    pub touch_required: Option<bool>,
 }
 
 /// `keyroostctl oath --json code` — the calculated code. The human handler
@@ -508,26 +512,6 @@ pub(crate) struct FidoLargeBlobCapacityJson {
     pub free_bytes: u64,
 }
 
-/// Decoded fields of a recognized OpenSSH certificate entry.
-#[derive(Serialize)]
-pub(crate) struct FidoLargeBlobSshCertJson {
-    pub key_type: String,
-    /// Decimal string: a u64 past 2^53 is not exact as a JSON number in
-    /// most consumers.
-    pub serial: String,
-    /// "user" or "host".
-    pub cert_type: &'static str,
-    pub key_id: String,
-    pub principals: Vec<String>,
-    pub valid_after: u64,
-    pub valid_before: u64,
-    /// Human validity window, e.g. "2026-01-01 00:00:00 UTC to …".
-    pub validity: String,
-    /// "name=value" (or bare "name") per critical option.
-    pub critical_options: Vec<String>,
-    pub extensions: Vec<String>,
-}
-
 /// One large-blob array entry as the `list` view renders it.
 #[derive(Serialize)]
 pub(crate) struct FidoLargeBlobEntryJson {
@@ -540,9 +524,8 @@ pub(crate) struct FidoLargeBlobEntryJson {
     /// The note text when `is_note`, the name for a "key-name" entry; `null`
     /// for other entries.
     pub text: Option<String>,
-    /// Entry classification: "note", "key-name", "ssh-cert", or "opaque".
+    /// Entry classification: "note", "key-name" or "opaque".
     pub kind: &'static str,
-    pub ssh_cert: Option<FidoLargeBlobSshCertJson>,
 }
 
 /// `keyroostctl fido blob --json get <INDEX>` — a single entry in full.
@@ -552,9 +535,8 @@ pub(crate) struct FidoLargeBlobGetJson {
     pub size: u64,
     pub is_note: bool,
     pub text: Option<String>,
-    /// Entry classification: "note", "key-name", "ssh-cert", or "opaque".
+    /// Entry classification: "note", "key-name" or "opaque".
     pub kind: &'static str,
-    pub ssh_cert: Option<FidoLargeBlobSshCertJson>,
     /// Hex of the raw ciphertext bytes (the note magic + UTF-8 for a note, or
     /// the RP's AEAD ciphertext for an opaque entry).
     pub hex: String,
@@ -1152,6 +1134,7 @@ mod tests {
                 name: "a".into(),
                 oath_type: "TOTP",
                 algorithm: "sha1",
+                touch_required: Some(true),
             }],
         });
         assert_shape(&v, &[("accounts", "array")]);
@@ -1161,9 +1144,22 @@ mod tests {
                 ("name", "string"),
                 ("type", "string"),
                 ("algorithm", "string"),
+                ("touch_required", "bool|null"),
             ],
         );
         assert_eq!(v["accounts"][0]["algorithm"], "sha1");
+        // Unknown is null, and the key is still present.
+        let v = to_v(&AccountsJson {
+            accounts: vec![OathCredentialJson {
+                name: "h".into(),
+                oath_type: "HOTP",
+                algorithm: "sha1",
+                touch_required: None,
+            }],
+        });
+        assert!(v["accounts"][0]
+            .get("touch_required")
+            .is_some_and(serde_json::Value::is_null));
     }
 
     #[test]
@@ -1262,25 +1258,12 @@ mod tests {
 
     #[test]
     fn large_blob_entry_shape() {
-        let cert = || FidoLargeBlobSshCertJson {
-            key_type: "ssh-ed25519-cert-v01@openssh.com".into(),
-            serial: u64::MAX.to_string(),
-            cert_type: "user",
-            key_id: "id".into(),
-            principals: vec![],
-            valid_after: 0,
-            valid_before: u64::MAX,
-            validity: "forever".into(),
-            critical_options: vec![],
-            extensions: vec![],
-        };
         let entry_shape = [
             ("index", "number"),
             ("size", "number"),
             ("is_note", "bool"),
             ("text", "string|null"),
             ("kind", "string"),
-            ("ssh_cert", "object|null"),
         ];
         let entries = vec![
             FidoLargeBlobEntryJson {
@@ -1289,15 +1272,13 @@ mod tests {
                 is_note: true,
                 text: Some("hi".into()),
                 kind: "note",
-                ssh_cert: None,
             },
             FidoLargeBlobEntryJson {
                 index: 1,
                 size: 9,
                 is_note: false,
                 text: None,
-                kind: "ssh-cert",
-                ssh_cert: Some(cert()),
+                kind: "opaque",
             },
         ];
         let v = to_v(&FidoLargeBlobListJson {
@@ -1313,23 +1294,17 @@ mod tests {
             assert_shape(e, &entry_shape);
         }
         assert_eq!(v["skipped"], 2);
-        assert_eq!(
-            v["entries"][1]["ssh_cert"]["serial"],
-            "18446744073709551615"
-        );
-        assert!(v["entries"][0]["ssh_cert"].is_null());
         assert!(v["entries"][1]["text"].is_null());
 
         let mut get_shape = entry_shape.to_vec();
         get_shape.push(("hex", "string"));
-        for (text, ssh_cert) in [(Some("hi".to_string()), None), (None, Some(cert()))] {
+        for text in [Some("hi".to_string()), None] {
             let v = to_v(&FidoLargeBlobGetJson {
                 index: 0,
                 size: 2,
                 is_note: text.is_some(),
                 text,
                 kind: "note",
-                ssh_cert,
                 hex: "00".into(),
             });
             assert_shape(&v, &get_shape);

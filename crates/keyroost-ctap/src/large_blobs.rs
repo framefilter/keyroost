@@ -176,21 +176,18 @@ impl LargeBlobEntry {
 
     /// Classify this entry. Conservative by construction: a name entry must
     /// pass its AEAD tag under the published name key, the keyroost note
-    /// magic wins over everything else, certificate recognition requires a
-    /// complete, well-formed parse, and everything else is opaque.
+    /// magic wins over everything else, and everything else is opaque.
+    ///
+    /// An SSH certificate stored for a credential (`fido2-token -S -b`, or
+    /// any client following CTAP 2.1 §6.10.3) is encrypted under that
+    /// credential's largeBlobKey, so it is opaque here too; reading it needs
+    /// the credential ([`extract_cert_from_entries`]).
     pub fn classify(&self) -> EntryKind {
         if let Some(label) = device_label::decode_entry(self) {
             return EntryKind::KeyName(label);
         }
         if let Some(text) = self.as_text() {
             return EntryKind::Note(text);
-        }
-        if let Some(c) = ssh_cert::from_stored(&self.ciphertext) {
-            return EntryKind::SshCert {
-                info: c.info,
-                wire: c.wire,
-                cert_pub: c.cert_pub,
-            };
         }
         EntryKind::Opaque
     }
@@ -203,14 +200,6 @@ pub enum EntryKind {
     Note(String),
     /// The key's own name ([`device_label`]).
     KeyName(DeviceLabel),
-    /// A recognized OpenSSH certificate. `wire` holds the canonical binary
-    /// certificate (decoded from base64 when the entry stored the text form);
-    /// `cert_pub` is the `-cert.pub` file to export ([`ssh_cert::StoredCert`]).
-    SshCert {
-        info: ssh_cert::SshCertInfo,
-        wire: Vec<u8>,
-        cert_pub: String,
-    },
     /// Anything unrecognized — treated as RP-owned AEAD data: shown raw,
     /// never reinterpreted, never rewritten.
     Opaque,
@@ -1448,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_note_ssh_cert_and_opaque() {
+    fn classify_note_and_opaque() {
         use crate::ssh_cert::tests_fixture::FIXTURE_CERT_PUB;
         use keyroost_proto::codec::base64_decode;
 
@@ -1460,36 +1449,19 @@ mod tests {
         let cert_note = LargeBlobEntry::from_text(FIXTURE_CERT_PUB);
         assert!(matches!(cert_note.classify(), EntryKind::Note(t) if t == FIXTURE_CERT_PUB));
 
-        // Wire-format certificate.
+        // A certificate dropped in unencrypted (wire or text form) is not a
+        // conforming entry, and no client stores one that way: opaque, like
+        // the encrypted certificate a real client stores.
         let wire =
             base64_decode(FIXTURE_CERT_PUB.split_ascii_whitespace().nth(1).unwrap()).unwrap();
-        let wire_entry = LargeBlobEntry {
-            ciphertext: wire.clone(),
-            nonce: vec![0; 12],
-            orig_size: wire.len() as u64,
-            original: None,
-        };
-        match wire_entry.classify() {
-            EntryKind::SshCert { info, wire: w, .. } => {
-                assert_eq!(info.key_id, "test-key-id");
-                assert_eq!(w, wire);
-            }
-            other => panic!("expected SshCert, got {other:?}"),
-        }
-
-        // Text-form certificate (a -cert.pub file dropped in verbatim).
-        let text_entry = LargeBlobEntry {
-            ciphertext: FIXTURE_CERT_PUB.as_bytes().to_vec(),
-            nonce: vec![0; 12],
-            orig_size: FIXTURE_CERT_PUB.len() as u64,
-            original: None,
-        };
-        match text_entry.classify() {
-            EntryKind::SshCert { info, wire: w, .. } => {
-                assert_eq!(info.serial, 42);
-                assert_eq!(w, wire); // canonical wire bytes, not the text
-            }
-            other => panic!("expected SshCert, got {other:?}"),
+        for raw in [wire, FIXTURE_CERT_PUB.as_bytes().to_vec()] {
+            let entry = LargeBlobEntry {
+                orig_size: raw.len() as u64,
+                ciphertext: raw,
+                nonce: vec![0; 12],
+                original: None,
+            };
+            assert_eq!(entry.classify(), EntryKind::Opaque);
         }
 
         // Random RP bytes stay opaque.

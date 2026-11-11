@@ -42,9 +42,12 @@ pub enum KeyType {
 /// the key's fingerprint and creation time, and GnuPG builds the matching
 /// public key from them (its "Existing key from card" uses the card's
 /// creation time). Checked with GnuPG 2.4 on a YubiKey: the public key it
-/// made had the fingerprint keyroost recorded, and signed.
+/// made had the fingerprint keyroost recorded, and signed. GnuPG signs that
+/// public key with the card's signature key, so it asks for the user PIN;
+/// the Windows round's tester typed the admin PIN there and got "Bad PIN".
 pub const GPG_PUBLIC_KEY_HINT: &str = "To use it with GnuPG, run \"gpg --card-status\", then \
-     \"gpg --full-gen-key --expert\" and choose \"Existing key from card\".";
+     \"gpg --full-gen-key --expert\" and choose \"Existing key from card\". GnuPG asks for \
+     the card's user PIN, not the admin PIN.";
 
 impl KeyType {
     /// What to say about how long making these keys on the computer takes,

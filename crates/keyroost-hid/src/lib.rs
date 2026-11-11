@@ -188,7 +188,7 @@ fn enumerate_hidapi() -> Result<Vec<HidDevice>, HidError> {
             product_name: info.product_string().unwrap_or_default().to_string(),
             usage_page: info.usage_page(),
             usage: info.usage(),
-            serial_number: info.serial_number().map(str::to_owned),
+            serial_number: info.serial_number().and_then(nonempty_serial),
             usb_device: None,
         })
         .collect();
@@ -395,7 +395,15 @@ fn usb_device_dir(device_link: &Path) -> Option<PathBuf> {
 /// attribute can't be read.
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 fn read_usb_serial(usb_dir: &Path) -> Option<String> {
-    let serial = fs::read_to_string(usb_dir.join("serial")).ok()?;
+    nonempty_serial(&fs::read_to_string(usb_dir.join("serial")).ok()?)
+}
+
+/// A USB serial string as keyroost keeps it: trimmed, and `None` when nothing
+/// is left. Windows reports an empty string, not an absent one, for a device
+/// without a serial (seen on a YubiKey 5 and a Token2 PIN+); kept as `Some("")`
+/// it printed as a bare `serial=` in `keyroostctl list` and hid the serial
+/// read over the smart-card interface.
+fn nonempty_serial(serial: &str) -> Option<String> {
     let serial = serial.trim();
     (!serial.is_empty()).then(|| serial.to_string())
 }
@@ -577,6 +585,14 @@ mod tests {
         assert_eq!(parse_hex_u16("00000407"), Some(0x0407));
         assert_eq!(parse_hex_u16("1050"), Some(0x1050));
         assert!(parse_hex_u16("xyz").is_none());
+    }
+
+    /// An empty or blank serial string is no serial; a real one is trimmed.
+    #[test]
+    fn an_empty_usb_serial_is_no_serial() {
+        assert_eq!(nonempty_serial(""), None);
+        assert_eq!(nonempty_serial(" \n"), None);
+        assert_eq!(nonempty_serial("0123456789\n"), Some("0123456789".into()));
     }
 
     #[test]

@@ -29,6 +29,12 @@ Being worked on right now — check with whoever holds it before starting.
 
 **Later:**
 
+- **`fido ssh list --json`.** It ignores `--json` and prints its text
+  lines, while `--json`'s help says query commands support it (found in
+  the v0.16 Windows round). Give it a JSON form when someone asks or in a
+  CLI pass; its field names go through CONTRIBUTING's "Words in output
+  and JSON" check first (`rp_id`, a certificate yes/no).
+
 - **Token2 serial in the key header on Windows ([#51](https://github.com/framefilter/keyroost/issues/51)).**
   The duplicate rows are fixed: with v0.15.0, Token2 and the reporter each
   saw one row per key (two PIN+ keys, Windows). Token2 then reported the

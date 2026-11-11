@@ -3042,8 +3042,8 @@ enum SshCertCmd {
 /// first so existing RP entries are never clobbered by stale state.
 #[derive(Subcommand)]
 enum LargeBlobCmd {
-    /// List every entry: index, size, type (note, key name, SSH certificate or
-    /// opaque), and a short preview.
+    /// List every entry: index, size, type (note, key name or opaque), and a
+    /// short preview.
     List {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3107,11 +3107,11 @@ enum LargeBlobCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Save one entry's bytes to a file (read-only; no PIN needed).
+    /// Save one entry's raw stored bytes to a file (read-only; no PIN
+    /// needed).
     ///
-    /// By default writes the entry's raw stored bytes. With --as-cert, a
-    /// recognized OpenSSH certificate entry is written as a `-cert.pub` text
-    /// line instead (the format `ssh` and `ssh-keygen` consume).
+    /// An SSH certificate stored for a credential is encrypted under that
+    /// credential; save it as a `-cert.pub` file with `fido ssh export`.
     Export {
         /// Zero-based entry index as printed by `fido blob list`.
         index: usize,
@@ -3120,9 +3120,6 @@ enum LargeBlobCmd {
         out: std::path::PathBuf,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
-        /// Write a recognized SSH certificate in `-cert.pub` text form.
-        #[arg(long)]
-        as_cert: bool,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -4332,6 +4329,13 @@ struct RetiredFlag {
 /// clap only hands us the flag name, never its value or the next token, so
 /// nothing a user typed can leak through these messages.
 const RETIRED_FLAGS: &[RetiredFlag] = &[
+    RetiredFlag {
+        flag: "--as-cert",
+        words: &["fido", "blob", "export"],
+        msg: "--as-cert was removed: a certificate stored for an SSH credential is encrypted \
+              under that credential, so save it with `keyroostctl fido ssh export`",
+        now: &[],
+    },
     RetiredFlag {
         flag: "--admin-pin-env",
         words: &["openpgp", "pin", "change", "--admin"],
@@ -8281,20 +8285,30 @@ fn oath_missing_error(name: &str, nothing_was: Option<&str>) -> String {
     msg
 }
 
-/// Whether the account `name` needs a touch to compute: the listing says so
-/// (Nitrokey's secrets app lists the property), or the card's CALCULATE ALL
-/// left it out for a touch (YubiKey).
+/// Whether the account `name` needs a touch to compute, as far as the key
+/// says: its listing's properties (Nitrokey's secrets app), else its
+/// CALCULATE ALL (YubiKey), which leaves a touch account out with TOUCH and
+/// computes the others. `None` when neither answers for this account: an
+/// HOTP account on a YubiKey (CALCULATE ALL skips it whatever its setting:
+/// on a YubiKey 5 with firmware 5.7.4 an HOTP account that requires a touch
+/// came back with the same no-code tag as one that doesn't), or a key that
+/// refused CALCULATE ALL.
 fn oath_needs_touch(
     listing: &keyroost_oath::Listing,
     all: Option<&keyroost_oath::CalculateAll>,
     name: &str,
-) -> bool {
-    listing.touch_required.iter().any(|n| n == name)
-        || all.is_some_and(|all| {
-            all.entries.iter().any(|e| {
-                e.name == name && matches!(e.result, keyroost_oath::CalculateAllResult::Touch)
-            })
-        })
+) -> Option<bool> {
+    use keyroost_oath::CalculateAllResult;
+    if let Some(touch) = &listing.touch_required {
+        return Some(touch.iter().any(|n| n == name));
+    }
+    let entry = all?.entries.iter().find(|e| e.name == name)?;
+    match entry.result {
+        CalculateAllResult::Touch => Some(true),
+        CalculateAllResult::Code(_) => Some(false),
+        // HOTP, and anything a later answer adds: the key didn't say.
+        _ => None,
+    }
 }
 
 fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -8315,7 +8329,30 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                     if listing.skipped == 1 { "is" } else { "are" },
                 ));
             }
-            let creds = listing.credentials;
+            // A YubiKey's listing doesn't say which accounts need a touch;
+            // its CALCULATE ALL does, without waiting for one (and without
+            // computing an HOTP code, so no counter moves). Asked only when
+            // the listing didn't say (a Nitrokey's does, and it has no
+            // CALCULATE ALL) and there is a TOTP account it could flag; a
+            // key that refuses it still gets its listing.
+            let has_totp = listing.touch_required.is_none()
+                && listing
+                    .credentials
+                    .iter()
+                    .any(|c| matches!(c.oath_type, keyroost_oath::OathType::Totp));
+            let all = if has_totp {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_secs();
+                session
+                    .reauthenticate()
+                    .ok()
+                    .and_then(|_| session.calculate_all(now).ok())
+            } else {
+                None
+            };
+            let creds = &listing.credentials;
             if json_output() {
                 let accounts: Vec<json_out::OathCredentialJson> = creds
                     .iter()
@@ -8323,6 +8360,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                         name: c.name.clone(),
                         oath_type: oath_type_str(c.oath_type),
                         algorithm: oath_algo_json(c.algorithm),
+                        touch_required: oath_needs_touch(&listing, all.as_ref(), &c.name),
                     })
                     .collect();
                 emit_json(&json_out::AccountsJson { accounts })?;
@@ -8333,10 +8371,16 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             } else {
                 for c in creds {
                     outln!(
-                        "{}  [{}/{}]",
+                        "{}  [{}/{}]{}",
                         sanitize_terminal(&c.name),
                         oath_type_str(c.oath_type),
-                        oath_algo_str(c.algorithm)
+                        oath_algo_str(c.algorithm),
+                        // The same mark as `otp list`.
+                        if oath_needs_touch(&listing, all.as_ref(), &c.name) == Some(true) {
+                            "  (touch)"
+                        } else {
+                            ""
+                        },
                     );
                 }
             }
@@ -8368,14 +8412,21 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // after the listing; without a password this sends nothing.
             // CALCULATE ALL never computes an HOTP code, so it can't advance
             // the counter; here it only says whether the account needs a touch.
-            let all = if is_hotp {
+            // Not asked when the listing already said (a Nitrokey's does).
+            let all = if is_hotp || listing.touch_required.is_some() {
                 None
             } else {
                 session.reauthenticate()?;
                 session.calculate_all(now).ok()
             };
-            if oath_needs_touch(&listing, all.as_ref(), name) {
-                crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
+            match oath_needs_touch(&listing, all.as_ref(), name) {
+                Some(true) => crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT),
+                Some(false) => {}
+                // The key didn't say (an HOTP account on a YubiKey): it may
+                // wait for a touch, so say so before it does.
+                None => crate::prompt::touch(
+                    "Reading the code \u{2014} touch the key if it blinks\u{2026}",
+                ),
             }
             session.reauthenticate()?;
             let code = if is_hotp {
@@ -8499,8 +8550,13 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 .unwrap_or(0);
             let needs_touch = session.asks_touch_to_delete()
                 || listing.as_ref().is_some_and(|listing| {
-                    let all = session.calculate_all(now).ok();
-                    oath_needs_touch(listing, all.as_ref(), name)
+                    // Only a listing that doesn't say needs CALCULATE ALL.
+                    let all = listing
+                        .touch_required
+                        .is_none()
+                        .then(|| session.calculate_all(now).ok())
+                        .flatten();
+                    oath_needs_touch(listing, all.as_ref(), name) == Some(true)
                 });
             if needs_touch {
                 crate::prompt::touch("Deleting \u{2014} touch the key if it blinks\u{2026}");
@@ -13973,11 +14029,10 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             index,
             out,
             overwrite,
-            as_cert,
             path,
         } => {
             let [out_mode] = crate::prompt::check_overwrites([Some(out.as_path())], *overwrite)?;
-            run_fido_large_blob_export(path.as_deref(), *index, out, out_mode, *as_cert)
+            run_fido_large_blob_export(path.as_deref(), *index, out, out_mode)
         }
         LargeBlobCmd::Clear {
             yes,
@@ -14226,50 +14281,15 @@ fn open_and_read_large_blobs(
 /// Classification results shaped for both the human and JSON views.
 fn large_blob_kind(
     entry: &keyroost_ctap::large_blobs::LargeBlobEntry,
-) -> (
-    &'static str,
-    Option<json_out::FidoLargeBlobSshCertJson>,
-    keyroost_ctap::large_blobs::EntryKind,
-) {
+) -> (&'static str, keyroost_ctap::large_blobs::EntryKind) {
     use keyroost_ctap::large_blobs::EntryKind;
     let kind = entry.classify();
-    match &kind {
-        EntryKind::Note(_) => ("note", None, kind),
-        EntryKind::KeyName(_) => ("key-name", None, kind),
-        EntryKind::Opaque => ("opaque", None, kind),
-        EntryKind::SshCert { info, .. } => {
-            let cert = json_out::FidoLargeBlobSshCertJson {
-                key_type: info.key_type.clone(),
-                serial: info.serial.to_string(),
-                cert_type: if info.cert_type == keyroost_ctap::ssh_cert::CERT_TYPE_USER {
-                    "user"
-                } else {
-                    "host"
-                },
-                key_id: info.key_id.clone(),
-                principals: info.principals.clone(),
-                valid_after: info.valid_after,
-                valid_before: info.valid_before,
-                validity: keyroost_ctap::ssh_cert::format_validity(
-                    info.valid_after,
-                    info.valid_before,
-                ),
-                critical_options: info
-                    .critical_options
-                    .iter()
-                    .map(|(n, v)| {
-                        if v.is_empty() {
-                            n.clone()
-                        } else {
-                            format!("{n}={v}")
-                        }
-                    })
-                    .collect(),
-                extensions: info.extensions.clone(),
-            };
-            ("ssh-cert", Some(cert), kind)
-        }
-    }
+    let name = match &kind {
+        EntryKind::Note(_) => "note",
+        EntryKind::KeyName(_) => "key-name",
+        EntryKind::Opaque => "opaque",
+    };
+    (name, kind)
 }
 
 /// An entry's text for JSON: a note's text, or the key's name.
@@ -14342,14 +14362,13 @@ fn large_blob_list_json(
         .into_iter()
         .enumerate()
         .map(|(index, e)| {
-            let (kind, ssh_cert, _) = large_blob_kind(e);
+            let (kind, _) = large_blob_kind(e);
             json_out::FidoLargeBlobEntryJson {
                 index,
                 size: e.orig_size,
                 is_note: e.is_kr_note(),
                 text: large_blob_text(e),
                 kind,
-                ssh_cert,
             }
         })
         .collect();
@@ -14388,13 +14407,6 @@ fn run_fido_large_blob_list(
                     preview_note(&text)
                 )
             }
-            EntryKind::SshCert { info, .. } => outln!(
-                "[{}] {} bytes  ssh-cert  {} ({})",
-                i,
-                e.orig_size,
-                sanitize_terminal(&info.key_id),
-                sanitize_terminal(&info.principals.join(","))
-            ),
             EntryKind::KeyName(l) => outln!(
                 "[{}] {} bytes  key name  \"{}\"",
                 i,
@@ -14431,7 +14443,7 @@ fn run_fido_large_blob_get(
     let entry = array
         .entry(index)
         .ok_or_else(|| large_blob_bad_index(index, array.len()))?;
-    let (kind, ssh_cert, classified) = large_blob_kind(entry);
+    let (kind, classified) = large_blob_kind(entry);
     if json_output() {
         emit_json(&json_out::FidoLargeBlobGetJson {
             index,
@@ -14439,7 +14451,6 @@ fn run_fido_large_blob_get(
             is_note: entry.is_kr_note(),
             text: large_blob_text(entry),
             kind,
-            ssh_cert,
             hex: hex_encode(&entry.ciphertext),
         })?;
         return Ok(());
@@ -14455,51 +14466,6 @@ fn run_fido_large_blob_get(
         EntryKind::KeyName(l) => {
             outln!("Entry {}: key name, {} bytes", index, entry.orig_size);
             outln!("{}", sanitize_terminal(&l.label));
-        }
-        EntryKind::SshCert { info, .. } => {
-            outln!(
-                "Entry {}: OpenSSH certificate, {} bytes",
-                index,
-                entry.orig_size
-            );
-            outln!(
-                "  Type:        {} ({})",
-                sanitize_terminal(&info.key_type),
-                if info.cert_type == keyroost_ctap::ssh_cert::CERT_TYPE_USER {
-                    "user"
-                } else {
-                    "host"
-                }
-            );
-            outln!("  Key ID:      {}", sanitize_terminal(&info.key_id));
-            outln!("  Serial:      {}", info.serial);
-            outln!(
-                "  Principals:  {}",
-                if info.principals.is_empty() {
-                    "(any)".to_string()
-                } else {
-                    sanitize_terminal(&info.principals.join(", "))
-                }
-            );
-            outln!(
-                "  Valid:       {}",
-                keyroost_ctap::ssh_cert::format_validity(info.valid_after, info.valid_before)
-            );
-            for (n, v) in &info.critical_options {
-                let n = sanitize_terminal(n);
-                if v.is_empty() {
-                    outln!("  Critical:    {n}");
-                } else {
-                    let v = sanitize_terminal(v);
-                    outln!("  Critical:    {n}={v}");
-                }
-            }
-            for ext in &info.extensions {
-                outln!("  Extension:   {}", sanitize_terminal(ext));
-            }
-            output::note(&format!(
-                "export with: keyroostctl fido blob export {index} --out FILE --as-cert"
-            ));
         }
         EntryKind::Opaque => {
             outln!(
@@ -14519,28 +14485,14 @@ fn run_fido_large_blob_export(
     index: usize,
     output: &std::path::Path,
     out_mode: crate::prompt::OutMode,
-    as_cert: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use keyroost_ctap::large_blobs::EntryKind;
     let (_dev, _info, array) = open_and_read_large_blobs(path)?;
     let entry = array
         .entry(index)
         .ok_or_else(|| large_blob_bad_index(index, array.len()))?;
-    let bytes: Vec<u8> = if as_cert {
-        match entry.classify() {
-            EntryKind::SshCert { cert_pub, .. } => cert_pub.into_bytes(),
-            _ => {
-                return Err(format!(
-                "entry {index} is not a recognized SSH certificate; drop --as-cert to export raw bytes"
-            )
-                .into())
-            }
-        }
-    } else {
-        entry.ciphertext.clone()
-    };
+    let bytes = &entry.ciphertext;
     out_mode
-        .write(output, &bytes)
+        .write(output, bytes)
         .map_err(|e| format!("write {}: {}", output.display(), e))?;
     output::status(&format!(
         "Wrote {} bytes to {}.",
@@ -16275,10 +16227,10 @@ mod cli_tests {
         use keyroost_oath::{
             CalculateAll, CalculateAllEntry, CalculateAllResult, Listing, OtpCode,
         };
-        let listing = |touch: &[&str]| Listing {
+        let listing = |touch: Option<&[&str]>| Listing {
             credentials: Vec::new(),
             skipped: 0,
-            touch_required: touch.iter().map(|n| n.to_string()).collect(),
+            touch_required: touch.map(|t| t.iter().map(|n| n.to_string()).collect()),
         };
         let entry = |name: &str, result| CalculateAllEntry {
             name: name.into(),
@@ -16298,14 +16250,19 @@ mod cli_tests {
             ],
             skipped: 0,
         };
-        // Nitrokey's secrets app: the listing names its touch accounts.
-        assert!(oath_needs_touch(&listing(&["nk-touch"]), None, "nk-touch"));
-        assert!(!oath_needs_touch(&listing(&["nk-touch"]), None, "nk-plain"));
-        // YubiKey: CALCULATE ALL leaves a touch account out with TOUCH.
-        assert!(oath_needs_touch(&listing(&[]), Some(&all), "yk-touch"));
-        assert!(!oath_needs_touch(&listing(&[]), Some(&all), "yk-plain"));
-        assert!(!oath_needs_touch(&listing(&[]), Some(&all), "yk-hotp"));
-        assert!(!oath_needs_touch(&listing(&[]), None, "yk-touch"));
+        // Nitrokey's secrets app: the listing names its touch accounts, and
+        // answers for every account.
+        let nk = listing(Some(&["nk-touch"]));
+        assert_eq!(oath_needs_touch(&nk, None, "nk-touch"), Some(true));
+        assert_eq!(oath_needs_touch(&nk, None, "nk-plain"), Some(false));
+        // YubiKey: CALCULATE ALL leaves a touch account out with TOUCH and
+        // computes the others; it skips HOTP whatever its setting, so an
+        // HOTP account is unknown, as is everything when it was refused.
+        let yk = listing(None);
+        assert_eq!(oath_needs_touch(&yk, Some(&all), "yk-touch"), Some(true));
+        assert_eq!(oath_needs_touch(&yk, Some(&all), "yk-plain"), Some(false));
+        assert_eq!(oath_needs_touch(&yk, Some(&all), "yk-hotp"), None);
+        assert_eq!(oath_needs_touch(&yk, None, "yk-touch"), None);
     }
 
     #[test]
@@ -24720,8 +24677,9 @@ mod cli_tests {
             name: "example".into(),
             oath_type: "TOTP",
             algorithm: "SHA1",
+            touch_required: Some(false),
         };
-        assert_json_has_keys(&c, &["name", "type", "algorithm"]);
+        assert_json_has_keys(&c, &["name", "type", "algorithm", "touch_required"]);
         // `oath list` emits one object whose `accounts` array holds these.
         let doc = serde_json::to_string(&json_out::AccountsJson { accounts: vec![c] }).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
@@ -24979,14 +24937,12 @@ mod cli_tests {
         assert_eq!(shaped.entries[0].text.as_deref(), Some("hello"));
         assert_eq!(shaped.entries[0].size, "hello".len() as u64);
         assert_eq!(shaped.entries[0].kind, "note");
-        assert!(shaped.entries[0].ssh_cert.is_none());
 
         // [1] is opaque: is_note false, no text.
         assert_eq!(shaped.entries[1].index, 1);
         assert!(!shaped.entries[1].is_note);
         assert!(shaped.entries[1].text.is_none());
         assert_eq!(shaped.entries[1].kind, "opaque");
-        assert!(shaped.entries[1].ssh_cert.is_none());
 
         // The array's capacity is computed against the given AuthenticatorInfo
         // (spec-minimum 1024 bytes here, since max_serialized_large_blob_array
@@ -24998,27 +24954,24 @@ mod cli_tests {
             shaped.capacity.max_bytes - shaped.capacity.used_bytes
         );
 
-        // The opaque entry's text is null in the JSON, and so is a note's
-        // ssh_cert; both keys are present.
+        // The opaque entry's text is null in the JSON; the key is present.
         let s = serde_json::to_string(&shaped).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let arr = v.get("entries").unwrap().as_array().unwrap();
         assert_eq!(arr[0]["text"], "hello");
         assert!(arr[1].get("text").is_some_and(|t| t.is_null()));
-        assert!(arr[0].get("ssh_cert").is_some_and(|c| c.is_null()));
     }
 
     #[test]
     fn large_blob_get_json_carries_hex_for_opaque() {
         let entry = opaque_entry();
-        let (kind, ssh_cert, _) = large_blob_kind(&entry);
+        let (kind, _) = large_blob_kind(&entry);
         let g = json_out::FidoLargeBlobGetJson {
             index: 0,
             size: entry.orig_size,
             is_note: entry.is_kr_note(),
             text: entry.as_text(),
             kind,
-            ssh_cert,
             hex: hex_encode(&entry.ciphertext),
         };
         assert!(!g.is_note);
@@ -25034,14 +24987,13 @@ mod cli_tests {
     #[test]
     fn large_blob_get_json_includes_note_text() {
         let entry = LargeBlobEntry::from_text("a note");
-        let (kind, ssh_cert, _) = large_blob_kind(&entry);
+        let (kind, _) = large_blob_kind(&entry);
         let g = json_out::FidoLargeBlobGetJson {
             index: 3,
             size: entry.orig_size,
             is_note: entry.is_kr_note(),
             text: entry.as_text(),
             kind,
-            ssh_cert,
             hex: hex_encode(&entry.ciphertext),
         };
         assert!(g.is_note);
@@ -25053,21 +25005,17 @@ mod cli_tests {
 
     #[test]
     fn large_blob_kind_classifies_note_and_opaque() {
-        // Note entries classify as "note" with no ssh_cert payload.
         let note = LargeBlobEntry::from_text("hello");
-        let (kind, ssh_cert, classified) = large_blob_kind(&note);
+        let (kind, classified) = large_blob_kind(&note);
         assert_eq!(kind, "note");
-        assert!(ssh_cert.is_none());
         assert!(matches!(
             classified,
             keyroost_ctap::large_blobs::EntryKind::Note(t) if t == "hello"
         ));
 
-        // Unrecognized bytes classify as "opaque" with no ssh_cert payload.
         let opaque = opaque_entry();
-        let (kind, ssh_cert, classified) = large_blob_kind(&opaque);
+        let (kind, classified) = large_blob_kind(&opaque);
         assert_eq!(kind, "opaque");
-        assert!(ssh_cert.is_none());
         assert!(matches!(
             classified,
             keyroost_ctap::large_blobs::EntryKind::Opaque
@@ -25150,7 +25098,14 @@ mod cli_tests {
             "/tmp/out-cert.pub",
             "--as-cert"
         ])
-        .is_ok());
+        .is_err());
+        // The removed --as-cert says where certificates are saved now.
+        let argv: Vec<String> = ["keyroostctl", "fido", "blob", "export", "0", "--as-cert"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hint = retired_flag_hint("--as-cert", &argv).expect("a hint");
+        assert!(hint.contains("fido ssh export"), "{hint}");
     }
 
     #[test]

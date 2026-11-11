@@ -3158,6 +3158,48 @@ fn oath_delete_label(applet_asks: bool, touch_account: bool) -> &'static str {
     }
 }
 
+/// The window's size at start-up, in points.
+const WINDOW_SIZE: [f32; 2] = [1180.0, 760.0];
+/// The smallest the window may get, in points.
+const WINDOW_MIN_SIZE: [f32; 2] = [900.0, 560.0];
+
+/// Points kept free at the bottom of the screen for a taskbar (Windows 11's
+/// is 48 at every display scaling).
+const SCREEN_BAR: f32 = 48.0;
+/// Points a title bar takes above the window's contents.
+const TITLE_BAR: f32 = 32.0;
+
+/// The size to shrink a window of `inner` points to so it fits a screen of
+/// `monitor` points with room for a taskbar and the title bar, or `None`
+/// when it already fits. Never below [`WINDOW_MIN_SIZE`], and never larger
+/// than it was (a zoomed window can be smaller than that minimum).
+fn window_size_for_screen(inner: egui::Vec2, monitor: egui::Vec2) -> Option<egui::Vec2> {
+    let room = egui::vec2(monitor.x * 0.95, monitor.y - SCREEN_BAR - TITLE_BAR);
+    if inner.x <= room.x && inner.y <= room.y {
+        return None;
+    }
+    let min = egui::Vec2::from(WINDOW_MIN_SIZE).min(inner);
+    Some(inner.min(room).max(min))
+}
+
+/// Where to move a window just shrunk to a frame of `outer` so its bottom
+/// edge clears the taskbar of a screen of `monitor` points, or `None` when
+/// it already does. The system picks the start-up position before the
+/// window is shrunk, so a window that now fits can still start with its
+/// bottom edge under the taskbar. Only upward, and by no more than a
+/// taskbar and a title bar: only this screen's size is known, not where it
+/// sits among several, so a larger move could carry the window onto
+/// another screen. A window whose corner is outside this screen's size is
+/// on another one and is left alone.
+fn window_pos_for_screen(outer: egui::Rect, monitor: egui::Vec2) -> Option<egui::Pos2> {
+    if !egui::Rect::from_min_size(egui::Pos2::ZERO, monitor).contains(outer.min) {
+        return None;
+    }
+    let under = outer.max.y - (monitor.y - SCREEN_BAR);
+    let up = under.min(outer.min.y).clamp(0.0, SCREEN_BAR + TITLE_BAR);
+    (up > 0.0).then(|| egui::pos2(outer.min.x, outer.min.y - up))
+}
+
 /// What the touch banner says while a job runs, or `None` for no banner: the
 /// job's own label when it asks for a touch, else a plain prompt once the key
 /// itself reports it is waiting for one, else a hedged one while the job
@@ -4673,8 +4715,8 @@ fn main() -> eframe::Result<()> {
         let apdu_trace = apdu_trace.clone();
         let mut options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([1180.0, 760.0])
-                .with_min_inner_size([900.0, 560.0])
+                .with_inner_size(WINDOW_SIZE)
+                .with_min_inner_size(WINDOW_MIN_SIZE)
                 .with_title("keyroost")
                 .with_icon(window_icon()),
             ..Default::default()
@@ -4896,6 +4938,17 @@ struct App {
     /// The selection `retry_dropped_info_read` already retried its info
     /// read for (once per selection).
     info_retried_for: Option<DeviceId>,
+    /// Frames spent waiting to learn the screen's size at start-up, for
+    /// [`App::fit_window_to_screen`]; `u8::MAX` once that is settled.
+    window_fit_frames: u8,
+    /// Where this frame's touch banner goes: the top middle of the key's
+    /// pane, just under its name and tabs ([`App::touch_banner`]). `None`
+    /// when no key's pane was drawn this frame.
+    touch_banner_at: Option<egui::Pos2>,
+    /// The key a finished job ran on, set only while its outcome is applied
+    /// after another key was selected ([`Self::apply_piv_job`]): log lines
+    /// then name this key, not the selected one.
+    outcome_for: Option<DeviceId>,
     /// Which capability pane is showing for the selected key.
     cap_tab: CapTab,
     /// Each device's own last-shown `cap_tab`, so switching to another
@@ -5401,7 +5454,6 @@ impl App {
                                 self.piv_export_cert();
                             }
                             FileTarget::LbExport(idx) => {
-                                use keyroost_ctap::large_blobs::EntryKind;
                                 // The array may have been reloaded, cleared, or
                                 // shrunk between the Export click and the dialog
                                 // resolving — fail loudly instead of writing the
@@ -5415,26 +5467,13 @@ impl App {
                                     None => {
                                         format!("Export failed: entry {idx} no longer exists")
                                     }
-                                    Some(entry) => {
-                                        let bytes = match entry.classify() {
-                                            EntryKind::SshCert { cert_pub, .. } => {
-                                                Some(cert_pub.into_bytes())
-                                            }
-                                            _ => Some(entry.ciphertext.clone()),
-                                        };
-                                        match bytes {
-                                            None => "Export failed: could not re-encode \
-                                                     certificate"
-                                                .into(),
-                                            Some(bytes) => match std::fs::write(&path, &bytes) {
-                                                Ok(()) => format!(
-                                                    "Exported entry {idx} ({} bytes) to {text}",
-                                                    bytes.len()
-                                                ),
-                                                Err(e) => format!("Export failed: {e}"),
-                                            },
-                                        }
-                                    }
+                                    Some(entry) => match std::fs::write(&path, &entry.ciphertext) {
+                                        Ok(()) => format!(
+                                            "Exported entry {idx} ({} bytes) to {text}",
+                                            entry.ciphertext.len()
+                                        ),
+                                        Err(e) => format!("Export failed: {e}"),
+                                    },
                                 });
                             }
                             FileTarget::SshCertSave(id) => {
@@ -5954,11 +5993,27 @@ impl App {
         // name so the log stays legible when a session touches several keys.
         // Fleet-level lines (device-scan counts, "selection moved on" reset
         // notices) go through `log_global`, which skips the prefix.
-        let text = match self.selected_device() {
-            Some(d) => format!("{}: {}", d.title(), text.into()),
-            None => text.into(),
-        };
+        let text = self.with_key_name(text.into());
         self.push_log(severity, kind, text);
+    }
+
+    /// `text` under the name of the key it is about: the selected one, or
+    /// the key a late outcome ran on (`outcome_for`; "a key" when that one
+    /// was unplugged meanwhile).
+    fn with_key_name(&self, text: String) -> String {
+        let key = match &self.outcome_for {
+            Some(id) => Some(
+                self.devices
+                    .iter()
+                    .find(|d| &d.id == id)
+                    .map_or_else(|| "a key".to_string(), |d| d.title().into_owned()),
+            ),
+            None => self.selected_device().map(|d| d.title().into_owned()),
+        };
+        match key {
+            Some(key) => format!("{key}: {text}"),
+            None => text,
+        }
     }
 
     /// Log without the selected-token prefix `log_kind` adds — for entries that
@@ -5973,10 +6028,7 @@ impl App {
     /// the same, so a failure that persists is logged once rather than
     /// pushing everything else out of the log.
     fn log_bg_once(&mut self, severity: Severity, text: impl Into<String>) {
-        let text = match self.selected_device() {
-            Some(d) => format!("{}: {}", d.title(), text.into()),
-            None => text.into(),
-        };
+        let text = self.with_key_name(text.into());
         self.log_global_bg_once(severity, text);
     }
 
@@ -6052,16 +6104,18 @@ impl App {
         // line that closure produces, then consumed so a later, unrelated log
         // call in the same frame doesn't also claim it.
         let trace = self.pending_trace.take().filter(|t| !t.is_empty());
+        // A file path in a message (a backup's, an import's) names the
+        // person's home folder; the log is meant to be pasted into bug
+        // reports, so that part shows as `~`, and the status bar's note
+        // matches the log line it repeats.
+        let text = without_home(&text);
         if let Some(note) = StatusNote::for_log_line(severity, kind, &text) {
             self.status_note = Some(note);
         }
         self.log.push(LogLine {
             severity,
             kind,
-            // A file path in a message (a backup's, an import's) names the
-            // person's home folder; the log is meant to be pasted into bug
-            // reports, so that part shows as `~`.
-            text: without_home(&text),
+            text,
             trace,
         });
         // Keep the log bounded; oldest entries are least interesting.
@@ -6478,6 +6532,50 @@ impl App {
         false
     }
 
+    /// Shrink the window at start-up when it opened larger than the screen:
+    /// its size is in points, so display scaling (125% on a 1280×800 screen)
+    /// can make the default bigger than the screen. Waits a few frames for
+    /// the screen's size and the window's place, which not every system
+    /// reports (Wayland never gives the place, so nothing happens there),
+    /// then leaves the window to the person. A maximized or full-screen
+    /// window is the system's to size.
+    fn fit_window_to_screen(&mut self, ctx: &egui::Context) {
+        if self.window_fit_frames == u8::MAX {
+            return;
+        }
+        let (monitor, inner, outer) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.monitor_size, v.inner_rect, v.outer_rect)
+        });
+        let filled = ctx.input(|i| {
+            let v = i.viewport();
+            v.maximized == Some(true) || v.fullscreen == Some(true)
+        });
+        if filled {
+            self.window_fit_frames = u8::MAX;
+            return;
+        }
+        if let (Some(monitor), Some(inner)) = (monitor, inner) {
+            self.window_fit_frames = u8::MAX;
+            let Some(size) = window_size_for_screen(inner.size(), monitor) else {
+                return;
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            // The frame (title bar, borders) keeps its size through the resize.
+            if let Some(outer) = outer {
+                let frame = outer.size() - inner.size();
+                let fitted = egui::Rect::from_min_size(outer.min, size + frame);
+                if let Some(pos) = window_pos_for_screen(fitted, monitor) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                }
+            }
+        } else if self.window_fit_frames >= 30 {
+            self.window_fit_frames = u8::MAX;
+        } else {
+            self.window_fit_frames += 1;
+        }
+    }
+
     /// Start the selected key's info read when the one its selection
     /// started never ran: refused because another job was running (switching
     /// keys while a Molto2 opened, say). Any tab otherwise showed "Reading
@@ -6591,7 +6689,16 @@ impl App {
                         app.apply_key_details();
                     }
                     Err(e) => {
-                        app.log_bg_once(Severity::Err, format!("FIDO2: {e}"));
+                        // Windows without administrator rights: every read
+                        // ends this way, and the Overview and the FIDO2 tab
+                        // say so and what to do. A plain line, then, not an
+                        // error on the status bar each time a key is selected.
+                        let severity = if e.contains(keyroost_transport::WINDOWS_NEEDS_ADMIN) {
+                            Severity::Info
+                        } else {
+                            Severity::Err
+                        };
+                        app.log_bg_once(severity, format!("FIDO2: {e}"));
                         app.security_keys.error = Some(e);
                     }
                 }
@@ -8074,7 +8181,7 @@ impl App {
         // already says need a touch (Nitrokey's secrets app).
         let all = session.calculate_all(now).ok();
         let mut touch = touch.to_vec();
-        touch.extend(listing.touch_required);
+        touch.extend(listing.touch_required.unwrap_or_default());
         let rows =
             Self::oath_rows_from(listing.credentials, all.as_ref(), &touch, |name, period| {
                 session
@@ -9745,11 +9852,13 @@ impl App {
             (label, progress.or(seconds))
         });
         // "Still working on…" only while something is (a Refresh runs as
-        // several jobs in a row, so it isn't cleared when one ends).
-        let note = self
-            .status_note
-            .clone()
-            .filter(|n| !n.refusal || running.is_some());
+        // several jobs in a row, so it isn't cleared when one ends). A job
+        // waiting for a touch counts: the banner asks for the touch, and the
+        // bar still has to say why a click or Enter did nothing. Its text
+        // quotes the running job's label, which for a touch job is that
+        // job's own touch prompt ("Still working on: Touch your key…").
+        let busy = self.busy();
+        let note = self.status_note.clone().filter(|n| !n.refusal || busy);
         if let Some(n) = &note {
             root_ui
                 .ctx()
@@ -9784,7 +9893,7 @@ impl App {
                 }
                 open_log = resp.clicked();
                 // A refused click shows over the running job's line.
-                let refused = running.is_some() && note.as_ref().is_some_and(|n| n.refusal);
+                let refused = busy && note.as_ref().is_some_and(|n| n.refusal);
                 egui::Sides::new().shrink_left().truncate().show(
                     ui,
                     |ui| {
@@ -9873,36 +9982,41 @@ impl App {
         let Some(label) = self.touch_banner_text() else {
             return;
         };
-        egui::Area::new(egui::Id::unique("touch_banner"))
+        let area = egui::Area::new(egui::Id::unique("touch_banner"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame {
-                    inner_margin: egui::Margin::symmetric(18, 12),
-                    corner_radius: egui::CornerRadius::same(10),
-                    fill: p.pop,
-                    stroke: egui::Stroke::new(1.5, p.accent),
-                    shadow: egui::epaint::Shadow {
-                        offset: [0, 8],
-                        blur: 28,
-                        spread: 0,
-                        color: egui::Color32::from_black_alpha(90),
-                    },
-                    ..Default::default()
-                }
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(18.0).color(p.accent));
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(label)
-                                .font(theme::f_sb(15.0))
-                                .color(p.txt),
-                        );
-                    });
+            .interactable(false);
+        // Under the key's name and tabs when a key's pane is on screen;
+        // near the top of the window otherwise.
+        let area = match self.touch_banner_at {
+            Some(at) => area.pivot(egui::Align2::CENTER_TOP).fixed_pos(at),
+            None => area.anchor(egui::Align2::CENTER_TOP, [0.0, 64.0]),
+        };
+        area.show(ctx, |ui| {
+            egui::Frame {
+                inner_margin: egui::Margin::symmetric(18, 12),
+                corner_radius: egui::CornerRadius::same(10),
+                fill: p.pop,
+                stroke: egui::Stroke::new(1.5, p.accent),
+                shadow: egui::epaint::Shadow {
+                    offset: [0, 8],
+                    blur: 28,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(90),
+                },
+                ..Default::default()
+            }
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(18.0).color(p.accent));
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(label)
+                            .font(theme::f_sb(15.0))
+                            .color(p.txt),
+                    );
                 });
             });
+        });
     }
 
     /// Report a FIDO2 reset that will not happen, where it will be read.
@@ -11117,7 +11231,7 @@ impl App {
             ctx,
             "Reset PIV applet?",
             "This wipes ALL PIV keys, certificates, and PINs.",
-            &["Only works when the PIN and PUK are already blocked."],
+            &["keyroost blocks the PIN and PUK first where the key needs that."],
             &mut self.piv.confirm_reset,
         ) && self.piv_reset()
         {
@@ -11884,17 +11998,38 @@ impl App {
     where
         F: FnOnce() -> ApplyFn + Send + 'static,
     {
+        let for_device = self.selected_device.clone();
         let queued = self.spawn_job(label, move || {
             let apply = job();
-            Box::new(move |app: &mut App| {
-                app.piv.inflight = false;
-                apply(app);
-            }) as ApplyFn
+            Box::new(move |app: &mut App| Self::apply_piv_job(app, for_device, apply)) as ApplyFn
         });
         if queued {
             self.piv.inflight = true;
         }
         queued
+    }
+
+    /// Apply a finished PIV job's outcome (`apply`) for the key it ran on.
+    ///
+    /// A slow one (an RSA key takes up to a minute to generate) can finish
+    /// after another key was selected, and the pane then shows that key. Its
+    /// outcome is still logged, under the key it ran on (`outcome_for`), and
+    /// what is remembered per key is kept, but the pane on screen is not
+    /// this job's to change: `apply` runs against a pane of its own, and
+    /// nothing is re-read for it ([`Self::load_piv_status_with_cache`]).
+    /// A job whose key isn't known is treated as moved on, as
+    /// [`completion_still_valid`] does for every pane.
+    fn apply_piv_job(app: &mut App, for_device: Option<DeviceId>, apply: ApplyFn) {
+        if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+            app.piv.inflight = false;
+            apply(app);
+            return;
+        }
+        let shown = std::mem::take(&mut app.piv);
+        app.outcome_for = for_device;
+        apply(app);
+        app.outcome_for = None;
+        app.piv = shown;
     }
 
     /// The selected device's cached [`keyroost_transport::PivSessionState`]
@@ -12047,6 +12182,12 @@ impl App {
     /// actually reached the card, "PIV status cache validated" when every
     /// value came out of the reused state with none.
     fn load_piv_status_with_cache(&mut self, kind: LogKind, cache: PivCache) {
+        // A re-read that follows a write which finished after another key
+        // was selected: that key's pane isn't on screen, and the selected
+        // one didn't change.
+        if self.outcome_for.is_some() {
+            return;
+        }
         self.piv.error = None;
         let Some(reader) = self.selected_oath_reader() else {
             return;
@@ -16551,6 +16692,8 @@ impl eframe::App for App {
         // thread before drawing.
         self.drain_worker();
         self.retry_dropped_info_read();
+        self.fit_window_to_screen(ctx);
+        self.touch_banner_at = None;
         // While a device job is in flight (e.g. fingerprint enrollment writing
         // live progress to a shared cell), keep the frame loop ticking so the UI
         // reflects per-sample updates instead of freezing until the job ends.
@@ -18507,6 +18650,12 @@ impl App {
                             .show(ui, |ui| {
                                 self.device_hero(ui, p, &dev);
                                 self.cap_tabs(ui, p, &dev);
+                                // The touch banner sits here, under the key's
+                                // name and tabs, so it covers neither.
+                                self.touch_banner_at = Some(egui::pos2(
+                                    ui.max_rect().center().x,
+                                    ui.cursor().top() + 8.0,
+                                ));
                                 ui.add_space(16.0);
                                 // Hero + tabs stay pinned; the active pane scrolls.
                                 // This is the one place every capability pane gets
@@ -21242,10 +21391,6 @@ impl App {
                         let meta = match &classification {
                             EntryKind::Note(_) => "keyroost text note".to_string(),
                             EntryKind::KeyName(l) => device::key_name_row_text(&l.label),
-                            EntryKind::SshCert { .. } => format!(
-                                "ssh-cert \u{00b7} {} bytes \u{00b7} relying-party data",
-                                entry.ciphertext.len(),
-                            ),
                             EntryKind::Opaque => format!(
                                 "{} bytes ciphertext \u{00b7} {}-byte nonce \u{00b7} origSize {} \u{00b7} relying-party data",
                                 entry.ciphertext.len(),
@@ -21284,13 +21429,7 @@ impl App {
                         // Export is read-only, so it's always available
                         // regardless of session lock state.
                         if theme::button(ui, p, BtnKind::Ghost, "Export\u{2026}").clicked() {
-                            let is_cert =
-                                matches!(classification, EntryKind::SshCert { .. });
-                            let default_name = if is_cert {
-                                format!("entry-{idx}-cert.pub")
-                            } else {
-                                format!("large-blob-entry-{idx}.bin")
-                            };
+                            let default_name = format!("large-blob-entry-{idx}.bin");
                             app.spawn_file_dialog(
                                 FileTarget::LbExport(idx),
                                 true,
@@ -21301,8 +21440,8 @@ impl App {
                     },
                 );
                 // keyroost notes: inline editor when editing this entry, else
-                // the decoded text read-only. SSH certificates get a parsed
-                // field-by-field view; anything else (opaque RP data) shows
+                // the decoded text read-only. Anything else (opaque RP data,
+                // which includes an SSH credential's certificate) shows
                 // nothing extra here — its bytes remain available via "View
                 // bytes" below.
                 if editing == Some(idx) {
@@ -21342,63 +21481,6 @@ impl App {
                             .font(theme::f_reg(12.5))
                             .color(p.txt),
                     );
-                } else if let EntryKind::SshCert { info, .. } = &classification {
-                    ui.add_space(6.0);
-                    egui::Grid::new(format!("lb_cert_{idx}"))
-                        .num_columns(2)
-                        .spacing([12.0, 2.0])
-                        .show(ui, |ui| {
-                            let row = |ui: &mut egui::Ui, k: &str, v: String| {
-                                ui.label(
-                                    egui::RichText::new(k).font(theme::f_reg(11.5)).color(p.txt3),
-                                );
-                                ui.label(
-                                    egui::RichText::new(v).font(theme::f_reg(11.5)).color(p.txt),
-                                );
-                                ui.end_row();
-                            };
-                            let kind = if info.cert_type
-                                == keyroost_ctap::ssh_cert::CERT_TYPE_USER
-                            {
-                                "user"
-                            } else {
-                                "host"
-                            };
-                            row(ui, "Type", format!("{} ({kind})", info.key_type));
-                            row(ui, "Key ID", info.key_id.clone());
-                            row(ui, "Serial", info.serial.to_string());
-                            row(
-                                ui,
-                                "Principals",
-                                if info.principals.is_empty() {
-                                    "(any)".to_string()
-                                } else {
-                                    info.principals.join(", ")
-                                },
-                            );
-                            row(
-                                ui,
-                                "Valid",
-                                keyroost_ctap::ssh_cert::format_validity(
-                                    info.valid_after,
-                                    info.valid_before,
-                                ),
-                            );
-                            for (n, v) in &info.critical_options {
-                                row(
-                                    ui,
-                                    "Critical",
-                                    if v.is_empty() {
-                                        n.clone()
-                                    } else {
-                                        format!("{n}={v}")
-                                    },
-                                );
-                            }
-                            for ext in &info.extensions {
-                                row(ui, "Extension", ext.clone());
-                            }
-                        });
                 }
                 if selected == Some(idx) {
                     ui.add_space(8.0);
@@ -21893,6 +21975,7 @@ impl App {
                     });
                 });
                 ui.add_space(12.0);
+                p.checkboxes_on_pop(ui);
                 body(ui);
             });
         (closed, help_resp)
@@ -22092,6 +22175,7 @@ impl App {
             })
             .show(ctx, |ui| {
                 ui.set_max_width(300.0);
+                p.checkboxes_on_pop(ui);
                 // Custom title at the button font size (the default window title
                 // bar is dropped via title_bar(false), so render our own).
                 self.adaptive_row(
@@ -31329,6 +31413,101 @@ mod tests {
         );
     }
 
+    /// At 125% a 1280×800 screen is 1024×640 points: the default window
+    /// (1180×760) shrinks to fit, not below its minimum; on a big screen it
+    /// stays as it is.
+    #[test]
+    fn the_window_shrinks_to_fit_a_small_screen() {
+        let default = egui::Vec2::from(WINDOW_SIZE);
+        let fitted = window_size_for_screen(default, egui::vec2(1024.0, 640.0)).expect("shrinks");
+        assert!(fitted.x <= 1024.0 * 0.95 && fitted.y <= 640.0, "{fitted:?}");
+        assert_eq!(fitted, egui::vec2(972.8, 560.0));
+        assert_eq!(
+            window_size_for_screen(default, egui::vec2(1920.0, 1080.0)),
+            None
+        );
+        // A screen smaller than the minimum gets the minimum.
+        assert_eq!(
+            window_size_for_screen(default, egui::vec2(800.0, 500.0)),
+            Some(egui::Vec2::from(WINDOW_MIN_SIZE))
+        );
+        // 1280×800 at 100%: the height leaves the taskbar and title bar free.
+        assert_eq!(
+            window_size_for_screen(default, egui::vec2(1280.0, 800.0)),
+            Some(egui::vec2(1180.0, 720.0))
+        );
+        // Never grows: a window already under the minimum (a zoomed one)
+        // only shrinks to the room.
+        assert_eq!(
+            window_size_for_screen(egui::vec2(700.0, 900.0), egui::vec2(1280.0, 800.0)),
+            Some(egui::vec2(700.0, 720.0))
+        );
+    }
+
+    /// Windows opens the window 26 pixels down; with its frame the fitted
+    /// window then ended 10 pixels under the taskbar on a 1280×800 screen.
+    /// It moves up just enough, stays put when it is on screen already, and
+    /// a window on a second screen is not pulled onto this one.
+    #[test]
+    fn the_window_moves_up_from_under_the_taskbar() {
+        let screen = egui::vec2(1280.0, 800.0);
+        let frame =
+            |x: f32, y: f32| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(1196.0, 743.0));
+        assert_eq!(
+            window_pos_for_screen(frame(26.0, 26.0), screen),
+            Some(egui::pos2(26.0, 9.0))
+        );
+        assert_eq!(window_pos_for_screen(frame(26.0, 9.0), screen), None);
+        assert_eq!(window_pos_for_screen(frame(1400.0, 26.0), screen), None);
+        // Taller than the screen can hold: the top edge stays on screen.
+        let tall = egui::Rect::from_min_size(egui::pos2(26.0, 26.0), egui::vec2(1196.0, 790.0));
+        assert_eq!(
+            window_pos_for_screen(tall, screen),
+            Some(egui::pos2(26.0, 0.0))
+        );
+        // Never sideways: a window on a wider screen to the right (x past
+        // this one's width would be left alone; x within it, as here, stays).
+        assert_eq!(
+            window_pos_for_screen(frame(1000.0, 26.0), screen).map(|p| p.x),
+            Some(1000.0)
+        );
+        // On a screen stacked below a taller one (y past this one's
+        // height) nothing moves; within it, no more than a taskbar and a
+        // title bar.
+        assert_eq!(window_pos_for_screen(frame(26.0, 900.0), screen), None);
+        let low = egui::Rect::from_min_size(egui::pos2(26.0, 600.0), egui::vec2(1196.0, 743.0));
+        assert_eq!(
+            window_pos_for_screen(low, screen),
+            Some(egui::pos2(26.0, 600.0 - SCREEN_BAR - TITLE_BAR))
+        );
+    }
+
+    /// The status bar's note repeats its log line as the log shows it,
+    /// home folder as `~`.
+    #[test]
+    fn the_status_note_shows_the_home_folder_as_a_tilde() {
+        let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .ok()
+            .filter(|h| h.trim_end_matches(['/', '\\']).len() > 1);
+        let Some(home) = home else {
+            return; // no usable home folder in this environment
+        };
+        let sep = if cfg!(windows) { '\\' } else { '/' };
+        let home = home.trim_end_matches(['/', '\\']);
+        let mut app = App::default();
+        app.log_global(
+            Severity::Ok,
+            LogKind::User,
+            format!("Saved the backup to {home}{sep}kr-test.asc"),
+        );
+        let note = app.status_note.as_ref().expect("a user line makes a note");
+        assert_eq!(note.text, format!("Saved the backup to ~{sep}kr-test.asc"));
+        assert_eq!(
+            app.log.last().map(|l| l.text.as_str()),
+            Some(note.text.as_str())
+        );
+    }
+
     /// The home folder in a log line shows as `~`, only where it is a whole
     /// path part: a home of `/home/al` leaves `/home/alice` alone.
     #[test]
@@ -32153,6 +32332,41 @@ mod tests {
         let status = keyroost_transport::PivStatus::default();
         App::apply_piv_write(&mut app, Ok(status), "did a thing".into());
         assert_eq!(app.piv.selected_slot, PivSlotSel::KeyMgmt);
+    }
+
+    /// A PIV job that finishes after another key was selected (an RSA key
+    /// takes a while to generate) logs its outcome under the key it ran on,
+    /// and leaves the pane on screen, now another key's, alone.
+    #[test]
+    fn a_piv_outcome_after_switching_keys_names_its_own_key() {
+        let mut app = App {
+            devices: vec![
+                test_key("serial:A", "1", Some("key-a")),
+                test_key("serial:B", "2", Some("key-b")),
+            ],
+            selected_device: Some("serial:B".into()),
+            ..Default::default()
+        };
+        let outcome: ApplyFn = Box::new(|app: &mut App| {
+            let status = keyroost_transport::PivStatus::default();
+            App::apply_piv_write(app, Ok(status), "Generated RSA-4096 key.".into());
+        });
+        App::apply_piv_job(&mut app, Some("serial:A".into()), outcome);
+        assert_eq!(app.log.len(), 1);
+        assert_eq!(app.log[0].text, "key-a: Generated RSA-4096 key.");
+        assert!(app.piv.status.is_none() && app.piv.notice.is_none());
+        assert!(app.outcome_for.is_none());
+
+        // The key it ran on is still the one shown: its pane takes it.
+        app.piv.inflight = true;
+        let outcome: ApplyFn = Box::new(|app: &mut App| {
+            let status = keyroost_transport::PivStatus::default();
+            App::apply_piv_write(app, Ok(status), "PIN changed.".into());
+        });
+        App::apply_piv_job(&mut app, Some("serial:B".into()), outcome);
+        assert_eq!(app.log[1].text, "key-b: PIN changed.");
+        assert_eq!(app.piv.notice.as_deref(), Some("PIN changed."));
+        assert!(!app.piv.inflight);
     }
 
     /// The management-key-gated flows declare they collect the current

@@ -139,7 +139,6 @@ keyroostctl fido blob show 0
 keyroostctl fido blob add "spare key in the desk drawer"   # asks for the PIN (hidden)
 keyroostctl fido blob edit 2 "moved to the safe"
 keyroostctl fido blob export 1 --out entry.bin            # raw bytes, no PIN
-keyroostctl fido blob export 1 -o id_ecdsa_sk-cert.pub --as-cert
 keyroostctl fido blob delete 1                            # asks y/N; RP-owned entries also print a warning
 keyroostctl fido blob clear                               # wipes the whole array, asks y/N
 keyroostctl fido blob clear --keep-name                   # ...but keeps the key's name
@@ -150,15 +149,17 @@ keyroostctl fido blob delete 1 --pin stdin --yes          # in a script: piped P
       process list while the command runs; that is fine for a note and unacceptable for a
       secret, which is another reason not to put one here. If the <code>--out</code> file
       of <code>export</code> already exists, a terminal asks "overwrite? [y/N]"; a script
-      must add <code>--overwrite</code>.</p>
+      must add <code>--overwrite</code>. <code>export</code> saves the stored bytes as they
+      are; an SSH certificate is stored encrypted, so save it with <code>fido ssh
+      export</code> (<a href="#ssh">below</a>).</p>
   </section>
 
-  <section class="kr-section">
+  <section class="kr-section" id="ssh">
     <h2>SSH certificates</h2>
-    <p>The commonest real occupant of the large-blob array is an <strong>OpenSSH
-      certificate</strong>: tools like <code>ssh-keygen</code> and <code>fido2-token</code>
-      store the certificate for a resident SSH credential here so it travels with the key
-      instead of living in a file you have to carry. keyroost can read one back out.</p>
+    <p>One use of the large-blob array is an <strong>OpenSSH certificate</strong>:
+      libfido2's <code>fido2-token -S -b</code> stores the certificate for a resident SSH
+      credential here so it travels with the key instead of living in a file you have to
+      carry. keyroost can read one back out.</p>
     <p>Each such entry is encrypted under a per-credential <em>largeBlobKey</em> that only the
       key can hand over, so extraction goes through credential management and needs your PIN
       (no touch). It is <strong>read-only</strong> — keyroost never writes or rewrites a

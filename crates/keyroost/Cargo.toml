@@ -45,7 +45,11 @@ keyroost-winwebauthn = { path = "../keyroost-winwebauthn", version = "0.15.0" }
 # in that crate so this one keeps forbid(unsafe_code). Inert (no deps) off Windows.
 keyroost-screengrab = { path = "../keyroost-screengrab", version = "0.15.0" }
 eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow", "links", "wayland", "x11"] }
-egui = "0.37"
+# egui 0.37 moved its two emoji fonts out of `default_fonts` into a feature of
+# their own. The app draws three glyphs only they have (the narrow top bar's
+# menu button, the fingerprint dialog's pointing hand, the key on the empty
+# state), which showed as empty boxes without it.
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
 # Already in the tree via eframe/egui-winit's clipboard integration; direct
 # use lets the OTP auto-clear check the clipboard still holds *our* code
 # before wiping it, instead of clobbering whatever the user copied since.
