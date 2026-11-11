@@ -100,8 +100,9 @@ What keyroost does **not** defend against:
   cross-platform crate.
 - **Vendored protocol code, scoped dependencies.** SM4, SHA-1/256/512, the
   OATH HMAC, base32/hex, and the APDU/TLV/CBOR and `otpauth://` parsers are
-  implemented in-tree with no external crate; `keyroost-proto` and
-  `keyroost-resolve` carry no external dependencies at all, and the OATH,
+  implemented in-tree with no external crate; `keyroost-proto` carries no
+  external dependencies at all, `keyroost-resolve` only `serde`/`serde_json`
+  for the bundled FIDO metadata, and the OATH,
   OpenPGP, PIV and Token2 single-profile byte layers carry nothing but
   `zeroize`. That does not mean no external hash code is in the tree: where
   the CTAP, Token2-OTP, OpenPGP key-set and PKCS#12 paths need those
@@ -118,7 +119,7 @@ What keyroost does **not** defend against:
   (DirectX 12 backend only); `serde`/`serde_json` and
   `base64`), and cryptography that would be irresponsible to hand-roll
   under `forbid(unsafe_code)` — RustCrypto (`sha2`, `hmac`, `aes`, `des`,
-  `cbc`, `cipher`, `p256`, `aes-gcm`), `getrandom`, `rand_core`, `zeroize`, `scrypt`
+  `cbc`, `cipher`, `p256`, `aes-gcm`), `getrandom`, `zeroize`, `scrypt`
   (Aegis vaults), `rc2` and `pbkdf2` (legacy and PBES2 PKCS#12
   decryption, confined to `keyroost-p12`), `rsa` (RSA key-file loading in
   `keyroost-rsakey`; the PIV self-test's verification in

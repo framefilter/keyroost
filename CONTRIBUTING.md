@@ -83,9 +83,10 @@ Check a new JSON field or output word against the existing ones first, and
 reuse what is there.
 
 - **Yes/no facts:** a `true`/`false` field named after the thing:
-  `cert_present`, `occupied`, `touch_required`.
+  `cert_present`, `occupied`, `cert_tested`.
 - **Facts keyroost can't always tell:** `true`, `false` or `null`, where
-  `null` means it couldn't tell: `pin_set`, `force_pin_change`. Never a
+  `null` means it couldn't tell: `pin_set`, `force_pin_change`,
+  `touch_required`. Never a
   string such as `"unknown"`.
 - **States:** a word from a fixed list, lowercase, with hyphens between
   words: `not-connected`, `removed-not-added`. Details such as an error go in

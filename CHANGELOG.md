@@ -81,7 +81,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A Token2 key still shows its full serial when its OTP applet answers.
   ([#237])
 - **Building from source needs Rust 1.89** (was 1.87) for the libraries
-  and the CLI; the app still needs 1.92. Packaged builds are unaffected.
+  and the CLI (the app's minimum is in the egui 0.37 entry below).
+  Packaged builds are unaffected.
   The crypto libraries keyroost uses moved to their current generation
   together (AES, SHA-2, HMAC, AES-GCM, PBKDF2, scrypt, 3DES, RC2, the OS
   random source, Ed25519 and X25519), and they now raise their own
@@ -188,8 +189,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   retry counter, "8 PIN attempt(s) remaining", on a key with no PIN (a
   Nitrokey 3), and on a key that refuses that question without one (a
   Token2 PIN+) it failed with `CTAP2_ERR_PIN_NOT_SET`. It now says no PIN
-  is set, as the app's "No PIN configured" does. `--json` is unchanged.
-  ([#237])
+  is set, as the app's "No PIN configured" does. `--json` adds `pin_set`
+  (see Changed). ([#237])
 - **`piv cert generate --generate-key` and `piv cert request
   --generate-key` check the key type first, as `piv key generate` does.**
   They skipped keyroost's support list, so asking a YubiKey for an ECC

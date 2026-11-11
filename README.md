@@ -72,7 +72,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   (`piv key import`; legacy-encrypted files (RC2/3DES, the kind some
   certificate authorities such as Spain's FNMT still issue) open directly;
   on a Nitrokey 3, RSA keys into slot 9A; not available on HID Crescendo
-  cards; not yet verified on Token2 keys), clearing a slot's
+  cards; on Token2 keys, verified for P-256 keys only), clearing a slot's
   certificate (`piv cert delete`) or key (`piv key delete`),
   moving a key between slots (`piv key move`), writing a
   fresh CHUID with a random GUID (`piv chuid generate`) so Windows re-reads a
@@ -739,7 +739,7 @@ for slot in 9a 9c 9d 9e; do
 done
 # (in a terminal, a step that would replace a slot in use asks y/N first;
 #  add --yes to overwrite without asking)
-# on a card without GET METADATA (non-Yubico PIV, or Yubico firmware < 5.3)
+# on a card without GET METADATA (YubiKey firmware before 5.3, and some other PIV cards)
 # the two steps can't share the key by slot name across invocations; fold
 # them into one so the fresh public key never needs a temp file:
 #   keyroostctl piv cert generate --slot 9a --subject "CN=$USER" --generate-key \
@@ -1006,6 +1006,13 @@ a script, use `--json` where a command has it.
 Breaking changes are tracked per release on the site's
 [migration notes](https://framefilter.github.io/keyroost/migration.html)
 page, with the exact before → after for scripts and library consumers.
+**v0.16.0** removes `fido blob export --as-cert` (use `fido ssh export`).
+A few `--json` values change: `openpgp info`'s `serial` is the key's own
+serial, `fido pin status` adds `pin_set` with `pin_retries` null when no PIN
+is set, `fido blob list` / `show` have no `ssh-cert` kind, and `list` names
+a FIDO2 key by its model; `piv info`'s `version_firmware` is deprecated in
+favor of `firmware`. Building from source needs Rust 1.89 for the CLI and
+libraries and 1.95 for the app. Library users: see the migration page.
 **v0.15.0** renames no command or flag; a PIN or touch policy on a
 Nitrokey 3 is now refused without `--force`, Rust 1.87 is the new floor, and
 `piv --json info` now reports
@@ -1049,7 +1056,7 @@ old script.
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`) and `getrandom` for ECDH seed encryption and the OTP-PIN session, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints) | `serde`, `serde_json`, `getrandom` (the per-computer salt); in-tree SHA-256 from `keyroost-proto` |
-| `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) and naming (names on the key and on this computer) | none (in-tree only, including `keyroost-ctap`) |
+| `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match), naming (names on the key and on this computer), and the model table and bundled FIDO metadata the CLI and the app both show | `serde`/`serde_json` (the bundled FIDO metadata); in-tree, including `keyroost-ctap` |
 | `keyroost-rsakey` | Host-side RSA key loading (PKCS#1/PKCS#8, PEM/DER, 2048-4096 bits) for OpenPGP import | `rsa`, `zeroize` |
 | `keyroost-pgpkey` | Host-side OpenPGP key sets: key generation, GnuPG-compatible passphrase-protected backups, reading backups and GnuPG exports, expiry changes; restore onto a card behind the `card` feature | `rsa`, `p256`, `p384`, `p521`, `k256`, `ed25519-dalek`, `x25519-dalek`, `sha2`, `aes`, `getrandom`, `zeroize`; in-tree `keyroost-transport` (behind `card`) |
 | `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers, file classification, and the per-key import plan and write loop | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`, `aes-gcm`, `base64` (behind `encrypted`, which implies `bulk`) |

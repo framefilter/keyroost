@@ -35,26 +35,15 @@ Being worked on right now — check with whoever holds it before starting.
   CLI pass; its field names go through CONTRIBUTING's "Words in output
   and JSON" check first (`rp_id`, a certificate yes/no).
 
-- **Token2 serial in the key header on Windows ([#51](https://github.com/framefilter/keyroost/issues/51)).**
-  The duplicate rows are fixed: with v0.15.0, Token2 and the reporter each
-  saw one row per key (two PIN+ keys, Windows). Token2 then reported the
-  header showing the short 8-digit OpenPGP serial (`#0991…`) instead of the
-  number printed on the key. On Windows the merged row takes the card
-  side's serial, and the full-serial read there needs the FIDO applet to
-  answer over the reader. Next: a Windows `keyroostctl --debug list` on a
-  PIN+ (queued in the next Windows test round) to see what the probe gets,
-  then read the full serial another way when the FIDO applet doesn't
-  answer. On Linux this key's card side isn't visible at all (libccid has
-  no entry for 349e:0024); its USB-only row gets its serial from the §6.10
-  read since #236.
-- **UI liveness — make "busy" visibly different from "frozen".** Card I/O stalls
-  the visible UI for seconds (touch-required sign/decrypt/authenticate, on-card
-  RSA keygen, the ~30s reset re-insert window, PC/SC enumeration) and a static
-  frame reads as a hang. There is a worker thread and a spinner on imports, but
-  it is inconsistent. Needs a coherent activity language: a global working
-  indicator while the device worker is busy, per-action busy/disabled button
-  states, a cue on long ops. Keep it tasteful — over-animation reads as cheap.
-  Research what feels alive vs. annoying before building.
+- **Token2 serial on Windows for keys before R3.4 ([#51](https://github.com/framefilter/keyroost/issues/51)).**
+  The duplicate rows are fixed (v0.15.0), and a PIN+ R3.4 shows its full
+  printed serial on Windows since v0.16.0, read from its OTP applet
+  (checked in the v0.16 Windows rounds). An older key's OTP answer isn't
+  used for the serial, so its row may still show the 8-digit OpenPGP serial
+  Token2 reported (`#0991…`). Needs a `keyroostctl --debug list` from such
+  a key on Windows. On Linux this key's card side isn't visible at all
+  (libccid has no entry for 349e:0024); its USB-only row gets its serial
+  from the §6.10 read since #236.
 
 - **Research: restoring missing OpenPGP fingerprints** from the user's public
   key file. Investigate only; may be a hornet's nest (key-generation times,
@@ -81,7 +70,7 @@ Being worked on right now — check with whoever holds it before starting.
   number detection on hardware keys") — needs testing on an OnlyKey.**
   Teach `keyroost-resolve` to recognize `1d50:60fc` / product `ONLYKEY`, label it
   "OnlyKey", and treat serial `1000000000` as a non-unique placeholder (fall
-  back to the hidraw path). Today OnlyKey appears only in the GUI AAGUID table.
+  back to the hidraw path). Today OnlyKey appears only in the AAGUID model table (`keyroost-resolve`).
   **Must be done as part of this work, not after:** on macOS/Windows the
   post-replug reinsert matcher still falls back to serial identity, and every
   OnlyKey ships the *same* serial, so it would accept a different OnlyKey as
@@ -89,18 +78,19 @@ Being worked on right now — check with whoever holds it before starting.
   narrows but does not remove the hazard — the *identity* match is still the
   serial.)
 
-- **Lift the "experimental" label on the Token2 PIN+ standards applets — needs
-  PIN+ hardware.** Verify OATH / OpenPGP / PIV over CCID on a real PIN+ key.
-  (Grew out of [#23](https://github.com/framefilter/keyroost/issues/23), now
-  closed; no live issue tracks this.) Token2 may be able to help, given the
-  collaboration.
-
 ---
 
 ## Hardware verification
 
 Not yet run. Everything here is behavior that automated tests cannot reach;
 items marked *(no hardware)* need a device the maintainer does not have.
+
+- **Lift the "experimental" label on the Token2 PIN+ OATH and OpenPGP
+  applets.** PIV is exercised on a PIN+ Dual Ace R3.4 since #251; verify
+  OATH and OpenPGP over CCID on a PIN+ key (on Windows: Linux's libccid
+  doesn't list it), then update the README's PIN+ row. (Grew out of
+  [#23](https://github.com/framefilter/keyroost/issues/23), now closed; no
+  live issue tracks this.)
 
 **Device binding and targeting** (deferred from the v0.7.5 security work — the
 plan's two-key manual steps were never executed):
@@ -135,8 +125,8 @@ plan's two-key manual steps were never executed):
   2.0-only key ([#81](https://github.com/framefilter/keyroost/issues/81) — the reporter's device class), and the standalone Reset
   card on a key with a blocked or absent PIN. (#82's HID→CCID fallback only
   engages on the quirky firmware; reporter confirmation stands in.)
-- **Windows GUI icon** *(no hardware — needs a Windows machine)*: confirm the
-  embedded icon shows in Explorer and the taskbar, and that Linux/macOS builds
+- **Windows GUI icon:** confirm the embedded icon shows in Explorer (the title
+  bar and taskbar were confirmed with egui 0.37, #249), and that Linux/macOS builds
   are unaffected (the `winresource` build-dep is host-gated). Future signed GUI
   binaries should then be byte-identical to CI plus a signature, with nothing
   injected.
