@@ -24,9 +24,9 @@ bundles automatically.
    (the commit that added `docs/app_icons/`) if you ever switch colorways. The
    Windows `.ico` is generated from the same PNGs into `crates/keyroost/assets/`
    — see
-   [`packaging/icons/README.md`](icons/README.md). (Still TODO for the auto-update
-   remote: copy the SVG into the `keyroost-flatpak` repo root as `keyroost-icon.svg`
-   — setup step 3.)
+   [`packaging/icons/README.md`](icons/README.md). (The auto-update remote's copy,
+   `keyroost-icon.svg` in the `keyroost-flatpak` repo root, is in place; see setup
+   step 3.)
 
 2. **pcsc-lite sha256 — DONE.** The manifest pins **pcsc-lite 2.5.1** (`.tar.xz`)
    with its verified sha256 (`bfcfe38a…8741b`). Expect to bump this on its own
@@ -174,8 +174,8 @@ applets need a running **host `pcscd`** (every target talks to the host daemon).
 ## Known caveats / TODOs
 
 - **cargo-sources.json** is generated on the runner each build from `Cargo.lock`
-  (never committed, never stale). Verified June 2026: the generator yields 414
-  crate archives + checksums, all from `static.crates.io`.
+  (never committed, never stale). Every entry comes from `static.crates.io`
+  (CI logs the count each build).
 - **pcsc-lite sha256** is pinned (2.5.1) — see setup step 2. The upstream file
   server prunes old releases, so a pin that built fine last release can 404 on
   the next one; the packaging probe run is what catches it.
@@ -184,9 +184,10 @@ applets need a running **host `pcscd`** (every target talks to the host daemon).
   if it nears GitHub Pages' soft ~1 GB guidance.
 - **Contact-vs-NFC** is unrelated to packaging (a PC/SC reader-mode concern, not
   a bundle concern) — do not conflate it with these targets.
-- Everything is still **unverified on real hardware** end-to-end (Molto2 + a FIDO
-  key in the Flatpak sandbox / AppImage). The `--filesystem=/run/udev:ro` and
-  `--device=all` breadth need a hardware test (see Target 1).
+- Users have run both bundles with real keys
+  ([#47](https://github.com/framefilter/keyroost/issues/47)). Whether the
+  Flatpak sandbox needs all of its `--filesystem=/run/udev:ro` and
+  `--device=all` breadth still needs a hardware test (see Target 1).
 
 ---
 
@@ -606,7 +607,7 @@ musl cross toolchain, then build libpcsclite there. See
 | Signing | GPG, OSTree repo (Flatpak key) | GPG, embedded (dedicated AppImage key) | n/a (not shipped) |
 | Host needs pcscd | yes | yes | yes |
 | glibc portability | n/a (runtime) | build on old glibc | fully static (no glibc) |
-| Verified on hardware | **no** | **no** | **no** |
+| Verified on hardware | by users (#47) | by users (#47) | **no** |
 
 ---
 
@@ -666,7 +667,8 @@ musl cross toolchain, then build libpcsclite there. See
   appimagetool/runtime version you ship.
 - **Whether `--filesystem=/run/udev:ro` is actually needed** for keyroost-hid in
   the Flatpak sandbox — needs a hardware test.
-- Everything is **unverified on real hardware** (Molto2 + a FIDO key) end-to-end.
+- Both bundles have been run with real keys by users (#47); a Molto2 in the
+  Flatpak sandbox has not been checked.
 
 ## Out-of-band runs (workflow_dispatch)
 

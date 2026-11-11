@@ -24,13 +24,14 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       that before the version bump, not during the cut. Exit 2 means the
       page or its table couldn't be read; check the page by hand.
 - [ ] **Semver check against the published crates** — with every library
-      crate on crates.io (20 as of 0.15.0), Cargo treats 0.7.x -> 0.7.y as compatible, so an
+      crate on crates.io (all 20 have a published baseline as of 0.15.0), Cargo
+      treats 0.16.x -> 0.16.y as compatible, so an
       accidental API break in a patch release ships silently and breaks
       downstream `cargo update`:
       `cargo semver-checks --workspace --exclude keyroost --exclude keyroostctl`
       (install once: `cargo install cargo-semver-checks`). A crate that is
       not on crates.io yet has no baseline: add `--exclude <crate>` for it
-      (for 0.15.0, `--exclude keyroost-p12`). A reported break
+      (none for 0.16.0). A reported break
       means either fix the API or bump the minor — a decision, not an
       accident. The binaries are excluded (nothing depends on them as
       libraries).
@@ -209,7 +210,8 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       Release exists — attach is idempotent (`--clobber`).
 - [ ] When both finish, the Release must hold: 3 platform archives,
       `SHA256SUMS`, `keyroost-x86_64.AppImage` (+ `.sha256`, `.zsync`),
-      `keyroost.flatpak` (+ `.sha256`). Check:
+      `keyroost.flatpak` (+ `.sha256`), plus the `*.sigstore.json` provenance
+      bundles release.yml uploads. Check:
       `gh release view vX.Y.Z --json assets --jq '[.assets[].name]'`
 - [ ] The AppImage job's "Verify AppImage signature" step is green (it
       runs before the attestation, so a red guard means nothing was
@@ -372,8 +374,10 @@ list, in this order:
 - [ ] **Stop the spread before fixing anything.** Delete the GitHub Release
       (keep the tag — history is not the enemy, distribution is) and mark it
       in the successor's release notes. The registries cannot unship:
-      crates.io yank (`cargo yank -p <crate> --version X.Y.Z`) prevents NEW
-      dependents but removes nothing already vendored; OSTree cannot retract
+      crates.io yank (`cargo yank <crate> --version X.Y.Z`) prevents NEW
+      dependents but removes nothing already vendored (yanking needs a
+      crates.io API token, and publishing stores none: create a short-lived
+      token with the yank scope and revoke it afterwards); OSTree cannot retract
       a commit users pulled — the flatpak fix is publishing the successor,
       fast. AUR/Homebrew/winget point at release assets, so deleting the
       Release breaks their installs immediately — acceptable for a

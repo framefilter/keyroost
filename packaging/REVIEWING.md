@@ -86,6 +86,6 @@ integrity") are the trust boundary for what ships.
 ## First-time contributors
 
 Workflow runs for outside collaborators require maintainer approval
-("Require approval for all outside collaborators"), so CI does not run
+("Require approval for all external contributors"), so CI does not run
 until the diff has been read — item 1's `.github/` check comes first. The
 checklist is not reduced for a first PR.

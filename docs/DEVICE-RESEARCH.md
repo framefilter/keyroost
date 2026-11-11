@@ -5,9 +5,9 @@ Two independent research threads. Keep findings in this file (it's the durable
 record). This is an **outline**, not a finished design — go only as deep as each
 step needs.
 
-Hardware in play (all on hand): Token2 Molto2 (`349e:0300`), YubiKey 5
-(`1050:0407`, fw 5.7.1) ×2, SoloKeys Solo 2 (`1209:beee`, Trussed, fw 2.964).
-Nothing here is "incoming" any more — the Solo 2 carried the first successful
+Devices this research covered: Token2 Molto2 (`349e:0300`), YubiKey 5
+(`1050:0407`, firmware 5.7.1; two units) and SoloKeys Solo 2 (`1209:beee`,
+Trussed, firmware 2.964). The Solo 2 carried the first successful
 FIDO F1–F5 run (`docs/BRINGUP.md`), and the two-YubiKey case is what the
 correlation work was verified against. Token2 PIN+ / FIDO2+ coverage
 comes mostly from the vendor (PIN+ OTP over USB, #155, was also checked on a
@@ -85,7 +85,7 @@ untested because an earlier row already answered the question.
 |---|---|---|---|---|---|
 | USB iSerial (E1) | n/a | n/a | yes | cross-interface correlatable | **not available** — most YubiKeys publish no `iSerialNumber`; the serial is only reachable over CCID (`keyroost_resolve::ccid_serial_for`) |
 | HID uniq (E2) | not tested | not tested | yes | none | not pursued — E4 answered it first |
-| AAGUID (E3) | yes | NO | yes | none | reject (model-level) — confirmed; the GUI treats AAGUID as a static *model* table |
+| AAGUID (E3) | yes | NO | yes | none | reject (model-level) — confirmed; keyroost treats AAGUID as a static *model* table |
 | OTP/CCID serial (E4) | yes | yes — two units told apart on hardware during the correlation work | yes | high (anti-tracking) — mitigated by local-only, opt-in storage | **adopted as the fallback** (`ccid_serial_for`) |
 
 ### SoloKey / Solo 2 (`1209:beee`, Trussed, fw 2.964)
@@ -109,14 +109,14 @@ Resolved in favor of **USB iSerial first, CCID-read serial as fallback**, local
 and opt-in. Shipped as `keyroost-keyring` (friendly names keyed by a salted fingerprint
 of the serial, never the serial itself, with an `IdSource` field recording how
 the serial was obtained; a record is written only when the user names a key or
-a key carrying its own name is first seen) and `keyroost-resolve` (`effective_serials` /
-`read_effective_serial`, with `ccid_serial_for` / `ccid_serials_for` covering
+a key carrying its own name is first seen) and `keyroost-resolve` (`effective_serials`, with `ccid_serial_for` / `ccid_serials_for` covering
 keys that expose no USB serial — experiment E4, built after all, despite the
 "do not build a reader during research" note above). Surfaced as
 `keyroostctl name` (`set`, `clear`, `list`) plus the global `-d`/`--device
 <NAME>`. E3
 resolved as predicted: AAGUID is model-level, which is why
-`crates/keyroost/src/ui/aaguid.rs` can be a static model table.
+`crates/keyroost-resolve/src/aaguid.rs` can be a static model table, shared by
+the CLI and the app.
 
 Two constraints the implementation had to add that this plan did not anticipate:
 
@@ -157,7 +157,8 @@ CTAPHID vendor commands were confirmed read-only on the same keys (YubiKey
 configuration unchanged; Solo 2 returned its UUID, keys unchanged). Token2 is
 implemented from its public protocol document; how the FIDO-format and
 OTP-applet encodings relate is not yet confirmed on a real key, so they are
-compared only like-for-like until it is. A Windows community test is pending.
+compared only like-for-like until it is. The identity reads ran on Windows
+in the v0.16 test rounds (a YubiKey 5 and a Token2 PIN+ R3.4).
 The Molto2 and the single-profile programmable tokens are never sent an
 identity read.
 

@@ -22,7 +22,7 @@ and we'll diff it against the expected format in `docs/PROTOCOL.md`.
 
 | OS | What you need |
 |---|---|
-| Linux | `sudo apt install libpcsclite-dev pcscd && sudo systemctl enable --now pcscd` |
+| Linux | `sudo apt install libpcsclite-dev pcscd libxkbcommon-dev libwayland-dev libxcb1-dev libgl1-mesa-dev && sudo systemctl enable --now pcscd` (other distros: README "Smart-card prerequisite") |
 | macOS | nothing — PCSC framework is built in |
 | Windows | nothing — winscard.dll is built in |
 
@@ -213,8 +213,9 @@ keyroostctl list
 **Expected:** one line under "FIDO HID devices:" per inserted authenticator, in
 the form `<path> <vid>:<pid> usage=f1d0:0001 <model> serial=… [FIDO]`. A
 `serial=…(ccid)` suffix means the serial came from the card interface because
-the key exposes none over USB; `name=…` appears once you've named the key with
-`keyroostctl name set`. Below the raw sections, `list` prints a correlated
+the key exposes none over USB; `name=…` appears once you've named the key on
+this computer with `keyroostctl name set` (a name stored on the key shows in the
+summary below instead). Below the raw sections, `list` prints a correlated
 per-device summary built from the same snapshot, numbered. With multiple keys
 plugged in you'll get one numbered line each; pick one with the global
 `--device N` (that number, a serial, or a saved name). Without it, a terminal
@@ -298,8 +299,8 @@ truncated for readability and is **not** a valid credential ID.
 **Use `ecdsa-sk`, not `ed25519-sk`,** if your authenticator's firmware
 doesn't support Ed25519 in `makeCredential`. On Solo 2 firmware 2.964,
 `ed25519-sk` enrollment fails with `Key enrollment failed: invalid format`;
-`ecdsa-sk` (ES256 / P-256) works on every CTAP2 device. A firmware update
-likely adds Ed25519 support.
+`ecdsa-sk` (ES256 / P-256) worked there and is the algorithm FIDO2 keys
+support most widely.
 
 ### What this validates
 
@@ -318,7 +319,7 @@ OpenSSH's `ecdsa-sk` support.
 
 ## What to send back if anything goes wrong
 
-Either email me, paste in the chat, or open an issue with:
+Open an issue (or paste in the chat) with:
 
 1. The exact command you ran
 2. **All of the `--debug` output** (this is the key piece — the hex tells us

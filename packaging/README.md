@@ -1,7 +1,8 @@
 # Release fanout — one-time setup
 
-After a GitHub Release is published, `.github/workflows/publish.yml` fans it
-out to the package channels below. Each channel is a thin pointer at the
+When release.yml publishes a GitHub Release, it dispatches
+`.github/workflows/publish.yml`, which fans the release out to the package
+channels below. Each channel is a thin pointer at the
 release's attested artifacts; nothing is rebuilt. Jobs whose secret isn't
 configured yet skip with a notice, so channels can be enabled one at a time.
 
@@ -77,12 +78,13 @@ credential is touched.
 ## What a release looks like afterwards
 
 ```text
-git tag vX.Y.Z && git push origin vX.Y.Z
+git tag -s vX.Y.Z -m "keyroost vX.Y.Z" && git push origin vX.Y.Z
   → release.yml: builds Linux/macOS/Windows archives, SHA256SUMS,
     provenance attestation, publishes the GitHub Release
   → linux-bundles.yml (same tag, in parallel): AppImage + flatpak bundle,
     attached to that same Release
-  → publish.yml (after your one-click environment approval):
+  → publish.yml (dispatched by release.yml; runs after your one-click
+    environment approval):
       crates.io  — the whole workspace in dependency order (OIDC)
       AUR        — keyroost-bin PKGBUILD/.SRCINFO push
       Homebrew   — tap formula push
