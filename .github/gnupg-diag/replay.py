@@ -146,10 +146,35 @@ def gpg(home, args, stdin=None, empty_stdin=False):
 # and checking the keys before signing, nothing at all on stdin when no
 # passphrase is needed.
 SWITCHES = ("debug", "status", "listing", "empty")
-VARIANTS = [("baseline", set())] + [(f"+{w}", {w}) for w in SWITCHES] + [("all four", set(SWITCHES))]
+VARIANTS = [
+    ("baseline", set()),
+    ("+checksigs only", {"checksigs"}),
+    ("+listsecret only", {"listsecret"}),
+    ("+listing", {"listing"}),
+    ("+listing+empty", {"listing", "empty"}),
+    ("+listing+debug", {"listing", "debug"}),
+    ("+listing+status", {"listing", "status"}),
+    ("all four", set(SWITCHES)),
+]
 
 
-def trial(keyfile, n, on):
+def snapshot(home):
+    """The agent's key files: name prefix, size, the s-expression type, hash."""
+    d = os.path.join(home, "private-keys-v1.d")
+    out = []
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return "(no key dir)"
+    for n in names:
+        b = open(os.path.join(d, n), "rb").read()
+        m = re.search(rb"\((openpgp-private-key|protected-private-key|private-key|shadowed-private-key)", b)
+        kind = m.group(1).decode() if m else "?"
+        out.append(f"{n[:6]} {len(b)}B {kind} {hashlib.sha1(b).hexdigest()[:8]}")
+    return "; ".join(out)
+
+
+def trial(keyfile, n, on, trace=None):
     """Import with the passphrase, sign, encrypt, decrypt in a fresh home,
     with the switches in `on`. Returns (decrypt ok, sign ok, agent error)."""
     home = f"/tmp/krdg-{os.getpid()}-{n}"
@@ -165,16 +190,25 @@ def trial(keyfile, n, on):
         gpg(home, ["--import", keyfile], TEST_PHRASE)
         cols = gpg(home, ["--list-keys", "--with-colons"], empty_stdin=empty).stdout.decode()
         fpr = next(l.split(":")[9] for l in cols.splitlines() if l.startswith("fpr"))
-        if "listing" in on:
+        def snap(step):
+            if trace is not None:
+                trace.append(f"{step}: {snapshot(home)}")
+        snap("after import")
+        if "listing" in on or "checksigs" in on:
             gpg(home, ["--with-colons", "--check-sigs", fpr], empty_stdin=empty)
+            snap("after check-sigs")
+        if "listing" in on or "listsecret" in on:
             gpg(home, ["--with-colons", "--list-secret-keys", fpr], empty_stdin=empty)
+            snap("after list-secret-keys")
         data = os.path.join(home, "d.txt")
         with open(data, "wb") as f:
             f.write(b"keyroost interop\n")
         sig = gpg(home, ["--local-user", fpr + "!", "-o", f"{data}.sig", "--detach-sign", data], TEST_PHRASE)
         gpg(home, ["--trust-model", "always", "--yes"] + status + ["-r", fpr, "-o", f"{data}.gpg", "--encrypt", data],
             empty_stdin=empty)
+        snap("after sign")
         dec = gpg(home, ["--yes"] + status + ["-o", f"{data}.out", "--decrypt", f"{data}.gpg"], TEST_PHRASE)
+        snap(f"after decrypt (rc {dec.returncode})")
         err = ""
         try:
             log = open(os.path.join(home, "agent.log")).read()
@@ -219,10 +253,18 @@ def main():
     except Exception as e:  # diagnostic: report, don't stop the replay
         print(f"  - check failed: {e!r}")
     for name, on in VARIANTS:
-        results = [trial(keyfile, i, on) for i in range(TRIALS)]
+        traces = []
+        results = []
+        for i in range(TRIALS):
+            tr = [] if i == 0 and name in ("baseline", "+listing", "+listsecret only", "+checksigs only") else None
+            results.append(trial(keyfile, i, on, tr))
+            if tr:
+                traces = tr
         dec_ok = sum(r[0] for r in results)
         sig_ok = sum(r[1] for r in results)
         print(f"  - replay {name}: decrypt {dec_ok}/{TRIALS} ok, sign {sig_ok}/{TRIALS} ok")
+        for t in traces:
+            print(f"    - {t}")
     print("\n<details><summary>key set (throwaway test key, passphrase \"test pass\")</summary>\n\n```\n"
           + armored + "```\n</details>")
 
