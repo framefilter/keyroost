@@ -56,7 +56,26 @@ echo "- cv25519 test alone: $runs runs, $alone_good ok, $alone_bad failed" >> "$
 # Replay the first three failures only; each replay runs 60 gpg trials.
 for f in "$out"/fail-1.log "$out"/fail-2.log "$out"/fail-3.log; do
   [ -e "$f" ] || continue
-  python3 -I "$here/replay.py" "$f" "$out/hwf" >> "$summary" 2>&1
+  DIAG_NO_DENY=1 python3 -I "$here/replay.py" "$f" "$out/hwf" >> "$summary" 2>&1
+  # The same key through the test's own Rust helpers.
+  [ -e "$f.asc" ] || continue
+  r_good=0
+  r_bad=0
+  for _ in $(seq 1 10); do
+    if KR_REPLAY_KEY="$f.asc" cargo test -q -p keyroost-pgpkey --locked \
+        --test gnupg_interop -- --ignored --exact replay_saved_key_in_gpg \
+        > "$out/rreplay.log" 2>&1; then
+      r_good=$((r_good + 1))
+    else
+      r_bad=$((r_bad + 1))
+      cp "$out/rreplay.log" "$f.rreplay-fail.log"
+    fi
+  done
+  echo "  - replay through the test's Rust helpers: 10 runs, $r_good ok, $r_bad failed" >> "$summary"
+  if [ -e "$f.rreplay-fail.log" ]; then
+    grep -E "failed:|gpg: |gpg-agent\[[0-9]+\] (failed|command)" "$f.rreplay-fail.log" \
+      | head -8 | sed 's/^/    - /' >> "$summary"
+  fi
 done
 
 # The job summary isn't readable through the API; repeat it in the log.
