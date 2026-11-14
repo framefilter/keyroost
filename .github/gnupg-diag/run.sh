@@ -65,6 +65,9 @@ for f in "$out"/fail-1.log "$out"/fail-2.log "$out"/fail-3.log; do
   fi
 done
 
+# Control: key sets gpg makes itself, through the same failing sequence.
+python3 -I "$here/replay.py" --control 10 >> "$summary" 2>&1
+
 # The job summary isn't readable through the API; repeat it in the log.
 echo "===== gnupg-diag summary ====="
 cat "$summary"

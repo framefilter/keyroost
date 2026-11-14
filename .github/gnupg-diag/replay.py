@@ -148,13 +148,7 @@ def gpg(home, args, stdin=None, empty_stdin=False):
 SWITCHES = ("debug", "status", "listing", "empty")
 VARIANTS = [
     ("baseline", set()),
-    ("+checksigs only", {"checksigs"}),
     ("+listsecret only", {"listsecret"}),
-    ("+listing", {"listing"}),
-    ("+listing+empty", {"listing", "empty"}),
-    ("+listing+debug", {"listing", "debug"}),
-    ("+listing+status", {"listing", "status"}),
-    ("all four", set(SWITCHES)),
 ]
 
 
@@ -223,6 +217,81 @@ def trial(keyfile, n, on, trace=None):
         shutil.rmtree(home, ignore_errors=True)
 
 
+def reexport(keyfile, out):
+    """Import our key set and export it again with gpg's own protection."""
+    home = f"/tmp/krdx-{os.getpid()}"
+    shutil.rmtree(home, ignore_errors=True)
+    os.mkdir(home, 0o700)
+    try:
+        gpg(home, ["--import", keyfile], TEST_PHRASE)
+        r = gpg(home, ["--armor", "--export-secret-keys"], TEST_PHRASE)
+        open(out, "wb").write(r.stdout)
+        return r.returncode == 0 and b"PRIVATE KEY" in r.stdout
+    finally:
+        subprocess.run(["gpgconf", "--homedir", home, "--kill", "gpg-agent"],
+                       env=dict(os.environ, GNUPGHOME=home), capture_output=True)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def gpg_made(out):
+    """A cv25519 key set made and exported by gpg itself, same passphrase."""
+    home = f"/tmp/krdm-{os.getpid()}"
+    shutil.rmtree(home, ignore_errors=True)
+    os.mkdir(home, 0o700)
+    try:
+        gpg(home, ["--quick-gen-key", "T <t@example.org>", "ed25519", "sign,cert", "never"], TEST_PHRASE)
+        cols = gpg(home, ["--list-keys", "--with-colons"]).stdout.decode()
+        fpr = next(l.split(":")[9] for l in cols.splitlines() if l.startswith("fpr"))
+        gpg(home, ["--quick-add-key", fpr, "cv25519", "encr", "never"], TEST_PHRASE)
+        gpg(home, ["--quick-add-key", fpr, "ed25519", "auth", "never"], TEST_PHRASE)
+        r = gpg(home, ["--armor", "--export-secret-keys"], TEST_PHRASE)
+        open(out, "wb").write(r.stdout)
+        return r.returncode == 0 and b"PRIVATE KEY" in r.stdout
+    finally:
+        subprocess.run(["gpgconf", "--homedir", home, "--kill", "gpg-agent"],
+                       env=dict(os.environ, GNUPGHOME=home), capture_output=True)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def protection(armored):
+    """Cipher/S2K of each secret packet, e.g. 254/9 s2k 3 hash 8 count 65536."""
+    out = []
+    for tag, body in packets(dearmor(armored)):
+        if tag not in (5, 7):
+            continue
+        algo = body[5]
+        i = 6
+        if algo in (18, 19, 22):
+            i += 1 + body[i]
+            _, _, i = mpi(body, i)
+            if algo == 18:
+                i += 1 + body[i]
+        elif algo == 1:
+            _, _, i = mpi(body, i)
+            _, _, i = mpi(body, i)
+        c = body[i + 12]
+        out.append(f"algo {algo}: usage {body[i]} cipher {body[i + 1]} s2k {body[i + 2]} hash {body[i + 3]} "
+                   f"count {(16 + (c & 15)) << ((c >> 4) + 6)}")
+    return "; ".join(out)
+
+
+def control(n):
+    """gpg-made key sets through the failing sequence (list-secret-keys first)."""
+    bad = 0
+    prot = ""
+    for i in range(n):
+        f = f"/tmp/krdc-{os.getpid()}-{i}.asc"
+        if not gpg_made(f):
+            print(f"- control key {i}: gpg could not make/export it")
+            continue
+        prot = protection(open(f).read())
+        ok = trial(f, i, {"listsecret"})[0]
+        bad += 0 if ok else 1
+        os.remove(f)
+    print(f"- control: {n} gpg-made cv25519 key sets with list-secret-keys first: {n - bad} decrypt ok, {bad} failed")
+    print(f"  - gpg's export protection: {prot}")
+
+
 def set_deny(content):
     if content is None:
         subprocess.run(["sudo", "rm", "-f", DENY_FILE], check=True)
@@ -256,7 +325,7 @@ def main():
         traces = []
         results = []
         for i in range(TRIALS):
-            tr = [] if i == 0 and name in ("baseline", "+listing", "+listsecret only", "+checksigs only") else None
+            tr = [] if i == 0 and False else None
             results.append(trial(keyfile, i, on, tr))
             if tr:
                 traces = tr
@@ -265,9 +334,21 @@ def main():
         print(f"  - replay {name}: decrypt {dec_ok}/{TRIALS} ok, sign {sig_ok}/{TRIALS} ok")
         for t in traces:
             print(f"    - {t}")
+    print(f"  - our export protection: {protection(armored)}")
+    rx = keyfile + ".gpg-reexport.asc"
+    if reexport(keyfile, rx):
+        print(f"  - gpg's re-export protection: {protection(open(rx).read())}")
+        for name, on in VARIANTS:
+            results = [trial(rx, i, on) for i in range(TRIALS)]
+            print(f"  - same key re-exported by gpg, replay {name}: decrypt {sum(r[0] for r in results)}/{TRIALS} ok")
+    else:
+        print("  - gpg re-export failed")
     print("\n<details><summary>key set (throwaway test key, passphrase \"test pass\")</summary>\n\n```\n"
           + armored + "```\n</details>")
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1] == "--control":
+        control(int(sys.argv[2]))
+    else:
+        main()
