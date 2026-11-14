@@ -65,6 +65,16 @@ Being worked on right now — check with whoever holds it before starting.
 
 ## Blocked / needs someone else
 
+- **Move CI's Linux test job back to `ubuntu-latest` — waits on Ubuntu.**
+  It runs on `ubuntu-24.04` for now: the latest image (26.04) ships libgcrypt
+  1.12.0, which randomly rejects valid Curve25519 keys
+  ([T8094](https://dev.gnupg.org/T8094), fixed in 1.12.1), so the GnuPG
+  interop tests fail about half the time. Switch back in
+  `.github/workflows/ci.yml` once 26.04 ships the fix
+  ([Launchpad #2174038](https://bugs.launchpad.net/bugs/2174038)). The same
+  bug can refuse a keyroost backup restored into GnuPG on Ubuntu 26.04
+  ("Bad passphrase" on first decrypt); keyroost's export is not at fault.
+
 - **OnlyKey recognition
   ([#37](https://github.com/framefilter/keyroost/issues/37), filed as "serial
   number detection on hardware keys") — needs testing on an OnlyKey.**
