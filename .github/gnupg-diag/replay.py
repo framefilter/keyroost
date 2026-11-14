@@ -78,7 +78,7 @@ def mpi(b, i):
 
 
 def s2k_key(phrase, hashalgo, salt, count, keylen):
-    h = {8: hashlib.sha256, 2: hashlib.sha1, 10: hashlib.sha512}[hashalgo]
+    h = {8: hashlib.sha256, 2: hashlib.sha1, 9: hashlib.sha384, 10: hashlib.sha512, 11: hashlib.sha224}[hashalgo]
     data = salt + phrase
     total = max(count, len(data))
     buf = (data * (total // len(data) + 1))[:total]
@@ -304,11 +304,40 @@ def reprotect(armored, cipher, hashalgo, count_byte):
 # (label, cipher, hash, count byte); ours is AES-256 (9), SHA-256 (8), 0xE0.
 REPROTECT = [
     ("ours, unchanged", 9, 8, 0xE0),
-    ("count 65011712 only", 9, 8, 0xFF),
-    ("AES-128 only", 7, 8, 0xE0),
-    ("SHA-1 only", 9, 2, 0xE0),
-    ("gpg's three settings", 7, 2, 0xFF),
+    ("SHA-1", 9, 2, 0xE0),
+    ("SHA-384", 9, 9, 0xE0),
+    ("SHA-512", 9, 10, 0xE0),
+    ("SHA-224", 9, 11, 0xE0),
 ]
+
+
+def user_path(keyfile):
+    """Import without a passphrase, list secret keys, decrypt; on a failure,
+    decrypt again with the same agent, then again after restarting it."""
+    home = f"/tmp/krdu-{os.getpid()}"
+    shutil.rmtree(home, ignore_errors=True)
+    os.mkdir(home, 0o700)
+    env = dict(os.environ, GNUPGHOME=home)
+    try:
+        gpg(home, ["--import", keyfile])
+        cols = gpg(home, ["--list-keys", "--with-colons"]).stdout.decode()
+        fpr = next(l.split(":")[9] for l in cols.splitlines() if l.startswith("fpr"))
+        gpg(home, ["--list-secret-keys"])
+        data = os.path.join(home, "d.txt")
+        open(data, "wb").write(b"keyroost interop\n")
+        gpg(home, ["--trust-model", "always", "-r", fpr, "-o", f"{data}.gpg", "--encrypt", data])
+        dec = lambda: gpg(home, ["--yes", "-o", f"{data}.out", "--decrypt", f"{data}.gpg"], TEST_PHRASE).returncode == 0
+        first = dec()
+        if first:
+            return "decrypt ok"
+        second = dec()
+        subprocess.run(["gpgconf", "--homedir", home, "--kill", "gpg-agent"], env=env, capture_output=True)
+        third = dec()
+        return (f"decrypt FAILED; again, same agent: {'ok' if second else 'failed'}; "
+                f"after restarting the agent: {'ok' if third else 'failed'}")
+    finally:
+        subprocess.run(["gpgconf", "--homedir", home, "--kill", "gpg-agent"], env=env, capture_output=True)
+        shutil.rmtree(home, ignore_errors=True)
 
 
 def reexport(keyfile, out):
@@ -438,6 +467,7 @@ def main():
             continue
         results = [trial(rp, i, {"listsecret"}) for i in range(TRIALS)]
         print(f"  - re-protected, {label}, list-secret-keys first: decrypt {sum(r[0] for r in results)}/{TRIALS} ok")
+    print(f"  - user path (import without passphrase, list-secret-keys, decrypt): {user_path(keyfile)}")
     print("\n<details><summary>key set (throwaway test key, passphrase \"test pass\")</summary>\n\n```\n"
           + armored + "```\n</details>")
 
