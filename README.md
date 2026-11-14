@@ -282,6 +282,11 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   ([#222](https://github.com/framefilter/keyroost/pull/222)); and Always UV
   offered only on keys that support it
   ([#224](https://github.com/framefilter/keyroost/pull/224)).
+- **[@dlacko](https://github.com/dlacko)** — `openpgp info` cardholder name
+  and public-key URL: the CLI prints the `005B` name and `5F50` URL
+  (`cardholder_name` and `url` in `--json`), and the app's Card details
+  entries pre-fill from the card
+  ([#260](https://github.com/framefilter/keyroost/pull/260)).
 
 (This credits their contributions to the codebase; it does not change keyroost's
 independent status described above.)

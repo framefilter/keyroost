@@ -370,6 +370,19 @@ pub(crate) struct OpenpgpStatusJson {
     pub reset_code_retries: u8,
     pub admin_pin_retries: u8,
     pub signature_count: Option<u32>,
+    /// Cardholder name (`005B`); `null` when unreadable, `""` when unset.
+    pub cardholder_name: Option<String>,
+    /// Public-key URL (`5F50`); `null` when unreadable, `""` when unset.
+    pub url: Option<String>,
+}
+
+/// JSON form of a tri-state public text field (`cardholder_name`, `url`):
+/// unreadable (`None`) stays `null` ("couldn't tell"), unset
+/// (`Some(None)`) becomes `""` so it stays distinct from unreadable, a
+/// value passes through. Mirrors `PivStatusJson::applet_name`, where `""`
+/// likewise means "the token didn't tell us its name".
+pub(crate) fn optional_text_json(v: Option<Option<String>>) -> Option<String> {
+    v.map(|inner| inner.unwrap_or_default())
 }
 
 /// `openpgp key import` (a new key set, a backup restored, an RSA key file)
@@ -1098,6 +1111,8 @@ mod tests {
             ("reset_code_retries", "number"),
             ("admin_pin_retries", "number"),
             ("signature_count", "number|null"),
+            ("cardholder_name", "string|null"),
+            ("url", "string|null"),
         ];
         let status = |serial: Option<u32>, fpr: Option<String>| OpenpgpStatusJson {
             aid: "D276".into(),
@@ -1115,6 +1130,8 @@ mod tests {
             reset_code_retries: 0,
             admin_pin_retries: 3,
             signature_count: fpr.as_ref().map(|_| 9),
+            cardholder_name: None,
+            url: None,
         };
         let v = to_v(&status(Some(0x0000_0001), Some("AB".into())));
         assert_shape(&v, &shape);
@@ -1125,6 +1142,16 @@ mod tests {
         let v = to_v(&status(None, None));
         assert_shape(&v, &shape);
         assert!(v["serial"].is_null());
+    }
+
+    #[test]
+    fn optional_text_json_keeps_unset_distinct_from_unreadable() {
+        assert_eq!(optional_text_json(None), None);
+        assert_eq!(optional_text_json(Some(None)), Some(String::new()));
+        assert_eq!(
+            optional_text_json(Some(Some("Doe<<John".to_string()))),
+            Some("Doe<<John".to_string())
+        );
     }
 
     #[test]

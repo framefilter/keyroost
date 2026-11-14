@@ -1221,6 +1221,18 @@ struct OpenPgpState {
     name_input: String,
     /// Public-key-URL entry.
     url_input: String,
+    /// Whether the user has edited the name/URL entry since the last
+    /// autofill. Guards `sync_openpgp_detail_inputs`: a re-read overwrites
+    /// only unedited fields, so typed text survives — while an unset value on
+    /// a newly-read card clears a stale autofill instead of keeping it
+    /// (same-reader card swap).
+    name_dirty: bool,
+    url_dirty: bool,
+    /// AID of the card whose name/URL last filled the entry fields. A
+    /// same-reader swap (same reader name, different card) must drop staged
+    /// edits: they belonged to the old card and must never be written to the
+    /// new one. Compared in `set_openpgp_status`; cleared on selection change.
+    card_id: Option<Vec<u8>>,
     /// The key (Signature / Decryption / Authentication) whose sub-tab is open.
     /// Every per-key action — generate on-card, import — targets this key, the
     /// same way the PIV pane's `selected_slot` drives its per-slot cards.
@@ -10250,6 +10262,40 @@ impl App {
         self.selected_device().and_then(|d| d.reader.clone())
     }
 
+    /// Copy the freshly-read cardholder name/URL into the Card-details entry
+    /// fields, but only where the user hasn't staged an edit: a re-read must
+    /// not clobber typed text (dirty), while untouched fields track the
+    /// on-card values — including back to empty when the new card has nothing
+    /// set, so a same-reader swap can't leave a stale autofill behind.
+    fn sync_openpgp_detail_inputs(&mut self) {
+        let (name, url) = match &self.openpgp.status {
+            Some(s) => (s.cardholder_name.clone().flatten(), s.url.clone().flatten()),
+            None => return,
+        };
+        // Entry fields can't show "(unavailable)": unreadable and unset both
+        // pre-fill as empty. The CLI keeps the distinction.
+        if !self.openpgp.name_dirty {
+            self.openpgp.name_input = name.unwrap_or_default();
+        }
+        if !self.openpgp.url_dirty {
+            self.openpgp.url_input = url.unwrap_or_default();
+        }
+    }
+
+    /// Store a fresh status read. When the card itself changed (different AID
+    /// — a same-reader swap), staged name/URL edits belonged to the old card
+    /// and are dropped so they can never be written to the new one; the
+    /// entries then re-fill from the new card via `sync_openpgp_detail_inputs`.
+    fn set_openpgp_status(&mut self, status: keyroost_transport::OpenPgpStatus) {
+        if self.openpgp.card_id.as_ref() != Some(&status.aid) {
+            self.openpgp.name_dirty = false;
+            self.openpgp.url_dirty = false;
+            self.openpgp.card_id = Some(status.aid.clone());
+        }
+        self.openpgp.status = Some(status);
+        self.sync_openpgp_detail_inputs();
+    }
+
     /// Read the selected card's status on the worker thread.
     fn load_openpgp_status(&mut self) {
         self.openpgp.error = None;
@@ -10276,10 +10322,10 @@ impl App {
                 }
                 match result {
                     Ok((status, supported, present)) => {
-                        app.openpgp.status = Some(status);
                         app.openpgp.key_present = present;
                         app.openpgp.supported = supported;
                         app.openpgp.loaded = true;
+                        app.set_openpgp_status(status);
                     }
                     // An automatic read: logged once, in the background.
                     Err(e) => {
@@ -10330,12 +10376,21 @@ impl App {
     ) {
         match result {
             Ok(status) => {
+                // The write went through, so whatever was staged is now the
+                // on-card value (or was cleared): drop the dirty marks so the
+                // re-read converges the entries — including back to empty.
+                // Record the card identity too, so a swap that landed mid-write
+                // can't leave the next read treating the new card as the old one.
+                app.openpgp.name_dirty = false;
+                app.openpgp.url_dirty = false;
+                app.openpgp.card_id = Some(status.aid.clone());
                 app.openpgp.status = Some(status);
                 if keys_changed {
                     app.openpgp.key_present = [None; 3];
                 }
                 app.openpgp.loaded = true;
                 app.openpgp.error = None;
+                app.sync_openpgp_detail_inputs();
                 app.openpgp_done(notice);
                 wipe(&mut app.openpgp.admin_pin);
             }
@@ -10479,7 +10534,7 @@ impl App {
             Box::new(move |app: &mut App| {
                 match result {
                     Ok((status, fpr)) => {
-                        app.openpgp.status = Some(status);
+                        app.set_openpgp_status(status);
                         app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
@@ -10599,7 +10654,7 @@ impl App {
                 }
                 match result {
                     Ok((status, kind, fpr)) => {
-                        app.openpgp.status = Some(status);
+                        app.set_openpgp_status(status);
                         app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
@@ -10767,7 +10822,7 @@ impl App {
                 match result {
                     Ok(status) => {
                         app.openpgp.created = None;
-                        app.openpgp.status = Some(status);
+                        app.set_openpgp_status(status);
                         app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
@@ -10902,7 +10957,7 @@ impl App {
                 match result {
                     Ok(status) => {
                         app.openpgp.restore_loaded = None;
-                        app.openpgp.status = Some(status);
+                        app.set_openpgp_status(status);
                         app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
@@ -11825,6 +11880,9 @@ impl App {
         self.openpgp.notice = None;
         self.openpgp.name_input.clear();
         self.openpgp.url_input.clear();
+        self.openpgp.name_dirty = false;
+        self.openpgp.url_dirty = false;
+        self.openpgp.card_id = None;
         self.openpgp.supported = None;
         self.openpgp.gen_alg = OpenPgpKeyAlgSel::CardDefault;
         self.piv = PivState::default();
@@ -15673,8 +15731,15 @@ fn mds_cell(ui: &mut egui::Ui, p: &Palette, key: &str, value: &str, w: f32) {
 
 /// A themed single-line text input with a fixed-width label — the non-password
 /// sibling of [`pin_field`], for cardholder name / URL / file path.
-fn text_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String, hint: &str, w: f32) {
-    ui.horizontal(|ui| {
+fn text_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    buf: &mut String,
+    hint: &str,
+    w: f32,
+) -> bool {
+    let resp = ui.horizontal(|ui| {
         ui.add_sized(
             [96.0, 22.0],
             egui::Label::new(
@@ -15688,9 +15753,10 @@ fn text_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String, hin
                 .margin(theme::TEXT_EDIT_MARGIN)
                 .hint_text(hint)
                 .desired_width(w),
-        );
+        )
     });
     ui.add_space(4.0);
+    resp.inner.changed()
 }
 
 /// Width for the New CHUID dialog's GUID input (and, to keep the two fields
@@ -25106,9 +25172,10 @@ impl App {
             // not to one key, so they sit with the applet status here.
             ui.add_space(12.0);
 
-            // Card details: cardholder name + public-key URL. The values are
-            // typed in the per-row text fields; both writes prompt for the admin
-            // PIN (PW3) in a dialog.
+            // Card details: cardholder name + public-key URL. The entry fields
+            // pre-fill with the on-card values on each status read (public, no
+            // PIN); editing them stages a new value — both writes prompt for
+            // the admin PIN (PW3) in a dialog.
             self.adaptive_row(
                 ui,
                 |app, ui| {
@@ -25131,23 +25198,27 @@ impl App {
                 },
             );
             ui.add_space(6.0);
-            text_field(
+            if text_field(
                 ui,
                 p,
                 "Name",
                 &mut self.openpgp.name_input,
                 "Surname<<Given",
                 200.0,
-            );
+            ) {
+                self.openpgp.name_dirty = true;
+            }
             ui.add_space(4.0);
-            text_field(
+            if text_field(
                 ui,
                 p,
                 "URL",
                 &mut self.openpgp.url_input,
                 "https://\u{2026}",
                 240.0,
-            );
+            ) {
+                self.openpgp.url_dirty = true;
+            }
 
             // PINs: change user / admin, unblock user. Each opens a dialog where
             // the PIN entry happens; nothing secret is typed inline.
