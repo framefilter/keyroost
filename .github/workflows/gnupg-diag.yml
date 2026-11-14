@@ -38,5 +38,5 @@ jobs:
 
       - name: Loop the export tests, replay failures
         env:
-          RUNS: "40"
+          RUNS: "15"
         run: bash .github/gnupg-diag/run.sh

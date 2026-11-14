@@ -39,7 +39,22 @@ for _ in $(seq 1 "$runs"); do
 done
 echo "- Loop: $runs runs of the export tests, $good ok, $bad failed" >> "$summary"
 
-for f in "$out"/fail-*.log; do
+# The same cv25519 test alone, one thread: does running beside the other
+# tests (load, timing) matter?
+alone_good=0
+alone_bad=0
+for _ in $(seq 1 "$runs"); do
+  if cargo test -q -p keyroost-pgpkey --locked --test gnupg_interop \
+      -- --exact cv25519_export_works_in_gpg --test-threads=1 > "$out/alone.log" 2>&1; then
+    alone_good=$((alone_good + 1))
+  else
+    alone_bad=$((alone_bad + 1))
+  fi
+done
+echo "- cv25519 test alone: $runs runs, $alone_good ok, $alone_bad failed" >> "$summary"
+
+# Replay the first three failures only; each replay runs 60 gpg trials.
+for f in "$out"/fail-1.log "$out"/fail-2.log "$out"/fail-3.log; do
   [ -e "$f" ] || continue
   python3 -I "$here/replay.py" "$f" "$out/hwf" >> "$summary" 2>&1
 done
