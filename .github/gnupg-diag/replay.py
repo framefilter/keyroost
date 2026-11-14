@@ -22,7 +22,7 @@ import sys
 
 TEST_PHRASE = b"test pass"
 DENY_FILE = "/etc/gcrypt/hwf.deny"
-TRIALS = 10
+TRIALS = 3
 MODES = [
     ("as is", None),
     ("VAES/AVX-512 denied", "intel-vaes-vpclmul\nintel-avx512\n"),
@@ -130,32 +130,51 @@ def check_key(armored):
     return lines
 
 
-def gpg(home, args, stdin=None):
+def gpg(home, args, stdin=None, empty_stdin=False):
     cmd = ["gpg", "--homedir", home, "--batch", "--no-tty", "--no-auto-check-trustdb"]
     if stdin is not None:
         cmd += ["--pinentry-mode", "loopback", "--passphrase-fd", "0"]
-    return subprocess.run(cmd + args, input=(stdin or b"") + b"\n", capture_output=True,
+        data = stdin + b"\n"
+    else:
+        data = b"" if empty_stdin else b"\n"
+    return subprocess.run(cmd + args, input=data, capture_output=True,
                           env=dict(os.environ, GNUPGHOME=home))
 
 
-def trial(keyfile, n, phrase_at_import):
-    """Import (with the passphrase, as the test does, or without), sign, encrypt,
-    decrypt in a fresh home. Returns (decrypt ok, sign ok, agent error)."""
+# Each switch is one way the Rust test drives gpg that the Python replay
+# didn't: agent debug logging, --status-fd 1 on encrypt/decrypt, listing
+# and checking the keys before signing, nothing at all on stdin when no
+# passphrase is needed.
+SWITCHES = ("debug", "status", "listing", "empty")
+VARIANTS = [("baseline", set())] + [(f"+{w}", {w}) for w in SWITCHES] + [("all four", set(SWITCHES))]
+
+
+def trial(keyfile, n, on):
+    """Import with the passphrase, sign, encrypt, decrypt in a fresh home,
+    with the switches in `on`. Returns (decrypt ok, sign ok, agent error)."""
     home = f"/tmp/krdg-{os.getpid()}-{n}"
     shutil.rmtree(home, ignore_errors=True)
     os.mkdir(home, 0o700)
     with open(os.path.join(home, "gpg-agent.conf"), "w") as f:
         f.write(f"log-file {home}/agent.log\n")
+        if "debug" in on:
+            f.write("debug-level basic\n")
+    empty = "empty" in on
+    status = ["--status-fd", "1"] if "status" in on else []
     try:
-        gpg(home, ["--import", keyfile], TEST_PHRASE if phrase_at_import else None)
-        cols = gpg(home, ["--list-keys", "--with-colons"]).stdout.decode()
+        gpg(home, ["--import", keyfile], TEST_PHRASE)
+        cols = gpg(home, ["--list-keys", "--with-colons"], empty_stdin=empty).stdout.decode()
         fpr = next(l.split(":")[9] for l in cols.splitlines() if l.startswith("fpr"))
+        if "listing" in on:
+            gpg(home, ["--with-colons", "--check-sigs", fpr], empty_stdin=empty)
+            gpg(home, ["--with-colons", "--list-secret-keys", fpr], empty_stdin=empty)
         data = os.path.join(home, "d.txt")
         with open(data, "wb") as f:
             f.write(b"keyroost interop\n")
         sig = gpg(home, ["--local-user", fpr + "!", "-o", f"{data}.sig", "--detach-sign", data], TEST_PHRASE)
-        gpg(home, ["--trust-model", "always", "-r", fpr, "-o", f"{data}.gpg", "--encrypt", data])
-        dec = gpg(home, ["--yes", "-o", f"{data}.out", "--decrypt", f"{data}.gpg"], TEST_PHRASE)
+        gpg(home, ["--trust-model", "always", "--yes"] + status + ["-r", fpr, "-o", f"{data}.gpg", "--encrypt", data],
+            empty_stdin=empty)
+        dec = gpg(home, ["--yes"] + status + ["-o", f"{data}.out", "--decrypt", f"{data}.gpg"], TEST_PHRASE)
         err = ""
         try:
             log = open(os.path.join(home, "agent.log")).read()
@@ -199,23 +218,11 @@ def main():
         print("\n".join(check_key(armored)))
     except Exception as e:  # diagnostic: report, don't stop the replay
         print(f"  - check failed: {e!r}")
-    modes = MODES[:1] if os.environ.get("DIAG_NO_DENY") else MODES
-    for name, deny in modes:
-        if len(modes) > 1:
-            set_deny(deny)
-        hw = subprocess.run([hwf], capture_output=True, text=True).stdout
-        hwl = next((l for l in hw.splitlines() if l.startswith("hwflist:")), "hwflist: ?")
-        print(f"- libgcrypt {name}: `{hwl}`")
-        for at_import, label in ((True, "passphrase at import (as the test)"),
-                                 (False, "no passphrase at import")):
-            results = [trial(keyfile, i, at_import) for i in range(TRIALS)]
-            dec_ok = sum(r[0] for r in results)
-            sig_ok = sum(r[1] for r in results)
-            errs = sorted({r[2] for r in results if r[2]})
-            print(f"  - replay, {label}: decrypt {dec_ok}/{TRIALS} ok, sign {sig_ok}/{TRIALS} ok"
-                  + (f"; agent: {'; '.join(errs)}" if errs else ""))
-    if len(modes) > 1:
-        set_deny(None)
+    for name, on in VARIANTS:
+        results = [trial(keyfile, i, on) for i in range(TRIALS)]
+        dec_ok = sum(r[0] for r in results)
+        sig_ok = sum(r[1] for r in results)
+        print(f"  - replay {name}: decrypt {dec_ok}/{TRIALS} ok, sign {sig_ok}/{TRIALS} ok")
     print("\n<details><summary>key set (throwaway test key, passphrase \"test pass\")</summary>\n\n```\n"
           + armored + "```\n</details>")
 
