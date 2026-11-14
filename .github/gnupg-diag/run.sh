@@ -44,5 +44,10 @@ for f in "$out"/fail-*.log; do
   python3 -I "$here/replay.py" "$f" "$out/hwf" >> "$summary" 2>&1
 done
 
+# The job summary isn't readable through the API; repeat it in the log.
+echo "===== gnupg-diag summary ====="
+cat "$summary"
+echo "===== end of gnupg-diag summary ====="
+
 # Fail the job when the loop saw a failure, so it stands out in the PR.
 [ "$bad" -eq 0 ]
