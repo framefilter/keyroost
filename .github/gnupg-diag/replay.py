@@ -217,6 +217,100 @@ def trial(keyfile, n, on, trace=None):
         shutil.rmtree(home, ignore_errors=True)
 
 
+def crc24(data):
+    crc = 0xB704CE
+    for b in data:
+        crc ^= b << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+    return crc & 0xFFFFFF
+
+
+def armor_private(raw):
+    b64 = base64.b64encode(raw).decode()
+    lines = [b64[i:i + 64] for i in range(0, len(b64), 64)]
+    crc = base64.b64encode(crc24(raw).to_bytes(3, "big")).decode()
+    return ("-----BEGIN PGP PRIVATE KEY BLOCK-----\n\n" + "\n".join(lines)
+            + f"\n={crc}\n-----END PGP PRIVATE KEY BLOCK-----\n")
+
+
+def cfb(op, cipher, key, iv, data):
+    name = {7: "-aes-128-cfb", 9: "-aes-256-cfb"}[cipher]
+    return subprocess.run(["openssl", "enc", op, name, "-nopad", "-K", key.hex(), "-iv", iv.hex()],
+                          input=data, capture_output=True, check=True).stdout
+
+
+def reprotect(armored, cipher, hashalgo, count_byte):
+    """Re-encrypt each secret packet's protected part with another cipher,
+    S2K hash or count; every other byte (salt, IV, packets) stays as is."""
+    raw = bytearray(dearmor(armored))
+    i = 0
+    while i < len(raw):
+        h = raw[i]
+        hdr = i
+        i += 1
+        if h & 0x40:
+            tag = h & 0x3F
+            l0 = raw[i]
+            i += 1
+            if l0 < 192:
+                n = l0
+            elif l0 < 224:
+                n = ((l0 - 192) << 8) + raw[i] + 192
+                i += 1
+            else:
+                n = struct.unpack(">I", bytes(raw[i:i + 4]))[0]
+                i += 4
+        else:
+            tag = (h >> 2) & 0xF
+            size = {0: 1, 1: 2, 2: 4}[h & 3]
+            n = int.from_bytes(raw[i:i + size], "big")
+            i += size
+        body_start = i
+        if tag in (5, 7):
+            body = bytes(raw[body_start:body_start + n])
+            algo = body[5]
+            j = 6
+            if algo in (18, 19, 22):
+                j += 1 + body[j]
+                _, _, j = mpi(body, j)
+                if algo == 18:
+                    j += 1 + body[j]
+            elif algo == 1:
+                _, _, j = mpi(body, j)
+                _, _, j = mpi(body, j)
+            old_cipher, old_hash = body[j + 1], body[j + 3]
+            salt = body[j + 4:j + 12]
+            c = body[j + 12]
+            iv = body[j + 13:j + 29]
+            ct = body[j + 29:]
+            klen = {7: 16, 9: 32}
+            old_key = s2k_key(TEST_PHRASE, old_hash, salt, (16 + (c & 15)) << ((c >> 4) + 6), klen[old_cipher])
+            plain = cfb("-d", old_cipher, old_key, iv, ct)
+            new_key = s2k_key(TEST_PHRASE, hashalgo, salt,
+                              (16 + (count_byte & 15)) << ((count_byte >> 4) + 6), klen[cipher])
+            new_ct = cfb("-e", cipher, new_key, iv, plain)
+            a = body_start + j
+            raw[a + 1] = cipher
+            raw[a + 3] = hashalgo
+            raw[a + 12] = count_byte
+            raw[a + 29:a + 29 + len(ct)] = new_ct
+        i = body_start + n
+    return armor_private(bytes(raw))
+
+
+# (label, cipher, hash, count byte); ours is AES-256 (9), SHA-256 (8), 0xE0.
+REPROTECT = [
+    ("ours, unchanged", 9, 8, 0xE0),
+    ("count 65011712 only", 9, 8, 0xFF),
+    ("AES-128 only", 7, 8, 0xE0),
+    ("SHA-1 only", 9, 2, 0xE0),
+    ("gpg's three settings", 7, 2, 0xFF),
+]
+
+
 def reexport(keyfile, out):
     """Import our key set and export it again with gpg's own protection."""
     home = f"/tmp/krdx-{os.getpid()}"
@@ -335,14 +429,15 @@ def main():
         for t in traces:
             print(f"    - {t}")
     print(f"  - our export protection: {protection(armored)}")
-    rx = keyfile + ".gpg-reexport.asc"
-    if reexport(keyfile, rx):
-        print(f"  - gpg's re-export protection: {protection(open(rx).read())}")
-        for name, on in VARIANTS:
-            results = [trial(rx, i, on) for i in range(TRIALS)]
-            print(f"  - same key re-exported by gpg, replay {name}: decrypt {sum(r[0] for r in results)}/{TRIALS} ok")
-    else:
-        print("  - gpg re-export failed")
+    for label, cipher, hashalgo, cb in REPROTECT:
+        rp = keyfile + ".rp.asc"
+        try:
+            open(rp, "w").write(reprotect(armored, cipher, hashalgo, cb))
+        except Exception as e:  # diagnostic: report, don't stop
+            print(f"  - re-protect {label}: failed {e!r}")
+            continue
+        results = [trial(rp, i, {"listsecret"}) for i in range(TRIALS)]
+        print(f"  - re-protected, {label}, list-secret-keys first: decrypt {sum(r[0] for r in results)}/{TRIALS} ok")
     print("\n<details><summary>key set (throwaway test key, passphrase \"test pass\")</summary>\n\n```\n"
           + armored + "```\n</details>")
 
