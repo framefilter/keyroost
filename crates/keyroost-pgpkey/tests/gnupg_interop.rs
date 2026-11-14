@@ -852,3 +852,74 @@ fn backup_with_changed_expiry_still_imports_in_gpg() {
         "sign",
     );
 }
+
+/// Diagnostic only (draft PR, never merged): replay a saved key set
+/// (`KR_REPLAY_KEY`, under the test passphrase) through the same gpg steps
+/// as `our_export_works_in_gpg`, with the same helpers and agent settings.
+#[test]
+#[ignore = "diagnostic"]
+fn replay_saved_key_in_gpg() {
+    let Ok(path) = std::env::var("KR_REPLAY_KEY") else {
+        return;
+    };
+    let armored = std::fs::read(&path).unwrap();
+    let home = Home::new("replay");
+    let h = &home.0;
+    let sec = home.write("sec.asc", &armored);
+    home.ok(&gpg(h, &["--import", &sec], Some(PASS)), "import");
+    let o = home.ok(
+        &gpg(h, &["--with-colons", "--list-secret-keys"], None),
+        "list-secret-keys",
+    );
+    let fprs: Vec<String> = colon_keys(&o).iter().map(|k| k.fpr.clone()).collect();
+    home.ok(
+        &gpg(h, &["--with-colons", "--check-sigs", &fprs[0]], None),
+        "check-sigs",
+    );
+    let data = home.write("data.txt", b"keyroost interop\n");
+    let sig = home.file("data.sig");
+    let sig = sig.to_str().unwrap();
+    let signer = format!("{}!", fprs[0]);
+    home.ok(
+        &gpg(
+            h,
+            &["--local-user", &signer, "-o", sig, "--detach-sign", &data],
+            Some(PASS),
+        ),
+        "detach-sign",
+    );
+    home.ok(
+        &gpg(h, &["--status-fd", "1", "--verify", sig, &data], None),
+        "verify",
+    );
+    let msg = home.file("data.gpg");
+    let msg = msg.to_str().unwrap();
+    let enc = gpg(
+        h,
+        &[
+            "--trust-model",
+            "always",
+            "--yes",
+            "--status-fd",
+            "1",
+            "-r",
+            &fprs[0],
+            "-o",
+            msg,
+            "--encrypt",
+            &data,
+        ],
+        None,
+    );
+    home.ok(&enc, "encrypt");
+    let plain = home.file("plain.txt");
+    let plain_s = plain.to_str().unwrap();
+    home.ok(
+        &gpg(
+            h,
+            &["--yes", "--status-fd", "1", "-o", plain_s, "--decrypt", msg],
+            Some(PASS),
+        ),
+        "decrypt",
+    );
+}

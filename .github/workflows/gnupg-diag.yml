@@ -1,0 +1,42 @@
+name: GnuPG interop diagnostic
+
+# Diagnostic only, lives on a draft PR and is never merged: loops the GnuPG
+# export tests that fail now and then on the Ubuntu runners, records each
+# runner's CPU and libgcrypt's active hardware features, and replays any
+# failing key with libgcrypt's AES acceleration on and off.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/gnupg-diag.yml"
+      - ".github/gnupg-diag/**"
+
+permissions:
+  contents: read
+
+jobs:
+  loop:
+    name: gnupg interop loop (${{ matrix.n }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpcsclite-dev libgcrypt20-dev
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Loop the export tests, replay failures
+        env:
+          RUNS: "8"
+        run: bash .github/gnupg-diag/run.sh
