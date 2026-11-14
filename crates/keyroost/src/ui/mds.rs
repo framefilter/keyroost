@@ -24,7 +24,11 @@ pub fn decode_icon(data_uri: &str) -> Option<egui::ColorImage> {
 /// error or a pixel format this doesn't expand; the buffer is always exactly
 /// `width * height * 4` bytes.
 pub fn decode_png_rgba(bytes: &[u8]) -> Option<([usize; 2], Vec<u8>)> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    // png 0.17+ applies no transformations by default, so a palette image (many
+    // vendor icons, Feitian's among them) would come back as raw indices. Expand
+    // to 8-bit gray / RGB(A), as `keyroost-qr` does.
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0u8; reader.output_buffer_size()?];
     let frame = reader.next_frame(&mut buf).ok()?;
@@ -46,8 +50,8 @@ pub fn decode_png_rgba(bytes: &[u8]) -> Option<([usize; 2], Vec<u8>)> {
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
         png::ColorType::Grayscale => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
-        // Indexed/other should already be expanded by png's transformations in
-        // the common case; bail rather than render garbage.
+        // EXPAND above turns palette images into Rgb/Rgba, so nothing else is
+        // expected; bail rather than render garbage.
         _ => return None,
     };
     // `ColorImage::from_rgba_unmultiplied` asserts the buffer is exactly w*h*4;
@@ -56,4 +60,45 @@ pub fn decode_png_rgba(bytes: &[u8]) -> Option<([usize; 2], Vec<u8>)> {
         return None;
     }
     Some(([w, h], rgba))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_png_rgba;
+
+    /// A 2x2 8-bit palette PNG (the format many vendor MDS icons use, e.g. Feitian's),
+    /// with an optional tRNS chunk.
+    fn indexed_png(trns: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, 2, 2);
+        enc.set_color(png::ColorType::Indexed);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_palette(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 10, 20, 30]);
+        if let Some(t) = trns {
+            enc.set_trns(t.to_vec());
+        }
+        let mut w = enc.write_header().unwrap();
+        w.write_image_data(&[0, 1, 2, 3]).unwrap();
+        w.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn palette_png_expands_to_rgba() {
+        let (size, rgba) = decode_png_rgba(&indexed_png(None)).expect("palette PNG decodes");
+        assert_eq!(size, [2, 2]);
+        assert_eq!(
+            rgba,
+            [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 10, 20, 30, 255]
+        );
+    }
+
+    #[test]
+    fn palette_png_keeps_trns_alpha() {
+        let (_, rgba) =
+            decode_png_rgba(&indexed_png(Some(&[0, 128]))).expect("palette PNG decodes");
+        // Entries 0 and 1 carry alpha 0 and 128; tRNS leaves the rest opaque.
+        let alpha: Vec<u8> = rgba.chunks(4).map(|p| p[3]).collect();
+        assert_eq!(alpha, [0, 128, 255, 255]);
+    }
 }
