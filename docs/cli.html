@@ -523,7 +523,7 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl otp pin change</code></td><td>Change the OTP PIN: current first, then new (stdin lines 1 and 2, env vars, or the prompt)</td></tr>
       <tr><td><code>keyroostctl otp pin clear</code></td><td>Remove the OTP PIN. Needs the current OTP PIN: via env, stdin or, with neither, a hidden prompt</td></tr>
       <tr><td><code>keyroostctl otp pin status</code></td><td>Report OTP-PIN status (R3.4+ keys): whether a PIN is set and retries left</td></tr>
-      <tr><td><code>keyroostctl otp pin verify</code></td><td>Verify the OTP PIN, opening the read window for this connection (mostly for testing; <code>otp list</code> takes <code>--pin</code> directly). The PIN comes from --pin env:NAME or stdin or, with neither, a hidden prompt</td></tr>
+      <tr><td><code>keyroostctl otp pin verify</code></td><td>Verify the OTP PIN, opening the read window for this connection (for testing; <code>otp list</code> and <code>otp code</code> take <code>--pin</code>). The PIN comes from --pin env:NAME or stdin or, with neither, a hidden prompt</td></tr>
       <tr><td><code>keyroostctl otp fingerprint</code></td><td>Check, enable or disable fingerprint unlock for the OTP entries</td></tr>
       <tr><td><code>keyroostctl otp fingerprint status</code></td><td>Report whether the key supports fingerprint-protected OTP and whether it is on</td></tr>
       <tr><td><code>keyroostctl otp fingerprint enable</code></td><td>Enable fingerprint protection for OTP. Needs the current OTP PIN. After this, codes can be unlocked by a fingerprint touch as well as the PIN</td></tr>

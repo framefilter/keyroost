@@ -1441,13 +1441,21 @@ impl App {
         };
         let for_device = self.selected_device.clone();
         let key = (app_name.clone(), account_name.clone());
+        // A protected key answers a code read only on the connection that
+        // verified its PIN (#261), so this read verifies the PIN the pane
+        // holds, as a list refresh does. Clone as `Zeroizing`: the copy is
+        // dropped in the worker thread.
+        let pin: Option<zeroize::Zeroizing<String>> = self.otp.pin.clone();
         self.spawn_job("Reading code \u{2014} touch your key\u{2026}", move || {
-            let result = (|| -> Result<Option<String>, String> {
-                let mut session = target.open().map_err(|e| e.to_string())?;
+            let result = (|| -> Result<Option<String>, OtpTransportError> {
+                let mut session = target.open()?;
                 let now = unix_now();
-                let entry = session
-                    .read_entry(now, &app_name, &account_name)
-                    .map_err(|e| e.to_string())?;
+                let entry = session.read_entry_pinned(
+                    now,
+                    &app_name,
+                    &account_name,
+                    pin.as_ref().map(|p| p.as_str()),
+                )?;
                 Ok(entry.code)
             })();
             Box::new(move |app: &mut App| {
@@ -1461,7 +1469,16 @@ impl App {
                     Ok(None) => {
                         app.otp_failed("the key did not return a code".into());
                     }
-                    Err(e) => app.otp_failed(e),
+                    // No PIN held (or it was unlocked by fingerprint, which
+                    // leaves none): back to the unlock prompt, as a refresh does.
+                    Err(OtpTransportError::PinRequired) => {
+                        app.otp.pin_required = true;
+                        app.otp.pin_set = Some(true);
+                        app.otp.rows.clear();
+                        app.otp.loaded = true;
+                        app.otp.error = None;
+                    }
+                    Err(e) => app.otp_failed(e.to_string()),
                 }
             })
         });
