@@ -12,4 +12,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = keyroost_openpgp::parse_algorithm_attributes(data);
     let _ = keyroost_openpgp::describe_algorithm_attributes(data);
     let _ = keyroost_openpgp::parse_algorithm_information(data);
+    let _ = keyroost_openpgp::parse_cardholder_name(data);
+    let _ = keyroost_openpgp::parse_url(data);
 });

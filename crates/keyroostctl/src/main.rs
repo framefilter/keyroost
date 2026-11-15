@@ -1528,7 +1528,7 @@ enum PivChuidCmd {
 #[derive(Subcommand)]
 enum OpenpgpCmd {
     /// Show card status: AID/serial, key algorithms and fingerprints, PIN retry
-    /// counters, and the signature counter. No PIN or touch required.
+    /// counters, the signature counter, and the cardholder name/URL. No PIN or touch required.
     Info {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -9670,6 +9670,8 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                     reset_code_retries: status.tries_rc,
                     admin_pin_retries: status.tries_pw3,
                     signature_count: status.signature_count,
+                    cardholder_name: json_out::optional_text_json(status.cardholder_name.clone()),
+                    url: json_out::optional_text_json(status.url.clone()),
                 })?;
                 return Ok(());
             }
@@ -9699,6 +9701,17 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             match status.signature_count {
                 Some(n) => outln!("Signatures:     {}", n),
                 None => outln!("Signatures:     (unavailable)"),
+            }
+            // Tri-state: unreadable is (unavailable), unset is (none).
+            match &status.cardholder_name {
+                None => outln!("Name:           (unavailable)"),
+                Some(None) => outln!("Name:           (none)"),
+                Some(Some(name)) => outln!("Name:           {name}"),
+            }
+            match &status.url {
+                None => outln!("URL:            (unavailable)"),
+                Some(None) => outln!("URL:            (none)"),
+                Some(Some(url)) => outln!("URL:            {url}"),
             }
         }
         OpenpgpCmd::Pin {
@@ -24646,6 +24659,8 @@ mod cli_tests {
             reset_code_retries: 0,
             admin_pin_retries: 3,
             signature_count: Some(7),
+            cardholder_name: Some("Doe<<John".into()),
+            url: None,
         };
         assert_json_has_keys(
             &o,
@@ -24658,6 +24673,8 @@ mod cli_tests {
                 "reset_code_retries",
                 "admin_pin_retries",
                 "signature_count",
+                "cardholder_name",
+                "url",
             ],
         );
     }

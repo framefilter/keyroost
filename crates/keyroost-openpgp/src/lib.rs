@@ -329,6 +329,26 @@ pub fn get_pw_status() -> Vec<u8> {
     get_data(TAG_PW_STATUS)
 }
 
+/// `GET DATA 0065` — the Cardholder Related Data aggregate (`65` wrapping
+/// `5B` name, `5F2D` language, `5F35` sex): `00 CA 00 65 00`.
+#[must_use]
+pub fn get_cardholder_related_data() -> Vec<u8> {
+    get_data(TAG_CARDHOLDER_RELATED_DATA)
+}
+
+/// `GET DATA 005B` — the standalone cardholder-name object: `00 CA 00 5B 00`.
+/// Some cards answer this directly; others only answer the `0065` aggregate.
+#[must_use]
+pub fn get_cardholder_name() -> Vec<u8> {
+    get_data(TAG_NAME)
+}
+
+/// `GET DATA 5F50` — the URL of the public key: `00 CA 5F 50 00`.
+#[must_use]
+pub fn get_url() -> Vec<u8> {
+    get_data(TAG_URL)
+}
+
 /// `VERIFY` — present `pin` against the password reference `pw_ref` (one of
 /// [`PW1_SIGN`], [`PW1_OTHER`], [`PW3_ADMIN`]).
 ///
@@ -2341,6 +2361,55 @@ pub fn parse_signature_counter(buf: &[u8]) -> Result<u32, ParseError> {
     Ok((u32::from(v[0]) << 16) | (u32::from(v[1]) << 8) | u32::from(v[2]))
 }
 
+/// Unwrap a text data object that cards return in either of two shapes: the
+/// full TLV envelope (`<tag> <len> <value>`, or the `0065` aggregate wrapping
+/// `005B`) or the bare value bytes. When the envelope (or aggregate) carrying
+/// `tag` is present its value wins; a buffer that parses as TLV but carries
+/// no such object means "unset" (empty); only a buffer that is not valid TLV
+/// at all is treated as the bare value.
+/// Never fails — a value that is not valid TLV is just a value.
+fn unwrap_text_do(buf: &[u8], tag: u16) -> &[u8] {
+    if buf.is_empty() {
+        return buf;
+    }
+    match parse_tlvs(buf) {
+        Ok(tlvs) => find_nested(&tlvs, tag).unwrap_or(&[]),
+        Err(_) => buf,
+    }
+}
+
+/// Decode the raw value bytes of a text object (name, URL) for display.
+/// Empty (or all-NUL) values mean "unset" and yield `None`; otherwise the
+/// bytes verbatim as lossy UTF-8 (the card stores them verbatim on PUT).
+fn decode_text_value(value: &[u8]) -> Option<String> {
+    let mut end = value.len();
+    while end > 0 && value[end - 1] == 0 {
+        end -= 1;
+    }
+    let trimmed = &value[..end];
+    if trimmed.is_empty() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(trimmed).into_owned();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Parse a cardholder-name response: either the `0065` Cardholder Related
+/// Data aggregate or the standalone `005B` object (enveloped or bare).
+/// Empty means "unset" (`Ok(None)`), matching a card with no name written.
+pub fn parse_cardholder_name(buf: &[u8]) -> Result<Option<String>, ParseError> {
+    Ok(decode_text_value(unwrap_text_do(buf, TAG_NAME)))
+}
+
+/// Parse a URL (`5F50`) response (enveloped or bare). Empty means "unset".
+pub fn parse_url(buf: &[u8]) -> Result<Option<String>, ParseError> {
+    Ok(decode_text_value(unwrap_text_do(buf, TAG_URL)))
+}
+
 /// The public key parsed from a GENERATE / READ PUBLIC KEY response (`7F49`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicKey {
@@ -2446,11 +2515,17 @@ mod tests {
             vec![0x00, 0xCA, 0x00, 0x6E, 0x00]
         );
         assert_eq!(get_pw_status(), vec![0x00, 0xCA, 0x00, 0xC4, 0x00]);
+        assert_eq!(
+            get_cardholder_related_data(),
+            vec![0x00, 0xCA, 0x00, 0x65, 0x00]
+        );
+        assert_eq!(get_cardholder_name(), vec![0x00, 0xCA, 0x00, 0x5B, 0x00]);
         // A 2-byte tag splits across P1/P2: 5F52 -> P1=5F P2=52.
         assert_eq!(
             get_data(TAG_HISTORICAL_BYTES),
             vec![0x00, 0xCA, 0x5F, 0x52, 0x00]
         );
+        assert_eq!(get_url(), vec![0x00, 0xCA, 0x5F, 0x50, 0x00]);
     }
 
     #[test]
@@ -2753,6 +2828,61 @@ mod tests {
         assert_eq!(parse_signature_counter(&blob).unwrap(), 0x0000_1234);
         // Bare value form also works.
         assert_eq!(parse_signature_counter(&inner).unwrap(), 4660);
+    }
+
+    // --- Cardholder name / URL -------------------------------------------
+
+    #[test]
+    fn parse_cardholder_name_envelopes() {
+        // Standalone 5B envelope: 5B 04 "Test".
+        assert_eq!(
+            parse_cardholder_name(&[0x5B, 0x04, 0x54, 0x65, 0x73, 0x74]).unwrap(),
+            Some("Test".to_string())
+        );
+        // 65 aggregate wrapping 5B.
+        let mut inner65 = vec![0x5B, 0x04, 0x54, 0x65, 0x73, 0x74];
+        let mut blob65 = vec![0x65, inner65.len() as u8];
+        blob65.append(&mut inner65);
+        assert_eq!(
+            parse_cardholder_name(&blob65).unwrap(),
+            Some("Test".to_string())
+        );
+        // Bare value (no TLV envelope).
+        assert_eq!(
+            parse_cardholder_name(b"Doe<<John").unwrap(),
+            Some("Doe<<John".to_string())
+        );
+        // Empty / all-NUL means unset.
+        assert_eq!(parse_cardholder_name(&[]).unwrap(), None);
+        assert_eq!(parse_cardholder_name(&[0x00, 0x00]).unwrap(), None);
+        // A 65 aggregate without 5B (e.g. language only) is unset, not garbage.
+        assert_eq!(
+            parse_cardholder_name(&[0x65, 0x05, 0x5F, 0x2D, 0x02, 0x65, 0x6E]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_url_envelopes() {
+        // 5F50 envelope.
+        let url = b"https://example.com/key.asc";
+        let mut blob = vec![0x5F, 0x50, url.len() as u8];
+        blob.extend_from_slice(url);
+        assert_eq!(
+            parse_url(&blob).unwrap(),
+            Some("https://example.com/key.asc".to_string())
+        );
+        // Bare value.
+        assert_eq!(
+            parse_url(b"https://example.com/key.asc").unwrap(),
+            Some("https://example.com/key.asc".to_string())
+        );
+        assert_eq!(parse_url(&[]).unwrap(), None);
+        // Valid TLV without the URL object means "unset", not the raw bytes.
+        assert_eq!(
+            parse_url(&[0x5B, 0x04, 0x54, 0x65, 0x73, 0x74]).unwrap(),
+            None
+        );
     }
 
     // --- Operation / write builders --------------------------------------

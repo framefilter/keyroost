@@ -21,7 +21,8 @@ use zeroize::Zeroizing;
 const SW_FILE_NOT_FOUND: u16 = 0x6A82;
 
 /// A read-only snapshot of an OpenPGP card's state, assembled from the
-/// Application Related Data (`6E`) and the signature counter (`7A`/`93`).
+/// Application Related Data (`6E`), the signature counter (`7A`/`93`), and
+/// the public cardholder data (`0065`/`005B` name, `5F50` URL).
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OpenPgpStatus {
@@ -53,6 +54,15 @@ pub struct OpenPgpStatus {
     /// (a cross-applet read, the same one PIV status makes). `None` on other
     /// cards, or when the OTP applet didn't answer.
     pub otp_applet_serial: Option<u128>,
+    /// Cardholder name (`005B`, via the `0065` aggregate with a `005B`
+    /// fallback). Public data, no PIN. Tri-state: outer `None` means the
+    /// object couldn't be read (card/transport error), `Some(None)` means it
+    /// read back but is unset (empty), `Some(Some(_))` is the value.
+    pub cardholder_name: Option<Option<String>>,
+    /// Public-key URL (`5F50`). Public data, no PIN. Tri-state like
+    /// [`Self::cardholder_name`]: outer `None` is unreadable, `Some(None)` is
+    /// unset.
+    pub url: Option<Option<String>>,
 }
 
 impl OpenPgpStatus {
@@ -134,6 +144,36 @@ fn key_present_from<T>(read: Result<T, TransportError>) -> Option<bool> {
     read.ok().map(|_| true)
 }
 
+/// Decode one best-effort public text reply for [`OpenPgpSession::status`]:
+/// `None` (transport miss) or a non-`SW_OK` card error (e.g. `6A82`/`6A88`
+/// on a card without the object) means unreadable (`None`); an `SW_OK`
+/// reply parses to unset (`Some(None)`) or a value. Never fails `status()`.
+fn decode_optional_text(
+    reply: Option<(Vec<u8>, u16)>,
+    parse: fn(&[u8]) -> Result<Option<String>, pgp::ParseError>,
+) -> Option<Option<String>> {
+    let (bytes, sw) = reply?;
+    if sw != pgp::SW_OK {
+        return None;
+    }
+    parse(&bytes).ok()
+}
+
+/// Name fallback for [`OpenPgpSession::status`]: the `0065` aggregate wins
+/// even when it is present-but-empty (`Some(None)` = unset); the standalone
+/// `005B` is read only when the aggregate is missing (`None`). `fallback`
+/// must not run in the first case — it would waste an APDU and could mask
+/// "unset" as a value.
+fn resolve_cardholder_name(
+    aggregate: Option<Option<String>>,
+    fallback: impl FnOnce() -> Option<Option<String>>,
+) -> Option<Option<String>> {
+    match aggregate {
+        Some(v) => Some(v),
+        None => fallback(),
+    }
+}
+
 impl OpenPgpSession {
     /// Connect to `reader_name` and SELECT the OpenPGP applet. Returns
     /// [`TransportError::NoOpenPgpApplet`] when the card has no OpenPGP applet.
@@ -213,8 +253,8 @@ impl OpenPgpSession {
         ok_or_apdu("select openpgp applet", sw)
     }
 
-    /// Read a status snapshot: Application Related Data plus the signature
-    /// counter. Read-only — no PIN, no touch.
+    /// Read a status snapshot: Application Related Data, the signature
+    /// counter, and the public cardholder name/URL. Read-only — no PIN, no touch.
     pub fn status(&mut self) -> Result<OpenPgpStatus, TransportError> {
         let (ard_bytes, sw) = self.transmit_full(&pgp::get_application_related_data())?;
         ok_or_apdu("get application related data", sw)?;
@@ -241,6 +281,23 @@ impl OpenPgpSession {
             None
         };
 
+        // Cardholder name + URL are public (no PIN). Best-effort: a missing
+        // object (card error like 6A88/6A82, transport miss) leaves the field
+        // outer-`None` (unreadable), a present-but-unset (empty) value is
+        // `Some(None)` — status must still succeed.
+        // For the name, fall back from the `0065` aggregate to the standalone
+        // `005B` object only when the aggregate is *missing* (outer `None`);
+        // a present-but-empty aggregate means "unset" and must not trigger a
+        // second read.
+        let aggregate = self.read_optional_text(
+            &pgp::get_cardholder_related_data(),
+            pgp::parse_cardholder_name,
+        );
+        let cardholder_name: Option<Option<String>> = resolve_cardholder_name(aggregate, || {
+            self.read_optional_text(&pgp::get_cardholder_name(), pgp::parse_cardholder_name)
+        });
+        let url: Option<Option<String>> = self.read_optional_text(&pgp::get_url(), pgp::parse_url);
+
         Ok(OpenPgpStatus {
             sig_algo_id: ard.sig_algo_id(),
             dec_algo_id: ard.dec_algo_id(),
@@ -257,7 +314,25 @@ impl OpenPgpSession {
             tries_pw3: ard.pw_status.tries_pw3,
             signature_count,
             otp_applet_serial,
+            cardholder_name,
+            url,
         })
+    }
+
+    /// Best-effort read of a public text object for [`status`](Self::status):
+    /// transmit `apdu` and parse a `SW_OK` reply with `parse`.
+    ///
+    /// Tri-state so callers can tell "missing" from "present but unset":
+    /// `None` means the object couldn't be read (transport failure or card
+    /// error) while `Some(None)` means it read back but is unset (empty).
+    /// The parsers are total, so a reply never fails the status read;
+    /// `.ok()` is only defensive.
+    fn read_optional_text(
+        &mut self,
+        apdu: &[u8],
+        parse: fn(&[u8]) -> Result<Option<String>, pgp::ParseError>,
+    ) -> Option<Option<String>> {
+        decode_optional_text(self.transmit_full(apdu).ok(), parse)
     }
 
     /// Present a PIN against the password reference `pw_ref` (one of
@@ -1647,6 +1722,8 @@ mod tests {
             tries_pw3: 3,
             signature_count: None,
             otp_applet_serial: None,
+            cardholder_name: None,
+            url: None,
         };
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Sign), "EdDSA Ed25519");
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Decrypt), "ECDH X25519");
@@ -1682,6 +1759,8 @@ mod tests {
             tries_pw3: 3,
             signature_count: None,
             otp_applet_serial: None,
+            cardholder_name: None,
+            url: None,
         }
     }
 
@@ -1741,5 +1820,61 @@ mod tests {
         assert_eq!(st.full_serial(), Some(12_345_678));
         st.otp_applet_serial = Some(1_000_000_123_456);
         assert_eq!(st.full_serial(), Some(1_000_000_123_456));
+    }
+
+    #[test]
+    fn optional_text_missing_object_is_unreadable_not_a_failure() {
+        // Transport miss and card errors (e.g. 6A82/6A88 on a card without
+        // the object) yield outer `None`; status must still succeed.
+        assert_eq!(decode_optional_text(None, pgp::parse_cardholder_name), None);
+        assert_eq!(
+            decode_optional_text(Some((vec![], 0x6A82)), pgp::parse_cardholder_name),
+            None
+        );
+        assert_eq!(
+            decode_optional_text(Some((vec![], 0x6A88)), pgp::parse_url),
+            None
+        );
+        // An SW_OK empty reply is present-but-unset, not unreadable.
+        assert_eq!(
+            decode_optional_text(Some((vec![], pgp::SW_OK)), pgp::parse_cardholder_name),
+            Some(None)
+        );
+        // An SW_OK value parses through (standalone 5B envelope, bare value).
+        assert_eq!(
+            decode_optional_text(
+                Some((vec![0x5B, 0x04, 0x54, 0x65, 0x73, 0x74], pgp::SW_OK)),
+                pgp::parse_cardholder_name
+            ),
+            Some(Some("Test".to_string()))
+        );
+    }
+
+    #[test]
+    fn cardholder_fallback_runs_only_when_the_aggregate_is_missing() {
+        // Present-but-empty aggregate means "unset": no second read.
+        let mut ran = false;
+        assert_eq!(
+            resolve_cardholder_name(Some(None), || {
+                ran = true;
+                Some(Some("stale".to_string()))
+            }),
+            Some(None)
+        );
+        assert!(!ran, "unset aggregate must not trigger the 005B fallback");
+        // Present value wins too.
+        assert_eq!(
+            resolve_cardholder_name(Some(Some("A".to_string())), || {
+                Some(Some("B".to_string()))
+            }),
+            Some(Some("A".to_string()))
+        );
+        // Missing aggregate falls back, including to missing/unset.
+        assert_eq!(
+            resolve_cardholder_name(None, || Some(Some("B".to_string()))),
+            Some(Some("B".to_string()))
+        );
+        assert_eq!(resolve_cardholder_name(None, || Some(None)), Some(None));
+        assert_eq!(resolve_cardholder_name(None, || None), None);
     }
 }

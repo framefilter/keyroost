@@ -111,7 +111,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "pgp-card-details" => &Help {
             title: "Cardholder name & URL",
-            body: "Optional labels stored on the card: the cardholder name and a web address where your public key can be found. They're public information, but writing them still needs the admin PIN.",
+            body: "Optional labels stored on the card: the cardholder name and a web address where your public key can be found. They're public information — the current values read back automatically — but writing them still needs the admin PIN.",
             slug: "/openpgp#card-details",
         },
         "piv" => &Help {

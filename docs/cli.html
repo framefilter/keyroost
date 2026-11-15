@@ -533,7 +533,7 @@ keyroostctl fido pin status --json</code></pre>
     <p class="kr-muted">Manage the OpenPGP card applet: info, keys, sign, decrypt, PINs, cardholder details, and reset</p>
     <div class="kr-table-wrap"><table class="kr-table">
       <tr><th>Command</th><th>What it does</th></tr>
-      <tr><td><code>keyroostctl openpgp info</code></td><td>Show card status: AID/serial, key algorithms and fingerprints, PIN retry counters, and the signature counter. No PIN or touch required</td></tr>
+      <tr><td><code>keyroostctl openpgp info</code></td><td>Show card status: AID/serial, key algorithms and fingerprints, PIN retry counters, the signature counter, and the cardholder name/URL. No PIN or touch required</td></tr>
       <tr><td><code>keyroostctl openpgp pin</code></td><td>Check, change or unblock the user PIN (PW1) or the admin PIN (PW3)</td></tr>
       <tr><td><code>keyroostctl openpgp pin verify</code></td><td>Check a PIN without changing anything (the user PIN, or the admin PIN with --admin)</td></tr>
       <tr><td><code>keyroostctl openpgp pin change</code></td><td>Change the user PIN, or the admin PIN with --admin</td></tr>
