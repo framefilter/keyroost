@@ -279,9 +279,13 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   says a change is required, hardware-verified on an AFD PocketKey+
   ([#220](https://github.com/framefilter/keyroost/pull/220)); every change-PIN
   draft wiped by the idle lock
-  ([#222](https://github.com/framefilter/keyroost/pull/222)); and Always UV
+  ([#222](https://github.com/framefilter/keyroost/pull/222)); Always UV
   offered only on keys that support it
-  ([#224](https://github.com/framefilter/keyroost/pull/224)).
+  ([#224](https://github.com/framefilter/keyroost/pull/224)); FIDO metadata
+  for every hardware key in the FIDO Alliance's list
+  ([#246](https://github.com/framefilter/keyroost/pull/246)); and logos
+  stored as palette PNGs in the FIDO metadata card
+  ([#257](https://github.com/framefilter/keyroost/pull/257)).
 - **[@dlacko](https://github.com/dlacko)** — `openpgp info` cardholder name
   and public-key URL: the CLI prints the `005B` name and `5F50` URL
   (`cardholder_name` and `url` in `--json`), and the app's Card details
