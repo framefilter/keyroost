@@ -45,9 +45,6 @@ Being worked on right now — check with whoever holds it before starting.
   (libccid has no entry for 349e:0024); its USB-only row gets its serial
   from the §6.10 read since #236.
 
-- **Research: restoring missing OpenPGP fingerprints** from the user's public
-  key file. Investigate only; may be a hornet's nest (key-generation times,
-  which key matches, writing to the card). (research)
 
 - **Drop the broken-pipe workaround when stable Rust lands the SIGPIPE fix.**
   `install_broken_pipe_guard()` in `crates/keyroostctl/src/main.rs` plus its
@@ -169,6 +166,12 @@ plan's two-key manual steps were never executed):
   replies must be written by the maintainer. Claude may explain requirements
   and review in words; it doesn't write the manifest or the submission text.
   The manifest in `packaging/flatpak/` can't be reused for this.
+
+- **Restoring missing OpenPGP fingerprints** from the user's public key
+  file — parked until someone asks for it (decided 2026-11-03). Only a bare
+  RSA key file import gets a new identity on the card; backups restore
+  their own fingerprints. May be a hornet's nest (key-generation times,
+  which key matches, writing to the card).
 
 - **Friendly names for Molto2 tokens** — detection never connects to a
   Molto2, so its row carries no serial and `name set` can't name it.
