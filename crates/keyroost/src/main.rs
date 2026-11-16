@@ -10376,13 +10376,11 @@ impl App {
     ) {
         match result {
             Ok(status) => {
-                // The write went through, so whatever was staged is now the
-                // on-card value (or was cleared): drop the dirty marks so the
-                // re-read converges the entries — including back to empty.
-                // Record the card identity too, so a swap that landed mid-write
-                // can't leave the next read treating the new card as the old one.
-                app.openpgp.name_dirty = false;
-                app.openpgp.url_dirty = false;
+                // Record the card identity, so a swap that landed mid-write
+                // can't leave the next read treating the new card as the old
+                // one. The name/URL edit marks are the callers': each write
+                // clears only what it wrote, so a staged edit of the other
+                // field (or of both, across a PIN change) survives.
                 app.openpgp.card_id = Some(status.aid.clone());
                 app.openpgp.status = Some(status);
                 if keys_changed {
@@ -10481,6 +10479,11 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
+                // The name on the card is now what was typed: let reads fill
+                // the entry again. The URL entry keeps any staged edit.
+                if wrote {
+                    app.openpgp.name_dirty = false;
+                }
                 Self::apply_openpgp_write(app, result, "Cardholder name set.".into(), false, wrote)
             })
         });
@@ -10504,6 +10507,10 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
+                // As for the name: only the URL entry follows the card again.
+                if wrote {
+                    app.openpgp.url_dirty = false;
+                }
                 Self::apply_openpgp_write(app, result, "Public-key URL set.".into(), false, wrote)
             })
         });
@@ -11174,6 +11181,11 @@ impl App {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     app.log_moved_on(for_device.as_ref(), "resetting OpenPGP", &result);
                     return; // selection changed mid-reset; don't paint A's outcome under B
+                }
+                // A reset wipes the name and URL: both entries follow the card.
+                if wrote {
+                    app.openpgp.name_dirty = false;
+                    app.openpgp.url_dirty = false;
                 }
                 Self::apply_openpgp_write(
                     app,

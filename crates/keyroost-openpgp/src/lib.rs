@@ -2361,20 +2361,17 @@ pub fn parse_signature_counter(buf: &[u8]) -> Result<u32, ParseError> {
     Ok((u32::from(v[0]) << 16) | (u32::from(v[1]) << 8) | u32::from(v[2]))
 }
 
-/// Unwrap a text data object that cards return in either of two shapes: the
-/// full TLV envelope (`<tag> <len> <value>`, or the `0065` aggregate wrapping
-/// `005B`) or the bare value bytes. When the envelope (or aggregate) carrying
-/// `tag` is present its value wins; a buffer that parses as TLV but carries
-/// no such object means "unset" (empty); only a buffer that is not valid TLV
-/// at all is treated as the bare value.
-/// Never fails — a value that is not valid TLV is just a value.
-fn unwrap_text_do(buf: &[u8], tag: u16) -> &[u8] {
-    if buf.is_empty() {
-        return buf;
-    }
+/// The value of a single-object `GET DATA` reply (`005B` name, `5F50` URL).
+/// Cards send the bare value (the YubiKey 5 and Nitrokey 3 do, per the
+/// OpenPGP card spec); a reply that is exactly one `<tag> <len> <value>`
+/// envelope of the requested tag is unwrapped too. Anything else is the
+/// value itself, even when it happens to parse as some other TLV: a bare
+/// 118-byte URL starting `ht` reads as tag `68` with length `74`, and must
+/// stay a URL (#260 follow-up).
+fn unwrap_single_do(buf: &[u8], tag: u16) -> &[u8] {
     match parse_tlvs(buf) {
-        Ok(tlvs) => find_nested(&tlvs, tag).unwrap_or(&[]),
-        Err(_) => buf,
+        Ok(tlvs) if tlvs.len() == 1 && tlvs[0].tag == tag => tlvs[0].value,
+        _ => buf,
     }
 }
 
@@ -2398,16 +2395,29 @@ fn decode_text_value(value: &[u8]) -> Option<String> {
     }
 }
 
-/// Parse a cardholder-name response: either the `0065` Cardholder Related
-/// Data aggregate or the standalone `005B` object (enveloped or bare).
-/// Empty means "unset" (`Ok(None)`), matching a card with no name written.
-pub fn parse_cardholder_name(buf: &[u8]) -> Result<Option<String>, ParseError> {
-    Ok(decode_text_value(unwrap_text_do(buf, TAG_NAME)))
+/// Parse the cardholder name out of a `GET DATA 0065` (Cardholder Related
+/// Data) reply: the `65` constructed object (the YubiKey 5 wraps it) or its
+/// bare contents (`5B`, `5F2D`, `5F35`; the Nitrokey 3 sends those). No `5B`
+/// inside, or an empty one, means "unset" (`Ok(None)`). A reply that isn't
+/// TLV at all is an error: this object is always TLV.
+pub fn parse_cardholder_related_data(buf: &[u8]) -> Result<Option<String>, ParseError> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let tlvs = parse_tlvs(buf)?;
+    Ok(find_nested(&tlvs, TAG_NAME).and_then(decode_text_value))
 }
 
-/// Parse a URL (`5F50`) response (enveloped or bare). Empty means "unset".
+/// Parse a standalone `GET DATA 005B` (cardholder name) reply: the bare name,
+/// or one `5B` envelope around it. Empty means "unset" (`Ok(None)`).
+pub fn parse_cardholder_name(buf: &[u8]) -> Result<Option<String>, ParseError> {
+    Ok(decode_text_value(unwrap_single_do(buf, TAG_NAME)))
+}
+
+/// Parse a `GET DATA 5F50` (public-key URL) reply: the bare URL, or one `5F50`
+/// envelope around it. Empty means "unset" (`Ok(None)`).
 pub fn parse_url(buf: &[u8]) -> Result<Option<String>, ParseError> {
-    Ok(decode_text_value(unwrap_text_do(buf, TAG_URL)))
+    Ok(decode_text_value(unwrap_single_do(buf, TAG_URL)))
 }
 
 /// The public key parsed from a GENERATE / READ PUBLIC KEY response (`7F49`).
@@ -2833,38 +2843,53 @@ mod tests {
     // --- Cardholder name / URL -------------------------------------------
 
     #[test]
-    fn parse_cardholder_name_envelopes() {
-        // Standalone 5B envelope: 5B 04 "Test".
+    fn parse_cardholder_related_data_both_shapes() {
+        // YubiKey 5: the 65 object itself (name "Test<<Review", empty 5F2D,
+        // 5F35 "9"), as traced on hardware.
+        let yk = [
+            0x65, 0x15, 0x5B, 0x0C, b'T', b'e', b's', b't', b'<', b'<', b'R', b'e', b'v', b'i',
+            b'e', b'w', 0x5F, 0x2D, 0x00, 0x5F, 0x35, 0x01, 0x39,
+        ];
         assert_eq!(
-            parse_cardholder_name(&[0x5B, 0x04, 0x54, 0x65, 0x73, 0x74]).unwrap(),
-            Some("Test".to_string())
+            parse_cardholder_related_data(&yk).unwrap(),
+            Some("Test<<Review".to_string())
         );
-        // 65 aggregate wrapping 5B.
-        let mut inner65 = vec![0x5B, 0x04, 0x54, 0x65, 0x73, 0x74];
-        let mut blob65 = vec![0x65, inner65.len() as u8];
-        blob65.append(&mut inner65);
+        // Nitrokey 3: the same contents without the 65 wrapper.
         assert_eq!(
-            parse_cardholder_name(&blob65).unwrap(),
-            Some("Test".to_string())
+            parse_cardholder_related_data(&yk[2..]).unwrap(),
+            Some("Test<<Review".to_string())
         );
-        // Bare value (no TLV envelope).
+        // Name unset: an empty 5B (as both keys send it), or none at all.
+        assert_eq!(
+            parse_cardholder_related_data(&[0x5B, 0x00, 0x5F, 0x2D, 0x00, 0x5F, 0x35, 0x01, 0x30])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_cardholder_related_data(&[0x65, 0x05, 0x5F, 0x2D, 0x02, 0x65, 0x6E]).unwrap(),
+            None
+        );
+        assert_eq!(parse_cardholder_related_data(&[]).unwrap(), None);
+        // Not TLV at all: an error (shown as unreadable), not a name.
+        assert!(parse_cardholder_related_data(b"Doe<<John").is_err());
+    }
+
+    #[test]
+    fn parse_cardholder_name_bare_or_enveloped() {
         assert_eq!(
             parse_cardholder_name(b"Doe<<John").unwrap(),
             Some("Doe<<John".to_string())
         );
-        // Empty / all-NUL means unset.
+        assert_eq!(
+            parse_cardholder_name(&[0x5B, 0x04, b'T', b'e', b's', b't']).unwrap(),
+            Some("Test".to_string())
+        );
         assert_eq!(parse_cardholder_name(&[]).unwrap(), None);
         assert_eq!(parse_cardholder_name(&[0x00, 0x00]).unwrap(), None);
-        // A 65 aggregate without 5B (e.g. language only) is unset, not garbage.
-        assert_eq!(
-            parse_cardholder_name(&[0x65, 0x05, 0x5F, 0x2D, 0x02, 0x65, 0x6E]).unwrap(),
-            None
-        );
     }
 
     #[test]
-    fn parse_url_envelopes() {
-        // 5F50 envelope.
+    fn parse_url_bare_or_enveloped() {
         let url = b"https://example.com/key.asc";
         let mut blob = vec![0x5F, 0x50, url.len() as u8];
         blob.extend_from_slice(url);
@@ -2872,17 +2897,32 @@ mod tests {
             parse_url(&blob).unwrap(),
             Some("https://example.com/key.asc".to_string())
         );
-        // Bare value.
         assert_eq!(
-            parse_url(b"https://example.com/key.asc").unwrap(),
+            parse_url(url).unwrap(),
             Some("https://example.com/key.asc".to_string())
         );
         assert_eq!(parse_url(&[]).unwrap(), None);
-        // Valid TLV without the URL object means "unset", not the raw bytes.
+        // A bare value that parses as some other TLV is still the value.
         assert_eq!(
-            parse_url(&[0x5B, 0x04, 0x54, 0x65, 0x73, 0x74]).unwrap(),
-            None
+            parse_url(&[0x5B, 0x04, b'T', b'e', b's', b't']).unwrap(),
+            Some("[\u{4}Test".to_string())
         );
+    }
+
+    #[test]
+    fn a_118_byte_bare_url_is_not_mistaken_for_a_tlv() {
+        // "ht" is tag 68 with length 74 (116): a bare URL of exactly 118
+        // bytes is one complete TLV. Both test cards send it bare and it was
+        // shown as unset (#260 follow-up).
+        let mut url = String::from("https://example.org/");
+        while url.len() < 118 {
+            url.push('a');
+        }
+        assert!(
+            parse_tlvs(url.as_bytes()).is_ok(),
+            "the premise: it parses as TLV"
+        );
+        assert_eq!(parse_url(url.as_bytes()).unwrap(), Some(url));
     }
 
     // --- Operation / write builders --------------------------------------
