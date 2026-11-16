@@ -1186,6 +1186,10 @@ pub struct Token2OtpSession {
 const MAX_ENUM_PAGES: usize = 256;
 const MAX_ENUM_ENTRIES: usize = 1024;
 
+/// `6982` ("security status not satisfied"): the key's answer to a code read
+/// when it has an OTP PIN and the read window isn't open on this connection.
+const SW_SECURITY_STATUS_NOT_SATISFIED: u16 = 0x6982;
+
 /// How long the HID probe waits for the OTP applet to answer before giving up
 /// and falling back to PC/SC (which carries the same applet). Reads are now
 /// bounded on every backend (`keyroost_hid::read_nonblocking_bounded` /
@@ -1546,7 +1550,8 @@ impl Token2OtpSession {
     }
 
     /// On a PIN-protected key with the read window open (after `verify_pin`), the
-    /// applet returns enumeration/read pages ENCRYPTED under the session key:
+    /// applet returns enumeration pages and single-entry reads ENCRYPTED under
+    /// the session key:
     /// `IV(16) || AES-CBC(SessionEncKey, IV, page) || HMAC(SessionMacKey, enc)[:16]`.
     /// Decrypt and authenticate before parsing. When the window isn't open (no
     /// PIN, or not verified) the page is already cleartext and returned as-is.
@@ -2033,6 +2038,15 @@ impl Token2OtpSession {
     /// Read a single entry by `(app, account)`, returning its live code (spec
     /// §6.2). A button-required entry blocks until the user touches the key;
     /// over HID the registered prompt fires while waiting.
+    ///
+    /// On a PIN-protected key the read works only on the connection that
+    /// verified the PIN: the reply then comes encrypted under this
+    /// connection's session key, like an enumeration page. Without that the
+    /// key answers `6982`, reported as [`OtpTransportError::PinRequired`]. A
+    /// window opened on another connection doesn't help: a new connection
+    /// can't decrypt what the key sends under the old one's key, and setting
+    /// up its own session key closes that window. Use
+    /// [`read_entry_pinned`](Self::read_entry_pinned) to verify first.
     pub fn read_entry(
         &mut self,
         timestamp: u64,
@@ -2042,8 +2056,33 @@ impl Token2OtpSession {
         let body = t2::serialize_read_entry(timestamp, app_name, account_name)?;
         let apdu = t2::build_apdu(cmd::ENUM_CODES, &body);
         let (data, sw) = self.transport.transmit(&apdu, true)?;
+        // "Security status not satisfied": the key has an OTP PIN and the read
+        // window isn't open on this connection. No PIN was sent, so this is not
+        // a wrong PIN (which `OtpError::check` would report).
+        if sw == SW_SECURITY_STATUS_NOT_SATISFIED {
+            return Err(OtpTransportError::PinRequired);
+        }
         OtpError::check(sw)?;
+        let data = self.maybe_decrypt_page(&data)?;
         Ok(t2::entry::parse_read_one(&data)?)
+    }
+
+    /// Read a single entry, transparently handling a PIN-protected key (see
+    /// [`enumerate_pinned`](Self::enumerate_pinned)): if a PIN is set and the
+    /// window isn't open on this connection yet, `pin` is verified first.
+    /// Returns [`OtpTransportError::PinRequired`] when a PIN is set but none
+    /// was given.
+    pub fn read_entry_pinned(
+        &mut self,
+        timestamp: u64,
+        app_name: &str,
+        account_name: &str,
+        pin: Option<&str>,
+    ) -> Result<Entry, OtpTransportError> {
+        if !self.pin_verified {
+            self.unlock_if_pinned(pin)?;
+        }
+        self.read_entry(timestamp, app_name, account_name)
     }
 
     /// Provision (or overwrite) an entry (spec §6.3). Fetches the device ECDH
@@ -3163,5 +3202,122 @@ mod pre_r34_keys_are_unaffected {
             Err(OtpTransportError::PinRequired)
         ));
         assert_eq!(session.pin_set_cached(), Some(true));
+    }
+}
+
+/// Code reads (`read_entry`) on a PIN-protected key (#261): the key answers
+/// only on the connection that verified the PIN, encrypted under that
+/// connection's session key, and with `6982` everywhere else.
+#[cfg(test)]
+mod pinned_code_read {
+    use super::*;
+
+    /// A READ_ONE record for app "KR", account "a", touch required, code
+    /// "123456" (spec §6.2).
+    fn read_one_record() -> Vec<u8> {
+        let mut r = vec![0x01, 0xC1, 0x00, 0x1E, 0x06, 0x01];
+        r.extend_from_slice(&[0x02, b'K', b'R', 0x01, b'a']);
+        r.extend_from_slice(&[0x06, b'1', b'2', b'3', b'4', b'5', b'6']);
+        r
+    }
+
+    /// Fixed session keys for the encrypted-reply tests.
+    fn test_session_keys() -> t2::crypto::SessionKeys {
+        t2::crypto::SessionKeys {
+            enc: zeroize::Zeroizing::new([0x11; 32]),
+            mac: zeroize::Zeroizing::new([0x22; 32]),
+        }
+    }
+
+    /// Answers every APDU with one fixed reply.
+    struct Fixed(Vec<u8>, u16);
+    impl OtpTransport for Fixed {
+        fn transmit(
+            &mut self,
+            _apdu: &[u8],
+            _b: bool,
+        ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+            Ok((self.0.clone(), self.1))
+        }
+    }
+
+    fn session_with(reply: Vec<u8>, sw: u16, verified: bool) -> Token2OtpSession {
+        Token2OtpSession {
+            transport: Box::new(Fixed(reply, sw)),
+            is_pcsc: false,
+            pin_session: verified.then(test_session_keys),
+            pin_verified: verified,
+            typed_pin_verified: verified,
+            pin_present: verified.then_some(true),
+            fp_present: None,
+        }
+    }
+
+    #[test]
+    fn a_code_read_on_a_pin_verified_connection_is_decrypted() {
+        // #261: with the PIN verified on this connection, the key encrypts a
+        // single-entry read like an enumeration page:
+        // IV || AES-CBC(enc) || HMAC(mac, enc)[:16].
+        let keys = test_session_keys();
+        let iv = [0x33u8; 16];
+        let enc = t2::crypto::session_encrypt(&keys.enc, &iv, &read_one_record());
+        let mut reply = iv.to_vec();
+        reply.extend_from_slice(&enc);
+        reply.extend_from_slice(&t2::crypto::session_auth_tag(&keys.mac, &enc));
+
+        let entry = session_with(reply, 0x9000, true)
+            .read_entry(0, "KR", "a")
+            .unwrap();
+        assert_eq!(entry.code.as_deref(), Some("123456"));
+        assert!(entry.button_required);
+    }
+
+    #[test]
+    fn a_code_read_without_the_pin_window_asks_for_the_pin() {
+        // The key's 6982 on a protected key means "no window here", not a
+        // wrong PIN: none was sent.
+        assert!(matches!(
+            session_with(Vec::new(), 0x6982, false).read_entry(0, "KR", "a"),
+            Err(OtpTransportError::PinRequired)
+        ));
+        // An unprotected key's cleartext reply still parses as before.
+        let entry = session_with(read_one_record(), 0x9000, false)
+            .read_entry(0, "KR", "a")
+            .unwrap();
+        assert_eq!(entry.code.as_deref(), Some("123456"));
+    }
+
+    #[test]
+    fn a_pinned_code_read_with_no_pin_asks_before_reading() {
+        // Same flag answer as `a_protected_key_with_no_pin_supplied_asks_for_one`;
+        // any other APDU (the read itself) would fail the test.
+        struct ProtectedNoRead;
+        impl OtpTransport for ProtectedNoRead {
+            fn transmit(
+                &mut self,
+                apdu: &[u8],
+                _b: bool,
+            ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+                assert_eq!(
+                    apdu[..4],
+                    t2::cmd::READ_OTP_PIN_FLAG,
+                    "read sent without a PIN"
+                );
+                Ok((vec![0x07, 0x64, 0x06, 0x64], 0x9000))
+            }
+        }
+        let mut session = Token2OtpSession {
+            transport: Box::new(ProtectedNoRead),
+            is_pcsc: false,
+            pin_session: None,
+            pin_verified: false,
+            typed_pin_verified: false,
+            pin_present: None,
+            fp_present: None,
+        };
+        assert!(matches!(
+            session.read_entry_pinned(0, "KR", "a", None),
+            Err(OtpTransportError::PinRequired)
+        ));
     }
 }

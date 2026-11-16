@@ -3173,6 +3173,11 @@ enum OtpCmd {
     },
     /// Print the current code for one entry, identified by app and account.
     /// A button-required entry will prompt for a touch.
+    ///
+    /// On a PIN-protected (R3.4+) key the code is unlocked as in `otp list`:
+    /// `--unlock pin` (the default) takes the PIN from `--pin env:NAME` /
+    /// `--pin stdin` or, with neither, a hidden prompt; `--unlock fingerprint`
+    /// and `--unlock auto` work as there.
     Code {
         /// Application/issuer name as stored (may be empty).
         #[arg(long, default_value = "")]
@@ -3180,6 +3185,16 @@ enum OtpCmd {
         /// Account name as stored.
         #[arg(long)]
         account: String,
+        /// How to unlock the code on a PIN-protected key; `pin` asks for the
+        /// PIN when the key needs one and no flag gives it.
+        #[arg(long, value_enum, default_value_t = OtpUnlock::Pin)]
+        unlock: OtpUnlock,
+        /// The OTP PIN to unlock a protected key: env:NAME reads that
+        /// environment variable, stdin reads one line (hidden when typed at a
+        /// terminal). With neither, a terminal asks when the key has a PIN
+        /// (`--unlock pin` only).
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
     },
     /// Add (or overwrite) an OTP entry.
     ///
@@ -3350,8 +3365,8 @@ enum OtpCmd {
 enum OtpPinCmd {
     /// Set an OTP PIN on a currently-unprotected key.
     ///
-    /// After this, reading codes needs the PIN (`otp list` asks for it, or
-    /// takes `--pin`). The new PIN comes from an
+    /// After this, reading codes needs the PIN (`otp list` and `otp code` ask
+    /// for it, or take `--pin`). The new PIN comes from an
     /// environment variable, stdin or, with neither, a hidden prompt (asked
     /// twice) — never argv.
     ///
@@ -3390,8 +3405,8 @@ enum OtpPinCmd {
     },
     /// Report OTP-PIN status (R3.4+ keys): whether a PIN is set and retries left.
     Status,
-    /// Verify the OTP PIN, opening the read window for this connection (mostly
-    /// for testing; `otp list` takes `--pin` directly). The PIN comes from
+    /// Verify the OTP PIN, opening the read window for this connection (for
+    /// testing; `otp list` and `otp code` take `--pin`). The PIN comes from
     /// --pin env:NAME or stdin or, with neither, a hidden prompt.
     Verify {
         /// The OTP PIN: env:NAME reads that environment variable, stdin reads
@@ -3472,7 +3487,7 @@ enum OtpButtonCmd {
     },
 }
 
-/// How `otp list` unlocks the codes on a PIN-protected key.
+/// How `otp list` and `otp code` unlock the codes on a PIN-protected key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum OtpUnlock {
     /// The OTP PIN: from --pin, or asked for when the key needs one.
@@ -4172,7 +4187,8 @@ fn molto_occupied(
 
 /// `--device` on a command that never touches a key is a mistake (it used
 /// to be silently ignored). `list` and the bare overview filter by it.
-/// The usage mistake in `otp list --unlock fingerprint --pin SOURCE`:
+/// The usage mistake in `otp list --unlock fingerprint --pin SOURCE` (and the
+/// same on `otp code`):
 /// a fingerprint unlock takes no PIN. clap can't tie a conflict to one value
 /// of `--unlock`, so `run` checks this straight after parsing and exits 2,
 /// like any other usage error, before a key is looked at.
@@ -4183,6 +4199,11 @@ fn otp_unlock_conflict(cmd: Option<&Cmd>) -> Option<&'static str> {
                 OtpCmd::List {
                     unlock: OtpUnlock::Fingerprint,
                     pin,
+                }
+                | OtpCmd::Code {
+                    unlock: OtpUnlock::Fingerprint,
+                    pin,
+                    ..
                 },
             ..
         }) if pin.is_some() => Some(
@@ -8992,60 +9013,50 @@ fn otp_pin_after_probe<I: crate::secrets::SecretIo, E: std::fmt::Display>(
         .map_err(|e| format!("{why}; {e}"))
 }
 
-fn run_otp(
-    cmd: &OtpCmd,
-    sel: OtpSelect<'_>,
+/// Open the selected key's OTP applet and unlock its codes as `--unlock`
+/// says, for `otp list` and `otp code`. A key without a PIN is never asked
+/// for one; a key whose PIN was set since the probe still reports a clear
+/// "PIN required" from `unlock_if_pinned`.
+fn otp_unlocked_session(
+    sel: &OtpSelect<'_>,
     debug: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match cmd {
-        OtpCmd::List {
-            unlock: OtpUnlock::Pin,
-            pin,
-        } => {
-            let dev = select_otp(&sel)?;
+    unlock: OtpUnlock,
+    pin: Option<&SecretSource>,
+) -> Result<keyroost_transport::Token2OtpSession, Box<dyn std::error::Error>> {
+    match unlock {
+        OtpUnlock::Pin => {
+            let dev = select_otp(sel)?;
             let pin = otp_pin_if_needed(
                 &mut Secrets::real(),
                 &dev,
                 sel.transport,
                 debug,
-                Source::from_flag(pin.as_ref()),
+                Source::from_flag(pin),
                 false,
             )?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
-            let now = unix_now() as u64;
-            // A key whose PIN was set since the probe still surfaces a clear
-            // "PIN required" error from enumerate_pinned.
-            let entries = session.enumerate_pinned(now, pin.as_deref().map(|p| p.as_str()))?;
-            print_otp_entries(&entries)?;
+            session.unlock_if_pinned(pin.as_deref().map(|p| p.as_str()))?;
+            Ok(session)
         }
-        OtpCmd::List {
-            unlock: OtpUnlock::Fingerprint,
-            pin,
-        } => {
+        OtpUnlock::Fingerprint => {
             // A PIN flag here was refused at parse time (otp_unlock_conflict).
             debug_assert!(pin.is_none());
-            let mut session = open_otp(&sel, debug)?;
+            let mut session = open_otp(sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
-            let now = unix_now() as u64;
             crate::prompt::touch("Touch the fingerprint sensor to unlock OTP codes\u{2026}");
             session.verify_fingerprint()?;
-            let entries = session.enumerate(now)?;
-            print_otp_entries(&entries)?;
+            Ok(session)
         }
-        OtpCmd::List {
-            unlock: OtpUnlock::Auto,
-            pin,
-        } => {
+        OtpUnlock::Auto => {
             // The PIN is only the fingerprint's fallback: read when a flag
             // names it, never prompted for.
             let mut sec = Secrets::real();
-            let dev = select_otp(&sel)?;
-            let pin = sec.read_given(&OTP_PIN, Source::from_flag(pin.as_ref()))?;
+            let dev = select_otp(sel)?;
+            let pin = sec.read_given(&OTP_PIN, Source::from_flag(pin))?;
             crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
-            let now = unix_now() as u64;
             if session.fp_is_enabled().unwrap_or(false) {
                 crate::prompt::touch(
                     "Touch the fingerprint sensor (or wait to fall back to PIN)\u{2026}",
@@ -9059,12 +9070,31 @@ fn run_otp(
                     keyroost_transport::UnlockMethod::Pin => "PIN",
                 }
             );
-            let entries = session.enumerate(now)?;
+            Ok(session)
+        }
+    }
+}
+
+fn run_otp(
+    cmd: &OtpCmd,
+    sel: OtpSelect<'_>,
+    debug: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        OtpCmd::List { unlock, pin } => {
+            let mut session = otp_unlocked_session(&sel, debug, *unlock, pin.as_ref())?;
+            let entries = session.enumerate(unix_now() as u64)?;
             print_otp_entries(&entries)?;
         }
-        OtpCmd::Code { app, account } => {
-            let mut session = open_otp(&sel, debug)?;
-            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
+        OtpCmd::Code {
+            app,
+            account,
+            unlock,
+            pin,
+        } => {
+            // A protected key answers a code read only on the connection that
+            // verified its PIN (#261), so unlock this one first.
+            let mut session = otp_unlocked_session(&sel, debug, *unlock, pin.as_ref())?;
             let now = unix_now() as u64;
             // Over USB the key says when it waits for its button, and the
             // session's prompt shows then. A reader gives no such sign, so
@@ -21744,6 +21774,32 @@ mod cli_tests {
                     "keyroostctl",
                     "otp",
                     "list",
+                    "--unlock",
+                    "fingerprint",
+                    "--pin",
+                    "stdin",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "otp",
+                    "code",
+                    "--account",
+                    "a",
+                    "--pin",
+                    "env:V",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "otp",
+                    "code",
+                    "--account",
+                    "a",
                     "--unlock",
                     "fingerprint",
                     "--pin",
