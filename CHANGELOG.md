@@ -99,7 +99,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of certified authenticators now covers every hardware key in the FIDO
   Alliance's list instead of a few vendors, so the FIDO2 overview shows the
   model, certification level and logo for many more keys. Logos published
-  only as SVG, or labeled as the wrong format, now show too. ([#246])
+  only as SVG, or labeled as the wrong format, now show too. Contributed
+  by @Snrat. ([#246])
 - **The app moves to egui 0.37** (from 0.35), the GUI toolkit it is built
   on. Building the app from source now needs Rust 1.95 (was 1.92); the CLI
   and libraries stay at 1.89, and packaged builds are unaffected. ([#249])
