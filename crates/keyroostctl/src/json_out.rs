@@ -377,10 +377,9 @@ pub(crate) struct OpenpgpStatusJson {
 }
 
 /// JSON form of a tri-state public text field (`cardholder_name`, `url`):
-/// unreadable (`None`) stays `null` ("couldn't tell"), unset
-/// (`Some(None)`) becomes `""` so it stays distinct from unreadable, a
-/// value passes through. Mirrors `PivStatusJson::applet_name`, where `""`
-/// likewise means "the token didn't tell us its name".
+/// unreadable (`None`) stays `null` ("couldn't tell", as CONTRIBUTING's
+/// "Words in output and JSON" has it), unset (`Some(None)`) becomes `""`
+/// (nothing stored), a value passes through.
 pub(crate) fn optional_text_json(v: Option<Option<String>>) -> Option<String> {
     v.map(|inner| inner.unwrap_or_default())
 }

@@ -291,7 +291,7 @@ impl OpenPgpSession {
         // second read.
         let aggregate = self.read_optional_text(
             &pgp::get_cardholder_related_data(),
-            pgp::parse_cardholder_name,
+            pgp::parse_cardholder_related_data,
         );
         let cardholder_name: Option<Option<String>> = resolve_cardholder_name(aggregate, || {
             self.read_optional_text(&pgp::get_cardholder_name(), pgp::parse_cardholder_name)
