@@ -3019,7 +3019,7 @@ enum SshCertCmd {
         /// Credential ID of the SSH credential, in hex (see `fido ssh list`). Needed only when several share an RP ID.
         #[arg(value_name = "ID", value_parser = parse_hex_arg)]
         id: Option<String>,
-        /// Output file (default: <rp-id-sanitized>-cert.pub).
+        /// Output file (default: <rp-id-sanitized>-cert.pub, with the ID's first 8 hex digits before -cert.pub when an ID is given).
         #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
@@ -4658,7 +4658,8 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
     RetiredFlag {
         flag: "--id",
         words: &["fido", "ssh"],
-        msg: "--id is now --rp (the SSH credential's RP ID)",
+        msg: "--id is now --rp (the SSH credential's RP ID); a credential ID is an \
+              argument (`fido ssh export ID`)",
         now: &["--rp"],
     },
     RetiredFlag {
@@ -14232,12 +14233,26 @@ fn select_ssh_credential<'a>(
     rp: Option<&str>,
     id: Option<&[u8]>,
 ) -> Result<&'a (String, keyroost_ctap::cred_mgmt::Credential), String> {
+    // Each RP ID once, in key order, for the advice in a refusal.
+    let mut rp_ids: Vec<&str> = Vec::new();
+    for (rp_id, _) in creds {
+        if !rp_ids.contains(&rp_id.as_str()) {
+            rp_ids.push(rp_id);
+        }
+    }
     let available = || {
-        creds
+        rp_ids
             .iter()
-            .map(|(rp_id, _)| sanitize_terminal(rp_id))
+            .map(|r| sanitize_terminal(r))
             .collect::<Vec<_>>()
             .join(", ")
+    };
+    let share = |rp_id: &str| {
+        format!(
+            "several SSH credentials share RP ID {}; pass the credential ID to pick one \
+             (see fido ssh list)",
+            sanitize_terminal(rp_id)
+        )
     };
     let matches: Vec<_> = creds
         .iter()
@@ -14260,22 +14275,33 @@ fn select_ssh_credential<'a>(
         ([], None, None) => {
             Err("no resident SSH credentials (ssh:* relying parties) on this key".into())
         }
+        // Two credentials with the same ID can't both be resident; refuse
+        // rather than guess if a key reports that anyway.
+        (_, _, Some(want)) => Err(format!(
+            "several SSH credentials report ID {}; refusing to pick one",
+            hex_encode(want)
+        )),
+        (_, Some(want), None) => Err(share(want)),
+        // Every credential under one RP ID: --rp can't help, only the ID.
+        (_, None, None) if rp_ids.len() == 1 => Err(share(rp_ids[0])),
         (_, None, None) => Err(format!(
             "several SSH credentials present; pass --rp RP_ID (one of: {}), or the \
              credential ID where several share one (see fido ssh list)",
             available()
         )),
-        (_, Some(want), _) => Err(format!(
-            "several SSH credentials share RP ID {}; pass the credential ID to pick one \
-             (see fido ssh list)",
-            sanitize_terminal(want)
-        )),
-        // Two credentials with the same ID can't both be resident; refuse
-        // rather than guess if a key reports that anyway.
-        (_, None, Some(want)) => Err(format!(
-            "several SSH credentials report ID {}; refusing to pick one",
-            hex_encode(want)
-        )),
+    }
+}
+
+/// The default file `fido ssh export` writes: `<rp-id>-cert.pub`, or, when
+/// the credential was picked by its ID, `<rp-id>-<first 8 hex digits>-cert.pub`
+/// so that credentials sharing an RP ID don't default to the same file.
+fn ssh_cert_default_name(rp_id: &str, picked_by_id: Option<&[u8]>) -> String {
+    let name = keyroost_ctap::ssh_cert::default_cert_filename(rp_id);
+    match (picked_by_id, name.strip_suffix("-cert.pub")) {
+        (Some(id), Some(stem)) => {
+            format!("{stem}-{}-cert.pub", hex_encode(&id[..id.len().min(4)]))
+        }
+        _ => name,
     }
 }
 
@@ -14318,7 +14344,10 @@ fn run_fido_ssh_cert_extract(
     // control/bidi/zero-width chars for display, not `/`, `\`, or `..`).
     let out_path = match out {
         Some(p) => p.to_path_buf(),
-        None => std::path::PathBuf::from(keyroost_ctap::ssh_cert::default_cert_filename(rp_id)),
+        None => std::path::PathBuf::from(ssh_cert_default_name(
+            rp_id,
+            id.map(|_| cred.credential_id.as_slice()),
+        )),
     };
     // A given --out was checked before the key was touched; the default name
     // is only known now.
@@ -18849,10 +18878,46 @@ mod cli_tests {
         let e = picked(&two_rps, Some("ssh:a"), Some(&[2])).unwrap_err();
         assert!(e.contains("ID 02 under RP ID ssh:a"), "{e}");
 
+        // Every credential under one RP ID and no flag: ask for the ID, not
+        // for an --rp that can't help, and name the RP ID once.
+        let e = picked(&shared, None, None).unwrap_err();
+        assert!(
+            e.contains("share RP ID ssh:;") && !e.contains("--rp"),
+            "{e}"
+        );
+        // Mixed: one RP ID shared, one not. --rp is offered, each RP ID once.
+        let mixed = [
+            ssh_cred("ssh:", &[1]),
+            ssh_cred("ssh:", &[2]),
+            ssh_cred("ssh:b", &[3]),
+        ];
+        let e = picked(&mixed, None, None).unwrap_err();
+        assert!(e.contains("(one of: ssh:, ssh:b)"), "{e}");
+        // A key reporting one ID twice: refuse without asking for the ID the
+        // user already gave.
+        let twice = [ssh_cred("ssh:", &[7]), ssh_cred("ssh:", &[7])];
+        for rp in [None, Some("ssh:")] {
+            let e = picked(&twice, rp, Some(&[7])).unwrap_err();
+            assert!(e.contains("report ID 07; refusing"), "{e}");
+        }
+
         // No credentials at all.
         assert!(picked(&[], None, None)
             .unwrap_err()
             .contains("no resident SSH"));
+    }
+
+    #[test]
+    fn ssh_cert_default_name_adds_the_id_when_picked_by_it() {
+        assert_eq!(ssh_cert_default_name("ssh:demo", None), "ssh_demo-cert.pub");
+        assert_eq!(
+            ssh_cert_default_name("ssh:", Some(&[0x23, 0xa1, 0x13, 0x0d, 0xa0])),
+            "ssh_-23a1130d-cert.pub"
+        );
+        assert_eq!(
+            ssh_cert_default_name("ssh:", Some(&[0xab])),
+            "ssh_-ab-cert.pub"
+        );
     }
 
     // `--force` was renamed to `--overwrite` with no alias, so that "force" has

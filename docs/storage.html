@@ -169,7 +169,9 @@ keyroostctl fido ssh export --rp ssh:demo --out id_ecdsa_sk-cert.pub</code></pre
     <p><code>--rp</code> (the SSH credential's RP ID) is needed only to disambiguate when the key holds several SSH
       credentials. When two share an RP ID (ssh-keygen keys made for the same application
       with different <code>-O user=</code> names, say), pick one by giving the credential ID
-      <code>fido ssh list</code> prints under it: <code>fido ssh export ID</code>. <code>--out</code> defaults to a sanitized
+      <code>fido ssh list</code> prints under it: <code>fido ssh export ID</code>. The
+      default file name then carries the ID's first 8 hex digits, so two such exports
+      don't land on the same file. <code>--out</code> defaults to a sanitized
       <code>&lt;rp-id&gt;-cert.pub</code>. If that file exists, a terminal asks before
       replacing it; a script must pass <code>--overwrite</code>. In the desktop app the same thing is <strong>Save certificate…</strong> on the
       <strong>Passkeys</strong> tab, next to the SSH credential it belongs to.</p>
