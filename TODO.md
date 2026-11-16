@@ -45,7 +45,6 @@ Being worked on right now — check with whoever holds it before starting.
   (libccid has no entry for 349e:0024); its USB-only row gets its serial
   from the §6.10 read since #236.
 
-
 - **Drop the broken-pipe workaround when stable Rust lands the SIGPIPE fix.**
   `install_broken_pipe_guard()` in `crates/keyroostctl/src/main.rs` plus its
   `tests/broken_pipe.rs` guard exist only because the clean fix — libstd

@@ -195,14 +195,17 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       reviewed at merge (`packaging/REVIEWING.md`); this pass reviews the
       aggregate.
 
-- [ ] Tag the release commit by its hash, then push the tag:
-      `git tag -s vX.Y.Z -m "keyroost vX.Y.Z" <sha>` and
-      `git push origin vX.Y.Z`. `<sha>` is origin/main's tip with CI green
-      (`git rev-parse origin/main` after a `git fetch`). Name it explicitly:
-      landing the prep branch with `git push origin <branch>:main` moves
-      origin/main but not the local `main`, so a tag without a hash lands on
-      the pre-release commit. After the push, check that
-      `git rev-parse vX.Y.Z^{commit}` matches origin/main.
+- [ ] Tag the release commit by its hash, check it, then push the tag.
+      `<sha>` is origin/main's tip with CI green (`git rev-parse origin/main`
+      after a `git fetch`). Name it explicitly: landing the prep branch with
+      `git push origin <branch>:main` moves origin/main but not the local
+      `main`, so a tag without a hash lands on the pre-release commit.
+      1. `git tag -s vX.Y.Z -m "keyroost vX.Y.Z" <sha>`
+      2. `git rev-parse vX.Y.Z^{commit}` must print the same hash as
+         `git rev-parse origin/main`. If not, `git tag -d vX.Y.Z` and redo
+         step 1: the push starts the release at once (release.yml has no
+         gate).
+      3. `git push origin vX.Y.Z`
       (`v*` tags are admin-only by ruleset.)
 - [ ] Two workflows start on the tag: `release.yml` (platform archives +
       GitHub Release) and `linux-bundles.yml` (AppImage + flatpak).
