@@ -507,6 +507,24 @@ pub(crate) struct FidoCredentialJson {
     pub algorithm_name: Option<&'static str>,
 }
 
+/// `keyroostctl fido ssh --json list` — one entry per resident SSH credential
+/// (an `ssh:*` relying party), as the text form prints one line each.
+#[derive(Serialize)]
+pub(crate) struct FidoSshListJson {
+    pub credentials: Vec<FidoSshCredentialJson>,
+}
+
+/// One resident SSH credential in the `fido ssh list` output.
+#[derive(Serialize)]
+pub(crate) struct FidoSshCredentialJson {
+    pub rp_id: String,
+    /// Full hex credentialId, as `fido credential list` gives it.
+    pub credential_id: String,
+    /// Whether the key's largeBlob store holds an OpenSSH certificate for this
+    /// credential (what `fido ssh export` saves).
+    pub cert_present: bool,
+}
+
 /// `keyroostctl fido blob --json list` — one entry per stored blob.
 #[derive(Serialize)]
 pub(crate) struct FidoLargeBlobListJson {
@@ -1280,6 +1298,32 @@ mod tests {
                 ],
             );
         }
+    }
+
+    #[test]
+    fn ssh_list_shape() {
+        for cert_present in [true, false] {
+            let v = to_v(&FidoSshListJson {
+                credentials: vec![FidoSshCredentialJson {
+                    rp_id: "ssh:".into(),
+                    credential_id: "00".into(),
+                    cert_present,
+                }],
+            });
+            assert_shape(&v, &[("credentials", "array")]);
+            assert_shape(
+                &v["credentials"][0],
+                &[
+                    ("rp_id", "string"),
+                    ("credential_id", "string"),
+                    ("cert_present", "bool"),
+                ],
+            );
+        }
+        let empty = to_v(&FidoSshListJson {
+            credentials: Vec::new(),
+        });
+        assert_shape(&empty, &[("credentials", "array")]);
     }
 
     #[test]
