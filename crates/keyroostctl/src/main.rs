@@ -14178,16 +14178,29 @@ fn run_fido_ssh_cert_list(
     pin: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (creds, array) = enumerate_ssh_credentials(path, pin)?;
+    let cert_present = |c: &keyroost_ctap::cred_mgmt::Credential| {
+        c.large_blob_key
+            .as_ref()
+            .and_then(|k| keyroost_ctap::large_blobs::extract_cert_from_entries(k, &array))
+            .is_some()
+    };
+    if json_output() {
+        let credentials = creds
+            .iter()
+            .map(|(rp_id, c)| json_out::FidoSshCredentialJson {
+                rp_id: rp_id.clone(),
+                credential_id: hex_encode(&c.credential_id),
+                cert_present: cert_present(c),
+            })
+            .collect();
+        return emit_json(&json_out::FidoSshListJson { credentials });
+    }
     if creds.is_empty() {
         outln!("No resident SSH credentials (ssh:* relying parties) on this key.");
         return Ok(());
     }
     for (rp_id, c) in &creds {
-        let has_cert = c
-            .large_blob_key
-            .as_ref()
-            .and_then(|k| keyroost_ctap::large_blobs::extract_cert_from_entries(k, &array))
-            .is_some();
+        let has_cert = cert_present(c);
         outln!(
             "{}  {}",
             sanitize_terminal(rp_id),
