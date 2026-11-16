@@ -3016,6 +3016,9 @@ enum SshCertCmd {
         /// RP ID of the SSH credential (e.g. ssh:demo). Needed only when several SSH credentials are present.
         #[arg(long, value_name = "RP_ID")]
         rp: Option<String>,
+        /// Credential ID of the SSH credential, in hex (see `fido ssh list`). Needed only when several share an RP ID.
+        #[arg(value_name = "ID", value_parser = parse_hex_arg)]
+        id: Option<String>,
         /// Output file (default: <rp-id-sanitized>-cert.pub).
         #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
@@ -14100,17 +14103,21 @@ fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>>
         }
         SshCertCmd::Export {
             rp,
+            id,
             out,
             overwrite,
             pin,
             path,
         } => {
+            // parse_hex_arg already checked it is non-empty hex.
+            let id = id.as_deref().map(hex_decode).transpose()?;
             let [out_mode] = crate::prompt::check_overwrites([out.as_deref()], *overwrite)?;
             let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_ssh_cert_extract(
                 path.as_deref(),
                 &pin,
                 rp.as_deref(),
+                id.as_deref(),
                 out.as_deref(),
                 out_mode,
                 *overwrite,
@@ -14210,14 +14217,73 @@ fn run_fido_ssh_cert_list(
                 "no certificate"
             }
         );
+        // The full credential ID, as `fido credential list` prints it: the
+        // value `fido ssh export ID` takes when several share an RP ID.
+        outln!("  id={}", hex_encode(&c.credential_id));
     }
     Ok(())
+}
+
+/// Pick the SSH credential `fido ssh export` saves: the one matching `--rp`
+/// and the credential ID where given, or the only one when neither is. Fails closed:
+/// when more than one matches, it refuses and says which flag picks one.
+fn select_ssh_credential<'a>(
+    creds: &'a [(String, keyroost_ctap::cred_mgmt::Credential)],
+    rp: Option<&str>,
+    id: Option<&[u8]>,
+) -> Result<&'a (String, keyroost_ctap::cred_mgmt::Credential), String> {
+    let available = || {
+        creds
+            .iter()
+            .map(|(rp_id, _)| sanitize_terminal(rp_id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let matches: Vec<_> = creds
+        .iter()
+        .filter(|(rp_id, _)| rp.is_none_or(|want| rp_id == want))
+        .filter(|(_, c)| id.is_none_or(|want| c.credential_id == want))
+        .collect();
+    match (matches.as_slice(), rp, id) {
+        ([one], _, _) => Ok(one),
+        ([], _, Some(want)) => Err(format!(
+            "no SSH credential with ID {}{}; see fido ssh list",
+            hex_encode(want),
+            rp.map(|r| format!(" under RP ID {}", sanitize_terminal(r)))
+                .unwrap_or_default()
+        )),
+        ([], Some(want), None) => Err(format!(
+            "no SSH credential with RP ID {}; available: {}",
+            sanitize_terminal(want),
+            available()
+        )),
+        ([], None, None) => {
+            Err("no resident SSH credentials (ssh:* relying parties) on this key".into())
+        }
+        (_, None, None) => Err(format!(
+            "several SSH credentials present; pass --rp RP_ID (one of: {}), or the \
+             credential ID where several share one (see fido ssh list)",
+            available()
+        )),
+        (_, Some(want), _) => Err(format!(
+            "several SSH credentials share RP ID {}; pass the credential ID to pick one \
+             (see fido ssh list)",
+            sanitize_terminal(want)
+        )),
+        // Two credentials with the same ID can't both be resident; refuse
+        // rather than guess if a key reports that anyway.
+        (_, None, Some(want)) => Err(format!(
+            "several SSH credentials report ID {}; refusing to pick one",
+            hex_encode(want)
+        )),
+    }
 }
 
 fn run_fido_ssh_cert_extract(
     path: Option<&std::path::Path>,
     pin: &str,
-    credential: Option<&str>,
+    rp: Option<&str>,
+    id: Option<&[u8]>,
     out: Option<&std::path::Path>,
     out_mode: crate::prompt::OutMode,
     overwrite: bool,
@@ -14227,48 +14293,7 @@ fn run_fido_ssh_cert_extract(
         return Err("no resident SSH credentials (ssh:* relying parties) on this key".into());
     }
 
-    // Select the SSH credential to extract — fail closed if ambiguous.
-    let choices = || {
-        creds
-            .iter()
-            .map(|(id, _)| sanitize_terminal(id))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let (rp_id, cred) = match credential {
-        Some(want) => {
-            let matches: Vec<&(String, keyroost_ctap::cred_mgmt::Credential)> =
-                creds.iter().filter(|(id, _)| id == want).collect();
-            match matches.len() {
-                0 => {
-                    return Err(format!(
-                        "no SSH credential with RP ID {}; available: {}",
-                        sanitize_terminal(want),
-                        choices()
-                    )
-                    .into());
-                }
-                1 => matches[0],
-                _ => {
-                    return Err(format!(
-                        "multiple credentials share RP id '{}'; cannot disambiguate",
-                        sanitize_terminal(want)
-                    )
-                    .into());
-                }
-            }
-        }
-        None => {
-            if creds.len() != 1 {
-                return Err(format!(
-                    "several SSH credentials present; pass --rp RP_ID (one of: {})",
-                    choices()
-                )
-                .into());
-            }
-            &creds[0]
-        }
-    };
+    let (rp_id, cred) = select_ssh_credential(&creds, rp, id)?;
 
     let key = cred.large_blob_key.as_ref().ok_or_else(|| {
         format!(
@@ -18747,6 +18772,87 @@ mod cli_tests {
             }
             _ => panic!("expected fido ssh export"),
         }
+    }
+
+    #[test]
+    fn fido_ssh_export_takes_id() {
+        match parse(&["keyroostctl", "fido", "ssh", "export", "0aFF"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Fido {
+                cmd:
+                    FidoCmd::Ssh {
+                        cmd: SshCertCmd::Export { rp, id, .. },
+                    },
+            }) => {
+                assert_eq!(rp, None);
+                assert_eq!(id.as_deref(), Some("0aFF"));
+            }
+            _ => panic!("expected fido ssh export"),
+        }
+        assert!(parse(&["keyroostctl", "fido", "ssh", "export", "xyz"]).is_err());
+        assert!(parse(&["keyroostctl", "fido", "ssh", "export", ""]).is_err());
+    }
+
+    fn ssh_cred(rp: &str, id: &[u8]) -> (String, keyroost_ctap::cred_mgmt::Credential) {
+        (
+            rp.to_string(),
+            keyroost_ctap::cred_mgmt::Credential {
+                credential_id: id.to_vec(),
+                user: keyroost_ctap::cred_mgmt::CredentialUser {
+                    id: b"openssh".to_vec(),
+                    name: Some("openssh".into()),
+                    display_name: None,
+                },
+                algorithm: Some(-8),
+                large_blob_key: None,
+            },
+        )
+    }
+
+    #[test]
+    fn ssh_export_selection() {
+        let picked = |creds: &[(String, keyroost_ctap::cred_mgmt::Credential)],
+                      rp: Option<&str>,
+                      id: Option<&[u8]>| {
+            select_ssh_credential(creds, rp, id).map(|(_, c)| c.credential_id.clone())
+        };
+        // One credential: no flag needed.
+        let one = [ssh_cred("ssh:", &[1])];
+        assert_eq!(picked(&one, None, None), Ok(vec![1]));
+
+        // Different RP IDs: --rp picks, no flag refuses and names them.
+        let two_rps = [ssh_cred("ssh:a", &[1]), ssh_cred("ssh:b", &[2])];
+        assert_eq!(picked(&two_rps, Some("ssh:b"), None), Ok(vec![2]));
+        let e = picked(&two_rps, None, None).unwrap_err();
+        assert!(e.contains("--rp") && e.contains("ssh:a, ssh:b"), "{e}");
+        let e = picked(&two_rps, Some("ssh:c"), None).unwrap_err();
+        assert!(e.contains("no SSH credential with RP ID ssh:c"), "{e}");
+
+        // The same RP ID twice: --rp alone refuses and asks for the credential
+        // ID; the ID picks, with or without --rp.
+        let shared = [ssh_cred("ssh:", &[1, 2]), ssh_cred("ssh:", &[3, 4])];
+        let e = picked(&shared, Some("ssh:"), None).unwrap_err();
+        assert!(
+            e.contains("share RP ID ssh:") && e.contains("credential ID"),
+            "{e}"
+        );
+        let e = picked(&shared, None, None).unwrap_err();
+        assert!(e.contains("credential ID"), "{e}");
+        assert_eq!(picked(&shared, None, Some(&[3, 4])), Ok(vec![3, 4]));
+        assert_eq!(picked(&shared, Some("ssh:"), Some(&[1, 2])), Ok(vec![1, 2]));
+
+        // An ID that isn't there, or under another RP ID, refuses.
+        let e = picked(&shared, None, Some(&[9])).unwrap_err();
+        assert!(e.contains("no SSH credential with ID 09"), "{e}");
+        let e = picked(&two_rps, Some("ssh:a"), Some(&[2])).unwrap_err();
+        assert!(e.contains("ID 02 under RP ID ssh:a"), "{e}");
+
+        // No credentials at all.
+        assert!(picked(&[], None, None)
+            .unwrap_err()
+            .contains("no resident SSH"));
     }
 
     // `--force` was renamed to `--overwrite` with no alias, so that "force" has
