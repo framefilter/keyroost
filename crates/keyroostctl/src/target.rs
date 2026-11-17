@@ -68,6 +68,14 @@ fn enumerate_for(need: Need) -> Result<Vec<Device>, Box<dyn Error>> {
     })?)
 }
 
+/// Whether selection failed because the `--device` value matched no row.
+fn matched_nothing(e: &(dyn Error + 'static)) -> bool {
+    matches!(
+        e.downcast_ref::<SelectError>(),
+        Some(SelectError::NotFound { .. } | SelectError::NameNotConnected { .. })
+    )
+}
+
 /// Whether a command with `need` could act on a Molto2. Every need is
 /// listed, so a new one has to be decided here.
 fn may_pick_a_molto2(need: Need) -> bool {
@@ -260,17 +268,30 @@ pub(crate) fn select(
         };
         let mut term = RealTerm;
         let mut picker = TermPicker::new(&mut term);
-        let (dev, line) = select_from(
-            || enumerate_for(need),
-            |devices: &mut Vec<Device>| keyroost_resolve::add_key_names(devices, debug_on()),
-            |dev: &mut Device| {
-                keyroost_resolve::add_fido_models(std::slice::from_mut(dev), debug_on())
-            },
-            &sel,
-            need,
-            &mut picker,
-        )
-        .map_err(|e| add_admin_hint(e, need, crate::admin_only_fido_key_present))?;
+        let pick = |scan_need: Need, picker: &mut dyn Picker| {
+            select_from(
+                || enumerate_for(scan_need),
+                |devices: &mut Vec<Device>| keyroost_resolve::add_key_names(devices, debug_on()),
+                |dev: &mut Device| {
+                    keyroost_resolve::add_fido_models(std::slice::from_mut(dev), debug_on())
+                },
+                &sel,
+                need,
+                picker,
+            )
+        };
+        let picked = match pick(need, &mut picker) {
+            // The scan didn't ask a Molto2 its serial (this command can't
+            // act on one), so a --device naming one by serial or name found
+            // nothing. Scan once more, reading it, so the refusal says the
+            // token can't do this rather than that nothing matches.
+            Err(e) if !may_pick_a_molto2(need) && matched_nothing(e.as_ref()) => {
+                pick(Need::Any, &mut picker)
+            }
+            r => r,
+        };
+        let (dev, line) =
+            picked.map_err(|e| add_admin_hint(e, need, crate::admin_only_fido_key_present))?;
         errln!("{line}");
         Ok(dev)
     })
@@ -507,6 +528,22 @@ mod tests {
     use super::*;
     use keyroost_resolve::NoPicker;
     use std::cell::Cell;
+
+    /// The rescan that reads a Molto2 runs only when a --device value
+    /// matched no row, never for other refusals.
+    #[test]
+    fn only_a_value_that_matched_nothing_rescans() {
+        let not_found: Box<dyn Error> = Box::new(SelectError::NotFound {
+            value: "826658711763730".into(),
+            need: Need::Otp,
+            candidates: Vec::new(),
+        });
+        assert!(matched_nothing(not_found.as_ref()));
+        let conflict: Box<dyn Error> = Box::new(SelectError::Conflict);
+        assert!(!matched_nothing(conflict.as_ref()));
+        let other: Box<dyn Error> = "some other failure".into();
+        assert!(!matched_nothing(other.as_ref()));
+    }
 
     /// A scan asks a Molto2 its serial exactly for the commands that could
     /// pick one: every need that admits a Molto2 row (with a serial, as a
