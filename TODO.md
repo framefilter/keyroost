@@ -107,12 +107,16 @@ plan's two-key manual steps were never executed):
   to unplug, while any other key is connected. *Partly exercised already* — the
   wrong-key refusal path was hit on hardware and fixed in `55adf2f`; the
   arm-and-fire and refuse-to-arm paths remain.
-- **CLI targeting:** with two OTP-capable keys, `keyroostctl --device <name> otp
-  list` / `molto info` must hit the named key only; ambiguous or duplicate-serial
-  setups must fail closed with the ambiguity error.
-- **GUI OTP pane binding:** two OTP-capable keys — list/add/delete operate on the
-  selected key only, and the fail-closed error appears when the transport pick
-  cannot be satisfied.
+- **CLI targeting with two Token2 OTP keys** *(needs a second key with
+  Token2's OTP applet; one PIN+ on hand)*: `keyroostctl --device <name> otp
+  list` must hit the named key only, and with neither named it must fail
+  closed with the ambiguity error. Across kinds this is checked (2026-11-16,
+  Token2 PIN+, Molto2, YubiKey, Nitrokey 3): `--device` picks only the named
+  key, OTP and Molto2 commands aimed at the wrong kind are refused naming the
+  right one, and `oath list` with two OATH keys and no terminal refuses.
+- **GUI OTP pane binding** *(same second key)*: two Token2 OTP keys —
+  list/add/delete operate on the selected key only, and the fail-closed error
+  appears when the transport pick cannot be satisfied.
 - **Duplicate-serial advisory:** with two same-serial keys connected, the sidebar
   advisory appears and both keys stay separately selectable.
 - **Card-content identity ([#83](https://github.com/framefilter/keyroost/issues/83))** *(no hardware)*: with a Token2 PIN+
