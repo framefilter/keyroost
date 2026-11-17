@@ -39,16 +39,25 @@ pub(crate) fn enumerate() -> Result<Vec<Device>, Box<dyn Error>> {
 }
 
 /// The shared device model with identity reads but without reading the
-/// names stored on keys (local names only). Selection adds those names only
-/// when the choice could depend on them (see [`select_from`]).
+/// names stored on keys (local names only), and without asking a Molto2
+/// its serial (one read earlier in this run is used): for the re-check
+/// after a question, which runs for every kind of key, so a `fido` or
+/// `oath` command doesn't connect to a Molto2 there either. A Molto2 the
+/// command acts on was read by its selection scan.
 pub(crate) fn enumerate_without_key_names() -> Result<Vec<Device>, Box<dyn Error>> {
-    enumerate_for(Need::Any)
+    Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
+        debug: debug_on(),
+        skip_identity_reads: false,
+        skip_key_names: true,
+        skip_protocol_asks: false,
+        skip_molto2_reads: true,
+    })?)
 }
 
-/// [`enumerate_without_key_names`] for a command that acts on a key `need`
-/// admits: a Molto2 is asked its printed serial only when the command could
-/// pick one (a `molto` command, `name`, or any key), so `fido`, `oath` and
-/// the like never connect to it.
+/// The selection scan for a command that acts on a key `need` admits, with
+/// identity reads and no names stored on keys: a Molto2 is asked its
+/// printed serial only when the command could pick one (a `molto` command,
+/// `name`, or any key), so `fido`, `oath` and the like never connect to it.
 fn enumerate_for(need: Need) -> Result<Vec<Device>, Box<dyn Error>> {
     Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
         debug: debug_on(),
@@ -59,9 +68,22 @@ fn enumerate_for(need: Need) -> Result<Vec<Device>, Box<dyn Error>> {
     })?)
 }
 
-/// Whether a command with `need` could act on a Molto2.
+/// Whether a command with `need` could act on a Molto2. Every need is
+/// listed, so a new one has to be decided here.
 fn may_pick_a_molto2(need: Need) -> bool {
-    matches!(need, Need::Molto2 | Need::Nameable | Need::Any)
+    match need {
+        Need::Molto2 | Need::Nameable | Need::Any => true,
+        Need::FidoHid
+        | Need::FidoAny
+        | Need::Oath
+        | Need::OpenPgp
+        | Need::Piv
+        | Need::Otp
+        | Need::OtpHid
+        | Need::OtpCcid
+        | Need::Prog
+        | Need::FactoryReset => false,
+    }
 }
 
 /// The device list without identity reads (topology, vendor and reported

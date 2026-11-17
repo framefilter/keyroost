@@ -1459,19 +1459,17 @@ pub fn remember_molto2_serial(reader: &str, serial: &str) {
     molto2_remember(&mut cache, reader, &serial);
 }
 
+/// Replace every entry for `reader` with one that carries no device node:
+/// Linux and macOS scans match it; a Windows scan, which keys by node,
+/// misses it and reads once more, which can't hand the serial to a token
+/// swapped back in under the same reader name.
 fn molto2_remember(cache: &mut Vec<Molto2Serial>, reader: &str, serial: &str) {
-    let mut hit = false;
-    for e in cache.iter_mut().filter(|e| e.reader == reader) {
-        e.read = Molto2Read::Serial(serial.to_owned());
-        hit = true;
-    }
-    if !hit {
-        cache.push(Molto2Serial {
-            reader: reader.to_owned(),
-            usb_device: None,
-            read: Molto2Read::Serial(serial.to_owned()),
-        });
-    }
+    cache.retain(|e| e.reader != reader);
+    cache.push(Molto2Serial {
+        reader: reader.to_owned(),
+        usb_device: None,
+        read: Molto2Read::Serial(serial.to_owned()),
+    });
 }
 
 /// A Molto2 serial as `get info` gives it, without the NUL or space padding
@@ -2997,10 +2995,18 @@ mod molto2_remember_tests {
             Some("OLD".into()),
         );
         molto2_remember(&mut cache, "TOKEN2 Molto2 0", "NEW");
+        // Without a node, a Linux or macOS scan finds it...
         assert_eq!(
-            molto2_lookup(&cache, "TOKEN2 Molto2 0", Some(&node)),
+            molto2_lookup(&cache, "TOKEN2 Molto2 0", None),
             Molto2Lookup::Known("NEW".into())
         );
+        // ...and a Windows scan reads once more rather than trust the old
+        // node's entry (a token swapped back in there isn't given "NEW").
+        assert_eq!(
+            molto2_lookup(&cache, "TOKEN2 Molto2 0", Some(&node)),
+            Molto2Lookup::Ask { failed: 0 }
+        );
+        assert_eq!(cache.len(), 1);
         let mut failed = Vec::new();
         molto2_record(&mut failed, "TOKEN2 Molto2 1", None, None);
         molto2_remember(&mut failed, "TOKEN2 Molto2 1", "S");
