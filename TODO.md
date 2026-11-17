@@ -166,11 +166,6 @@ plan's two-key manual steps were never executed):
   their own fingerprints. May be a hornet's nest (key-generation times,
   which key matches, writing to the card).
 
-- **Friendly names for Molto2 tokens** — detection never connects to a
-  Molto2, so its row carries no serial and `name set` can't name it.
-  Needs a way to get the token's serial during detection, without logging in
-  with the customer key.
-
 - **Speed up the Nix CI build** (after v0.16, as a measured trial started from
   main) — the Nix build job
   ([#144](https://github.com/framefilter/keyroost/pull/144)) is the slowest

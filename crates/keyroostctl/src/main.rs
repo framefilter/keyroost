@@ -13566,8 +13566,8 @@ fn name_list() -> Result<(), Box<dyn std::error::Error>> {
 /// keyroost actually detected (not a synthetic `--reader`/`--path` override —
 /// `target::select` skips the capability check for those, so an override row
 /// can reach here) and it must carry a serial, which is the match key
-/// `name set` stores. A Molto2 is never connected during detection, so it
-/// always has an empty serial and can't be named yet.
+/// `name set` stores. A Molto2 whose printed serial couldn't be read during
+/// detection has none.
 fn nameable(dev: &keyroost_resolve::Device) -> Result<(), String> {
     if dev.id.starts_with("override:") {
         return Err("can't name a key keyroost didn't detect; check `keyroostctl list`".into());
@@ -25458,8 +25458,8 @@ mod cli_tests {
         let err = nameable(&over).unwrap_err();
         assert!(err.contains("didn't detect"), "{err}");
 
-        // A detected row with no serial (e.g. a Molto2, never connected
-        // during detection) is refused too, whatever picked it.
+        // A detected row with no serial (e.g. a Molto2 whose serial read
+        // failed during detection) is refused too, whatever picked it.
         let mut no_serial = base.clone();
         no_serial.serial = String::new();
         no_serial.kind = DeviceKind::Token;

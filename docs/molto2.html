@@ -156,10 +156,13 @@ keyroostctl molto import -i export.json --file-password env:EXPORT_PW   # encryp
       script, or a command whose seed is piped in, adds <code>--yes</code>. With several
       Molto2 tokens connected, a terminal shows a numbered list to pick from and a script
       names one with <code>--device</code> (the number <code>keyroostctl list</code> shows,
-      or either serial keyroost shows for the token: the one in <code>keyroostctl
-      list</code> or the one <code>molto info</code> prints) or <code>--reader</code>; keyroost never uses the first one it finds. On the command line, Molto2
-      tokens can't be given a friendly name yet; in the app, open the token and use
-      <strong>Name this token</strong> in its header.</p>
+      the serial printed on the token, which <code>molto info</code> prints, or the USB
+      serial in its reader name in <code>keyroostctl list</code>) or <code>--reader</code>; keyroost never uses the first one it finds. To give the token a
+      <a href="naming.html">friendly name</a>, use <code>keyroostctl name set</code> or
+      <strong>Name this token</strong> in the app's header. keyroost reads the serial
+      printed on the token once each time it's plugged in, with the token's own keyless
+      <em>get info</em> request and nothing else, so the name shows in the device list
+      straight away. If that read fails, the name shows once the token is opened.</p>
   </section>
 
   <section class="kr-section" id="single-profile">

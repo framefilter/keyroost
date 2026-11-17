@@ -1885,10 +1885,11 @@ fn completion_still_valid(captured: Option<&DeviceId>, current: Option<&DeviceId
     matches!((captured, current), (Some(c), Some(now)) if c == now)
 }
 
-/// A device scan never connects to a Molto2, so its fresh row has no serial
-/// (and so no local name); only opening the token reads them. Carry both over
-/// from the previous list for the token whose session is open, or a rescan
-/// while it stays selected would blank the header until it's reopened.
+/// A device scan reads a Molto2's serial only once per plug-in, and a token
+/// whose read failed has a fresh row with no serial (and so no local name)
+/// until opening it reads them. Carry both over from the previous list for
+/// the token whose session is open, or a rescan while it stays selected
+/// would blank the header until it's reopened.
 fn keep_open_token_identity(old: &[Device], new: &mut [Device], open: Option<&DeviceId>) {
     let Some(open) = open else {
         return;

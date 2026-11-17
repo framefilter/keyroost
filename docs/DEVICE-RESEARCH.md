@@ -159,8 +159,10 @@ implemented from its public protocol document; how the FIDO-format and
 OTP-applet encodings relate is not yet confirmed on a real key, so they are
 compared only like-for-like until it is. The identity reads ran on Windows
 in the v0.16 test rounds (a YubiKey 5 and a Token2 PIN+ R3.4).
-The Molto2 and the single-profile programmable tokens are never sent an
-identity read.
+The single-profile programmable tokens are never sent an identity read. A
+Molto2 is sent its own keyless `get info` once per plug-in, for the serial
+printed on it: at most three tries until it answers, kept until its reader
+is gone, on a shared connection released without a reset.
 
 **Privacy.** Identities are read only to join the two halves of a key, held in
 memory (an answer over HID is kept while that key stays plugged in, so later
