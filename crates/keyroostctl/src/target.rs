@@ -68,6 +68,19 @@ fn enumerate_for(need: Need) -> Result<Vec<Device>, Box<dyn Error>> {
     })?)
 }
 
+/// Whether a refusal lists connected keys for the user to choose from.
+fn lists_keys(e: &SelectError) -> bool {
+    matches!(
+        e,
+        SelectError::NoCandidates { .. }
+            | SelectError::NeedsChoice { .. }
+            | SelectError::NotFound { .. }
+            | SelectError::Ambiguous { .. }
+            | SelectError::NameNotConnected { .. }
+            | SelectError::LacksCapability { .. }
+    )
+}
+
 /// Whether selection failed because the `--device` value matched no row.
 fn matched_nothing(e: &(dyn Error + 'static)) -> bool {
     matches!(
@@ -314,10 +327,27 @@ fn select_from(
     picker: &mut dyn Picker,
 ) -> Result<(Device, String), Box<dyn Error>> {
     let mut devices = scan()?;
+    let mut add_names = Some(add_names);
     if need == Need::Nameable || keyroost_resolve::selection_needs_key_names(&devices, sel, need) {
-        add_names(&mut devices);
+        if let Some(add) = add_names.take() {
+            add(&mut devices);
+        }
     }
-    let (mut dev, line) = choose(&devices, sel, need, picker)?;
+    let (mut dev, line) = match choose(&devices, sel, need, picker) {
+        Ok(chosen) => chosen,
+        // A refusal that lists keys to choose from names them as the other
+        // refusals do (names stored on keys, full model names), not by the
+        // short labels a scan that skipped those reads gives: read them now,
+        // on this error path only, and build the refusal again.
+        Err(e) if lists_keys(&e) => match add_names.take() {
+            Some(add) => {
+                add(&mut devices);
+                choose(&devices, sel, need, picker)?
+            }
+            None => return Err(e.into()),
+        },
+        Err(e) => return Err(e.into()),
+    };
     // A --reader / --path passed through as typed is no detected key.
     if typed_value(&dev).is_some() {
         return Ok((dev, line));
@@ -697,6 +727,44 @@ mod tests {
         );
         let one = two_fido_keys().into_iter().take(1).collect();
         assert_eq!(name_reads(one, None, None, Need::FidoHid).0, 0);
+    }
+
+    /// A refusal after a serial or list number names the keys it lists the
+    /// way every other refusal does: names stored on keys and full model
+    /// names are read for it, once, on that error path only.
+    #[test]
+    fn a_refusal_names_the_keys_it_lists() {
+        let reads = Cell::new(0);
+        for v in ["12345678", "1"] {
+            reads.set(0);
+            let sel = Selector {
+                device: Some(v),
+                reader: None,
+                path: None,
+            };
+            // The second key has OATH, so the refusal lists it.
+            let mut keys = two_fido_keys();
+            keys[1].caps.insert(Caps::OATH);
+            keys[1].reader = Some("Reader B".into());
+            let err = select_from(
+                || Ok(keys),
+                |devices: &mut Vec<Device>| {
+                    reads.set(reads.get() + 1);
+                    for d in devices.iter_mut() {
+                        d.model = "YubiKey 5 Series with NFC".into();
+                    }
+                },
+                |_: &mut Device| {},
+                &sel,
+                Need::Oath,
+                &mut NoPicker,
+            )
+            .err()
+            .expect("an OATH command can't pick a FIDO-only key")
+            .to_string();
+            assert_eq!(reads.get(), 1, "{v}");
+            assert!(err.contains("YubiKey 5 Series with NFC"), "{v}: {err}");
+        }
     }
 
     #[test]
