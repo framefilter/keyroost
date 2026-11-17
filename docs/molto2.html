@@ -160,9 +160,11 @@ keyroostctl molto import -i export.json --file-password env:EXPORT_PW   # encryp
       serial in its reader name in <code>keyroostctl list</code>) or <code>--reader</code>; keyroost never uses the first one it finds. To give the token a
       <a href="naming.html">friendly name</a>, use <code>keyroostctl name set</code> or
       <strong>Name this token</strong> in the app's header. keyroost reads the serial
-      printed on the token once each time it's plugged in, with the token's own keyless
-      <em>get info</em> request and nothing else, so the name shows in the device list
-      straight away. If that read fails, the name shows once the token is opened.</p>
+      printed on the token with the token's own keyless <em>get info</em> request and
+      nothing else: the app once each time the token is plugged in, and
+      <code>keyroostctl</code> once per command that lists keys, names one or works on a
+      Molto2. So the name shows in the device list straight away. If that read fails,
+      the name shows once the token is opened.</p>
   </section>
 
   <section class="kr-section" id="single-profile">

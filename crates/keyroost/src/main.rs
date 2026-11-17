@@ -10096,7 +10096,9 @@ impl App {
     /// (`skip_key_names`), so the poll never talks CTAP to the key being
     /// reset, and FIDO interfaces aren't asked their protocol
     /// (`skip_protocol_asks`): this runs every poll on the UI thread, and a
-    /// key that doesn't answer INIT would stall each one for the timeout.
+    /// key that doesn't answer INIT would stall each one for the timeout. A
+    /// Molto2 isn't asked its serial either (`skip_molto2_reads`), for the
+    /// same reason.
     ///
     /// `None` when the device is gone or the identity can't be read *yet* (a
     /// just-replugged key's CCID interface takes a beat to register with
@@ -10105,6 +10107,7 @@ impl App {
         keyroost_resolve::enumerate_with(&keyroost_resolve::EnumerateOptions {
             skip_key_names: true,
             skip_protocol_asks: true,
+            skip_molto2_reads: true,
             ..Default::default()
         })
         .unwrap_or_default()
@@ -10186,6 +10189,7 @@ impl App {
                             keyroost_resolve::enumerate_with(&keyroost_resolve::EnumerateOptions {
                                 skip_key_names: true,
                                 skip_protocol_asks: true,
+                                skip_molto2_reads: true,
                                 ..Default::default()
                             })
                             .unwrap_or_default();
@@ -11995,15 +11999,22 @@ impl App {
                         // user's own — same treatment as the device scan
                         // that usually precedes it.
                         app.log_bg(Severity::Ok, format!("opened Molto2 {}", info.serial));
-                        // Enumeration's gentle probe usually fills these already;
-                        // refresh them here as a fallback in case that read failed.
+                        // The scan usually read the serial already; this read
+                        // is the token's own answer, so it wins: a failed scan
+                        // read gets filled in, and a token swapped in under the
+                        // same reader name before a scan noticed gets its own
+                        // serial and name. Later scans keep it.
                         if let Some(id) = for_device.clone() {
                             let named = keyroost_keyring::Keyring::load_default()
                                 .ok()
                                 .and_then(|k| k.local_name_for(&info.serial).map(str::to_owned));
                             if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
+                                if let Some(reader) = dev.reader.as_deref() {
+                                    keyroost_transport::remember_molto2_serial(reader, &info.serial);
+                                }
+                                let swapped = dev.serial != info.serial;
                                 dev.serial = info.serial.clone();
-                                if dev.name.is_none() {
+                                if swapped || dev.name.is_none() {
                                     dev.name = named;
                                 }
                             }
@@ -34386,8 +34397,8 @@ mod tests {
         }
     }
 
-    /// #125: a rescan rebuilds the open Molto2's row without its serial
-    /// (enumeration never connects to it); the header must keep showing it.
+    /// #125: a rescan can rebuild the open Molto2's row without its serial
+    /// (when the scan's read failed); the header must keep showing it.
     #[test]
     fn rescan_keeps_the_open_molto2_serial_and_name() {
         let old = [test_token("molto:A", "M2SERIAL", Some("Desk"))];

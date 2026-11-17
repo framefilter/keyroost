@@ -34,6 +34,7 @@ pub(crate) fn enumerate() -> Result<Vec<Device>, Box<dyn Error>> {
         skip_identity_reads: false,
         skip_key_names: false,
         skip_protocol_asks: false,
+        skip_molto2_reads: false,
     })?)
 }
 
@@ -41,12 +42,26 @@ pub(crate) fn enumerate() -> Result<Vec<Device>, Box<dyn Error>> {
 /// names stored on keys (local names only). Selection adds those names only
 /// when the choice could depend on them (see [`select_from`]).
 pub(crate) fn enumerate_without_key_names() -> Result<Vec<Device>, Box<dyn Error>> {
+    enumerate_for(Need::Any)
+}
+
+/// [`enumerate_without_key_names`] for a command that acts on a key `need`
+/// admits: a Molto2 is asked its printed serial only when the command could
+/// pick one (a `molto` command, `name`, or any key), so `fido`, `oath` and
+/// the like never connect to it.
+fn enumerate_for(need: Need) -> Result<Vec<Device>, Box<dyn Error>> {
     Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
         debug: debug_on(),
         skip_identity_reads: false,
         skip_key_names: true,
         skip_protocol_asks: false,
+        skip_molto2_reads: !may_pick_a_molto2(need),
     })?)
+}
+
+/// Whether a command with `need` could act on a Molto2.
+fn may_pick_a_molto2(need: Need) -> bool {
+    matches!(need, Need::Molto2 | Need::Nameable | Need::Any)
 }
 
 /// The device list without identity reads (topology, vendor and reported
@@ -58,6 +73,7 @@ pub(crate) fn enumerate_without_identity_reads() -> Result<Vec<Device>, Box<dyn 
         skip_identity_reads: true,
         skip_key_names: true,
         skip_protocol_asks: true,
+        skip_molto2_reads: true,
     })?)
 }
 
@@ -223,7 +239,7 @@ pub(crate) fn select(
         let mut term = RealTerm;
         let mut picker = TermPicker::new(&mut term);
         let (dev, line) = select_from(
-            enumerate_without_key_names,
+            || enumerate_for(need),
             |devices: &mut Vec<Device>| keyroost_resolve::add_key_names(devices, debug_on()),
             |dev: &mut Device| {
                 keyroost_resolve::add_fido_models(std::slice::from_mut(dev), debug_on())
@@ -469,6 +485,35 @@ mod tests {
     use super::*;
     use keyroost_resolve::NoPicker;
     use std::cell::Cell;
+
+    /// A scan asks a Molto2 its serial exactly for the commands that could
+    /// pick one: every need that admits a Molto2 row (with a serial, as a
+    /// read gives it), and no other.
+    #[test]
+    fn only_commands_that_could_pick_a_molto2_read_its_serial() {
+        let mut molto = typed_device(Some("TOKEN2 Molto2 0".into()), None, "x");
+        molto.id = "molto:TOKEN2 Molto2 0".into();
+        molto.kind = keyroost_resolve::DeviceKind::Token;
+        molto.caps = keyroost_resolve::Caps::TOTP;
+        molto.serial = "826658711763730".into();
+        for need in [
+            Need::FidoHid,
+            Need::FidoAny,
+            Need::Oath,
+            Need::OpenPgp,
+            Need::Piv,
+            Need::Otp,
+            Need::OtpHid,
+            Need::OtpCcid,
+            Need::Molto2,
+            Need::Prog,
+            Need::FactoryReset,
+            Need::Nameable,
+            Need::Any,
+        ] {
+            assert_eq!(may_pick_a_molto2(need), need.admits(&molto), "{need:?}");
+        }
+    }
 
     fn dev(name: Option<&str>, serial: &str) -> Device {
         Device {

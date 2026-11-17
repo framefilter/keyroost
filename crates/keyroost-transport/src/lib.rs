@@ -945,7 +945,10 @@ impl Session {
             },
             _ => TransportError::MalformedResponse("get info: unrecognized error"),
         })?;
-        Ok(DeviceInfo { serial, utc_time })
+        Ok(DeviceInfo {
+            serial: clean_molto2_serial(&serial),
+            utc_time,
+        })
     }
 
     /// Read a profile's public block (title, occupancy, TOTP config).
@@ -1355,7 +1358,9 @@ fn forget_r34_serials_except(readers: &[String]) {
 /// `get info`, by reader and USB device. Each plug-in is asked until it
 /// answers, at most [`MOLTO2_SERIAL_TRIES`] times, and an answer is kept
 /// until the reader is gone (the token unplugged), so the rescans that
-/// follow a plug-in and the app's later refreshes don't connect again. A
+/// follow a plug-in and the app's later refreshes don't connect again. The
+/// cache lives as long as the process: each `keyroostctl` run that scans
+/// with [`Molto2Serials::Read`] asks once. A
 /// June 2026 version connected on every scan; repeated across a plug-in's
 /// rescan burst, that churn was suspected of wedging the token's reader.
 static MOLTO2_SERIALS: std::sync::Mutex<Vec<Molto2Serial>> = std::sync::Mutex::new(Vec::new());
@@ -1397,6 +1402,7 @@ fn molto2_serial(
     name: &std::ffi::CStr,
     reader: &str,
     usb_device: Option<&UsbDeviceKey>,
+    molto2: Molto2Serials,
     trace: bool,
 ) -> Option<String> {
     let mut cache = MOLTO2_SERIALS
@@ -1405,6 +1411,7 @@ fn molto2_serial(
     let failed = match molto2_lookup(&cache, reader, usb_device) {
         Molto2Lookup::Known(s) => return Some(s),
         Molto2Lookup::GaveUp => return None,
+        Molto2Lookup::Ask { .. } if molto2 == Molto2Serials::KnownOnly => return None,
         Molto2Lookup::Ask { failed } => failed,
     };
     let mut states = [ReaderState::new(name.to_owned(), State::UNAWARE)];
@@ -1434,6 +1441,45 @@ fn molto2_serial(
     let serial = read.ok();
     molto2_record(&mut cache, reader, usb_device, serial.clone());
     serial
+}
+
+/// Remember `serial` as the printed serial of the Molto2 on `reader`, read
+/// in a session of its own (the app opening the token): it replaces what a
+/// scan read for that reader, so a token swapped in under the same reader
+/// name before any scan noticed is known by its own serial from then on,
+/// and a plug-in whose scan reads all failed gets one.
+pub fn remember_molto2_serial(reader: &str, serial: &str) {
+    let serial = clean_molto2_serial(serial);
+    if serial.is_empty() {
+        return;
+    }
+    let mut cache = MOLTO2_SERIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    molto2_remember(&mut cache, reader, &serial);
+}
+
+fn molto2_remember(cache: &mut Vec<Molto2Serial>, reader: &str, serial: &str) {
+    let mut hit = false;
+    for e in cache.iter_mut().filter(|e| e.reader == reader) {
+        e.read = Molto2Read::Serial(serial.to_owned());
+        hit = true;
+    }
+    if !hit {
+        cache.push(Molto2Serial {
+            reader: reader.to_owned(),
+            usb_device: None,
+            read: Molto2Read::Serial(serial.to_owned()),
+        });
+    }
+}
+
+/// A Molto2 serial as `get info` gives it, without the NUL or space padding
+/// a fixed-width field may carry: the one form every reader of it uses.
+fn clean_molto2_serial(serial: &str) -> String {
+    serial
+        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+        .to_owned()
 }
 
 /// What the cache says about one plug-in's Molto2.
@@ -1511,9 +1557,7 @@ fn read_molto2_serial(
     }
     let (serial, _) = commands::parse_info(&data)
         .map_err(|_| TransportError::MalformedResponse("get info: unrecognized response"))?;
-    let serial = serial
-        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
-        .to_owned();
+    let serial = clean_molto2_serial(&serial);
     if serial.is_empty() {
         return Err(TransportError::MalformedResponse("get info: empty serial"));
     }
@@ -1525,7 +1569,8 @@ fn read_molto2_serial(
 /// applet SELECTs are issued in sequence.
 ///
 /// Molto2 (Token2) readers are detected by name and sent **nothing but the
-/// keyless `get info`**, once per plug-in, for the printed serial — selecting
+/// keyless `get info`**, once per plug-in within one process (the app; each
+/// `keyroostctl` run asks again), for the printed serial — selecting
 /// foreign applets on a Molto2 resets its card and invalidates a held
 /// [`Session`], which is what produced spurious "the smart card has been reset"
 /// failures when a refresh ran between opening the token and authenticating.
@@ -1535,6 +1580,22 @@ fn read_molto2_serial(
 /// PC/SC service failure errors; an individual reader that can't be connected is
 /// returned with all-false capabilities rather than failing the whole scan.
 pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
+    probe_readers_with(Molto2Serials::Read)
+}
+
+/// Whether a scan may connect to a Molto2 for its printed serial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Molto2Serials {
+    /// Read it when this plug-in hasn't answered yet (see [`probe_readers`]).
+    Read,
+    /// Use only a serial already read for this plug-in; connect to no
+    /// Molto2. For scans repeated in a tight loop, or that can't act on a
+    /// Molto2 anyway.
+    KnownOnly,
+}
+
+/// [`probe_readers`], choosing whether a Molto2 may be asked its serial.
+pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, TransportError> {
     let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
     let mut buf = [0u8; 4096];
     let names: Vec<std::ffi::CString> = ctx
@@ -1572,7 +1633,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                     keyroost_proto::trace::reader_name(&reader_name)
                 ));
             }
-            let serial = molto2_serial(&ctx, &name, &reader_name, tree_key.as_ref(), trace);
+            let serial = molto2_serial(&ctx, &name, &reader_name, tree_key.as_ref(), molto2, trace);
             out.push(ReaderProbe {
                 reader_name,
                 is_molto2: true,
@@ -2100,7 +2161,7 @@ fn transmit_apdu(card: &Card, apdu: &[u8]) -> Result<(Vec<u8>, u8, u8), Transpor
     let resp = card.transmit(apdu, &mut buf)?;
     if resp.len() < 2 {
         return Err(TransportError::ShortResponse {
-            label: "yubikey apdu",
+            label: "apdu",
             got: resp.len(),
             expected_min: 2,
         });
@@ -2914,5 +2975,54 @@ mod molto2_serial_tests {
             molto2_lookup(&cache, "TOKEN2 Molto2 0", Some(&a)),
             Molto2Lookup::Known("1".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod molto2_remember_tests {
+    use super::{clean_molto2_serial, molto2_lookup, molto2_record, molto2_remember, Molto2Lookup};
+    use keyroost_hid::UsbDeviceKey;
+
+    /// A session's own read replaces what a scan read for that reader: a
+    /// token swapped in before any scan noticed is known by its own serial,
+    /// and a plug-in whose scan reads failed gets one.
+    #[test]
+    fn a_session_read_replaces_the_scan_read_for_its_reader() {
+        let node = UsbDeviceKey::WinNode("USB\\VID_349E&PID_0300\\AAAA".into());
+        let mut cache = Vec::new();
+        molto2_record(
+            &mut cache,
+            "TOKEN2 Molto2 0",
+            Some(&node),
+            Some("OLD".into()),
+        );
+        molto2_remember(&mut cache, "TOKEN2 Molto2 0", "NEW");
+        assert_eq!(
+            molto2_lookup(&cache, "TOKEN2 Molto2 0", Some(&node)),
+            Molto2Lookup::Known("NEW".into())
+        );
+        let mut failed = Vec::new();
+        molto2_record(&mut failed, "TOKEN2 Molto2 1", None, None);
+        molto2_remember(&mut failed, "TOKEN2 Molto2 1", "S");
+        assert_eq!(
+            molto2_lookup(&failed, "TOKEN2 Molto2 1", None),
+            Molto2Lookup::Known("S".into())
+        );
+        // A reader no scan has seen yet gets an entry of its own.
+        molto2_remember(&mut failed, "TOKEN2 Molto2 2", "T");
+        assert_eq!(
+            molto2_lookup(&failed, "TOKEN2 Molto2 2", None),
+            Molto2Lookup::Known("T".into())
+        );
+    }
+
+    #[test]
+    fn padding_is_trimmed_the_same_everywhere() {
+        assert_eq!(
+            clean_molto2_serial("826658711763730\0\0"),
+            "826658711763730"
+        );
+        assert_eq!(clean_molto2_serial(" 82665871 "), "82665871");
+        assert_eq!(clean_molto2_serial("\0"), "");
     }
 }
