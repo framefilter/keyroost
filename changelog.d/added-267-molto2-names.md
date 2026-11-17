@@ -7,4 +7,4 @@
   Until now a scan never connected to a Molto2, so it could be named only
   in the app, after opening it. A token that doesn't answer is asked at
   most three times per plug-in, and opening it in the app fills the serial
-  in. ([#266])
+  in. ([#267])
