@@ -1095,6 +1095,11 @@ pub struct EnumerateOptions {
     /// that needs no badges, where a key that doesn't answer would cost every
     /// scan the INIT timeout. Implied by `skip_identity_reads`.
     pub skip_protocol_asks: bool,
+    /// Don't connect to a Molto2 for its printed serial; use one already
+    /// read for this plug-in. For scans repeated in a tight loop, and for
+    /// a command that can't act on a Molto2. Implied by
+    /// `skip_identity_reads`.
+    pub skip_molto2_reads: bool,
 }
 
 impl EnumerateOptions {
@@ -1102,6 +1107,15 @@ impl EnumerateOptions {
     /// protocol.
     fn may_ask_protocol(&self) -> bool {
         !self.skip_identity_reads && !self.skip_protocol_asks
+    }
+
+    /// Whether a scan with these options may connect to a Molto2.
+    fn molto2_serials(&self) -> keyroost_transport::Molto2Serials {
+        if self.skip_identity_reads || self.skip_molto2_reads {
+            keyroost_transport::Molto2Serials::KnownOnly
+        } else {
+            keyroost_transport::Molto2Serials::Read
+        }
     }
 }
 
@@ -1615,7 +1629,7 @@ fn mark_live_smart_cards(
 /// Build the unified device list (see [`enumerate`]) with options.
 pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
     let hids = keyroost_hid::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
-    let probed = keyroost_transport::probe_readers();
+    let probed = keyroost_transport::probe_readers_with(opts.molto2_serials());
     let pcsc_up = probed.is_ok();
     let probes = probed.unwrap_or_default();
     let (keyring, may_save) = load_keyring_for_scan(opts.debug);

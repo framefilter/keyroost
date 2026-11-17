@@ -945,7 +945,10 @@ impl Session {
             },
             _ => TransportError::MalformedResponse("get info: unrecognized error"),
         })?;
-        Ok(DeviceInfo { serial, utc_time })
+        Ok(DeviceInfo {
+            serial: clean_molto2_serial(&serial),
+            utc_time,
+        })
     }
 
     /// Read a profile's public block (title, occupancy, TOTP config).
@@ -1136,8 +1139,8 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
 /// reader, `None` where it can't be told. Sends no APDU: on Linux and macOS
 /// each reader is connected shared, its `CHANNEL_ID` read, and the connection
 /// released with `LeaveCard`; on Windows the device tree answers without a
-/// connection. A Molto2 reader is never connected (see [`probe_readers`]), so
-/// its entry is `None`, as is a reader that can't be connected.
+/// connection. A Molto2 reader isn't connected here, so its entry is `None`,
+/// as is a reader that can't be connected.
 ///
 /// For a caller that doesn't probe the readers anyway (`doctor`); a scan that
 /// runs [`probe_readers`] already has these in [`ReaderProbe::usb_device`].
@@ -1170,19 +1173,19 @@ pub fn reader_usb_devices() -> Result<Vec<Option<UsbDeviceKey>>, TransportError>
 }
 
 /// One PC/SC reader, probed in a single connection: which applets it answers,
-/// plus YubiKey serial/topology when it is a YubiKey. Molto2 readers are flagged
-/// but deliberately *not* connected.
+/// plus YubiKey serial/topology when it is a YubiKey. Molto2 readers are
+/// flagged and asked only for their printed serial, once per plug-in.
 #[derive(Debug, Clone)]
 pub struct ReaderProbe {
     pub reader_name: String,
     /// True when the reader name matches the Token2 Molto2 hint. Such readers
-    /// are listed by name only and never connected during enumeration (see
+    /// are sent nothing but the keyless `get info`, once per plug-in (see
     /// [`probe_readers`]).
     pub is_molto2: bool,
-    /// Reserved for a reader serial read during enumeration. Currently always
-    /// `None`: the Molto2 is not connected during a probe (its serial is read
-    /// later via [`Session::read_info`]), and security keys carry their serial
-    /// in [`ReaderProbe::yubikey_serial`] instead.
+    /// A Molto2's printed serial, read once per plug-in with its keyless
+    /// `get info` (see [`probe_readers`]); `None` when it couldn't be read,
+    /// and for other readers, which carry a serial in
+    /// [`ReaderProbe::yubikey_serial`] or [`ReaderProbe::prog_serial`].
     pub serial: Option<String>,
     /// The serial an earlier keyroost knew this card by, when `serial` now
     /// differs: a Token2 PIN+ R3.4's OpenPGP-AID serial, once its full serial
@@ -1350,12 +1353,223 @@ fn forget_r34_serials_except(readers: &[String]) {
     cache.retain(|e| readers.contains(&e.reader));
 }
 
+/// A Molto2's printed serial (the one `molto info` shows and the token
+/// carries on its back), read during a scan with the token's own keyless
+/// `get info`, by reader and USB device. Each plug-in is asked until it
+/// answers, at most [`MOLTO2_SERIAL_TRIES`] times, and an answer is kept
+/// until the reader is gone (the token unplugged), so the rescans that
+/// follow a plug-in and the app's later refreshes don't connect again. The
+/// cache lives as long as the process: each `keyroostctl` run that scans
+/// with [`Molto2Serials::Read`] asks once. A
+/// June 2026 version connected on every scan; repeated across a plug-in's
+/// rescan burst, that churn was suspected of wedging the token's reader.
+static MOLTO2_SERIALS: std::sync::Mutex<Vec<Molto2Serial>> = std::sync::Mutex::new(Vec::new());
+
+/// Reads one plug-in gets before it waits for the next plug-in.
+const MOLTO2_SERIAL_TRIES: u8 = 3;
+
+struct Molto2Serial {
+    reader: String,
+    /// The Windows device-tree node, where known: two tokens swapped
+    /// between scans under one reader name ("TOKEN2 Molto2 0") don't share
+    /// an entry. A Linux reader name carries the token's USB serial.
+    usb_device: Option<UsbDeviceKey>,
+    read: Molto2Read,
+}
+
+enum Molto2Read {
+    Serial(String),
+    /// Reads that failed so far for this plug-in.
+    Failed(u8),
+}
+
+/// Forget the Molto2 readers that are gone.
+fn forget_molto2_serials_except(readers: &[String]) {
+    let mut cache = MOLTO2_SERIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.retain(|e| readers.contains(&e.reader));
+}
+
+/// The printed serial of the Molto2 on `name`: remembered from this
+/// plug-in, or read now with the keyless `get info` on a shared connection
+/// released with `LeaveCard` (the `pcsc` crate's `Drop` would reset the
+/// card, ending any session another process holds on it). A reader whose
+/// token isn't ready yet is skipped without spending a try. `None` when it
+/// couldn't be read; the row then has no serial, as before.
+fn molto2_serial(
+    ctx: &pcsc::Context,
+    name: &std::ffi::CStr,
+    reader: &str,
+    usb_device: Option<&UsbDeviceKey>,
+    molto2: Molto2Serials,
+    trace: bool,
+) -> Option<String> {
+    let mut cache = MOLTO2_SERIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let failed = match molto2_lookup(&cache, reader, usb_device) {
+        Molto2Lookup::Known(s) => return Some(s),
+        Molto2Lookup::GaveUp => return None,
+        Molto2Lookup::Ask { .. } if molto2 == Molto2Serials::KnownOnly => return None,
+        Molto2Lookup::Ask { failed } => failed,
+    };
+    let mut states = [ReaderState::new(name.to_owned(), State::UNAWARE)];
+    let ready = match ctx.get_status_change(std::time::Duration::ZERO, &mut states) {
+        Ok(()) | Err(pcsc::Error::Timeout) => crate::recover::card_ready(states[0].event_state()),
+        Err(_) => false,
+    };
+    if !ready {
+        if trace {
+            probe_note("molto2 serial: token not ready, not asked");
+        }
+        return None;
+    }
+    let read = read_molto2_serial(ctx, name);
+    if trace {
+        match &read {
+            Ok(s) => probe_note(&format!(
+                "molto2 serial -> {}",
+                keyroost_proto::trace::abbreviate(s)
+            )),
+            Err(e) => probe_note(&format!(
+                "molto2 serial -> error: {e} (try {} of {MOLTO2_SERIAL_TRIES})",
+                failed + 1
+            )),
+        }
+    }
+    let serial = read.ok();
+    molto2_record(&mut cache, reader, usb_device, serial.clone());
+    serial
+}
+
+/// Remember `serial` as the printed serial of the Molto2 on `reader`, read
+/// in a session of its own (the app opening the token): it replaces what a
+/// scan read for that reader, so a token swapped in under the same reader
+/// name before any scan noticed is known by its own serial from then on,
+/// and a plug-in whose scan reads all failed gets one.
+pub fn remember_molto2_serial(reader: &str, serial: &str) {
+    let serial = clean_molto2_serial(serial);
+    if serial.is_empty() {
+        return;
+    }
+    let mut cache = MOLTO2_SERIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    molto2_remember(&mut cache, reader, &serial);
+}
+
+/// Replace every entry for `reader` with one that carries no device node:
+/// Linux and macOS scans match it; a Windows scan, which keys by node,
+/// misses it and reads once more, which can't hand the serial to a token
+/// swapped back in under the same reader name.
+fn molto2_remember(cache: &mut Vec<Molto2Serial>, reader: &str, serial: &str) {
+    cache.retain(|e| e.reader != reader);
+    cache.push(Molto2Serial {
+        reader: reader.to_owned(),
+        usb_device: None,
+        read: Molto2Read::Serial(serial.to_owned()),
+    });
+}
+
+/// A Molto2 serial as `get info` gives it, without the NUL or space padding
+/// a fixed-width field may carry: the one form every reader of it uses.
+fn clean_molto2_serial(serial: &str) -> String {
+    serial
+        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+        .to_owned()
+}
+
+/// What the cache says about one plug-in's Molto2.
+#[derive(Debug, PartialEq, Eq)]
+enum Molto2Lookup {
+    /// Read earlier in this plug-in: send nothing.
+    Known(String),
+    /// [`MOLTO2_SERIAL_TRIES`] reads failed: wait for the next plug-in.
+    GaveUp,
+    /// Read it; `failed` reads failed so far.
+    Ask { failed: u8 },
+}
+
+fn molto2_lookup(
+    cache: &[Molto2Serial],
+    reader: &str,
+    usb_device: Option<&UsbDeviceKey>,
+) -> Molto2Lookup {
+    match cache
+        .iter()
+        .find(|e| e.reader == reader && e.usb_device.as_ref() == usb_device)
+        .map(|e| &e.read)
+    {
+        Some(Molto2Read::Serial(s)) => Molto2Lookup::Known(s.clone()),
+        Some(Molto2Read::Failed(n)) if *n >= MOLTO2_SERIAL_TRIES => Molto2Lookup::GaveUp,
+        Some(Molto2Read::Failed(n)) => Molto2Lookup::Ask { failed: *n },
+        None => Molto2Lookup::Ask { failed: 0 },
+    }
+}
+
+/// Keep one read's outcome: the serial, or one more failed try.
+fn molto2_record(
+    cache: &mut Vec<Molto2Serial>,
+    reader: &str,
+    usb_device: Option<&UsbDeviceKey>,
+    serial: Option<String>,
+) {
+    let at = cache
+        .iter()
+        .position(|e| e.reader == reader && e.usb_device.as_ref() == usb_device);
+    let failed = match at.map(|i| &cache[i].read) {
+        Some(Molto2Read::Failed(n)) => *n,
+        _ => 0,
+    };
+    let read = match serial {
+        Some(s) => Molto2Read::Serial(s),
+        None => Molto2Read::Failed(failed.saturating_add(1)),
+    };
+    match at {
+        Some(i) => cache[i].read = read,
+        None => cache.push(Molto2Serial {
+            reader: reader.to_owned(),
+            usb_device: usb_device.cloned(),
+            read,
+        }),
+    }
+}
+
+/// One keyless `get info` on its own shared connection, released without a
+/// reset. Sends nothing else: a foreign applet SELECT resets a Molto2.
+fn read_molto2_serial(
+    ctx: &pcsc::Context,
+    name: &std::ffi::CStr,
+) -> Result<String, TransportError> {
+    let card = ctx.connect(name, ShareMode::Shared, Protocols::ANY)?;
+    let answer = transmit_apdu(&card, &commands::get_info().apdu);
+    let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+    let (data, sw1, sw2) = answer?;
+    if !sw_ok(sw1, sw2) {
+        return Err(TransportError::Apdu {
+            label: "get info",
+            sw1,
+            sw2,
+        });
+    }
+    let (serial, _) = commands::parse_info(&data)
+        .map_err(|_| TransportError::MalformedResponse("get info: unrecognized response"))?;
+    let serial = clean_molto2_serial(&serial);
+    if serial.is_empty() {
+        return Err(TransportError::MalformedResponse("get info: empty serial"));
+    }
+    Ok(serial)
+}
+
 /// Probe every connected PC/SC reader in a single pass: one context, the reader
 /// list once, and **at most one card connection per reader**, on which all
 /// applet SELECTs are issued in sequence.
 ///
-/// Molto2 (Token2) readers are detected by name and **never connected** —
-/// selecting foreign applets on a Molto2 resets its card and invalidates a held
+/// Molto2 (Token2) readers are detected by name and sent **nothing but the
+/// keyless `get info`**, once per plug-in within one process (the app; each
+/// `keyroostctl` run asks again), for the printed serial — selecting
+/// foreign applets on a Molto2 resets its card and invalidates a held
 /// [`Session`], which is what produced spurious "the smart card has been reset"
 /// failures when a refresh ran between opening the token and authenticating.
 /// The connections we do make are released with `LeaveCard` so they don't reset
@@ -1364,6 +1578,22 @@ fn forget_r34_serials_except(readers: &[String]) {
 /// PC/SC service failure errors; an individual reader that can't be connected is
 /// returned with all-false capabilities rather than failing the whole scan.
 pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
+    probe_readers_with(Molto2Serials::Read)
+}
+
+/// Whether a scan may connect to a Molto2 for its printed serial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Molto2Serials {
+    /// Read it when this plug-in hasn't answered yet (see [`probe_readers`]).
+    Read,
+    /// Use only a serial already read for this plug-in; connect to no
+    /// Molto2. For scans repeated in a tight loop, or that can't act on a
+    /// Molto2 anyway.
+    KnownOnly,
+}
+
+/// [`probe_readers`], choosing whether a Molto2 may be asked its serial.
+pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, TransportError> {
     let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
     let mut buf = [0u8; 4096];
     let names: Vec<std::ffi::CString> = ctx
@@ -1373,12 +1603,12 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         .collect();
 
     let tree = reader_devtree_keys(&names);
-    forget_r34_serials_except(
-        &names
-            .iter()
-            .map(|n| n.to_string_lossy().into_owned())
-            .collect::<Vec<_>>(),
-    );
+    let present: Vec<String> = names
+        .iter()
+        .map(|n| n.to_string_lossy().into_owned())
+        .collect();
+    forget_r34_serials_except(&present);
+    forget_molto2_serials_except(&present);
     let mut out = Vec::with_capacity(names.len());
     for (name, (tree_key, usb_product)) in names.into_iter().zip(tree) {
         let reader_name = name.to_string_lossy().into_owned();
@@ -1386,21 +1616,26 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         // `reader_name` is moved into a `ReaderProbe`.
         let lower = reader_name.to_ascii_lowercase();
 
-        // Molto2: list it by name only — NEVER connect during enumeration.
-        // Even a gentle `get info` + `LeaveCard` churns the token's CCID slot,
-        // and repeated across hotplug-triggered rescans it accumulates state
-        // that wedges pcscd until the PC/SC stack is restarted (the reader then
-        // stops enumerating entirely). The serial is read later, when the user
-        // opens the token (`Session::read_info`).
+        // Molto2: read only its printed serial, with its own keyless
+        // `get info`, once per plug-in (see [`molto2_serial`]): never an
+        // applet SELECT, which would reset it and end a held [`Session`].
         //
         // `is_molto2_reader` (not a bare "TOKEN2" substring) so Token2's own
         // FIDO keys — same brand, same VID, also a CCID reader — aren't
         // mis-flagged as a ghost Molto2 (issue #21).
         if keyroost_proto::is_molto2_reader(&reader_name) {
+            let trace = probe_trace_on() || keyroost_proto::trace::capturing();
+            if trace {
+                probe_note(&format!(
+                    "reader seen: {}",
+                    keyroost_proto::trace::reader_name(&reader_name)
+                ));
+            }
+            let serial = molto2_serial(&ctx, &name, &reader_name, tree_key.as_ref(), molto2, trace);
             out.push(ReaderProbe {
                 reader_name,
                 is_molto2: true,
-                serial: None,
+                serial,
                 former_serial: None,
                 openpgp_manufacturer: None,
                 has_oath: false,
@@ -1924,7 +2159,7 @@ fn transmit_apdu(card: &Card, apdu: &[u8]) -> Result<(Vec<u8>, u8, u8), Transpor
     let resp = card.transmit(apdu, &mut buf)?;
     if resp.len() < 2 {
         return Err(TransportError::ShortResponse {
-            label: "yubikey apdu",
+            label: "apdu",
             got: resp.len(),
             expected_min: 2,
         });
@@ -2677,5 +2912,123 @@ mod r34_serial_tests {
             Some("65103000000002")
         );
         forget_r34_serials_except(&[]);
+    }
+}
+
+#[cfg(test)]
+mod molto2_serial_tests {
+    use super::{molto2_lookup, molto2_record, Molto2Lookup, MOLTO2_SERIAL_TRIES};
+    use keyroost_hid::UsbDeviceKey;
+
+    const READER: &str = "TOKEN2 Molto2 (5C7D6241EF67245B) 02 00";
+
+    /// A plug-in is asked until it answers, at most MOLTO2_SERIAL_TRIES
+    /// times, and an answer is kept: later scans send nothing.
+    #[test]
+    fn a_plug_in_is_asked_until_it_answers_then_kept() {
+        let mut cache = Vec::new();
+        assert_eq!(
+            molto2_lookup(&cache, READER, None),
+            Molto2Lookup::Ask { failed: 0 }
+        );
+        molto2_record(&mut cache, READER, None, None);
+        assert_eq!(
+            molto2_lookup(&cache, READER, None),
+            Molto2Lookup::Ask { failed: 1 }
+        );
+        molto2_record(&mut cache, READER, None, Some("826658711763730".into()));
+        assert_eq!(
+            molto2_lookup(&cache, READER, None),
+            Molto2Lookup::Known("826658711763730".into())
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn a_plug_in_that_never_answers_is_left_alone_after_the_last_try() {
+        let mut cache = Vec::new();
+        for n in 0..MOLTO2_SERIAL_TRIES {
+            assert_eq!(
+                molto2_lookup(&cache, READER, None),
+                Molto2Lookup::Ask { failed: n }
+            );
+            molto2_record(&mut cache, READER, None, None);
+        }
+        assert_eq!(molto2_lookup(&cache, READER, None), Molto2Lookup::GaveUp);
+    }
+
+    /// Two tokens under one Windows reader name, on different device-tree
+    /// nodes, don't share an answer.
+    #[test]
+    fn another_usb_device_under_the_same_reader_name_is_asked_again() {
+        let a = UsbDeviceKey::WinNode("USB\\VID_349E&PID_0300\\AAAA".into());
+        let b = UsbDeviceKey::WinNode("USB\\VID_349E&PID_0300\\BBBB".into());
+        let mut cache = Vec::new();
+        molto2_record(&mut cache, "TOKEN2 Molto2 0", Some(&a), Some("1".into()));
+        assert_eq!(
+            molto2_lookup(&cache, "TOKEN2 Molto2 0", Some(&b)),
+            Molto2Lookup::Ask { failed: 0 }
+        );
+        assert_eq!(
+            molto2_lookup(&cache, "TOKEN2 Molto2 0", Some(&a)),
+            Molto2Lookup::Known("1".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod molto2_remember_tests {
+    use super::{clean_molto2_serial, molto2_lookup, molto2_record, molto2_remember, Molto2Lookup};
+    use keyroost_hid::UsbDeviceKey;
+
+    /// A session's own read replaces what a scan read for that reader: a
+    /// token swapped in before any scan noticed is known by its own serial,
+    /// and a plug-in whose scan reads failed gets one.
+    #[test]
+    fn a_session_read_replaces_the_scan_read_for_its_reader() {
+        let node = UsbDeviceKey::WinNode("USB\\VID_349E&PID_0300\\AAAA".into());
+        let mut cache = Vec::new();
+        molto2_record(
+            &mut cache,
+            "TOKEN2 Molto2 0",
+            Some(&node),
+            Some("OLD".into()),
+        );
+        molto2_remember(&mut cache, "TOKEN2 Molto2 0", "NEW");
+        // Without a node, a Linux or macOS scan finds it...
+        assert_eq!(
+            molto2_lookup(&cache, "TOKEN2 Molto2 0", None),
+            Molto2Lookup::Known("NEW".into())
+        );
+        // ...and a Windows scan reads once more rather than trust the old
+        // node's entry (a token swapped back in there isn't given "NEW").
+        assert_eq!(
+            molto2_lookup(&cache, "TOKEN2 Molto2 0", Some(&node)),
+            Molto2Lookup::Ask { failed: 0 }
+        );
+        assert_eq!(cache.len(), 1);
+        let mut failed = Vec::new();
+        molto2_record(&mut failed, "TOKEN2 Molto2 1", None, None);
+        molto2_remember(&mut failed, "TOKEN2 Molto2 1", "S");
+        assert_eq!(
+            molto2_lookup(&failed, "TOKEN2 Molto2 1", None),
+            Molto2Lookup::Known("S".into())
+        );
+        // A reader no scan has seen yet gets an entry of its own.
+        molto2_remember(&mut failed, "TOKEN2 Molto2 2", "T");
+        assert_eq!(
+            molto2_lookup(&failed, "TOKEN2 Molto2 2", None),
+            Molto2Lookup::Known("T".into())
+        );
+    }
+
+    #[test]
+    fn padding_is_trimmed_the_same_everywhere() {
+        assert_eq!(
+            clean_molto2_serial("826658711763730\0\0"),
+            "826658711763730"
+        );
+        assert_eq!(clean_molto2_serial(" 82665871 "), "82665871");
+        assert_eq!(clean_molto2_serial("\0"), "");
     }
 }

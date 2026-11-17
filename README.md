@@ -802,11 +802,11 @@ a terminal shows a numbered list to pick from; a script is refused with the
 exact `--device` value for each key. `--device` takes a saved name, a serial,
 or the number `keyroostctl list` shows (prefix `name:`, `serial:` or `list:`
 to say which you mean); `keyroostctl --json list` gives scripts the same
-values. A Molto2 answers to either serial keyroost shows for it: the one in
-`keyroostctl list` or the one `molto info` prints. `--reader` (a reader
-name, or a unique part of one) and `--path` are expert overrides: they skip
-the capability check, and a value that matches no detected key is used as
-typed. Neither can be combined with `--device`.
+values. A Molto2 answers to the serial printed on it (what `molto info`
+prints) and to the USB serial in its reader name (in `keyroostctl list`).
+`--reader` (a reader name, or a unique part of one) and `--path` are expert
+overrides: they skip the capability check, and a value that matches no
+detected key is used as typed. Neither can be combined with `--device`.
 
 Five flags have a short form, with the same meaning on every command:
 `-d` (`--device`), `-y` (`--yes`), `-o` (`--out`), `-i` (`--in`) and

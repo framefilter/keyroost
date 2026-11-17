@@ -48,7 +48,7 @@ fn should_retry(tries: u32, opened: bool, e: &TransportError) -> bool {
 }
 
 /// Whether a reader state shows a card PC/SC can talk to.
-fn card_ready(state: State) -> bool {
+pub(crate) fn card_ready(state: State) -> bool {
     state.contains(State::PRESENT)
         && !state.intersects(State::EMPTY | State::MUTE | State::UNAVAILABLE | State::UNKNOWN)
 }

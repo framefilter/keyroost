@@ -147,8 +147,9 @@ pub fn list_number(devices: &[Device], index: usize) -> Option<usize> {
 
 /// The USB serial a Molto2's reader name carries in parentheses
 /// (`TOKEN2 Molto2 (5C7D6241EF67245B) 02 00` → `5C7D6241EF67245B`), as
-/// `list` shows it. The row's own serial stays empty: the token's card
-/// serial is read only on demand (see [`resolve_target_reading`]).
+/// `list` shows it. The row's own serial is the one printed on the token,
+/// read once per plug-in during a scan, or empty when that read failed or
+/// the scan skipped it (see [`resolve_target_reading`]).
 pub fn molto_reader_serial(reader: &str) -> Option<&str> {
     let (_, rest) = reader.split_once('(')?;
     let (serial, _) = rest.split_once(')')?;
@@ -596,8 +597,9 @@ pub fn resolve_target<'d>(
 /// serial is read with `card_serial` (the serial `molto info` and the GUI
 /// show) and compared, when the command can act on a Molto2 (`need`
 /// admits it). The card is contacted only then, and only for
-/// Molto2 rows: a Molto2 is slow to start a session, so no other lookup
-/// waits on it. `card_serial` returns `None` for a card it couldn't read.
+/// Molto2 rows whose scan left them without a serial: a Molto2 is slow to
+/// start a session, so no other lookup waits on it. `card_serial` returns
+/// `None` for a card it couldn't read.
 pub fn resolve_target_reading<'d>(
     devices: &'d [Device],
     sel: &Selector<'_>,
@@ -676,6 +678,7 @@ fn resolve<'d>(
                     .filter(|&i| {
                         devices[i].kind == DeviceKind::Token
                             && devices[i].reader.is_some()
+                            && devices[i].serial.is_empty()
                             && need.admits(&devices[i])
                     })
                     .filter(|&i| read(&devices[i]).is_some_and(|c| c.eq_ignore_ascii_case(s)))
@@ -1100,7 +1103,8 @@ mod tests {
     }
 
     /// A Molto2 as PC/SC lists it: its USB serial in the reader name, no
-    /// serial on the row (the card's own serial is read only on demand).
+    /// serial on the row (its scan read failed or was skipped; the card's
+    /// own serial is then read only on demand).
     fn molto_named() -> Device {
         row(
             None,
