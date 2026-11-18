@@ -36,6 +36,7 @@ tool. Workspace contains:
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management (status, GENERAL AUTHENTICATE, key-gen, cert import, PIN/PUK/mgmt-key, reset) + SPKI/PEM | `zeroize` |
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO management byte layer (APDU + HID framing, ECDH+AES seed encryption) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`), `getrandom`, `zeroize` |
+| `keyroost-feitianotp` | Pure-Rust Feitian OTP applet byte layer (APDU + TLV; `docs/PROTOCOL-feitianotp.md`) | `zeroize`; in-tree `keyroost-proto` |
 | `keyroost-token2prog` | Pure-Rust Token2 2nd-gen single-profile programmable-token protocol (SM4 seed/MAC, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints); no hardware | `serde`, `serde_json`, `getrandom` (per-computer salt); in-tree `keyroost-proto` (SHA-256) |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) and naming (on-key names, first-seen records); the AAGUID model table and the bundled FIDO metadata (MDS) the CLI and the app both show | `serde`/`serde_json` (the bundled MDS JSON); in-tree (incl. `keyroost-ctap`) |

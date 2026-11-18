@@ -102,6 +102,7 @@ fn may_pick_a_molto2(need: Need) -> bool {
         | Need::Otp
         | Need::OtpHid
         | Need::OtpCcid
+        | Need::FeitianOtp
         | Need::Prog
         | Need::FactoryReset => false,
     }

@@ -44,6 +44,9 @@ pub(crate) fn establish_context() -> Result<Context, PcscError> {
 mod oath;
 pub use oath::OathSession;
 
+mod feitianotp;
+pub use feitianotp::{FeitianOtpListing, FeitianOtpSession};
+
 mod ctap_pcsc;
 pub use ctap_pcsc::{CtapPcscDevice, WINDOWS_NEEDS_ADMIN};
 
@@ -318,6 +321,19 @@ pub enum TransportError {
     /// or delete a touch-required account, and answers `6982` when none comes
     /// in time. `action` is what was asked ("save the account", ...).
     OathNoTouch { action: &'static str },
+    /// A Feitian OTP applet response could not be parsed.
+    FeitianOtpParse(keyroost_feitianotp::ParseError),
+    /// A Feitian OTP command could not be built: the name or secret does not
+    /// fit, or the applet does not take the digits or period asked for.
+    FeitianOtpBuild(keyroost_feitianotp::BuildError),
+    /// A Feitian OTP CALCULATE, PUT or DELETE answered `6984` on every try:
+    /// the key acts once it is touched and gives up after a few seconds
+    /// without one. `action` is what was asked ("save the account", ...).
+    FeitianOtpNoTouch { action: &'static str },
+    /// A Feitian OTP command answered `6982` for `slot`. Feitian's software
+    /// uses that answer for a slot that has an access code; keyroost has no
+    /// way to enter one.
+    FeitianOtpAccessCode { slot: &'static str },
     /// The RSA key's public exponent is wider than the OpenPGP card's declared
     /// exponent field (`e_bits`). Caught before building the import (the pure
     /// builder would otherwise panic); guards against a malformed card
@@ -663,6 +679,21 @@ impl fmt::Display for TransportError {
                 f,
                 "the key would not {action} (SW=6982); it may want a touch: \
                  try again and touch the key when it blinks"
+            ),
+            TransportError::FeitianOtpParse(e) => {
+                write!(f, "Feitian OTP response parse error: {}", e)
+            }
+            TransportError::FeitianOtpBuild(e) => write!(f, "{}", e),
+            TransportError::FeitianOtpNoTouch { action } => write!(
+                f,
+                "the key did not {action} (SW=6984): it waits for a touch and none \
+                 came. Try again and touch the key when it blinks"
+            ),
+            TransportError::FeitianOtpAccessCode { slot } => write!(
+                f,
+                "the key refused (SW=6982) for slot {slot}. Feitian's software answers \
+                 this way for a slot protected by an access code, which keyroost \
+                 cannot enter"
             ),
             TransportError::OpenPgpExponentTooWide => write!(
                 f,
@@ -1213,6 +1244,9 @@ pub struct ReaderProbe {
     /// than guessing from the reader name, so the OTP tab is offered only for
     /// keys that really have it.
     pub has_otp: bool,
+    /// True when the card answers a SELECT of the Feitian OTP applet
+    /// (`D15600013283260101`), detected the same way.
+    pub has_feitian_otp: bool,
     /// True when the card answers the single-profile programmable token's
     /// `get_info` with a serial whose prefix matches a known model. Set during
     /// the same probe connection. The matched serial is carried in
@@ -1644,6 +1678,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                 has_fido: false,
                 fido_ctap2_confirmed: false,
                 has_otp: false,
+                has_feitian_otp: false,
                 is_prog: false,
                 prog_serial: None,
                 yubikey_serial: None,
@@ -1665,6 +1700,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
             has_fido: false,
             fido_ctap2_confirmed: false,
             has_otp: false,
+            has_feitian_otp: false,
             is_prog: false,
             prog_serial: None,
             yubikey_serial: None,
@@ -1735,6 +1771,10 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                 "otp",
                 keyroost_token2otp::build_select(&keyroost_token2otp::OTP_APPLET_AID),
             );
+            // Feitian OTP applet: selected by its own AID, like the others.
+            // A Feitian key answers the Yubico OATH AID above with 6700 or
+            // 6D00, so `has_oath` is already false for it.
+            probe.has_feitian_otp = answers("ftotp", keyroost_feitianotp::select());
             // Single-profile programmable token: it has no distinctive reader
             // name and no applet to SELECT, so identify it by its info response.
             // Only flag it when the returned serial matches a known model prefix

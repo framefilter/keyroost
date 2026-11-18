@@ -1,0 +1,211 @@
+# Feitian OTP applet wire protocol
+
+This document describes the protocol of the OTP (TOTP/HOTP) applet on Feitian
+FIDO security keys, as implemented by `keyroost-feitianotp`.
+
+It is a smart-card applet like the Yubico/Trussed OATH applet (`oath` group),
+and its commands have the same general shape, but it is a different protocol:
+its own AID, instruction bytes and tags, three slots, and no field for a TOTP
+period.
+
+## How each statement here is known
+
+Every fact below is marked with where it comes from:
+
+- **Measured**: seen in an exchange with a physical key.
+  - *Key A*: USB `096E:086A`, OTP applet 1.0.1. Read with Libre Key Companion
+    (Android, USB CCID), and with `keyroostctl` over PC/SC on Windows
+    (SELECT).
+  - *Key B*: Feitian ePass FIDO-NFC, USB `096E:0853`, OTP applet 1.0.2. Read
+    with Libre Key Companion (Android, USB CCID), over direct CCID, and with
+    `keyroostctl` over PC/SC on Windows (every `ftotp` command).
+- **Client**: what Feitian's own client applications send or expect. Not yet
+  exercised on hardware by this project.
+
+Codes were checked against references computed independently from the
+published RFC 4226 and RFC 6238 test seeds, written to Key B for the purpose.
+
+## Transport
+
+- **Interface:** the key's smart-card interface: CCID over USB, or NFC. The
+  applet is selected by AID. *(Measured.)*
+- **APDUs:** short ISO 7816. Both keys answer over T=1. *(Measured.)*
+- Feitian's desktop client can also carry the same APDUs over the FIDO HID
+  interface when no CCID reader is available. *(Client.)* `keyroost` does not.
+
+## Selecting the applet
+
+```
+00 A4 04 00 09  D1 56 00 01 32 83 26 01 01
+```
+
+The AID starts with Feitian's registered RID, `D1 56 00 01 32`. There is no
+`Le` byte. *(Measured, both keys.)*
+
+The answer is a flat run of TLVs with one-byte lengths:
+
+| Tag | Length | Meaning |
+|---|---|---|
+| `59` | 3 | Applet version: `01 00 02` is 1.0.2. *(Measured.)* |
+| `51` | 8 | A value Feitian's client calls the challenge and uses as the salt of a slot's access-code key. *(Length measured; use is Client.)* |
+| `7B` | 1 | One bit per slot that has an access code: bit 0 slot 1, bit 1 slot 2, bit 2 the default slot. Both keys answer `00`. *(Value measured; bit layout is Client.)* |
+
+Key A answered the same `51` value when it was first read and when it was
+read again on 2026-11-19. Two captures of Key B's model, taken a day apart
+(one with four accounts on the key, one with six), hold different values. It
+is not confirmed that both are of one physical key, so whether the value can
+change on a key is not established. Within a day it stayed the same across
+repeated SELECTs and card resets. *(Measured.)*
+
+These keys do not host the Yubico OATH applet. A SELECT of its AID
+(`A0 00 00 05 27 21 01`) is answered `6700` by Key A and `6D00` by Key B, not
+`6A82`. *(Measured.)*
+
+## Slots
+
+Every command after SELECT names a slot in P2.
+
+| P2 | Slot | |
+|---|---|---|
+| `F0` | default | Where Feitian's apps store codes. *(Measured: all credentials on both keys.)* |
+| `00` | 1 | Keyboard slot. *(LIST measured, empty on Key B; use is Client.)* |
+| `01` | 2 | Keyboard slot. *(Same.)* |
+
+A credential is identified by its slot and its stored name together.
+
+## Credential names
+
+The applet has no period field. Feitian's apps keep the period in the stored
+name, and so does `keyroost`:
+
+```
+TOTP:  30:issuer_#_account      60:issuer_#_account
+HOTP:  issuer_#_account
+```
+
+- A TOTP name starts with `30:` or `60:`; those are the only two periods.
+- Issuer and account are joined with `_#_`. With no issuer the account stands
+  alone.
+- An HOTP name has no prefix.
+
+*(Measured: every stored name on both keys has this form. That Feitian's apps
+write it this way is Client.)* A TOTP name with no prefix is read as a
+30-second credential; the card has nothing that says otherwise.
+
+CALCULATE and DELETE send the stored name back unchanged, prefix included.
+
+## Commands
+
+All commands use CLA `00`. Data is a run of TLVs with one-byte lengths.
+
+### LIST (`17`)
+
+```
+00 17 00 <slot> 00
+```
+
+The answer is one `52` TLV per credential, `52 <len> <kind|algorithm> <name>`.
+An empty slot answers `9000` with no data. *(Measured.)*
+
+The first value byte holds the kind in its high nibble and the algorithm in its
+low nibble:
+
+| Nibble | Value | Meaning |
+|---|---|---|
+| high | `1` | HOTP *(Measured, Key A)* |
+| high | `2` | TOTP *(Measured)* |
+| high | `3`, `4` | Static password, challenge-response *(Client; not handled, counted as skipped)* |
+| low | `1` | HMAC-SHA-1 *(Measured)* |
+| low | `2` | HMAC-SHA-256 *(Measured, Key B)* |
+
+Feitian's client answers a `6700` here by sending the four bytes `00 17 00 00`
+(no slot, no `Le`) and then asks no other slot. *(Client. Neither key returned
+`6700` to a LIST.)* `keyroost` does the same for the default slot only.
+
+### CALCULATE (`A2`)
+
+```
+00 A2 01 <slot> <Lc>  54 08 <time step, 8 bytes big-endian>  51 <len> <name>
+```
+
+P1 is `01`. For TOTP the challenge is `floor(unix time / period)`. The answer
+is
+
+```
+76 05 <digits> <4 bytes>
+```
+
+and the code is those four bytes with the top bit cleared, modulo
+`10^digits`, zero-padded (RFC 4226). *(Measured. On Key B, a SHA-1 6-digit
+30-second code and a SHA-256 8-digit 60-second code both matched the
+reference.)*
+
+The key computes the code once it is touched. With no touch it answers `6984`
+after about three and a half seconds. *(Measured, both keys.)* `keyroost`
+sends the command again a few times, so there is longer to reach the key.
+
+For HOTP the challenge is empty (`54 00`). A new credential's first code is
+the one for counter 0, and the key then moves its counter on. A CALCULATE
+answered `6984` does not move it. *(Measured, Key B: the first two codes
+matched RFC 4226's values for counters 0 and 1, with dozens of untouched
+tries before and between them.)*
+
+### PUT (`09`)
+
+```
+00 09 00 <slot> <Lc>  53 <len - 1> <algorithm> <kind> <digits> <secret>  51 <len> <name>
+```
+
+- `algorithm` is `01` (SHA-1) or `02` (SHA-256); `kind` is `10` (HOTP) or
+  `20` (TOTP); `digits` is 6 or 8.
+- The length byte of the `53` TLV is **one less** than the real length of its
+  value. Feitian's client writes it this way and so does `keyroost`.
+- There is no counter field: an HOTP credential starts at 0.
+- The secret is sent in the clear.
+- The key stores the credential once it is touched. With no touch it answers
+  `6984` and stores nothing.
+
+*(Measured, Key B, default slot: TOTP and HOTP credentials written this way
+by `keyroostctl` list back and compute the right codes. What the applet does
+with the true length in the `53` TLV has not been tried, nor what it does
+with a name it already holds: `keyroost` never sends one.)*
+
+### DELETE (`08`)
+
+```
+00 08 00 <slot> <Lc>  51 <len> <name>
+```
+
+The key removes the credential once it is touched. With no touch it answers
+`6984` and the credential stays. *(Measured, Key B, default slot.)*
+
+## Status words
+
+| SW | Meaning | |
+|---|---|---|
+| `9000` | Success | *Measured* |
+| `6984` | CALCULATE, PUT, DELETE: no touch arrived | *Measured* |
+| `6982` | The slot has an access code that must be presented first | *Client* |
+| `6700` | LIST: use the four-byte form | *Client* |
+| `6A84` | No space left | *Client* |
+| `6A82` | Credential not found | *Client* |
+
+## Limits
+
+| | Value | |
+|---|---|---|
+| Kinds | TOTP, HOTP | *Measured* |
+| Algorithms | SHA-1, SHA-256 | *Measured* |
+| Digits | 6 or 8 | *Both measured; that there is no other is Client* |
+| TOTP period | 30 or 60 seconds | *Measured* |
+| HOTP counter | starts at 0 | *Measured* |
+| Stored name | 64 bytes, prefix and separator included | Libre Key Companion's limit, the tightest of the known clients; the applet's own limit is not measured |
+| Secret | 64 bytes | Libre Key Companion's limit and the HMAC block size of both algorithms; longer is not measured |
+| Number of credentials | not known | |
+
+## Not implemented
+
+Known from Feitian's client and left out until measured: the applet's RESET
+(`07`), the per-slot access codes (`A3`), the touch flag a PUT can carry
+(`5C`), and the commands that swap the keyboard slots or pick which credential
+a slot types. Static passwords and challenge-response secrets are not handled.
