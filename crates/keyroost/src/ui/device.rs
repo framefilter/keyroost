@@ -23,6 +23,8 @@ pub enum CapTab {
     Pgp,
     Piv,
     Otp,
+    /// The Feitian OTP applet.
+    Ftotp,
 }
 
 /// The capability a tab manages, if it maps to one (`Overview` does not).
@@ -34,6 +36,7 @@ pub fn tab_cap(t: CapTab) -> Option<Caps> {
         CapTab::Pgp => Some(Caps::PGP),
         CapTab::Piv => Some(Caps::PIV),
         CapTab::Otp => Some(Caps::OTP),
+        CapTab::Ftotp => Some(Caps::FEITIAN_OTP),
     }
 }
 
@@ -81,6 +84,9 @@ impl DeviceView for Device {
         }
         if self.caps.has(Caps::OTP) {
             v.push(CapTab::Otp);
+        }
+        if self.caps.has(Caps::FEITIAN_OTP) {
+            v.push(CapTab::Ftotp);
         }
         v
     }
@@ -282,6 +288,18 @@ mod tests {
         d.caps.insert(Caps::U2F_ONLY);
         assert!(!d.tabs().contains(&CapTab::Fido2));
         assert!(d.tabs().contains(&CapTab::Overview));
+    }
+
+    /// A key with the Feitian OTP applet gets its tab; one without doesn't.
+    #[test]
+    fn feitian_otp_applet_gets_its_tab() {
+        let mut d = dev(false, false, KeyLabel::default());
+        assert!(!d.tabs().contains(&CapTab::Ftotp));
+        d.caps.insert(Caps::FEITIAN_OTP);
+        assert_eq!(d.tabs(), vec![CapTab::Overview, CapTab::Ftotp]);
+        // The tab stands for that capability (`Caps` has no `Debug`).
+        assert!(tab_cap(CapTab::Ftotp).is_some_and(|c| d.caps.has(c)));
+        assert!(!d.tab_unverified(CapTab::Ftotp));
     }
 
     /// A key whose FIDO protocol isn't known shows "FIDO2?" like an

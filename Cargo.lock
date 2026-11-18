@@ -1994,6 +1994,7 @@ dependencies = [
  "eframe",
  "egui",
  "keyroost-ctap",
+ "keyroost-feitianotp",
  "keyroost-hid",
  "keyroost-import",
  "keyroost-keyring",

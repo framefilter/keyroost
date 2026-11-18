@@ -7,6 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod ftotp_pane;
 mod hid_watch;
 mod import_flow;
 mod otp_pane;
@@ -18,6 +19,7 @@ mod qrscan;
 mod screengrab;
 mod settings;
 mod ui;
+use ftotp_pane::FtotpState;
 use otp_pane::OtpState;
 use settings::{Settings, SidebarSetting};
 use ui::device::{self, CapState, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
@@ -620,6 +622,8 @@ enum Reread {
     Piv,
     Pgp,
     Otp,
+    /// The Feitian OTP account list.
+    Ftotp,
     /// The FIDO2 passkey list (unlocked key).
     Passkeys,
     /// The FIDO2 fingerprint list (unlocked key).
@@ -5053,6 +5057,8 @@ struct App {
     piv_compat_ignored: std::collections::HashSet<DeviceId>,
     /// Token2 on-device OTP (TOTP/HOTP) view state.
     otp: OtpState,
+    /// Feitian OTP (TOTP/HOTP) view state.
+    ftotp: FtotpState,
     /// Dark / light theme (persisted via eframe storage).
     mode: Mode,
     /// Accent index into `Palette::ACCENTS` (persisted).
@@ -5089,6 +5095,8 @@ struct App {
     piv_tried: bool,
     /// Same guard for the OTP pane's auto-read.
     otp_tried: bool,
+    /// Same guard for the Feitian OTP pane's auto-read.
+    ftotp_tried: bool,
     /// Same guard for the OpenPGP pane's auto-read.
     pgp_tried: bool,
     /// A Refresh click is waiting for its rescan: when the scan lands with the
@@ -6951,6 +6959,7 @@ impl App {
             || self.otp.pin.is_some()
             || self.otp.rows.iter().any(|r| r.code.is_some())
             || !self.otp.touch_codes.is_empty()
+            || self.ftotp.has_codes()
     }
 
     /// Whether a dialog holds what a typed password opened: the entries of a
@@ -6983,6 +6992,7 @@ impl App {
         out.push(&mut self.reset_mgmt_auth_input);
         out.extend(self.oath.secrets_mut());
         out.extend(self.otp.secrets_mut());
+        out.extend(self.ftotp.secrets_mut());
         out.extend(self.openpgp.secrets_mut());
         out.extend(self.piv.secrets_mut());
         out.push(&mut *self.prog_seed_input);
@@ -7135,6 +7145,12 @@ impl App {
             self.otp.info = Some(idle_locked_msg());
         } else if otp_codes {
             self.otp.info = Some(format!("{} Refresh to show them again.", idle_hidden_msg()));
+        }
+        // Feitian OTP codes each came from a touch: reading one again takes
+        // another.
+        if self.ftotp.has_codes() {
+            self.ftotp.forget_codes();
+            self.ftotp.info = Some(idle_hidden_msg());
         }
         self.log(
             Severity::Info,
@@ -11597,6 +11613,7 @@ impl App {
             CapTab::Piv => Reread::Piv,
             CapTab::Pgp => Reread::Pgp,
             CapTab::Otp => Reread::Otp,
+            CapTab::Ftotp => Reread::Ftotp,
             CapTab::Fido2 => match self.security_keys.subview {
                 FidoSubview::LargeBlobs => Reread::LargeBlobs,
                 // Both lists need an unlocked key; locked, the key's info
@@ -11618,6 +11635,7 @@ impl App {
             Reread::Piv => self.load_piv_status_with_cache(LogKind::User, PivCache::Bypass),
             Reread::Pgp => self.load_openpgp_status(),
             Reread::Otp => self.refresh_otp(),
+            Reread::Ftotp => self.refresh_ftotp(),
             Reread::Passkeys => self.refresh_credentials(),
             Reread::Fingerprints => self.refresh_fingerprints(),
             Reread::LargeBlobs => {
@@ -11942,8 +11960,12 @@ impl App {
         self.oath_tried = false;
         self.piv_tried = false;
         self.otp_tried = false;
+        self.ftotp_tried = false;
         self.pgp_tried = false;
         self.otp = OtpState::default();
+        // Replaced whole: its typed seed, shown codes and pending delete
+        // confirmation all belong to the key that was selected.
+        self.ftotp = FtotpState::default();
         self.molto_reset_confirm = false;
         self.molto_delete_confirm = false;
         self.close_rename();
@@ -14930,6 +14952,7 @@ fn cap_tab_label(t: CapTab) -> &'static str {
         CapTab::Pgp => "OpenPGP",
         CapTab::Piv => "PIV",
         CapTab::Otp => "On-device OTP",
+        CapTab::Ftotp => "Feitian OTP",
     }
 }
 
@@ -17043,6 +17066,9 @@ impl eframe::App for App {
                     .rows
                     .iter()
                     .any(|r| r.type_str.eq_ignore_ascii_case("TOTP") && r.code.is_some()))
+            // A Feitian OTP code's countdown, and its removal when the
+            // window ends.
+            || (matches!(self.cap_tab, CapTab::Ftotp) && self.ftotp.shows_totp_code())
             || self
                 .selected_device()
                 .is_some_and(|d| d.kind == DeviceKind::Token);
@@ -18779,6 +18805,7 @@ impl App {
                                             CapTab::Pgp => self.cap_pgp(ui, p),
                                             CapTab::Piv => self.cap_piv(ui, p),
                                             CapTab::Otp => self.cap_otp(ui, p),
+                                            CapTab::Ftotp => self.cap_ftotp(ui, p),
                                         }
                                         // Breathing room below the last card.
                                         ui.add_space(18.0);
@@ -19798,6 +19825,42 @@ impl App {
                     } else {
                         ui.label(
                             egui::RichText::new("Open On-device OTP to view stored entries.")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt3),
+                        );
+                    }
+                });
+            }
+            if dev.caps.has(Caps::FEITIAN_OTP) {
+                ui.add_space(14.0);
+                theme::card_frame(p).show(ui, |ui| {
+                    if self.card_head(ui, p, "Feitian OTP", "ftotp") {
+                        self.cap_tab = CapTab::Ftotp;
+                    }
+                    ui.add_space(8.0);
+                    if self.ftotp.loaded && !self.ftotp.rows.is_empty() {
+                        let total = self.ftotp.rows.len();
+                        for row in self.ftotp.rows.iter().take(2) {
+                            ui.horizontal(|ui| {
+                                theme::pill(ui, row.type_str(), p.txt2, p.raised2);
+                                ui.label(
+                                    egui::RichText::new(row.label())
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt2),
+                                );
+                            });
+                            ui.add_space(4.0);
+                        }
+                        if total > 2 {
+                            ui.label(
+                                egui::RichText::new(format!("+{} more accounts", total - 2))
+                                    .font(theme::f_reg(12.5))
+                                    .color(p.txt3),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Open Feitian OTP to view stored accounts.")
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt3),
                         );
@@ -34737,6 +34800,35 @@ mod tests {
             .info
             .as_deref()
             .is_some_and(|m| m.starts_with(&idle_hidden_msg())));
+        assert!(!app.holds_unlocked_secrets());
+    }
+
+    /// A Feitian OTP code, each read with a touch, is held the same way; the
+    /// list it sits in stays, and a seed left in that pane's add form goes
+    /// with the other typed secrets.
+    #[test]
+    fn idle_lock_wipes_feitian_otp_codes_and_a_typed_seed() {
+        let mut app = App::default();
+        app.ftotp.rows = vec![ftotp_pane::FtotpRow {
+            slot: keyroost_feitianotp::Slot::Default,
+            stored: "30:Example_#_alice".into(),
+            issuer: Some("Example".into()),
+            account: "alice".into(),
+            hotp: false,
+            sha256: false,
+            period: 30,
+            code: Some("112233".into()),
+            code_window: Some(1),
+        }];
+        app.ftotp.add.secret = "JBSWY3DP".into();
+        assert!(app.holds_unlocked_secrets());
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+        assert!(!app.ftotp.has_codes());
+        assert_eq!(app.ftotp.rows.len(), 1, "only the code goes");
+        assert!(app.ftotp.add.secret.is_empty());
+        assert_eq!(app.ftotp.info, Some(idle_hidden_msg()));
         assert!(!app.holds_unlocked_secrets());
     }
 
