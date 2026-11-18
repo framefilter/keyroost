@@ -11,7 +11,7 @@
 //! supplied), so [`Token2ProgSession::authenticate`] takes no arguments.
 
 use keyroost_token2prog::{self as prog, Command};
-use pcsc::{Card, Protocols, ShareMode};
+use pcsc::Card;
 
 use crate::{trace, TransportError};
 use keyroost_proto::trace::{format_line, Dir};
@@ -36,7 +36,7 @@ impl Token2ProgSession {
         let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let cstring = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let card = ctx.connect(&cstring, ShareMode::Shared, Protocols::ANY)?;
+        let card = crate::connect_shared(&ctx, &cstring)?;
         Ok(Self {
             card,
             authenticated: false,

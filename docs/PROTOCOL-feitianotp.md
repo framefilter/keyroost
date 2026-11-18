@@ -32,6 +32,16 @@ published RFC 4226 and RFC 6238 test seeds, written to Key B for the purpose.
 - **APDUs:** short ISO 7816. Both keys answer over T=1. *(Measured.)*
 - Feitian's desktop client can also carry the same APDUs over the FIDO HID
   interface when no CCID reader is available. *(Client.)* `keyroost` does not.
+- **Windows:** Key B's card can stay unresponsive after plug-in. The reader's
+  cold reset fails, and connecting answers `SCARD_W_UNRESPONSIVE_CARD`, or
+  `SCARD_E_PROTO_MISMATCH` about ten seconds after a warm reset. This is the
+  whole card, not this applet: OpenPGP and PIV on the key go undetected too. A
+  warm reset over a direct connection (`IOCTL_SMARTCARD_POWER` with
+  `SCARD_WARM_RESET`) brings the card up, and `keyroost` does that once, for a
+  Feitian reader, before it gives up. *(Measured on one PC, Windows 11 with the
+  inbox CCID driver: no applet detected without the retry, all three with it.
+  Key A connected without it there. Reported on other PCs. Why the cold reset
+  fails is not established.)*
 
 ## Selecting the applet
 

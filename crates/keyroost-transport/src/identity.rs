@@ -10,8 +10,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use pcsc::{Protocols, ShareMode};
-
 use crate::trace;
 use keyroost_proto::trace::{format_line, Dir};
 
@@ -226,7 +224,7 @@ pub fn ccid_applet_read(
     let shown = keyroost_proto::trace::reader_name(reader);
     let ctx = crate::establish_context().ok()?;
     let name = std::ffi::CString::new(reader).ok()?;
-    let card = match ctx.connect(&name, ShareMode::Shared, Protocols::ANY) {
+    let card = match crate::connect_shared(&ctx, &name) {
         Ok(c) => c,
         Err(e) => {
             trace::line(debug, || {

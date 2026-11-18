@@ -110,8 +110,7 @@ impl CtapPcscDevice {
             .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?;
         let cname = std::ffi::CString::new(reader_name)
             .map_err(|_| CtapError::Transport("reader name contains NUL".into()))?;
-        let card = ctx
-            .connect(&cname, ShareMode::Shared, Protocols::ANY)
+        let card = crate::connect_shared(&ctx, &cname)
             .map_err(|e| CtapError::Transport(format!("connect to reader failed: {e}")))?;
         let mut dev = CtapPcscDevice {
             card: Some(card),
@@ -140,8 +139,7 @@ impl CtapPcscDevice {
             .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?;
         let cname = std::ffi::CString::new(reader_name)
             .map_err(|_| CtapError::Transport("reader name contains NUL".into()))?;
-        let mut card = ctx
-            .connect(&cname, ShareMode::Shared, Protocols::ANY)
+        let mut card = crate::connect_shared(&ctx, &cname)
             .map_err(|e| CtapError::Transport(format!("connect to reader failed: {e}")))?;
         card.reconnect(
             ShareMode::Shared,
@@ -172,7 +170,7 @@ impl CtapPcscDevice {
             .collect();
         let mut out = Vec::new();
         for name in names {
-            if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+            if let Ok(card) = crate::connect_shared(&ctx, name.as_c_str()) {
                 let mut dev = CtapPcscDevice {
                     card: Some(card),
                     selected_version: Vec::new(),
