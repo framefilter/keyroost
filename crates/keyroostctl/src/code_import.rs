@@ -15,8 +15,8 @@ use keyroost_proto::commands::DisplayTimeout;
 use keyroost_qr::file::{OpenError, Opened, MAX_FILE_BYTES};
 use keyroost_resolve::{Device, Need, SelectError};
 use keyroost_transport::import::{
-    read_molto_existing, read_oath_existing, read_token2_existing, MoltoImportStore,
-    OathImportStore, Token2ImportStore,
+    read_feitian_existing, read_molto_existing, read_oath_existing, read_token2_existing,
+    FeitianImportStore, MoltoImportStore, OathImportStore, Token2ImportStore,
 };
 use keyroost_transport::Session;
 
@@ -578,6 +578,52 @@ fn to_otp(
     write_and_report(file, &again, &mut writer)
 }
 
+/// `ftotp import`: into the Feitian OTP applet's default slot, on the same
+/// plan, preview, question, write and report as the other imports. The file
+/// password is the only secret (the applet has no password of its own that
+/// keyroost can enter). Order: check its source, read the file, select and
+/// announce the key, read the key, plan and preview, ask once, re-check the
+/// key, write, report.
+pub(crate) fn run_feitian_import(
+    reader: Option<&str>,
+    file: &Path,
+    file_password: Option<&SecretSource>,
+    replace: bool,
+    dry_run: bool,
+    yes: bool,
+    debug: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut sec = Secrets::real();
+    if file_password.is_some() {
+        sec.check(&FILE_PASSWORD, Source::from_flag(file_password))?;
+    }
+    let import = read_import_file(&mut sec, file, file_password)?;
+    let shown = Shown::new(file, &import, dry_run, yes);
+    // This store has no per-code touch setting to pick.
+    let how = How {
+        replace,
+        touch: TouchPick::new(false, &[]),
+    };
+    let dev = crate::target::select(Need::FeitianOtp, reader, None)?;
+    crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
+    let reader = crate::target::reader_of(&dev)?;
+    let open = || keyroost_transport::FeitianOtpSession::open_traced(&reader, debug);
+    let existing = read_feitian_existing(&mut open()?)?; // closed before the question
+    let first = how.plan(&import, Store::FeitianOtp, existing);
+    let Some(asked) = preview_and_ask(&dev, &shown, &first, KeyView::READ)? else {
+        return Ok(());
+    };
+    crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
+    let mut session = open()?;
+    let existing = read_feitian_existing(&mut session)?;
+    let again = how.plan(&import, Store::FeitianOtp, existing.clone());
+    recheck(&first, &again)?;
+    // The key stores each code once it is touched.
+    crate::prompt::touch("Writing \u{2014} touch the key for each code as it blinks\u{2026}");
+    let mut writer = FeitianImportStore::new(&mut session, &existing);
+    write_and_report(&import, &again, &mut writer)
+}
+
 /// The name column never grows past this many characters, so a long name
 /// can't push its reason off the screen; a longer name gets its reason on
 /// the next line.
@@ -612,6 +658,7 @@ impl KeyView<'static> {
 fn store_words(store: Store, first_slot: u8) -> String {
     match store {
         Store::Token2Otp => " OTP".to_owned(),
+        Store::FeitianOtp => " Feitian OTP".to_owned(),
         Store::Oath(_) => " OATH".to_owned(),
         Store::Molto2 => format!(", slots #{first_slot:02} to #99"),
     }
@@ -809,6 +856,7 @@ pub(crate) fn import_json(
     ImportJson {
         destination: match plan.store {
             Store::Token2Otp => "otp",
+            Store::FeitianOtp => "ftotp",
             Store::Molto2 => "molto2",
             Store::Oath(_) => "oath",
         },

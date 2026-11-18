@@ -14,7 +14,7 @@ use crate::recover::{self, FirstContact};
 use crate::{trace, TransportError};
 use keyroost_openpgp as pgp;
 use keyroost_proto::trace::{format_line, Dir};
-use pcsc::{Card, Protocols, ShareMode};
+use pcsc::Card;
 use zeroize::Zeroizing;
 
 /// `SW 6A82`: selected file/application not found — i.e. no OpenPGP applet.
@@ -192,7 +192,7 @@ impl OpenPgpSession {
         let mut contact = FirstContact::new(reader_name, debug, "openpgp");
         loop {
             let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
-            let card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
+            let card = match crate::connect_shared(&ctx, &cstr) {
                 Ok(card) => card,
                 Err(e) => {
                     contact.retry_or_fail(e.into())?;
@@ -231,7 +231,7 @@ impl OpenPgpSession {
             .collect();
         let mut out = Vec::new();
         for name in names {
-            if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+            if let Ok(card) = crate::connect_shared(&ctx, name.as_c_str()) {
                 let mut session = OpenPgpSession { card, debug: false };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());

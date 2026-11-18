@@ -41,8 +41,71 @@ pub(crate) fn establish_context() -> Result<Context, PcscError> {
     Context::establish(Scope::User)
 }
 
+/// Connect to `reader`, shared, on any protocol: what every session and
+/// probe here does first.
+///
+/// On Windows the card of a Feitian ePass FIDO-NFC (USB `096E:0853`, reader
+/// "FS CCID 0") can stay unresponsive after plug-in: the reader's cold reset
+/// fails, and `SCardConnect` answers `SCARD_W_UNRESPONSIVE_CARD`, or
+/// `SCARD_E_PROTO_MISMATCH` some ten seconds after an earlier warm reset.
+/// Nothing on the key is reachable then: OpenPGP, PIV and Feitian OTP all go
+/// undetected. A warm reset on a direct connection brings the card up. So
+/// on Windows, for a Feitian reader, either of those two errors gets one
+/// warm reset and one more try; every other reader, error and outcome is
+/// returned as it came.
+///
+/// Measured on one PC (Windows 11, the inbox CCID driver), where the same
+/// key went from no applet detected to all three with this retry; reported
+/// on other PCs. A Feitian key with USB `096E:086A` connected without it
+/// there. Why the cold reset fails is not established.
+pub(crate) fn connect_shared(
+    context: &Context,
+    reader: &std::ffi::CStr,
+) -> Result<Card, PcscError> {
+    let first = context.connect(reader, ShareMode::Shared, Protocols::ANY);
+    #[cfg(windows)]
+    if matches!(
+        first,
+        Err(PcscError::UnresponsiveCard | PcscError::ProtoMismatch)
+    ) && is_feitian_reader(&reader.to_string_lossy())
+        && warm_reset(context, reader)
+    {
+        return context.connect(reader, ShareMode::Shared, Protocols::ANY);
+    }
+    first
+}
+
+/// A Feitian key's own reader, by the names Windows gives them ("FS CCID 0",
+/// "FT CCID 0").
+#[cfg(windows)]
+fn is_feitian_reader(name: &str) -> bool {
+    name.starts_with("FS CCID") || name.starts_with("FT CCID")
+}
+
+/// Warm-reset the card in `reader` over a direct connection, which needs no
+/// card protocol, and release it without a further reset. `false` when the
+/// reader can't be opened that way or refuses the reset.
+#[cfg(windows)]
+fn warm_reset(context: &Context, reader: &std::ffi::CStr) -> bool {
+    let Ok(card) = context.connect(reader, ShareMode::Direct, Protocols::UNDEFINED) else {
+        return false;
+    };
+    // IOCTL_SMARTCARD_POWER is control function 1; its argument 2 is
+    // SCARD_WARM_RESET.
+    let mut answer = [0u8; 64];
+    let ok = card
+        .control(pcsc::ctl_code(1), &2u32.to_le_bytes(), &mut answer)
+        .is_ok();
+    // pcsc's `Drop` would reset the card again.
+    let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+    ok
+}
+
 mod oath;
 pub use oath::OathSession;
+
+mod feitianotp;
+pub use feitianotp::{FeitianOtpListing, FeitianOtpSession};
 
 mod ctap_pcsc;
 pub use ctap_pcsc::{CtapPcscDevice, WINDOWS_NEEDS_ADMIN};
@@ -318,6 +381,19 @@ pub enum TransportError {
     /// or delete a touch-required account, and answers `6982` when none comes
     /// in time. `action` is what was asked ("save the account", ...).
     OathNoTouch { action: &'static str },
+    /// A Feitian OTP applet response could not be parsed.
+    FeitianOtpParse(keyroost_feitianotp::ParseError),
+    /// A Feitian OTP command could not be built: the name or secret does not
+    /// fit, or the applet does not take the digits or period asked for.
+    FeitianOtpBuild(keyroost_feitianotp::BuildError),
+    /// A Feitian OTP CALCULATE, PUT or DELETE answered `6984` on every try:
+    /// the key acts once it is touched and gives up after a few seconds
+    /// without one. `action` is what was asked ("save the account", ...).
+    FeitianOtpNoTouch { action: &'static str },
+    /// A Feitian OTP command answered `6982` for `slot`. Feitian's software
+    /// uses that answer for a slot that has an access code; keyroost has no
+    /// way to enter one.
+    FeitianOtpAccessCode { slot: &'static str },
     /// The RSA key's public exponent is wider than the OpenPGP card's declared
     /// exponent field (`e_bits`). Caught before building the import (the pure
     /// builder would otherwise panic); guards against a malformed card
@@ -664,6 +740,21 @@ impl fmt::Display for TransportError {
                 "the key would not {action} (SW=6982); it may want a touch: \
                  try again and touch the key when it blinks"
             ),
+            TransportError::FeitianOtpParse(e) => {
+                write!(f, "Feitian OTP response parse error: {}", e)
+            }
+            TransportError::FeitianOtpBuild(e) => write!(f, "{}", e),
+            TransportError::FeitianOtpNoTouch { action } => write!(
+                f,
+                "the key did not {action} (SW=6984): it waits for a touch and none \
+                 came. Try again and touch the key when it blinks"
+            ),
+            TransportError::FeitianOtpAccessCode { slot } => write!(
+                f,
+                "the key refused (SW=6982) for slot {slot}. Feitian's software answers \
+                 this way for a slot protected by an access code, which keyroost \
+                 cannot enter"
+            ),
             TransportError::OpenPgpExponentTooWide => write!(
                 f,
                 "the key's RSA public exponent is wider than this OpenPGP card's \
@@ -826,7 +917,7 @@ impl Session {
         let name = readers
             .find(|r| keyroost_proto::is_molto2_reader(&r.to_string_lossy()))
             .ok_or(TransportError::NoMolto2Reader)?;
-        let card = ctx.connect(name, ShareMode::Shared, Protocols::ANY)?;
+        let card = crate::connect_shared(&ctx, name)?;
         Ok(Self {
             card,
             sm4_key: None,
@@ -840,7 +931,7 @@ impl Session {
         let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let cstring = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let card = ctx.connect(&cstring, ShareMode::Shared, Protocols::ANY)?;
+        let card = crate::connect_shared(&ctx, &cstring)?;
         Ok(Self {
             card,
             sm4_key: None,
@@ -1114,7 +1205,7 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
     for (name, (tree_key, _)) in names.into_iter().zip(tree) {
         let reader_name = name.to_string_lossy().into_owned();
         let (mut usb_device, mut serial) = (tree_key, None);
-        if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+        if let Ok(card) = crate::connect_shared(&ctx, name.as_c_str()) {
             // Windows reports no bus/address here; its evidence is the device
             // tree read above, without a connection.
             if !cfg!(windows) {
@@ -1161,9 +1252,7 @@ pub fn reader_usb_devices() -> Result<Vec<Option<UsbDeviceKey>>, TransportError>
             if cfg!(windows) || keyroost_proto::is_molto2_reader(&name.to_string_lossy()) {
                 return tree_key;
             }
-            let card = ctx
-                .connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY)
-                .ok()?;
+            let card = crate::connect_shared(&ctx, name.as_c_str()).ok()?;
             let key = read_channel_id(&card);
             // Release without resetting (pcsc's `Drop` would reset the card).
             let _ = card.disconnect(pcsc::Disposition::LeaveCard);
@@ -1213,6 +1302,9 @@ pub struct ReaderProbe {
     /// than guessing from the reader name, so the OTP tab is offered only for
     /// keys that really have it.
     pub has_otp: bool,
+    /// True when the card answers a SELECT of the Feitian OTP applet
+    /// (`D15600013283260101`), detected the same way.
+    pub has_feitian_otp: bool,
     /// True when the card answers the single-profile programmable token's
     /// `get_info` with a serial whose prefix matches a known model. Set during
     /// the same probe connection. The matched serial is carried in
@@ -1542,7 +1634,7 @@ fn read_molto2_serial(
     ctx: &pcsc::Context,
     name: &std::ffi::CStr,
 ) -> Result<String, TransportError> {
-    let card = ctx.connect(name, ShareMode::Shared, Protocols::ANY)?;
+    let card = crate::connect_shared(ctx, name)?;
     let answer = transmit_apdu(&card, &commands::get_info().apdu);
     let _ = card.disconnect(pcsc::Disposition::LeaveCard);
     let (data, sw1, sw2) = answer?;
@@ -1644,6 +1736,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                 has_fido: false,
                 fido_ctap2_confirmed: false,
                 has_otp: false,
+                has_feitian_otp: false,
                 is_prog: false,
                 prog_serial: None,
                 yubikey_serial: None,
@@ -1665,6 +1758,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
             has_fido: false,
             fido_ctap2_confirmed: false,
             has_otp: false,
+            has_feitian_otp: false,
             is_prog: false,
             prog_serial: None,
             yubikey_serial: None,
@@ -1678,7 +1772,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                 keyroost_proto::trace::reader_name(&probe.reader_name)
             ));
         }
-        if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+        if let Ok(card) = crate::connect_shared(&ctx, name.as_c_str()) {
             // Windows reports no bus/address here; its evidence is the device
             // tree read above, without a connection.
             if !cfg!(windows) {
@@ -1735,6 +1829,10 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                 "otp",
                 keyroost_token2otp::build_select(&keyroost_token2otp::OTP_APPLET_AID),
             );
+            // Feitian OTP applet: selected by its own AID, like the others.
+            // A Feitian key answers the Yubico OATH AID above with 6700 or
+            // 6D00, so `has_oath` is already false for it.
+            probe.has_feitian_otp = answers("ftotp", keyroost_feitianotp::select());
             // Single-profile programmable token: it has no distinctive reader
             // name and no applet to SELECT, so identify it by its info response.
             // Only flag it when the returned serial matches a known model prefix
@@ -2568,6 +2666,24 @@ mod reader_poll_tests {
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    /// The warm-reset retry is for a Feitian key's own reader only: no
+    /// other reader is reset because a connect failed.
+    #[cfg(windows)]
+    #[test]
+    fn only_feitian_readers_get_the_warm_reset_retry() {
+        assert!(is_feitian_reader("FS CCID 0"));
+        assert!(is_feitian_reader("FT CCID 1"));
+        for other in [
+            "Yubico YubiKey OTP+FIDO+CCID 0",
+            "TOKEN2 Molto2 0",
+            "FSCCID 0",
+            "Generic FS CCID 0",
+            "",
+        ] {
+            assert!(!is_feitian_reader(other), "{other}");
+        }
+    }
 
     #[test]
     fn fido_select_names_ctap2_by_prefix() {

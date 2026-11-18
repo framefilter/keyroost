@@ -22,6 +22,7 @@ keyroost-proto = { path = "../keyroost-proto", version = "0.16.0" }
 keyroost-transport = { path = "../keyroost-transport", version = "0.16.0" }
 keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.16.0" }
 keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.16.0" }
+keyroost-feitianotp = { path = "../keyroost-feitianotp", version = "0.16.0" }
 keyroost-piv = { path = "../keyroost-piv", version = "0.16.0" }
 keyroost-pivtest = { path = "../keyroost-pivtest", version = "0.16.0" }
 # PKCS#12 (.p12/.pfx) reading for "Import key from file" (#174); shared with

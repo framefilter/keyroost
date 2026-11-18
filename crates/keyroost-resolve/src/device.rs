@@ -39,6 +39,9 @@ impl Caps {
     /// whose FIDO SELECT didn't name CTAP2 is only marked unverified, not
     /// this: it keeps its FIDO2 reset step.
     pub const FIDO_PROTOCOL_UNKNOWN: Caps = Caps(1 << 8);
+    /// The OTP applet on Feitian FIDO keys (the `ftotp` group): its own
+    /// protocol, neither the OATH applet nor Token2's.
+    pub const FEITIAN_OTP: Caps = Caps(1 << 9);
 
     pub fn has(self, c: Caps) -> bool {
         self.0 & c.0 != 0
@@ -193,6 +196,7 @@ impl Device {
             (Caps::PGP, "PGP"),
             (Caps::PIV, "PIV"),
             (Caps::OTP, "OTP"),
+            (Caps::FEITIAN_OTP, "FTOTP"),
         ] {
             if self.caps.has(c) {
                 v.push((label, self.cap_state(c)));
@@ -768,6 +772,9 @@ pub fn correlate_with(
         }
         if p.has_otp {
             caps.insert(Caps::OTP);
+        }
+        if p.has_feitian_otp {
+            caps.insert(Caps::FEITIAN_OTP);
         }
         if caps.is_empty() {
             continue;
@@ -2108,6 +2115,7 @@ mod tests {
             has_fido: false,
             fido_ctap2_confirmed: false,
             has_otp: false,
+            has_feitian_otp: false,
             is_prog: false,
             prog_serial: None,
             yubikey_serial: yk_serial.map(str::to_owned),
