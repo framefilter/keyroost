@@ -28296,6 +28296,32 @@ impl App {
         }
     }
 
+    /// Fill the Feitian OTP add-form fields from a scanned screen QR. A
+    /// digit count the applet doesn't take (4 or 10) is left as scanned: the
+    /// form's own check refuses it on Add, in words.
+    #[cfg(feature = "qr")]
+    fn ftotp_scan_qr(&mut self) {
+        match self.scan_qr_parsed() {
+            Ok((secret, parsed)) => {
+                self.ftotp.add.secret = secret;
+                if let Some(issuer) = &parsed.issuer {
+                    self.ftotp.add.issuer = issuer.clone();
+                }
+                if let Some(account) = &parsed.account {
+                    self.ftotp.add.account = account.clone();
+                }
+                self.ftotp.add.sha256 = matches!(parsed.algorithm, HmacAlgo::Sha256);
+                self.ftotp.add.digits = parsed.digits as u8;
+                self.ftotp.add.period = match parsed.time_step {
+                    TimeStep::Seconds30 => 30,
+                    TimeStep::Seconds60 => 60,
+                };
+                self.ftotp.add.totp = true; // otpauth://totp
+            }
+            Err(e) => self.log(Severity::Err, format!("scan QR: {e}")),
+        }
+    }
+
     /// Scan a TOTP QR from the screen and fill the prog seed form from it.
     #[cfg(feature = "qr")]
     fn prog_scan_qr(&mut self) {

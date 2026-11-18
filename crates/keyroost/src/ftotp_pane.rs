@@ -867,6 +867,15 @@ impl App {
                     }
                     ui.end_row();
 
+                    #[cfg(feature = "qr")]
+                    {
+                        ui.label("");
+                        if crate::scan_qr_button(ui, p) {
+                            self.ftotp_scan_qr();
+                        }
+                        ui.end_row();
+                    }
+
                     ui.label("Type");
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.ftotp.add.totp, true, "TOTP");
