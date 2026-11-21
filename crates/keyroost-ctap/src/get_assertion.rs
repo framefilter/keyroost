@@ -68,7 +68,9 @@ pub struct GetAssertionRequest<'a> {
     pub hmac: Option<(&'a HmacSecretSession, [u8; 32])>,
     pub large_blob_key: bool,
     /// User presence. `false` sends options `{"up": false}`; `true` (the
-    /// spec default) sends no options at all.
+    /// spec default) sends no options at all. `hmac-secret` needs `true`:
+    /// authenticators refuse it without user presence (CTAP 2.1 §12.5), so
+    /// [`get_assertions`] rejects that combination before sending.
     pub up: bool,
     /// The pinUvAuthToken and the pinUvAuthProtocol (1 or 2) it was obtained
     /// under; the protocol must match the token's own.
@@ -338,6 +340,13 @@ fn check_request(info: &AuthenticatorInfo, req: &GetAssertionRequest) -> Result<
             ));
         }
     }
+    // CTAP 2.1 §12.5: an authenticator answers hmac-secret with
+    // {"up": false} with CTAP2_ERR_UNSUPPORTED_OPTION, every time.
+    if req.hmac.is_some() && !req.up {
+        return Err(CtapError::InvalidArgument(
+            "hmac-secret needs user presence (up)",
+        ));
+    }
     let has = |ext: &str| info.extensions.iter().any(|e| e == ext);
     if req.hmac.is_some() && !has(EXT_HMAC_SECRET) {
         return Err(CtapError::Unsupported(
@@ -496,7 +505,7 @@ mod tests {
             allow: Some(&[0xca, 0xfe]),
             hmac: Some((session, SALT)),
             large_blob_key: true,
-            up: false,
+            up: true,
             pin_uv_auth: Some((token, PIN_PROTOCOL_V1)),
         }
     }
@@ -507,7 +516,7 @@ mod tests {
     /// - saltAuth = HMAC-SHA-256(key = 32 x 0x42, saltEnc)[..16]
     /// - pinUvAuthParam = HMAC-SHA-256(key = 16 x 0x5a, 32 x 0x11)[..16]
     const EXPECTED_KAT: &str = concat!(
-        "a7",
+        "a6",
         // 1: rpId "fido2-vault.token2"
         "01 72 6669646f322d7661756c742e746f6b656e32",
         // 2: clientDataHash
@@ -521,8 +530,7 @@ mod tests {
         "02 5820 a95faacb949e1a813357e3b0f300dd0b56d0f4e29dd91fcb6cc1ea1266727823",
         "03 50 c58685e15118f9b41fa62393e080ff30",
         "6c 6c61726765426c6f624b6579 f5",
-        // 5: options {"up": false}
-        "05 a1 627570 f4",
+        // (no 5: up = true is the default, so no options are sent)
         // 6: pinUvAuthParam
         "06 50 e2019a86620dd331caf307ac4dec120d",
         // 7: pinUvAuthProtocol
@@ -566,6 +574,21 @@ mod tests {
             "01 6161",
             "02 5820 2222222222222222222222222222222222222222222222222222222222222222",
             "04 a1 6c 6c61726765426c6f624b6579 f5",
+        ));
+        assert_eq!(encode_get_assertion(&req), expected);
+
+        // up = false (without hmac-secret, which needs presence) sends
+        // options {"up": false}.
+        let req = GetAssertionRequest {
+            up: false,
+            large_blob_key: false,
+            ..req
+        };
+        let expected = unhex(concat!(
+            "a3",
+            "01 6161",
+            "02 5820 2222222222222222222222222222222222222222222222222222222222222222",
+            "05 a1 627570 f4",
         ));
         assert_eq!(encode_get_assertion(&req), expected);
     }
@@ -1036,6 +1059,45 @@ mod tests {
         let err = get_assertions(&mut dev, &full_info(), &req).unwrap_err();
         assert!(matches!(err, CtapError::InvalidArgument(_)), "{err:?}");
         assert!(dev.requests.is_empty());
+    }
+
+    #[test]
+    fn hmac_secret_without_user_presence_is_refused_before_sending() {
+        // CTAP 2.1 §12.5: hmac-secret with {"up": false} always fails with
+        // CTAP2_ERR_UNSUPPORTED_OPTION, so it is not sent at all.
+        let token = v1_token();
+        let session = v1_session();
+        let req = GetAssertionRequest {
+            up: false,
+            ..vault_request(&token, &session)
+        };
+        let mut dev = ScriptedDevice::new(vec![]);
+        let err = get_assertions(&mut dev, &full_info(), &req).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CtapError::InvalidArgument("hmac-secret needs user presence (up)")
+            ),
+            "{err:?}"
+        );
+        assert!(dev.requests.is_empty());
+
+        // up = false without hmac-secret is a valid request and is sent.
+        let req = GetAssertionRequest {
+            up: false,
+            hmac: None,
+            ..vault_request(&token, &session)
+        };
+        let resp = Resp {
+            hmac_enc: None,
+            ..vault_resp(&[0x01], "v", None)
+        };
+        let mut dev = ScriptedDevice::new(vec![ok(encode_resp(&resp))]);
+        assert_eq!(
+            get_assertions(&mut dev, &full_info(), &req).unwrap().len(),
+            1
+        );
+        assert_eq!(dev.requests.len(), 1);
     }
 
     #[test]
