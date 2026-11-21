@@ -55,6 +55,9 @@ pub enum CtapError {
         sw1: u8,
         sw2: u8,
     },
+    /// The operating system's random source failed, so nothing that needs
+    /// a fresh nonce was built (there is no fallback).
+    Random,
 }
 
 impl CtapError {
@@ -103,6 +106,7 @@ impl std::fmt::Display for CtapError {
             CtapError::Apdu { sw1, sw2 } => {
                 write!(f, "the card refused the FIDO request ({sw1:02X}{sw2:02X})")
             }
+            CtapError::Random => write!(f, "the system's random number source failed"),
         }
     }
 }

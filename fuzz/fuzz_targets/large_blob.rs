@@ -4,11 +4,15 @@
 //! same entries (byte for byte) and skipped elements come back in the same
 //! order. Looking up the key's name and classifying every entry must not
 //! panic either. An array read with bytes after its end refuses to be rewritten.
+//! A credential's own entry (trial-decrypted under a fixed largeBlobKey) is
+//! looked up without panicking; storing one reads back, and removing it again
+//! leaves every other entry exactly as it was.
 #![no_main]
 use keyroost_ctap::large_blobs::LargeBlobArray;
 use libfuzzer_sys::fuzz_target;
 
 const CHECKSUM_LEN: usize = 16;
+const KEY: [u8; 32] = [0x42; 32];
 
 fuzz_target!(|data: &[u8]| {
     let Ok(array) = LargeBlobArray::parse(data) else {
@@ -20,6 +24,26 @@ fuzz_target!(|data: &[u8]| {
     for entry in array.entries() {
         let _ = entry.classify();
     }
+    // Hostile entries must not panic the per-credential lookup, which
+    // decrypts and inflates (bounded) whatever verifies under the key.
+    let _ = array.credential_blob(&KEY);
+    let payload = &data[..data.len().min(512)];
+    let stored = array
+        .with_credential_blob(&KEY, payload)
+        .expect("a small payload is stored");
+    assert_eq!(
+        stored.credential_blob(&KEY).as_deref().map(|v| &v[..]),
+        Some(payload)
+    );
+    let mine_gone = array.without_credential_blob(&KEY);
+    assert_eq!(
+        stored.without_credential_blob(&KEY).entries(),
+        mine_gone.entries()
+    );
+    assert_eq!(
+        stored.without_credential_blob(&KEY).skipped_count(),
+        array.skipped_count()
+    );
     // Bytes after the array can't survive a rewrite, so it is refused.
     let Ok(serialized) = array.serialize_with_checksum() else {
         return;
