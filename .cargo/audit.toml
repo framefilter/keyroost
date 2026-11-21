@@ -11,14 +11,4 @@ ignore = [
     # vulnerable decryption path is never reached, with attacker-supplied
     # ciphertext or otherwise. Revisit when a fixed `rsa` version ships.
     "RUSTSEC-2023-0071",
-    # quick-xml 0.39 quadratic-time duplicate-attribute check (0194) and
-    # unbounded NsReader namespace allocation (0195). quick-xml enters the
-    # tree only through wayland-scanner, a build-time proc-macro that parses
-    # the Wayland protocol XML files vendored inside the windowing crates —
-    # it never sees attacker-supplied XML, and the affected code isn't in the
-    # shipped binaries at all. No parent release allows quick-xml >=0.41 yet
-    # (wayland-scanner 0.31.10 is the newest its dependents accept); drop
-    # both ignores when the winit/smithay stack moves to a fixed quick-xml.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
 ]
