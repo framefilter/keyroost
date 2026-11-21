@@ -4,7 +4,9 @@
 mod backup;
 mod blob;
 mod error;
+mod generate;
 mod kdf;
+mod merge;
 mod model;
 
 #[cfg(test)]
@@ -13,4 +15,6 @@ pub(crate) mod test_vectors;
 pub use backup::{export_backup, import_backup, KdfParams, BACKUP_KDF};
 pub use blob::{open, seal};
 pub use error::VaultError;
+pub use generate::{generate_password, GenOptions};
+pub use merge::{apply_import, classify, ImportStatus};
 pub use model::{canon_id, from_json, new_id, to_json, Entry, Vault};
