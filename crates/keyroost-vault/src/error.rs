@@ -21,6 +21,8 @@ pub enum VaultError {
     ShortPassphrase,
     /// The data inflates past the size cap.
     TooLarge,
+    /// The system's random number source failed.
+    Random,
 }
 
 impl fmt::Display for VaultError {
@@ -42,6 +44,7 @@ impl fmt::Display for VaultError {
                 f.write_str("use a backup passphrase of at least 10 characters")
             }
             VaultError::TooLarge => f.write_str("the vault data is too large"),
+            VaultError::Random => f.write_str("the system's random number source failed"),
         }
     }
 }
