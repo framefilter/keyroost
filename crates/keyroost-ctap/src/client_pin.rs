@@ -420,7 +420,7 @@ fn pin_uv_auth_token_extra(
 }
 
 /// Bundle of negotiated v1 state used by every subsequent sub-command.
-struct PeerKey {
+pub(crate) struct PeerKey {
     /// Authenticator's public key — we keep this so we can echo it as the
     /// `keyAgreement` parameter (CTAP echoes the host's, not the peer's).
     our_x: [u8; 32],
@@ -428,7 +428,7 @@ struct PeerKey {
 }
 
 impl PeerKey {
-    fn our_public_cose(&self) -> Value {
+    pub(crate) fn our_public_cose(&self) -> Value {
         cose_p256_public(&self.our_x, &self.our_y)
     }
 }
@@ -438,7 +438,7 @@ impl PeerKey {
 /// `chosen` is the protocol [`select_pin_protocol`] picked for this device. The
 /// returned [`PinProtocol`] is boxed so the v1/v2 split key derivation and
 /// AES/HMAC framing stay behind one interface; callers don't branch on version.
-fn key_agreement(
+pub(crate) fn key_agreement(
     dev: &mut impl CtapTransport,
     chosen: SelectedPinProtocol,
 ) -> Result<(Box<dyn PinProtocol>, PeerKey), CtapError> {

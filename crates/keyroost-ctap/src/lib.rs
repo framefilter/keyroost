@@ -20,6 +20,7 @@ pub mod config;
 pub mod cred_mgmt;
 pub mod device_label;
 pub mod hid;
+pub mod hmac_secret;
 pub mod large_blobs;
 pub mod pin;
 pub mod ssh_cert;
