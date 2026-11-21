@@ -19,3 +19,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 miniz_oxide = "0.9"
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }

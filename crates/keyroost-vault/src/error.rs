@@ -7,6 +7,8 @@ use std::fmt;
 pub enum VaultError {
     /// The data does not start with the vault magic.
     NotAVault,
+    /// The file does not start with the backup magic.
+    NotABackup,
     /// A blob or backup version this build does not know.
     UnsupportedVersion(u8),
     /// The JSON format number is newer than this build understands.
@@ -29,14 +31,15 @@ impl fmt::Display for VaultError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VaultError::NotAVault => f.write_str("the data on this key is not a vault"),
+            VaultError::NotABackup => f.write_str("this is not a vault backup file"),
             VaultError::UnsupportedVersion(v) => write!(f, "unsupported vault version {v}"),
             VaultError::NewerFormat(n) => {
                 write!(f, "this vault was saved by a newer app (format {n})")
             }
             VaultError::Corrupt(what) => write!(f, "the vault data is damaged: {what}"),
-            VaultError::Decrypt => {
-                f.write_str("could not decrypt the vault (wrong key or damaged data)")
-            }
+            VaultError::Decrypt => f.write_str(
+                "could not decrypt the vault (wrong key or passphrase, or damaged data)",
+            ),
             VaultError::KdfParams => {
                 f.write_str("the backup file asks for unreasonable key-derivation settings")
             }

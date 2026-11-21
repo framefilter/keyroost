@@ -39,6 +39,33 @@ fn derive_key(hmac_secret: &[u8; 32], salt: &[u8]) -> Zeroizing<[u8; 32]> {
     k
 }
 
+/// AES-256-GCM seal with `aad`; shared with the backup format.
+pub(crate) fn aead_seal(
+    key: &[u8; 32],
+    nonce: [u8; 12],
+    aad: &[u8],
+    plain: &[u8],
+) -> Result<Vec<u8>, VaultError> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| VaultError::Decrypt)?;
+    cipher
+        .encrypt(&Nonce::from(nonce), Payload { msg: plain, aad })
+        .map_err(|_| VaultError::Decrypt)
+}
+
+/// AES-256-GCM open with `aad`; shared with the backup format.
+pub(crate) fn aead_open(
+    key: &[u8; 32],
+    nonce: [u8; 12],
+    aad: &[u8],
+    ct: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| VaultError::Decrypt)?;
+    cipher
+        .decrypt(&Nonce::from(nonce), Payload { msg: ct, aad })
+        .map(Zeroizing::new)
+        .map_err(|_| VaultError::Decrypt)
+}
+
 pub(crate) fn seal_with(
     v: &Vault,
     hmac_secret: &[u8; 32],
@@ -52,16 +79,7 @@ pub(crate) fn seal_with(
     header.extend_from_slice(&nonce);
     let key = derive_key(hmac_secret, &salt);
     let plain = Zeroizing::new(deflate(&to_json(v)));
-    let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|_| VaultError::Decrypt)?;
-    let ct = cipher
-        .encrypt(
-            &Nonce::from(nonce),
-            Payload {
-                msg: &plain,
-                aad: &header,
-            },
-        )
-        .map_err(|_| VaultError::Decrypt)?;
+    let ct = aead_seal(&key, nonce, &header, &plain)?;
     header.extend_from_slice(&ct);
     Ok(header)
 }
@@ -84,20 +102,11 @@ pub fn open(blob: &[u8], hmac_secret: &[u8; 32]) -> Result<Vault, VaultError> {
         return Err(VaultError::UnsupportedVersion(blob[5]));
     }
     let (header, ct) = blob.split_at(HEADER_LEN);
-    let nonce = Nonce::try_from(&header[22..34]).map_err(|_| VaultError::NotAVault)?;
+    let nonce: [u8; 12] = header[22..34]
+        .try_into()
+        .map_err(|_| VaultError::NotAVault)?;
     let key = derive_key(hmac_secret, &header[6..22]);
-    let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|_| VaultError::Decrypt)?;
-    let plain = Zeroizing::new(
-        cipher
-            .decrypt(
-                &nonce,
-                Payload {
-                    msg: ct,
-                    aad: header,
-                },
-            )
-            .map_err(|_| VaultError::Decrypt)?,
-    );
+    let plain = aead_open(&key, nonce, header, ct)?;
     from_json(&inflate(&plain)?)
 }
 
