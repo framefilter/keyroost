@@ -71,7 +71,8 @@ pub(crate) type SampleEntry = (
     i64,
 );
 
-/// The entries of the sample vault, in order.
+/// The entries of the sample vault, in order. `modified` is in seconds here;
+/// the JSON stores minutes.
 pub(crate) const SAMPLE_ENTRIES: [SampleEntry; 2] = [
     (
         "AAAAAAAA",
