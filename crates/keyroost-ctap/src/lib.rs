@@ -12,6 +12,7 @@
 //!
 //! Currently Linux-only; cross-platform HID backends are a later phase.
 
+pub mod auth_data;
 pub mod bio_enroll;
 pub mod cbor;
 pub mod client_pin;
@@ -22,6 +23,7 @@ pub mod device_label;
 pub mod hid;
 pub mod hmac_secret;
 pub mod large_blobs;
+pub mod make_credential;
 pub mod pin;
 pub mod ssh_cert;
 pub mod transport;

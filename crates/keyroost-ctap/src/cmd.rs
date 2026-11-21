@@ -250,7 +250,7 @@ pub fn reset(dev: &mut impl CtapTransport) -> Result<(), CtapError> {
     Ok(())
 }
 
-fn split_status(resp: &[u8]) -> Result<(u8, &[u8]), CtapError> {
+pub(crate) fn split_status(resp: &[u8]) -> Result<(u8, &[u8]), CtapError> {
     resp.split_first()
         .map(|(s, rest)| (*s, rest))
         .ok_or(CtapError::EmptyResponse)
