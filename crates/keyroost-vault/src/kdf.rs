@@ -2,6 +2,7 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -24,15 +25,17 @@ pub(crate) fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) 
     };
     let mut extract = mac(salt);
     extract.update(ikm);
-    let prk = extract.finalize().into_bytes();
+    let prk = Zeroizing::new(<[u8; HASH_LEN]>::from(extract.finalize().into_bytes()));
 
-    let mut prev: Vec<u8> = Vec::new();
+    let mut prev = Zeroizing::new([0u8; HASH_LEN]);
     for (i, chunk) in out.chunks_mut(HASH_LEN).enumerate() {
-        let mut m = mac(&prk);
-        m.update(&prev);
+        let mut m = mac(&prk[..]);
+        if i > 0 {
+            m.update(&prev[..]);
+        }
         m.update(info);
         m.update(&[(i + 1) as u8]);
-        prev = m.finalize().into_bytes().to_vec();
+        *prev = <[u8; HASH_LEN]>::from(m.finalize().into_bytes());
         chunk.copy_from_slice(&prev[..chunk.len()]);
     }
 }
