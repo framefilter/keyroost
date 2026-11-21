@@ -2249,6 +2249,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyroost-vault"
+version = "0.16.0"
+dependencies = [
+ "hmac",
+ "sha2 0.11.1",
+]
+
+[[package]]
 name = "keyroost-windevtree"
 version = "0.16.0"
 dependencies = [

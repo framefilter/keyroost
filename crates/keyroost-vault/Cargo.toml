@@ -1,0 +1,15 @@
+[package]
+name = "keyroost-vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FIDO2 password vault (fidoparole-compatible formats) for keyroost."
+
+[lints]
+workspace = true
+
+[dependencies]
+hmac = { version = "0.13", default-features = false }
+sha2 = { version = "0.11", default-features = false }
