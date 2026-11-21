@@ -20,6 +20,7 @@ pub mod cmd;
 pub mod config;
 pub mod cred_mgmt;
 pub mod device_label;
+pub mod get_assertion;
 pub mod hid;
 pub mod hmac_secret;
 pub mod large_blobs;

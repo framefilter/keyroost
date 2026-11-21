@@ -238,10 +238,10 @@ pub fn parse_make_credential(resp: &[u8]) -> Result<MadeCredential, CtapError> {
     })
 }
 
-const LARGE_BLOB_KEY_SHAPE: CtapError =
+pub(crate) const LARGE_BLOB_KEY_SHAPE: CtapError =
     CtapError::InvalidResponseShape("largeBlobKey is not 32 bytes");
 
-fn large_blob_key_from(bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, CtapError> {
+pub(crate) fn large_blob_key_from(bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, CtapError> {
     let mut key = Zeroizing::new([0u8; 32]);
     if bytes.len() != key.len() {
         return Err(LARGE_BLOB_KEY_SHAPE);
