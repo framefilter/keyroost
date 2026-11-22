@@ -4,8 +4,8 @@
 //!
 //! - **captured**: bytes exchanged with a physical key, with the raw output
 //!   kept. Key B is a Feitian ePass FIDO-NFC (USB `096E:0853`, OTP applet
-//!   1.0.2), read over direct CCID on 2026-11-18 and over PC/SC on
-//!   2026-11-19.
+//!   1.0.2). Two keys of that model were read: one over direct CCID on
+//!   2026-11-18, the other over PC/SC on 2026-11-19.
 //! - **recorded**: bytes noted from a physical key whose raw capture was not
 //!   kept. Key A is a Feitian FIDO key (USB `096E:086A`, OTP applet 1.0.1).
 //! - **constructed**: bytes written out by hand from the wire format of
@@ -69,11 +69,10 @@ fn select_answer_of_key_b_over_pcsc() {
 
 #[test]
 fn select_answer_of_key_b_over_direct_ccid() {
-    // Captured over direct CCID, 2026-11-18, from a key of the same model
-    // and applet version, holding four accounts. The value under tag 51 is
-    // replaced. The key answered a different value there than in the PC/SC
-    // capture above; that the two captures are of one physical key is not
-    // confirmed.
+    // Captured over direct CCID, 2026-11-18, from the other key of the same
+    // model and applet version, holding four accounts. The value under tag
+    // 51 is replaced. Each of the two keys answers its own value there, and
+    // each answered it again on 2026-11-22.
     let info = parse_select(&hex(
         "59 03 01 00 02  51 08 D0 D1 D2 D3 D4 D5 D6 D7  7B 01 00",
     ))

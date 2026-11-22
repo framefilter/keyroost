@@ -15,15 +15,20 @@ Every fact below is marked with where it comes from:
 - **Measured**: seen in an exchange with a physical key.
   - *Key A*: USB `096E:086A`, OTP applet 1.0.1. Read with Libre Key Companion
     (Android, USB CCID), and with `keyroostctl` over PC/SC on Windows
-    (SELECT).
+    (`feitian info`, `list`, `add`, `code` and `delete`).
   - *Key B*: Feitian ePass FIDO-NFC, USB `096E:0853`, OTP applet 1.0.2. Read
     with Libre Key Companion (Android, USB CCID), over direct CCID, and with
-    `keyroostctl` over PC/SC on Windows (every `feitian` command).
+    `keyroostctl` over PC/SC on Windows (every `feitian` command). Two keys
+    of this model were read. Apart from the value under tag `51` they
+    answered alike in what both were asked: SELECT and LIST over PC/SC, and
+    the wait for a touch. Which of the two an exchange was made with was not
+    always noted.
 - **Client**: what Feitian's own client applications send or expect. Not yet
   exercised on hardware by this project.
 
 Codes were checked against references computed independently from the
-published RFC 4226 and RFC 6238 test seeds, written to Key B for the purpose.
+published RFC 4226 and RFC 6238 test seeds, written to the keys for the
+purpose.
 
 ## Transport
 
@@ -60,12 +65,12 @@ The answer is a flat run of TLVs with one-byte lengths:
 | `51` | 8 | A value Feitian's client calls the challenge and uses as the salt of a slot's access-code key. *(Length measured; use is Client.)* |
 | `7B` | 1 | One bit per slot that has an access code: bit 0 slot 1, bit 1 slot 2, bit 2 the default slot. Both keys answer `00`. *(Value measured; bit layout is Client.)* |
 
-Key A answered the same `51` value when it was first read and when it was
-read again on 2026-11-19. Two captures of Key B's model, taken a day apart
-(one with four accounts on the key, one with six), hold different values. It
-is not confirmed that both are of one physical key, so whether the value can
-change on a key is not established. Within a day it stayed the same across
-repeated SELECTs and card resets. *(Measured.)*
+Each key answers its own `51` value, and none was seen to change it. Key A
+answered the same value when it was first read and when it was read again on
+2026-11-19 and on 2026-11-22. The two keys of Key B's model answer different
+values from each other: one answered its value on 2026-11-18 and on
+2026-11-22, the other on 2026-11-19 and on 2026-11-22, across repeated
+SELECTs and card resets. *(Measured.)*
 
 These keys do not host the Yubico OATH applet. A SELECT of its AID
 (`A0 00 00 05 27 21 01`) is answered `6700` by Key A and `6D00` by Key B, not
@@ -148,17 +153,21 @@ is
 and the code is those four bytes with the top bit cleared, modulo
 `10^digits`, zero-padded (RFC 4226). *(Measured. On Key B, a SHA-1 6-digit
 30-second code and a SHA-256 8-digit 60-second code both matched the
-reference.)*
+reference; on Key A, a SHA-1 6-digit 30-second code.)*
 
-The key computes the code once it is touched. With no touch it answers `6984`
-after about three and a half seconds. *(Measured, both keys.)* `keyroost`
-sends the command again a few times, so there is longer to reach the key.
+The key computes the code once it is touched. With no touch it answers
+`6984`, and how long it waits first differs by model. *(Measured, timed over
+PC/SC.)* Key A answers 5.2 seconds after the command: 5.13 to 5.25 s in four
+runs. Both keys of Key B's model answer after 3.2 seconds: 3.17 to 3.18 s in
+four runs on one of them. `keyroost` sends the command again a few times, so
+there is longer to reach the key.
 
 For HOTP the challenge is empty (`54 00`). A new credential's first code is
 the one for counter 0, and the key then moves its counter on. A CALCULATE
 answered `6984` does not move it. *(Measured, Key B: the first two codes
 matched RFC 4226's values for counters 0 and 1, with dozens of untouched
-tries before and between them.)*
+tries before and between them. Key A: the first code matched the value for
+counter 0.)*
 
 ### PUT (`09`)
 
@@ -175,8 +184,9 @@ tries before and between them.)*
 - The key stores the credential once it is touched. With no touch it answers
   `6984` and stores nothing.
 
-*(Measured, Key B, default slot: TOTP and HOTP credentials written this way
-by `keyroostctl` list back and compute the right codes. What the applet does
+*(Measured, Key A and Key B, default slot: TOTP and HOTP credentials written
+this way by `keyroostctl` list back and compute the right codes. The answer
+with no touch was seen on Key B. What the applet does
 with the true length in the `53` TLV has not been tried, nor what it does
 with a name it already holds: `keyroost` never sends one.)*
 
@@ -187,7 +197,8 @@ with a name it already holds: `keyroost` never sends one.)*
 ```
 
 The key removes the credential once it is touched. With no touch it answers
-`6984` and the credential stays. *(Measured, Key B, default slot.)*
+`6984` and the credential stays. *(Measured, default slot: the removal on
+Key A and Key B, the answer with no touch on Key B.)*
 
 ## Status words
 

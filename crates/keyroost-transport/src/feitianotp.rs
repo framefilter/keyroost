@@ -333,8 +333,8 @@ fn list_all(
 
 /// How many times a command that waits for a touch is sent before giving up.
 ///
-/// The measured key answers [`fotp::SW_NO_TOUCH`] about three and a half
-/// seconds after a command it wants a touch for, and stores or computes
+/// The measured keys answer [`fotp::SW_NO_TOUCH`] 3.2 or 5.2 seconds, by
+/// model, after a command they want a touch for, and store or compute
 /// nothing. That is short for a person, so the same command is sent again:
 /// five tries give about as long as other keys wait on their own.
 const TOUCH_TRIES: usize = 5;
