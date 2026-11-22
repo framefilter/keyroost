@@ -166,6 +166,9 @@ keyroostctl factory-reset --device my-key --yes  # in a script</code></pre>
       <code>keyroostctl fido reset --reader &lt;name&gt;</code>. Each step prints its
       own result, the command ends with a line like <code>factory reset: 5 wiped, 0
       skipped, 0 failed</code>, and it exits nonzero if any step failed or was skipped.</p>
+    <p>The OTP applet on Feitian keys has no step yet: Feitian OTP accounts are not reset.
+      keyroost says so before it asks and again with the result. Remove them with
+      <code>keyroostctl feitian delete</code> or in the app's Feitian OTP tab.</p>
     <p>The desktop app offers the same sweep as a <strong>Factory reset</strong> card on a
       key's Overview tab, with a live per-step report — including a FIDO2 row — so you can
       see exactly which applets came back clean and which need another pass.</p>

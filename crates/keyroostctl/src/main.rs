@@ -220,16 +220,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProgCmd,
     },
-    /// Factory-reset EVERY resettable applet on the selected key: OATH,
-    /// OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a typed
-    /// confirmation (`--yes` to skip).
+    /// Factory-reset every applet keyroost can reset on the selected key:
+    /// OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a
+    /// typed confirmation (`--yes` to skip).
     ///
-    /// Wipes all credentials, codes, keys, and PINs (including a name stored
-    /// on the key); each applet that
+    /// Wipes all credentials, codes, keys, and PINs in those applets
+    /// (including a name stored on the key); each applet that
     /// completes comes back in factory condition, and every step reports its
     /// own outcome. On a USB key the FIDO2 step ends with an unplug/replug +
     /// touch; a card in a smart-card reader is reset in place instead (no
-    /// replug, no touch).
+    /// replug, no touch). Feitian OTP accounts are not reset; remove them
+    /// with `feitian delete`.
     FactoryReset {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -7412,6 +7413,12 @@ fn run_factory_reset(
     if plan.contains(&ResetStep::Fido) && dev.hid_path.is_some() {
         refuse_serial_less_reset_with_others(&dev)?;
     }
+    // What no step resets is said before the question and again with the
+    // result, as the app does.
+    let keeps = factory_reset_keeps_note(dev.caps);
+    if let Some(note) = &keeps {
+        output::note(note);
+    }
     let asked =
         crate::prompt::confirm_typed_then_read(&dev, yes, "reset", &factory_reset_action(&labels))?;
     // The PIV credential, if one was given, is read now — after the question
@@ -7592,7 +7599,18 @@ fn run_factory_reset(
 
     let (summary, verdict) = factory_reset_summary(&reports);
     outln!("{summary}");
+    if let Some(note) = &keeps {
+        output::note(note);
+    }
     verdict.map_err(Into::into)
+}
+
+/// What a factory reset of a key with `caps` leaves, and how to remove it
+/// here: the shared words ([`keyroost_resolve::factory_reset_keeps`]) and
+/// the command that does it.
+fn factory_reset_keeps_note(caps: keyroost_resolve::Caps) -> Option<String> {
+    keyroost_resolve::factory_reset_keeps(caps)
+        .map(|keeps| format!("{keeps}; remove them with `keyroostctl feitian delete`"))
 }
 
 /// The closing line of a factory reset and whether the command succeeded.
@@ -20647,6 +20665,36 @@ mod cli_tests {
         assert!(
             msg.contains("not bricked"),
             "the user needs to know the card is recoverable: {msg}"
+        );
+    }
+
+    /// A key with the Feitian OTP applet is told what the reset leaves; one
+    /// without hears nothing about it.
+    #[test]
+    fn factory_reset_says_feitian_otp_accounts_stay() {
+        let mut caps = keyroost_resolve::Caps::default();
+        caps.insert(keyroost_resolve::Caps::PIV);
+        assert_eq!(factory_reset_keeps_note(caps), None);
+        caps.insert(keyroost_resolve::Caps::FEITIAN_OTP);
+        assert_eq!(
+            factory_reset_keeps_note(caps).as_deref(),
+            Some(
+                "Feitian OTP accounts are not reset; remove them with \
+                 `keyroostctl feitian delete`"
+            )
+        );
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let help = cmd
+            .find_subcommand("factory-reset")
+            .unwrap()
+            .get_long_about()
+            .unwrap()
+            .to_string();
+        assert!(help.contains("every applet keyroost can reset"), "{help}");
+        assert!(
+            help.contains("Feitian OTP accounts are not reset"),
+            "{help}"
         );
     }
 

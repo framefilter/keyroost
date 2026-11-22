@@ -1861,6 +1861,17 @@ pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     steps
 }
 
+/// What a factory reset leaves on a key with these capabilities, in the words
+/// both front ends use, or `None` when it leaves nothing. The Feitian OTP
+/// applet has no step: its RESET is known only from Feitian's client and was
+/// never run by keyroost. Each front end follows the line with where to
+/// remove what stays (`feitian delete`, the Feitian OTP tab), in the
+/// confirmation and in the result.
+pub fn factory_reset_keeps(caps: Caps) -> Option<&'static str> {
+    caps.has(Caps::FEITIAN_OTP)
+        .then_some("Feitian OTP accounts are not reset")
+}
+
 /// Remove [`ResetStep::Piv`] from an already-built [`factory_reset_plan`]
 /// result — call once a live fingerprint
 /// (`keyroost_transport::PivSession::preview_factory_reset` resolving
@@ -3015,6 +3026,20 @@ mod tests {
         ft_probe.has_feitian_otp = true;
         let ft = &correlate(&[], &[ft_probe], &Keyring::default())[0];
         assert_eq!(ft.cap_badges(), vec!["PGP", "PIV", "FEITIAN-OTP"]);
+    }
+
+    /// A factory reset has no Feitian OTP step, so it says what it leaves.
+    #[test]
+    fn factory_reset_names_the_feitian_otp_accounts_it_leaves() {
+        let mut caps = Caps::default();
+        caps.insert(Caps::PGP);
+        assert_eq!(factory_reset_keeps(caps), None);
+        caps.insert(Caps::FEITIAN_OTP);
+        assert_eq!(factory_reset_plan(caps), vec![ResetStep::OpenPgp]);
+        assert_eq!(
+            factory_reset_keeps(caps),
+            Some("Feitian OTP accounts are not reset")
+        );
     }
 
     #[test]

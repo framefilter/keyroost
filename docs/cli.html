@@ -340,7 +340,7 @@ keyroostctl piv reset       # all certificates, PIV keys and PINs
 keyroostctl openpgp reset   # all OpenPGP keys; PINs back to 123456 / 12345678
 keyroostctl otp reset       # all codes in a Token2 key's code storage
 keyroostctl molto reset     # all 100 slots of a Molto2
-keyroostctl factory-reset   # every part of the key at once</code></pre>
+keyroostctl factory-reset   # every part keyroost can reset, at once</code></pre>
     <p>Before anything is erased, keyroost names the key and asks:</p>
 <pre><code>wipe the OATH applet on Work key (serial 12345678)? [y/N]</code></pre>
     <p>Anything other than <kbd>y</kbd> cancels. <code>factory-reset</code> asks you to
@@ -436,7 +436,7 @@ keyroostctl fido pin status --json</code></pre>
       <tr><th>Command</th><th>What it does</th></tr>
       <tr><td><code>keyroostctl list</code></td><td>List connected keys: smart-card (PC/SC) readers and FIDO USB (HID) devices</td></tr>
       <tr><td><code>keyroostctl doctor</code></td><td>Diagnose the local environment: PC/SC service, readers, FIDO HID access, udev rules, registry permissions. Read-only, touches no key</td></tr>
-      <tr><td><code>keyroostctl factory-reset</code></td><td>Factory-reset EVERY resettable applet on the selected key: OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a typed confirmation (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl factory-reset</code></td><td>Factory-reset every applet keyroost can reset on the selected key: OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a typed confirmation (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl completions</code></td><td>Print shell completions to stdout</td></tr>
       <tr><td><code>keyroostctl manpage</code></td><td>Write man pages (keyroostctl.1 + keyroostctl-&lt;group&gt;.1) into a directory</td></tr>
     </table></div>

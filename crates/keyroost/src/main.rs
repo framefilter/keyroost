@@ -2223,6 +2223,14 @@ enum ResetMgmtAuth {
     Pin(zeroize::Zeroizing<String>),
 }
 
+/// What a factory reset of a key with `caps` leaves, and where to remove it
+/// in the app: the shared words ([`keyroost_resolve::factory_reset_keeps`])
+/// and the tab that does it. Shown in the confirmation and with the result.
+fn factory_reset_keeps_note(caps: keyroost_resolve::Caps) -> Option<String> {
+    keyroost_resolve::factory_reset_keeps(caps)
+        .map(|keeps| format!("{keeps}; remove them in the Feitian OTP tab."))
+}
+
 /// The confirmation body for the Factory reset modal: what key, and exactly
 /// which applets get wiped, with the two ceremonies that aren't a plain wipe
 /// spelled out (PIV's actual precondition, per `piv_preview`; FIDO needs a
@@ -9140,6 +9148,10 @@ impl App {
                     needs_reset_mgmt_auth,
                     reset_long_running,
                 );
+                let summary = match factory_reset_keeps_note(dev.caps) {
+                    Some(note) => format!("{summary}\n\n{note}"),
+                    None => summary,
+                };
                 let fido_replug = plan.contains(&keyroost_resolve::ResetStep::Fido)
                     && Self::card_reset_reader(Some(dev)).is_none();
                 (summary, fido_replug)
@@ -19914,9 +19926,9 @@ impl App {
                             });
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Resets every applet on this key ({}) to factory state. \
-                                     Each step reports on its own \u{2014} anything that \
-                                     doesn't complete is listed below.",
+                                    "Resets every applet keyroost can reset on this key \
+                                     ({}) to factory state. Each step reports on its own \
+                                     \u{2014} anything that doesn't complete is listed below.",
                                     plan.iter()
                                         .map(|s| s.label())
                                         .collect::<Vec<_>>()
@@ -19960,6 +19972,15 @@ impl App {
                                         egui::RichText::new(text)
                                             .font(theme::f_reg(12.5))
                                             .color(color),
+                                    );
+                                }
+                                // What no step reset, with the result as in
+                                // the confirmation.
+                                if let Some(note) = factory_reset_keeps_note(dev.caps) {
+                                    ui.label(
+                                        egui::RichText::new(note)
+                                            .font(theme::f_reg(12.5))
+                                            .color(p.warn),
                                     );
                                 }
                             }
@@ -29318,6 +29339,21 @@ mod tests {
         assert_eq!(
             busy_refusal_text(Some("Scanning")),
             "Still working on: Scanning\u{2026} Try again when it finishes."
+        );
+    }
+
+    /// The app says what a factory reset leaves on a Feitian key, in the
+    /// CLI's words, and where to remove it here.
+    #[test]
+    fn factory_reset_says_feitian_otp_accounts_stay() {
+        use keyroost_resolve::Caps;
+        let mut caps = Caps::default();
+        caps.insert(Caps::PIV);
+        assert_eq!(factory_reset_keeps_note(caps), None);
+        caps.insert(Caps::FEITIAN_OTP);
+        assert_eq!(
+            factory_reset_keeps_note(caps).as_deref(),
+            Some("Feitian OTP accounts are not reset; remove them in the Feitian OTP tab.")
         );
     }
 

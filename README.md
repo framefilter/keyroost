@@ -131,8 +131,10 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   the PIN); fingerprint
   enrollment itself is done through the key's FIDO2 fingerprint setup.
 - **One-shot factory reset** — `keyroostctl factory-reset` (and a card on
-  the GUI device Overview tab) resets every resettable applet on a key in turn:
-  OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. In a terminal you confirm by
+  the GUI device Overview tab) resets every applet keyroost can reset on a key
+  in turn: OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. Feitian OTP accounts
+  are not reset (it says so before asking and with the result); remove them
+  with `keyroostctl feitian delete` or the app's Feitian OTP tab. In a terminal you confirm by
   typing `reset`; a script passes `--yes`. On a USB key the FIDO2 step ends
   with an unplug/replug (detected automatically) and a touch; a card in a smart-card reader is instead
   reset in place (no replug, no touch — the card is power-cycled in the

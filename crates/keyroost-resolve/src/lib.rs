@@ -27,11 +27,12 @@ pub mod names;
 pub mod select;
 pub use device::{
     add_fido_models, add_key_names, correlate, correlate_live, correlate_with, enumerate,
-    enumerate_with, exclude_unresettable_piv, factory_reset_plan, forget_key_names,
-    load_keyring_for_scan, name_from_keys, serial_less_reinsert, serial_less_reset_blockers,
-    smart_cards_without_reader, take_scan_warnings, vendor_name, with_key_names_forgotten,
-    CapState, Caps, Device, DeviceId, DeviceKind, EnumerateOptions, MatchOptions, MatchStep,
-    ResetStep, SerialLessReinsert, StepOutcome, StepReport, PIV_GLOBAL_RESET_LABEL,
+    enumerate_with, exclude_unresettable_piv, factory_reset_keeps, factory_reset_plan,
+    forget_key_names, load_keyring_for_scan, name_from_keys, serial_less_reinsert,
+    serial_less_reset_blockers, smart_cards_without_reader, take_scan_warnings, vendor_name,
+    with_key_names_forgotten, CapState, Caps, Device, DeviceId, DeviceKind, EnumerateOptions,
+    MatchOptions, MatchStep, ResetStep, SerialLessReinsert, StepOutcome, StepReport,
+    PIV_GLOBAL_RESET_LABEL,
 };
 pub use identity::{
     plan_identity_reads, read_identities, CanonicalId, IdScheme, Identities, IdentityPlan,
