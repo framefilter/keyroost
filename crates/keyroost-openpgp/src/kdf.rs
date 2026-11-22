@@ -223,6 +223,15 @@ impl Kdf {
         matches!(self, Kdf::IterSaltedS2k(_))
     }
 
+    /// The hash PINs are derived with; `None` when the setting is off.
+    #[must_use]
+    pub fn hash(&self) -> Option<KdfHash> {
+        match self {
+            Kdf::Off => None,
+            Kdf::IterSaltedS2k(p) => Some(p.hash),
+        }
+    }
+
     /// The bytes to send for `pin` in `role`: the derived value with the
     /// setting on, a copy of `pin` with it off.
     #[must_use]
@@ -512,6 +521,8 @@ mod tests {
         .concat();
         let kdf = parse_kdf(&do_bytes).unwrap();
         assert_eq!(params(&kdf).hash(), KdfHash::Sha512);
+        assert_eq!(kdf.hash(), Some(KdfHash::Sha512));
+        assert_eq!(Kdf::Off.hash(), None);
         let d = kdf.derive(PinRole::User, b"123456");
         assert_eq!(d.len(), 64);
         assert_eq!(

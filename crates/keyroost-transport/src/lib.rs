@@ -168,7 +168,7 @@ mod token2prog;
 pub use token2prog::Token2ProgSession;
 
 mod openpgp;
-pub use openpgp::{ImportKey, KeyImport, OpenPgpSession, OpenPgpStatus};
+pub use openpgp::{ImportKey, KeyImport, OpenPgpKdf, OpenPgpSession, OpenPgpStatus};
 
 mod gzip;
 
@@ -277,6 +277,13 @@ pub enum TransportError {
     /// *accepted*: it happened to be the card's live PW1/PW3. The counter never
     /// decrements for a correct PIN, so that password can't be blocked this way.
     OpenPgpPinGuessAccepted,
+    /// The card's KDF setting (`F9`) is one keyroost doesn't recognize, so
+    /// it can't tell how the card wants PINs hashed. No PIN was sent.
+    OpenPgpKdfUnrecognized(keyroost_openpgp::KdfError),
+    /// With the card's KDF setting on, a PIN shorter than the spec allows
+    /// (the card can't check a hashed one). `pin` is "user PIN", "admin
+    /// PIN" or "reset code". Nothing was sent.
+    OpenPgpPinTooShort { pin: &'static str, min: usize },
     /// A PIV applet response could not be parsed.
     PivParse(keyroost_piv::ParseError),
     /// No PIV applet is present on the selected card (`SW 6A82` on SELECT).
@@ -598,6 +605,14 @@ impl fmt::Display for TransportError {
                  password cannot be blocked this way. Change the card's PW1/PW3 \
                  and run the factory reset again."
             ),
+            TransportError::OpenPgpKdfUnrecognized(e) => write!(
+                f,
+                "this card's OpenPGP KDF setting is one keyroost doesn't recognize ({e}); \
+                 no PIN was sent to it"
+            ),
+            TransportError::OpenPgpPinTooShort { pin, min } => {
+                write!(f, "OpenPGP {pin} must be at least {min} characters")
+            }
             TransportError::PivParse(e) => write!(f, "PIV response parse error: {}", e),
             TransportError::NoPivApplet => write!(f, "no PIV applet on this card"),
             TransportError::PivManagementAuthFailed => {
@@ -905,6 +920,7 @@ impl std::error::Error for TransportError {
             TransportError::OathParse(e) => Some(e),
             TransportError::OpenPgpParse(e) => Some(e),
             TransportError::OpenPgpSlotMismatch(e) => Some(e),
+            TransportError::OpenPgpKdfUnrecognized(e) => Some(e),
             TransportError::OpenPgpKeySetPartial { cause, .. } => Some(cause.as_ref()),
             TransportError::PivParse(e) => Some(e),
             TransportError::PivResetUnverifiedFailed(e)
