@@ -28,16 +28,15 @@ fn block_attempts_cap(reported: Option<u8>) -> u32 {
 }
 
 /// The APDU that resets the PIV application on a card with these quirks:
-/// Yubico's `INS 0xFB`, unless the card is known to use another byte for the
-/// same reset. A Feitian card's is `INS 0xFC`
-/// ([`keyroost_piv::compat::PivQuirk::ResetUsesInsFc`]), with the same
-/// preconditions and the same status words, so nothing else about
-/// [`PivSession::reset`] or [`PivSession::force_reset`] differs for it.
+/// the one of the dialect they name ([`keyroost_piv::compat::PivDialect`]).
+/// Yubico's is `INS 0xFB` and Feitian's `INS 0xFC`, with the same
+/// preconditions, so nothing else about [`PivSession::reset`] or
+/// [`PivSession::force_reset`] differs between them.
 fn reset_command(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> Vec<u8> {
-    if quirks.contains(&keyroost_piv::compat::PivQuirk::ResetUsesInsFc) {
-        piv::reset_feitian()
-    } else {
-        piv::reset()
+    use keyroost_piv::compat::PivDialect;
+    match PivDialect::of(quirks) {
+        PivDialect::YubiKey => piv::reset(),
+        PivDialect::Feitian => piv::reset_feitian(),
     }
 }
 
@@ -46,14 +45,14 @@ fn reset_command(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> Vec<u8> {
 /// 6985 (conditions of use not satisfied), not 6983 per Yubico's own docs —
 /// see `SW_CONDITIONS_NOT_SATISFIED`. Other fingerprints have been observed
 /// using 6983 for the identical precondition, and others still 6982
-/// (security status not satisfied). A Feitian card
-/// ([`keyroost_piv::compat::PivQuirk::ResetUsesInsFc`]) answers 6982 or, on
-/// another model, 6984; that last one is read this way on such a card only.
+/// (security status not satisfied). 6984 is read this way only on a card
+/// known to answer it there
+/// ([`keyroost_piv::compat::PivQuirk::ResetNotAllowedIs6984`]).
 fn reset_not_allowed(sw: u16, quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> bool {
     sw == piv::SW_AUTH_BLOCKED
         || sw == piv::SW_CONDITIONS_NOT_SATISFIED
         || sw == piv::SW_SECURITY_NOT_SATISFIED
-        || (sw == 0x6984 && quirks.contains(&keyroost_piv::compat::PivQuirk::ResetUsesInsFc))
+        || (sw == 0x6984 && quirks.contains(&keyroost_piv::compat::PivQuirk::ResetNotAllowedIs6984))
 }
 
 /// How many times [`PivSession::force_reset`] sends the reset to a card that
@@ -70,30 +69,37 @@ const RESET_UNTOUCHED: &str = "the key was not touched, so PIV was NOT reset: wi
      the key when it blinks.";
 
 /// The APDU that sets the PIN and PUK retry counts on a card with these
-/// quirks: Yubico's `INS 0xFA`, or a Feitian card's `INS 0xFE`
-/// ([`keyroost_piv::compat::PivQuirk::SetPinRetriesUsesInsFe`]). Same
-/// parameters and the same preconditions either way.
+/// quirks, in the dialect they name
+/// ([`keyroost_piv::compat::PivDialect`]): Yubico's `INS 0xFA` or Feitian's
+/// `INS 0xFE`. Same parameters and the same preconditions either way.
 fn set_pin_retries_command(
     quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>,
     pin_tries: u8,
     puk_tries: u8,
 ) -> Vec<u8> {
-    if quirks.contains(&keyroost_piv::compat::PivQuirk::SetPinRetriesUsesInsFe) {
-        piv::set_pin_retries_feitian(pin_tries, puk_tries)
-    } else {
-        piv::set_pin_retries(pin_tries, puk_tries)
+    use keyroost_piv::compat::PivDialect;
+    match PivDialect::of(quirks) {
+        PivDialect::YubiKey => piv::set_pin_retries(pin_tries, puk_tries),
+        PivDialect::Feitian => piv::set_pin_retries_feitian(pin_tries, puk_tries),
     }
 }
 
 /// The tags and touch values a GENERATE carries a slot's policies under on a
-/// card with these quirks: Yubico's, or a Feitian card's
-/// ([`keyroost_piv::compat::PivQuirk::SlotPolicyUsesTagsBaBc`]).
+/// card with these quirks, in the dialect they name
+/// ([`keyroost_piv::compat::PivDialect`]).
 fn generate_policy_tags(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> piv::PolicyTags {
-    if quirks.contains(&keyroost_piv::compat::PivQuirk::SlotPolicyUsesTagsBaBc) {
-        piv::PolicyTags::Feitian
-    } else {
-        piv::PolicyTags::Yubico
+    use keyroost_piv::compat::PivDialect;
+    match PivDialect::of(quirks) {
+        PivDialect::YubiKey => piv::PolicyTags::Yubico,
+        PivDialect::Feitian => piv::PolicyTags::Feitian,
     }
+}
+
+/// Whether a card with these quirks takes Feitian's management commands
+/// ([`keyroost_piv::compat::PivDialect::Feitian`]).
+fn speaks_feitian(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> bool {
+    use keyroost_piv::compat::PivDialect;
+    PivDialect::of(quirks) == PivDialect::Feitian
 }
 
 /// A throwaway 8-ASCII-digit credential for the loops that deliberately block a
@@ -3931,9 +3937,7 @@ impl<'tx> PivSession<'tx> {
                 );
             }
         }
-        let feitian = self
-            .quirks()
-            .contains(&keyroost_piv::compat::PivQuirk::SetManagementKeyUsesInsCf);
+        let feitian = speaks_feitian(&self.quirks());
         // A Feitian card's own command has no touch-required form, and
         // nothing was sent to find out what it makes of Yubico's.
         if feitian && require_touch {
@@ -5116,10 +5120,7 @@ impl<'tx> PivSession<'tx> {
         // A card with a policy read of its own (Feitian) is asked that way.
         // It answers for a slot with no key too, with what a key generated
         // there without policy tags would get.
-        if self
-            .quirks()
-            .contains(&keyroost_piv::compat::PivQuirk::SlotPolicyUsesTagsBaBc)
-        {
+        if speaks_feitian(&self.quirks()) {
             let policy = self
                 .transmit_full(&piv::get_slot_policy_feitian(key_ref))
                 .ok()
@@ -5500,14 +5501,17 @@ impl<'tx> PivSession<'tx> {
     /// Reset the PIV application to factory defaults. Always sends the bare
     /// RESET APDU and reports whatever the card says — this method does
     /// nothing to detect or satisfy either precondition below itself. The
-    /// APDU is Yubico's `INS 0xFB`, or `INS 0xFC` on a fingerprint that
-    /// carries [`keyroost_piv::compat::PivQuirk::ResetUsesInsFc`] (Feitian):
+    /// APDU is Yubico's `INS 0xFB`, or `INS 0xFC` on a card that takes
+    /// Feitian's commands ([`keyroost_piv::compat::PivDialect::Feitian`]):
     ///
     /// * The widespread YubiKey-mimicking convention: succeeds only when
     ///   **both** the PIN and PUK are already blocked (the card enforces
     ///   this); otherwise it returns `6983` or `6985` (a genuine YubiKey's own
     ///   choice, per Yubico's docs) — or, on some other fingerprints, `6982`
     ///   — any of the three mapped to [`TransportError::PivResetNotAllowed`].
+    ///   A card known to answer `6984` there
+    ///   ([`keyroost_piv::compat::PivQuirk::ResetNotAllowedIs6984`]) has
+    ///   that one mapped the same way.
     /// * Some fingerprints instead require an authenticated management-key
     ///   session before RESET is accepted — flagged by
     ///   [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`] — with
@@ -7572,29 +7576,37 @@ mod tests {
     }
 
     #[test]
-    fn a_feitian_card_may_answer_an_unmet_reset_precondition_6984() {
+    fn a_card_known_to_answer_an_unmet_reset_precondition_6984() {
         use keyroost_piv::compat::resolve_quirks;
-        use keyroost_piv::fingerprint::AppletFingerprint;
-        // Hardware-observed: the ePass FIDO NFC Plus answers 6982, a 096E:086A
-        // key 6984, each with nothing blocked and with only the PIN blocked.
-        let yubikey = resolve_quirks(AppletFingerprint::YubiKey, Some(&[5, 7, 4]), None);
-        for fingerprint in [
-            AppletFingerprint::Feitian(keyroost_piv::fingerprint::FeitianModel::EPassFidoNfcPlus),
-            AppletFingerprint::Feitian(keyroost_piv::fingerprint::FeitianModel::BioPassFidoPro),
-        ] {
-            let feitian = resolve_quirks(fingerprint, None, None);
+        use keyroost_piv::fingerprint::{AppletFingerprint, FeitianModel};
+        // Hardware-observed: the ePass FIDO NFC Plus answers 6982, the
+        // BioPass FIDO Pro 6984, each with nothing blocked and with only
+        // the PIN blocked. A Feitian key of an unmeasured product is read
+        // either way.
+        for model in [FeitianModel::BioPassFidoPro, FeitianModel::Generic] {
+            let quirks = resolve_quirks(AppletFingerprint::Feitian(model), None, None);
             for sw in [0x6982, 0x6983, 0x6984, 0x6985] {
-                assert!(reset_not_allowed(sw, &feitian), "{fingerprint} {sw:04X}");
+                assert!(reset_not_allowed(sw, &quirks), "{model:?} {sw:04X}");
             }
             for sw in [0x9000, 0x6D00, 0x6A86] {
-                assert!(!reset_not_allowed(sw, &feitian), "{fingerprint} {sw:04X}");
+                assert!(!reset_not_allowed(sw, &quirks), "{model:?} {sw:04X}");
             }
         }
-        // 6984 is read that way on such a card only.
-        for sw in [0x6982, 0x6983, 0x6985] {
-            assert!(reset_not_allowed(sw, &yubikey), "{sw:04X}");
+        // 6984 is read that way on such a card only: not on the ePass FIDO
+        // NFC Plus, which takes the same reset instruction, and not on a
+        // YubiKey.
+        let epass = resolve_quirks(
+            AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
+            None,
+            None,
+        );
+        let yubikey = resolve_quirks(AppletFingerprint::YubiKey, Some(&[5, 7, 4]), None);
+        for quirks in [&epass, &yubikey] {
+            for sw in [0x6982, 0x6983, 0x6985] {
+                assert!(reset_not_allowed(sw, quirks), "{sw:04X}");
+            }
+            assert!(!reset_not_allowed(0x6984, quirks));
         }
-        assert!(!reset_not_allowed(0x6984, &yubikey));
     }
 
     #[test]

@@ -2224,7 +2224,7 @@ pub fn reset() -> Vec<u8> {
 
 /// Feitian's RESET: wipe the PIV application back to factory defaults, on a
 /// card whose reset is `INS 0xFC` rather than Yubico's `0xFB` (see
-/// [`compat::PivQuirk::ResetUsesInsFc`]). Five bytes, as Feitian's own client
+/// [`compat::PivDialect::Feitian`]). Five bytes, as Feitian's own client
 /// software sends it.
 ///
 /// Measured on a Feitian ePass FIDO NFC Plus (USB `096E:0853`): with neither the
