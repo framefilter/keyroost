@@ -162,14 +162,17 @@ pub enum StoredName {
     /// back from the key).
     Molto2 { slot: u8, title: String },
     /// The full name in the Feitian OTP applet's default slot, `30:` / `60:`
-    /// prefix included.
-    Feitian(String),
+    /// prefix included, and whether it is an HOTP account (whose name has no
+    /// period prefix, so it is read differently). Two names are the same
+    /// account when they hold the same app and account
+    /// ([`feitian_account`]), whatever their type or period.
+    Feitian { name: String, hotp: bool },
 }
 
 impl core::fmt::Display for StoredName {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            StoredName::Oath(n) | StoredName::Feitian(n) => write!(f, "{}", n),
+            StoredName::Oath(n) | StoredName::Feitian { name: n, .. } => write!(f, "{}", n),
             StoredName::Token2 { app, account } if app.is_empty() => write!(f, "{}", account),
             StoredName::Token2 { app, account } => write!(f, "{}:{}", app, account),
             StoredName::Molto2 { slot, title } if title.is_empty() => write!(f, "#{}", slot),
@@ -755,6 +758,33 @@ pub fn feitian_name(e: &ImportEntry) -> Result<String, Skip> {
     })
 }
 
+/// The app (empty when none) and account a Feitian OTP stored name holds:
+/// after the `30:` / `60:` period of a TOTP name, split at the first `_#_`
+/// with something on both sides. Mirrors `keyroost_feitianotp::parse_name`.
+pub fn feitian_account(name: &str, hotp: bool) -> (&str, &str) {
+    let rest = match name.split_once(':') {
+        Some(("30" | "60", rest)) if !hotp && !rest.is_empty() => rest,
+        _ => name,
+    };
+    match rest.split_once(FEITIAN_SEPARATOR) {
+        Some((app, account)) if !app.is_empty() && !account.is_empty() => (app, account),
+        _ => ("", rest),
+    }
+}
+
+/// Whether two names planned or read for `store` are the same code: a
+/// Feitian OTP account is one per app and account, whatever its type or
+/// period (`30:GitHub_#_alice` and `60:GitHub_#_alice` are one account);
+/// every other store compares the names themselves.
+fn same_code(a: &StoredName, b: &StoredName) -> bool {
+    match (a, b) {
+        (StoredName::Feitian { name: a, hotp: ha }, StoredName::Feitian { name: b, hotp: hb }) => {
+            feitian_account(a, *ha) == feitian_account(b, *hb)
+        }
+        _ => a == b,
+    }
+}
+
 /// Whether an OATH PUT fits one short APDU: the name TLV, the key TLV
 /// (type/algorithm and digits bytes plus the seed, zero-padded to 14 bytes),
 /// and the 6-byte IMF TLV when a non-zero HOTP counter is sent — at most 255
@@ -910,7 +940,10 @@ fn name_for(e: &ImportEntry, store: Store, lim: &Limits) -> Result<StoredName, S
                     });
                 }
             }
-            Ok(StoredName::Feitian(name))
+            Ok(StoredName::Feitian {
+                name,
+                hotp: matches!(e.kind, OtpKind::Hotp { .. }),
+            })
         }
         Store::Molto2 => unreachable!("Molto2 names are assigned with their slot"),
     }
@@ -993,26 +1026,27 @@ pub fn plan(file: &ImportFile, target: &Target) -> Plan {
                 Ok(()) => match name_for(e, store, &lim) {
                     Err(s) => (None, Verdict::Skip(s)),
                     Ok(n) => {
-                        let v = if let Some((_, first)) = seen.iter().find(|(s, _)| *s == n) {
-                            Verdict::Skip(Skip::SameNameInFile { first: *first })
-                        } else {
-                            let on_key = existing.names.contains(&n);
-                            // Exists comes first: nothing is written, so the
-                            // prefix rule (a write rule) doesn't apply.
-                            if on_key && !target.replace {
-                                seen.push((n.clone(), item.index));
-                                Verdict::Exists
-                            } else if starts_another_name(store, &n, existing, &seen) {
-                                Verdict::Skip(Skip::StartsAnotherName)
+                        let v =
+                            if let Some((_, first)) = seen.iter().find(|(s, _)| same_code(s, &n)) {
+                                Verdict::Skip(Skip::SameNameInFile { first: *first })
                             } else {
-                                seen.push((n.clone(), item.index));
-                                if on_key {
-                                    Verdict::Replace
+                                let on_key = existing.names.iter().any(|x| same_code(x, &n));
+                                // Exists comes first: nothing is written, so the
+                                // prefix rule (a write rule) doesn't apply.
+                                if on_key && !target.replace {
+                                    seen.push((n.clone(), item.index));
+                                    Verdict::Exists
+                                } else if starts_another_name(store, &n, existing, &seen) {
+                                    Verdict::Skip(Skip::StartsAnotherName)
                                 } else {
-                                    Verdict::Add
+                                    seen.push((n.clone(), item.index));
+                                    if on_key {
+                                        Verdict::Replace
+                                    } else {
+                                        Verdict::Add
+                                    }
                                 }
-                            }
-                        };
+                            };
                         (Some(n), v)
                     }
                 },
@@ -1303,6 +1337,21 @@ mod tests {
         StoredName::Oath(n.to_owned())
     }
 
+    /// A TOTP name read from (or planned for) the Feitian OTP applet.
+    fn fname(n: &str) -> StoredName {
+        StoredName::Feitian {
+            name: n.to_owned(),
+            hotp: false,
+        }
+    }
+
+    fn fname_hotp(n: &str) -> StoredName {
+        StoredName::Feitian {
+            name: n.to_owned(),
+            hotp: true,
+        }
+    }
+
     #[test]
     fn existing_name_is_exists_without_overwrite() {
         let f = file(vec![simple("Example", "alice"), simple("Example", "bob")]);
@@ -1525,7 +1574,7 @@ mod tests {
         // Names: the period in front for TOTP, issuer and account joined with _#_.
         assert_eq!(
             named(simple("GitHub", "alice")),
-            Some(StoredName::Feitian("30:GitHub_#_alice".into()))
+            Some(fname("30:GitHub_#_alice"))
         );
         assert_eq!(
             named(e(
@@ -1535,11 +1584,11 @@ mod tests {
                 6,
                 OtpKind::Totp { period: 60 }
             )),
-            Some(StoredName::Feitian("60:alice".into()))
+            Some(fname("60:alice"))
         );
         assert_eq!(
             named(e(Some("GitHub"), None, sha1, 6, TOTP30)),
-            Some(StoredName::Feitian("30:GitHub".into()))
+            Some(fname("30:GitHub"))
         );
         // HOTP names carry no prefix.
         assert_eq!(
@@ -1550,7 +1599,7 @@ mod tests {
                 6,
                 OtpKind::Hotp { counter: 0 }
             )),
-            Some(StoredName::Feitian("A_#_b".into()))
+            Some(fname_hotp("A_#_b"))
         );
         // A name with non-ASCII characters is stored as UTF-8.
         assert_eq!(one(ft, simple("Exämple", "alice")), Verdict::Add);
@@ -1570,7 +1619,7 @@ mod tests {
         // In the account, after an issuer, it reads back whole.
         assert_eq!(
             named(simple("GitHub", "a_#_b")),
-            Some(StoredName::Feitian("30:GitHub_#_a_#_b".into()))
+            Some(fname("30:GitHub_#_a_#_b"))
         );
         // At an end of a lone part it is no separator.
         assert_eq!(
@@ -1640,7 +1689,7 @@ mod tests {
     fn feitian_plan_matches_names_on_the_key_and_notes_what_is_not_known() {
         let ft = Store::FeitianOtp;
         let f = file(vec![simple("GitHub", "alice"), simple("GitLab", "bob")]);
-        let on_key = vec![StoredName::Feitian("30:GitHub_#_alice".into())];
+        let on_key = vec![fname("30:GitHub_#_alice")];
 
         let p = plan(&f, &target(ft, on_key.clone(), false));
         assert_eq!(verdicts(&p), vec![Verdict::Exists, Verdict::Add]);
@@ -1656,10 +1705,44 @@ mod tests {
             vec![Note::ReplaceMayLoseOld, Note::CapacityUnknown]
         );
 
-        // The same account at another period is another name on the key.
-        let other_period = vec![StoredName::Feitian("60:GitHub_#_alice".into())];
-        let p = plan(&f, &target(ft, other_period, false));
+        // The same app and account is the same account whatever its period
+        // or type, and with or without a period in front: it is there, and
+        // `--replace` replaces it, so the key never holds two of one account.
+        for same in [
+            fname("60:GitHub_#_alice"),
+            fname("GitHub_#_alice"),
+            fname_hotp("GitHub_#_alice"),
+        ] {
+            let p = plan(&f, &target(ft, vec![same.clone()], false));
+            assert_eq!(verdicts(&p), vec![Verdict::Exists, Verdict::Add], "{same}");
+            let p = plan(&f, &target(ft, vec![same.clone()], true));
+            assert_eq!(verdicts(&p), vec![Verdict::Replace, Verdict::Add], "{same}");
+        }
+        // An HOTP name keeps a `30:` in front as part of its account.
+        let p = plan(
+            &f,
+            &target(ft, vec![fname_hotp("30:GitHub_#_alice")], false),
+        );
         assert_eq!(verdicts(&p), vec![Verdict::Add, Verdict::Add]);
+        // Another app or account is another account.
+        let p = plan(&f, &target(ft, vec![fname("30:GitHub_#_alicia")], false));
+        assert_eq!(verdicts(&p), vec![Verdict::Add, Verdict::Add]);
+
+        // Two entries for one account in the file: the second is skipped
+        // rather than written next to the first.
+        let mut sixty = simple("GitHub", "alice");
+        sixty.kind = OtpKind::Totp { period: 60 };
+        let p = plan(
+            &file(vec![simple("GitHub", "alice"), sixty]),
+            &target(ft, vec![], false),
+        );
+        assert_eq!(
+            verdicts(&p),
+            vec![
+                Verdict::Add,
+                Verdict::Skip(Skip::SameNameInFile { first: 0 })
+            ]
+        );
 
         // No per-code touch setting is offered for this store.
         assert!(!ft.takes_touch());

@@ -554,6 +554,38 @@ pub fn stored_name(
     Ok(out)
 }
 
+/// How keyroost names an account to the user: `app:account`, or the account
+/// alone when it has no app (`app` empty), as for Token2 OTP entries.
+#[must_use]
+pub fn account_label(app: &str, account: &str) -> String {
+    if app.is_empty() {
+        account.to_owned()
+    } else {
+        format!("{app}:{account}")
+    }
+}
+
+/// Whether the stored `name` of an `oath_type` account holds the app (empty
+/// for none) and account given. One app and account is one account,
+/// whatever its type or period and with or without a period in front: what
+/// keyroost writes is checked against this, so it never stores a second
+/// code for an account the key already holds.
+#[must_use]
+pub fn holds_account(name: &str, oath_type: OathType, app: &str, account: &str) -> bool {
+    let parts = parse_name(name, oath_type);
+    parts.issuer.unwrap_or("") == app && parts.account == account
+}
+
+/// What both front ends say when an add finds the account already on the
+/// key; each follows it with where to remove the old one.
+#[must_use]
+pub fn already_on_key(app: &str, account: &str) -> String {
+    format!(
+        "an account {:?} is already on the key; nothing was added",
+        account_label(app, account)
+    )
+}
+
 /// The longest stored name keyroost writes, in bytes, with the `30:` prefix
 /// and the `_#_` separator counted: Libre Key Companion's limit, the tightest
 /// of the known clients. The applet's own limit is not measured.
@@ -957,6 +989,35 @@ mod tests {
                 Err(BuildError::UnsupportedPeriod(period))
             );
         }
+    }
+
+    #[test]
+    fn one_app_and_account_is_one_account() {
+        let t = OathType::Totp;
+        for name in ["30:GitHub_#_alice", "60:GitHub_#_alice", "GitHub_#_alice"] {
+            assert!(holds_account(name, t, "GitHub", "alice"), "{name}");
+        }
+        assert!(holds_account(
+            "GitHub_#_alice",
+            OathType::Hotp,
+            "GitHub",
+            "alice"
+        ));
+        // An HOTP name has no period in front: `30:` is part of its app.
+        assert!(!holds_account(
+            "30:GitHub_#_alice",
+            OathType::Hotp,
+            "GitHub",
+            "alice"
+        ));
+        assert!(!holds_account("30:GitHub_#_alice", t, "", "alice"));
+        assert!(holds_account("30:alice", t, "", "alice"));
+        assert_eq!(account_label("GitHub", "alice"), "GitHub:alice");
+        assert_eq!(account_label("", "alice"), "alice");
+        assert_eq!(
+            already_on_key("GitHub", "alice"),
+            "an account \"GitHub:alice\" is already on the key; nothing was added"
+        );
     }
 
     #[test]

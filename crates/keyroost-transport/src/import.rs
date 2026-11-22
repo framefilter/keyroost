@@ -329,12 +329,17 @@ impl FeitianIo for FeitianOtpSession {
 ///
 /// What the applet does with a PUT of a name it already holds has not been
 /// measured, so one is never sent: the store keeps the names read from the
-/// key and answers [`StoreError::Exists`] itself. A replace then removes the
-/// old code first, like the applets that refuse duplicates.
+/// key and answers [`StoreError::Exists`] itself for any name that holds the
+/// same app and account, whatever its type or period. A replace then removes
+/// every such old name first, like the applets that refuse duplicates, so the
+/// key never ends up with two codes for one account.
 pub struct FeitianImportStore<'a> {
     session: &'a mut FeitianOtpSession,
-    on_key: Vec<String>,
+    on_key: Vec<OnKey>,
 }
+
+/// A name in the default slot, and whether it is an HOTP account.
+type OnKey = (String, bool);
 
 impl<'a> FeitianImportStore<'a> {
     /// `existing` is what [`read_feitian_existing`] read from this session's
@@ -370,30 +375,39 @@ pub fn read_feitian_existing(session: &mut FeitianOtpSession) -> Result<Existing
             .credentials
             .into_iter()
             .filter(|c| c.slot == fotp::Slot::Default)
-            .map(|c| StoredName::Feitian(c.name))
+            .map(|c| StoredName::Feitian {
+                hotp: c.oath_type == fotp::OathType::Hotp,
+                name: c.name,
+            })
             .collect(),
         hidden: listing.skipped,
     })
 }
 
-fn feitian_names(existing: &Existing) -> Vec<String> {
+fn feitian_names(existing: &Existing) -> Vec<OnKey> {
     existing
         .names
         .iter()
         .filter_map(|n| match n {
-            StoredName::Feitian(n) => Some(n.clone()),
+            StoredName::Feitian { name, hotp } => Some((name.clone(), *hotp)),
             _ => None,
         })
         .collect()
 }
 
-fn feitian_stored_name(name: &StoredName) -> Result<&str, StoreError> {
+fn feitian_stored_name(name: &StoredName) -> Result<(&str, bool), StoreError> {
     match name {
-        StoredName::Feitian(n) => Ok(n),
+        StoredName::Feitian { name, hotp } => Ok((name, *hotp)),
         _ => Err(StoreError::Failed(
             "this entry has no Feitian OTP name to store it under".to_owned(),
         )),
     }
+}
+
+/// Whether a name on the key holds the same app and account as `name`.
+fn same_account(on_key: &OnKey, name: &str, hotp: bool) -> bool {
+    keyroost_import::plan::feitian_account(&on_key.0, on_key.1)
+        == keyroost_import::plan::feitian_account(name, hotp)
 }
 
 /// The PUT for one entry. The plan only lets through what the applet stores;
@@ -455,28 +469,37 @@ fn feitian_result(
 
 fn feitian_add<I: FeitianIo + ?Sized>(
     io: &mut I,
-    on_key: &mut Vec<String>,
+    on_key: &mut Vec<OnKey>,
     name: &StoredName,
     entry: &ImportEntry,
 ) -> Result<(), StoreError> {
-    let n = feitian_stored_name(name)?;
-    if on_key.iter().any(|k| k == n) {
+    let (n, hotp) = feitian_stored_name(name)?;
+    if on_key.iter().any(|k| same_account(k, n, hotp)) {
         return Err(StoreError::Exists);
     }
     let params = feitian_put_params(n, entry)?;
     feitian_result("save the account", io.put(&params))?;
-    on_key.push(n.to_owned());
+    on_key.push((n.to_owned(), hotp));
     Ok(())
 }
 
 fn feitian_delete<I: FeitianIo + ?Sized>(
     io: &mut I,
-    on_key: &mut Vec<String>,
+    on_key: &mut Vec<OnKey>,
     name: &StoredName,
 ) -> Result<(), StoreError> {
-    let n = feitian_stored_name(name)?;
-    feitian_result("delete the account", io.delete(n))?;
-    on_key.retain(|k| k != n);
+    // Every name on the key for this app and account goes, under its own
+    // stored name (another period or type than the new one's, say).
+    let (n, hotp) = feitian_stored_name(name)?;
+    let old: Vec<String> = on_key
+        .iter()
+        .filter(|k| same_account(k, n, hotp))
+        .map(|k| k.0.clone())
+        .collect();
+    for stored in old {
+        feitian_result("delete the account", io.delete(&stored))?;
+        on_key.retain(|k| k.0 != stored);
+    }
     Ok(())
 }
 
@@ -1127,7 +1150,13 @@ mod tests {
     /// `run` over the scripted applet through the real adapter rules.
     struct ScriptedFeitianStore {
         io: ScriptedFeitian,
-        on_key: Vec<String>,
+        on_key: Vec<OnKey>,
+    }
+
+    impl ScriptedFeitianStore {
+        fn names(&self) -> Vec<&str> {
+            self.on_key.iter().map(|(n, _)| n.as_str()).collect()
+        }
     }
 
     impl CodeStore for ScriptedFeitianStore {
@@ -1144,16 +1173,31 @@ mod tests {
         }
     }
 
+    /// [`run_feitian_on`] with TOTP names on the key.
     fn run_feitian(
         f: &ImportFile,
         on_key: &[&str],
         replace: bool,
         io: ScriptedFeitian,
     ) -> (Vec<Outcome>, ScriptedFeitianStore) {
+        let on_key: Vec<(&str, bool)> = on_key.iter().map(|n| (*n, false)).collect();
+        run_feitian_on(f, &on_key, replace, io)
+    }
+
+    /// `run` into a key holding `on_key` (name, is HOTP).
+    fn run_feitian_on(
+        f: &ImportFile,
+        on_key: &[(&str, bool)],
+        replace: bool,
+        io: ScriptedFeitian,
+    ) -> (Vec<Outcome>, ScriptedFeitianStore) {
         let existing = Existing {
             names: on_key
                 .iter()
-                .map(|n| StoredName::Feitian((*n).to_owned()))
+                .map(|(n, hotp)| StoredName::Feitian {
+                    name: (*n).to_owned(),
+                    hotp: *hotp,
+                })
                 .collect(),
             hidden: 0,
         };
@@ -1189,7 +1233,7 @@ mod tests {
         let (out, s) = run_feitian(&file(2), &[], false, ScriptedFeitian::default());
         assert_eq!(out, vec![Outcome::Added, Outcome::Added]);
         assert_eq!(s.io.calls, vec!["put 30:I0_#_a", "put 30:I1_#_a"]);
-        assert_eq!(s.on_key, vec!["30:I0_#_a", "30:I1_#_a"]);
+        assert_eq!(s.names(), vec!["30:I0_#_a", "30:I1_#_a"]);
     }
 
     #[test]
@@ -1206,7 +1250,41 @@ mod tests {
         let (out, s) = run_feitian(&file(1), &["30:I0_#_a"], true, ScriptedFeitian::default());
         assert_eq!(out, vec![Outcome::Replaced]);
         assert_eq!(s.io.calls, vec!["delete 30:I0_#_a", "put 30:I0_#_a"]);
-        assert_eq!(s.on_key, vec!["30:I0_#_a"]);
+        assert_eq!(s.names(), vec!["30:I0_#_a"]);
+    }
+
+    /// One account is one app and account: another period or type of it on
+    /// the key is "already there", and a replace deletes every old stored
+    /// name of it before the PUT, never the new name.
+    #[test]
+    fn feitian_one_account_per_app_and_account() {
+        let on_key = [("60:I0_#_a", false), ("I0_#_a", false), ("I0_#_a", true)];
+        let (out, s) = run_feitian_on(&file(1), &on_key, false, ScriptedFeitian::default());
+        assert!(out.is_empty(), "exists: nothing written: {out:?}");
+        assert!(s.io.calls.is_empty());
+
+        let (out, s) = run_feitian_on(&file(1), &on_key, true, ScriptedFeitian::default());
+        assert_eq!(out, vec![Outcome::Replaced]);
+        assert_eq!(
+            s.io.calls,
+            vec![
+                "delete 60:I0_#_a",
+                "delete I0_#_a",
+                "delete I0_#_a",
+                "put 30:I0_#_a"
+            ]
+        );
+        assert_eq!(s.names(), vec!["30:I0_#_a"]);
+
+        // An HOTP account named `30:I0_#_a` is another account.
+        let (out, s) = run_feitian_on(
+            &file(1),
+            &[("30:I0_#_a", true)],
+            false,
+            ScriptedFeitian::default(),
+        );
+        assert_eq!(out, vec![Outcome::Added]);
+        assert_eq!(s.names(), vec!["30:I0_#_a", "30:I0_#_a"]);
     }
 
     #[test]
@@ -1218,7 +1296,7 @@ mod tests {
         let (out, s) = run_feitian(&file(2), &["30:I0_#_a"], true, io);
         assert!(matches!(out[0], Outcome::RemovedNotAdded(_)), "{out:?}");
         assert_eq!(out[1], Outcome::NotTried);
-        assert!(s.on_key.is_empty());
+        assert!(s.names().is_empty());
     }
 
     #[test]
@@ -1258,7 +1336,7 @@ mod tests {
         assert!(why.contains("touch"), "{why}");
         assert_eq!(out[2], Outcome::NotTried);
         // The one that was stored stays known; the refused one isn't.
-        assert_eq!(s.on_key, vec!["30:I0_#_a"]);
+        assert_eq!(s.names(), vec!["30:I0_#_a"]);
     }
 
     #[test]
@@ -1325,6 +1403,27 @@ mod tests {
             );
         }
         assert_eq!(fotp::ISSUER_SEPARATOR, "_#_");
+        // The plan reads an account out of a stored name as the byte layer
+        // does, for both types.
+        for name in [
+            "30:GitHub_#_alice",
+            "60:alice",
+            "GitHub_#_alice",
+            "30:",
+            "45:a",
+            "_#_b",
+            "a_#_",
+            "30:a_#_b_#_c",
+        ] {
+            for (hotp, oath_type) in [(false, fotp::OathType::Totp), (true, fotp::OathType::Hotp)] {
+                let parts = fotp::parse_name(name, oath_type);
+                assert_eq!(
+                    keyroost_import::plan::feitian_account(name, hotp),
+                    (parts.issuer.unwrap_or(""), parts.account),
+                    "{name} hotp={hotp}"
+                );
+            }
+        }
         // The import's name limit mirrors the byte layer's.
         assert_eq!(
             keyroost_import::plan::limits(keyroost_import::plan::Store::FeitianOtp).name_max,
