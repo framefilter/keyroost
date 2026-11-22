@@ -4,4 +4,4 @@
   field of its OpenPGP applet, 00000001 on both keys measured, or none
   when it has no OpenPGP applet. A name saved under the old value does
   not follow the key: name it again. Checked on three keys of two
-  models. ([#278])
+  models. ([#273])
