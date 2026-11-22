@@ -337,6 +337,43 @@ pub fn get_response() -> Vec<u8> {
     build_apdu_get(0x00, INS_GET_RESPONSE, 0x00, 0x00, 0x00)
 }
 
+/// Read the key's serial: `80 E3 03 00 00`.
+///
+/// Not a command of the OTP applet: the key answers it whichever
+/// application is selected (measured with nothing selected after a reset,
+/// and with this applet, PIV and OpenPGP selected). It is the command
+/// Feitian's own client reads the serial it shows with. The answer is read
+/// by [`parse_device_serial`].
+#[must_use]
+pub fn device_serial() -> Vec<u8> {
+    vec![0x80, 0xE3, 0x03, 0x00, 0x00]
+}
+
+/// The fewest characters an answer to [`device_serial`] is taken for a
+/// serial with. Feitian's client drops a shorter one.
+pub const DEVICE_SERIAL_MIN: usize = 6;
+
+/// The serial in an answer to [`device_serial`]: ASCII letters or digits,
+/// then only zero bytes to the end. The measured key answered twelve bytes,
+/// nine digits and three zeros.
+///
+/// `None` for any other shape: fewer than [`DEVICE_SERIAL_MIN`] characters,
+/// anything but zeros after them, or any other byte among them. Feitian's
+/// client also reads an answer of exactly eight bytes as a binary serial;
+/// no key was seen to answer that way, so it is not guessed at here.
+#[must_use]
+pub fn parse_device_serial(data: &[u8]) -> Option<String> {
+    let len = data.iter().position(|b| *b == 0).unwrap_or(data.len());
+    let (serial, padding) = data.split_at(len);
+    if serial.len() < DEVICE_SERIAL_MIN
+        || !serial.iter().all(u8::is_ascii_alphanumeric)
+        || padding.iter().any(|b| *b != 0)
+    {
+        return None;
+    }
+    String::from_utf8(serial.to_vec()).ok()
+}
+
 /// Build a `LIST` APDU for one slot: `00 17 00 <slot> 00`. An empty slot
 /// answers a bare `9000`. The answer is read by [`parse_list`].
 #[must_use]

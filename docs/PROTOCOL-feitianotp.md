@@ -101,6 +101,32 @@ These keys do not host the Yubico OATH applet. A SELECT of its AID
 (`A0 00 00 05 27 21 01`) is answered `6700` by Key A and `6D00` by Key B, not
 `6A82`. *(Measured.)*
 
+## The key's serial
+
+```
+80 E3 03 00 00
+```
+
+This is not a command of the OTP applet. The key answers it whichever
+application is selected: nothing selected after a reset, and this applet, PIV
+and OpenPGP selected, all gave the same answer. *(Measured, one Key B,
+2026-11-22.)* It is the command Feitian's client reads the serial it shows
+with. *(Client.)*
+
+The answer is the serial in ASCII, padded with zero bytes: twelve bytes, nine
+digits and three zeros. *(Measured, one Key B.)* keyroost takes an answer of
+that shape, six or more letters or digits and then only zeros, as the key's
+serial, and nothing else. Feitian's client also reads an answer of exactly
+eight bytes as a binary serial; no key was seen to answer that way.
+*(Client.)*
+
+The key's OpenPGP application has a serial field of its own, in its AID:
+`00 00 00 01` on the measured key. Feitian's client selects that application
+by an AID with those four bytes in it, so the field does not tell one key
+from another. *(AID measured, one Key B; the AID the client selects by is
+Client.)* keyroost used to show that field as the serial of a Feitian key
+with OpenPGP, and showed none for one without.
+
 ## Slots
 
 Every command after SELECT names a slot in P2.

@@ -22,9 +22,9 @@
 //! None of the expected bytes were produced by this crate.
 
 use keyroost_feitianotp::{
-    calculate_hotp, calculate_totp, delete, list, list_legacy, parse_calculate, parse_list,
-    parse_name, parse_select, put, reset, reset_legacy, select, stored_name, totp_challenge,
-    Algorithm, OathType, PutParams, Slot,
+    calculate_hotp, calculate_totp, delete, device_serial, list, list_legacy, parse_calculate,
+    parse_device_serial, parse_list, parse_name, parse_select, put, reset, reset_legacy, select,
+    stored_name, totp_challenge, Algorithm, OathType, PutParams, Slot,
 };
 
 fn hex(s: &str) -> Vec<u8> {
@@ -100,6 +100,45 @@ fn select_answer_of_key_a() {
 // ---------------------------------------------------------------------------
 // LIST
 // ---------------------------------------------------------------------------
+
+#[test]
+fn serial_read_is_the_command_key_b_answered() {
+    // Captured 2026-11-22: one Key B answered this `9000` with nothing
+    // selected and with the OTP, PIV and OpenPGP applications selected.
+    assert_eq!(device_serial(), hex("80 E3 03 00 00"));
+}
+
+#[test]
+fn serial_answer_of_key_b() {
+    // Captured the same day: twelve bytes, nine ASCII digits and three zero
+    // bytes. The digits here are made up; the shape is the key's.
+    assert_eq!(
+        parse_device_serial(&hex("31 32 33 34 35 36 37 38 39 00 00 00")).as_deref(),
+        Some("123456789")
+    );
+}
+
+#[test]
+fn a_serial_answer_of_another_shape_is_not_guessed_at() {
+    // Constructed. Too short, something after the padding starts, a byte
+    // that is neither a letter nor a digit, nothing at all, and eight binary
+    // bytes (which Feitian's client would read as a serial).
+    for answer in [
+        "31 32 33 34 35 00 00 00",
+        "31 32 33 34 35 36 00 37",
+        "31 32 33 34 35 36 20 37 00",
+        "",
+        "00 00 00 00 00 00 00 00 00 00 00 00",
+        "A1 B2 C3 D4 E5 F6 07 18",
+    ] {
+        assert_eq!(parse_device_serial(&hex(answer)), None, "{answer}");
+    }
+    // Six characters are enough, and padding is not required.
+    assert_eq!(
+        parse_device_serial(&hex("41 42 43 31 32 33")).as_deref(),
+        Some("ABC123")
+    );
+}
 
 #[test]
 fn list_commands_are_the_ones_key_b_answered() {
