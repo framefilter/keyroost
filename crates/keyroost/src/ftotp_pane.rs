@@ -273,6 +273,8 @@ pub struct FtotpState {
     pub add: FtotpAddDialog,
     /// The account a delete is being confirmed for: slot and stored name.
     pub confirm_delete: Option<(fotp::Slot, String)>,
+    /// The reset confirmation is showing.
+    pub confirm_reset: bool,
 }
 
 impl FtotpState {
@@ -644,6 +646,46 @@ impl App {
         );
     }
 
+    /// Wipe the applet with its own RESET, as `keyroostctl feitian reset`
+    /// does. The key wipes it once it is touched.
+    pub(crate) fn reset_ftotp(&mut self) {
+        self.ftotp.error = None;
+        self.ftotp.info = None;
+        let reader = match self.ftotp_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                self.ftotp.error = Some(e);
+                return;
+            }
+        };
+        let for_device = self.selected_device.clone();
+        self.spawn_job(
+            "Resetting Feitian OTP \u{2014} touch your key\u{2026}",
+            move || {
+                let result = FeitianOtpSession::open(&reader)
+                    .and_then(|mut session| session.reset())
+                    .map_err(|e| e.to_string());
+                Box::new(move |app: &mut App| {
+                    if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                        app.log_moved_on(for_device.as_ref(), "resetting Feitian OTP", &result);
+                        return;
+                    }
+                    match result {
+                        Ok(()) => {
+                            // Replaced whole: the rows, their codes and any
+                            // open form belonged to what was wiped. The tab
+                            // reads the now-empty applet again on its own.
+                            app.ftotp = FtotpState::default();
+                            app.ftotp_tried = false;
+                            app.ftotp_done("Feitian OTP reset: all accounts wiped.".into());
+                        }
+                        Err(e) => app.ftotp_failed(e),
+                    }
+                })
+            },
+        );
+    }
+
     /// Drop TOTP codes whose time window has ended.
     fn ftotp_expire_codes(&mut self) {
         let now = unix_now();
@@ -730,6 +772,7 @@ impl App {
 
         self.render_ftotp_add_form(ui, p);
         self.render_ftotp_delete_confirm(ui, p);
+        self.render_ftotp_reset_confirm(ui, p);
 
         if !self.ftotp.loaded {
             ui.label(
@@ -853,6 +896,13 @@ impl App {
             }
         });
 
+        ui.add_space(10.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::button(ui, p, BtnKind::Danger, "Reset\u{2026}").clicked() {
+                self.ftotp.confirm_reset = true;
+            }
+        });
+
         if let Some(code) = copy {
             self.copy_secret(ui.ctx(), code);
         }
@@ -861,6 +911,54 @@ impl App {
         }
         if let Some((slot, stored)) = read {
             self.read_ftotp_code(slot, stored);
+        }
+    }
+
+    /// The reset confirmation, shown inline while it is pending.
+    fn render_ftotp_reset_confirm(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
+        if !self.ftotp.confirm_reset {
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        theme::card_frame(p).show(ui, |ui| {
+            ui.colored_label(
+                p.err,
+                "Reset Feitian OTP? This wipes ALL its accounts and cannot be undone.",
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "After you confirm, touch the key: it wipes the accounts once it is \
+                     touched.",
+                )
+                .font(theme::f_reg(11.5))
+                .color(p.txt3),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if theme::key_button(ui, p, BtnKind::Danger, "Reset", waiting.as_deref()).clicked()
+                {
+                    confirm = true;
+                }
+                ui.add_space(6.0);
+                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        ui.add_space(10.0);
+        if confirm {
+            // Refused while a job runs, before the confirmation is taken: it
+            // stays for the next try.
+            if self.refuse_if_busy() {
+                return;
+            }
+            self.ftotp.confirm_reset = false;
+            self.reset_ftotp();
+        } else if cancel {
+            self.ftotp.confirm_reset = false;
         }
     }
 

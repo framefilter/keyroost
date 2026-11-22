@@ -235,6 +235,18 @@ impl FeitianOtpSession {
         touch_answer("feitian delete", "delete the account", slot, sw)
     }
 
+    /// Wipe the applet with its RESET (`07`), as Feitian's client does: the
+    /// five-byte form, then the four-byte one if the key answers `6700`. Like
+    /// the other commands that change the key, it is sent again while the
+    /// key answers that no touch came.
+    pub fn reset(&mut self) -> Result<(), TransportError> {
+        let (_, mut sw) = self.transmit_for_touch(&fotp::reset())?;
+        if sw == fotp::SW_WRONG_LENGTH {
+            (_, sw) = self.transmit_for_touch(&fotp::reset_legacy())?;
+        }
+        touch_answer("feitian reset", "reset the applet", fotp::Slot::Default, sw)
+    }
+
     /// DELETE and return the raw status word.
     pub fn delete_status(&mut self, slot: fotp::Slot, name: &str) -> Result<u16, TransportError> {
         let apdu = fotp::delete(slot, name).map_err(TransportError::FeitianOtpBuild)?;

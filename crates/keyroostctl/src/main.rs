@@ -221,16 +221,15 @@ enum Cmd {
         cmd: ProgCmd,
     },
     /// Factory-reset every applet keyroost can reset on the selected key:
-    /// OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a
-    /// typed confirmation (`--yes` to skip).
+    /// OATH, OpenPGP, Token2 OTP, Feitian OTP, PIV, then FIDO2. Irreversible:
+    /// asks for a typed confirmation (`--yes` to skip).
     ///
     /// Wipes all credentials, codes, keys, and PINs in those applets
     /// (including a name stored on the key); each applet that
     /// completes comes back in factory condition, and every step reports its
     /// own outcome. On a USB key the FIDO2 step ends with an unplug/replug +
     /// touch; a card in a smart-card reader is reset in place instead (no
-    /// replug, no touch). Feitian OTP accounts are not reset; remove them
-    /// with `feitian delete`.
+    /// replug, no touch).
     FactoryReset {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -2449,6 +2448,19 @@ enum FtotpCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Wipe every account in the Feitian OTP applet. Irreversible: asks first
+    /// (`--yes` to skip).
+    Reset {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Ask the key's FIDO HID interface whether it carries the OTP applet's
+    /// commands, and print what it answers. Reads only.
+    #[command(hide = true)]
+    HidProbe,
 }
 
 /// A slot of the Feitian OTP applet.
@@ -7431,12 +7443,6 @@ fn run_factory_reset(
     if plan.contains(&ResetStep::Fido) && dev.hid_path.is_some() {
         refuse_serial_less_reset_with_others(&dev)?;
     }
-    // What no step resets is said before the question and again with the
-    // result, as the app does.
-    let keeps = factory_reset_keeps_note(dev.caps);
-    if let Some(note) = &keeps {
-        output::note(note);
-    }
     let asked =
         crate::prompt::confirm_typed_then_read(&dev, yes, "reset", &factory_reset_action(&labels))?;
     // The PIV credential, if one was given, is read now — after the question
@@ -7617,18 +7623,7 @@ fn run_factory_reset(
 
     let (summary, verdict) = factory_reset_summary(&reports);
     outln!("{summary}");
-    if let Some(note) = &keeps {
-        output::note(note);
-    }
     verdict.map_err(Into::into)
-}
-
-/// What a factory reset of a key with `caps` leaves, and how to remove it
-/// here: the shared words ([`keyroost_resolve::factory_reset_keeps`]) and
-/// the command that does it.
-fn factory_reset_keeps_note(caps: keyroost_resolve::Caps) -> Option<String> {
-    keyroost_resolve::factory_reset_keeps(caps)
-        .map(|keeps| format!("{keeps}; remove them with `keyroostctl feitian delete`"))
 }
 
 /// The closing line of a factory reset and whether the command succeeded.
@@ -8502,6 +8497,12 @@ fn reset_one_card_applet(
                 arm_otp_erase_prompt(&mut s);
                 s.erase_all()?;
             }
+            ResetStep::FeitianOtp => {
+                let mut s = keyroost_transport::FeitianOtpSession::open_traced(&reader()?, debug)?;
+                // The key wipes the applet once it is touched.
+                crate::prompt::touch(&format!("{}  touch your key\u{2026}", step.label()));
+                s.reset()?;
+            }
             ResetStep::Fido => unreachable!("FIDO handled by the interactive path"),
         }
         Ok(())
@@ -9361,6 +9362,87 @@ fn run_ftotp(cmd: &FtotpCmd, debug: bool) -> Result<(), Box<dyn std::error::Erro
             crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
             session.delete(found.slot, &found.name)?;
             outln!("Deleted Feitian OTP account {label:?}.");
+        }
+        FtotpCmd::Reset { reader, yes } => {
+            let dev = crate::target::select(Need::FeitianOtp, reader.as_deref(), None)?;
+            crate::prompt::confirm_on(&dev, *yes, "wipe the Feitian OTP applet")?;
+            let name = crate::target::reader_of(&dev)?;
+            let mut session = keyroost_transport::FeitianOtpSession::open_traced(&name, debug)?;
+            // Whether the key waits for a touch here is not measured yet.
+            crate::prompt::touch("Resetting \u{2014} touch the key if it blinks\u{2026}");
+            session.reset()?;
+            outln!("Feitian OTP applet reset: all accounts wiped.");
+        }
+        FtotpCmd::HidProbe => feitian_hid_probe()?,
+    }
+    Ok(())
+}
+
+/// `feitian hid-probe`: does the key's FIDO HID interface carry the OTP
+/// applet's APDUs? Feitian's client falls back to that interface when there
+/// is no smart-card one, wrapping each APDU in a CTAPHID_MSG; whether the
+/// applet answers that way was never measured. This sends SELECT and the
+/// default slot's LIST and prints the raw outcome of each: the SELECT answer
+/// in full (version and flags, nothing private), and for LIST only its
+/// length and status word, since it holds account names.
+fn feitian_hid_probe() -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_ctap::hid::{CtapHidDevice, CTAPHID_MSG};
+    const FEITIAN_VID: u16 = 0x096E;
+    let devices: Vec<_> = keyroost_hid::enumerate()?
+        .into_iter()
+        .filter(|d| d.vendor_id == FEITIAN_VID)
+        .collect();
+    if devices.is_empty() {
+        return Err(
+            "no Feitian FIDO HID interface found (on Windows, run this from an \
+                    administrator terminal)"
+                .into(),
+        );
+    }
+    for d in &devices {
+        outln!(
+            "{:04X}:{:04X} {}",
+            d.vendor_id,
+            d.product_id,
+            sanitize_terminal(&d.product_name)
+        );
+        let (mut hid, init) = match CtapHidDevice::open(&d.path) {
+            Ok(opened) => opened,
+            Err(e) => {
+                outln!("  open: {e}");
+                continue;
+            }
+        };
+        outln!(
+            "  CTAPHID INIT ok (cbor: {}, wink: {})",
+            init.supports_cbor(),
+            init.supports_wink()
+        );
+        let select = keyroost_feitianotp::select();
+        let list = keyroost_feitianotp::list(keyroost_feitianotp::Slot::Default);
+        // The applet's short APDU as it is, then the same SELECT in the
+        // extended-length form U2F uses on this channel.
+        let mut select_extended = select[..4].to_vec();
+        select_extended.extend_from_slice(&[0x00, 0x00, (select.len() - 5) as u8]);
+        select_extended.extend_from_slice(&select[5..]);
+        for (what, apdu, show) in [
+            ("SELECT (short APDU)", &select, true),
+            ("LIST default slot (short APDU)", &list, false),
+            ("SELECT (extended-length APDU)", &select_extended, true),
+        ] {
+            match hid.transact(CTAPHID_MSG, apdu) {
+                Ok(answer) if answer.len() >= 2 => {
+                    let (body, sw) = answer.split_at(answer.len() - 2);
+                    let shown = if show {
+                        hex_encode(body)
+                    } else {
+                        format!("{} bytes (not shown)", body.len())
+                    };
+                    outln!("  {what}: SW={:02X}{:02X}  data: {shown}", sw[0], sw[1]);
+                }
+                Ok(answer) => outln!("  {what}: {} byte answer, no status word", answer.len()),
+                Err(e) => outln!("  {what}: {e}"),
+            }
         }
     }
     Ok(())
@@ -17442,6 +17524,7 @@ mod cli_tests {
             ("oath reset", IRREVERSIBLE),
             ("otp delete", IRREVERSIBLE),
             ("feitian delete", IRREVERSIBLE),
+            ("feitian reset", IRREVERSIBLE),
             ("otp reset", IRREVERSIBLE),
             ("otp button clear", IRREVERSIBLE),
             ("openpgp reset", IRREVERSIBLE),
@@ -20792,21 +20875,10 @@ mod cli_tests {
         );
     }
 
-    /// A key with the Feitian OTP applet is told what the reset leaves; one
-    /// without hears nothing about it.
+    /// The Feitian OTP applet is one of the applets the reset names, and
+    /// the help no longer says its accounts stay.
     #[test]
-    fn factory_reset_says_feitian_otp_accounts_stay() {
-        let mut caps = keyroost_resolve::Caps::default();
-        caps.insert(keyroost_resolve::Caps::PIV);
-        assert_eq!(factory_reset_keeps_note(caps), None);
-        caps.insert(keyroost_resolve::Caps::FEITIAN_OTP);
-        assert_eq!(
-            factory_reset_keeps_note(caps).as_deref(),
-            Some(
-                "Feitian OTP accounts are not reset; remove them with \
-                 `keyroostctl feitian delete`"
-            )
-        );
+    fn factory_reset_help_names_the_feitian_otp_applet() {
         use clap::CommandFactory;
         let cmd = Cli::command();
         let help = cmd
@@ -20816,10 +20888,8 @@ mod cli_tests {
             .unwrap()
             .to_string();
         assert!(help.contains("every applet keyroost can reset"), "{help}");
-        assert!(
-            help.contains("Feitian OTP accounts are not reset"),
-            "{help}"
-        );
+        assert!(help.contains("Feitian OTP, PIV, then FIDO2"), "{help}");
+        assert!(!help.contains("are not reset"), "{help}");
     }
 
     #[test]
@@ -26278,7 +26348,10 @@ mod cli_tests {
                 ..
             } => yes,
             Cmd::Feitian {
-                cmd: FtotpCmd::Delete { yes, .. } | FtotpCmd::Import { yes, .. },
+                cmd:
+                    FtotpCmd::Delete { yes, .. }
+                    | FtotpCmd::Import { yes, .. }
+                    | FtotpCmd::Reset { yes, .. },
             } => yes,
             Cmd::Fido {
                 cmd:
@@ -26519,6 +26592,7 @@ mod cli_tests {
             &["keyroostctl", "otp", "button", "clear"],
             &["keyroostctl", "feitian", "delete", "--account", "a"],
             &["keyroostctl", "feitian", "import", "--in", "f.json"],
+            &["keyroostctl", "feitian", "reset"],
             &["keyroostctl", "fido", "credential", "delete", "00"],
             &["keyroostctl", "fido", "fingerprint", "delete", "00"],
             &[

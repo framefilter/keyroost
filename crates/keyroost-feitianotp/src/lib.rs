@@ -38,6 +38,8 @@ pub const P1_SELECT_BY_NAME: u8 = 0x04;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Instruction {
+    /// Wipe the applet's credentials.
+    Reset = 0x07,
     /// Remove a credential by name.
     Delete = 0x08,
     /// Store a credential.
@@ -350,6 +352,22 @@ pub fn list(slot: Slot) -> Vec<u8> {
 #[must_use]
 pub fn list_legacy() -> Vec<u8> {
     vec![0x00, Instruction::List.code(), 0x00, 0x00]
+}
+
+/// Build the `RESET` APDU, `00 07 00 00 00`: no slot, no data.
+///
+/// Known from Feitian's client, where it wipes the applet's credentials.
+#[must_use]
+pub fn reset() -> Vec<u8> {
+    build_apdu_get(0x00, Instruction::Reset.code(), 0x00, 0x00, 0x00)
+}
+
+/// The four-byte `RESET`, `00 07 00 00`, with no `Le`: what Feitian's client
+/// sends when [`reset`] is answered [`SW_WRONG_LENGTH`], as for
+/// [`list_legacy`].
+#[must_use]
+pub fn reset_legacy() -> Vec<u8> {
+    vec![0x00, Instruction::Reset.code(), 0x00, 0x00]
 }
 
 /// Parameters for storing a credential via [`put`].

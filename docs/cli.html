@@ -436,7 +436,7 @@ keyroostctl fido pin status --json</code></pre>
       <tr><th>Command</th><th>What it does</th></tr>
       <tr><td><code>keyroostctl list</code></td><td>List connected keys: smart-card (PC/SC) readers and FIDO USB (HID) devices</td></tr>
       <tr><td><code>keyroostctl doctor</code></td><td>Diagnose the local environment: PC/SC service, readers, FIDO HID access, udev rules, registry permissions. Read-only, touches no key</td></tr>
-      <tr><td><code>keyroostctl factory-reset</code></td><td>Factory-reset every applet keyroost can reset on the selected key: OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a typed confirmation (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl factory-reset</code></td><td>Factory-reset every applet keyroost can reset on the selected key: OATH, OpenPGP, Token2 OTP, Feitian OTP, PIV, then FIDO2. Irreversible: asks for a typed confirmation (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl completions</code></td><td>Print shell completions to stdout</td></tr>
       <tr><td><code>keyroostctl manpage</code></td><td>Write man pages (keyroostctl.1 + keyroostctl-&lt;group&gt;.1) into a directory</td></tr>
     </table></div>
@@ -539,6 +539,7 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl feitian add</code></td><td>Add a TOTP or HOTP account to the key&#x27;s default slot</td></tr>
       <tr><td><code>keyroostctl feitian import</code></td><td>Add every code in an authenticator export to this key&#x27;s default slot</td></tr>
       <tr><td><code>keyroostctl feitian delete</code></td><td>Delete one account by app and account. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl feitian reset</code></td><td>Wipe every account in the Feitian OTP applet. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
     </table></div>
     <h3 id="ref-openpgp">openpgp</h3>
     <p class="kr-muted">Manage the OpenPGP card applet: info, keys, sign, decrypt, PINs, cardholder details, and reset</p>

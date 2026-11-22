@@ -22,8 +22,8 @@
 
 use keyroost_feitianotp::{
     calculate_hotp, calculate_totp, delete, list, list_legacy, parse_calculate, parse_list,
-    parse_name, parse_select, put, select, stored_name, totp_challenge, Algorithm, OathType,
-    PutParams, Slot,
+    parse_name, parse_select, put, reset, reset_legacy, select, stored_name, totp_challenge,
+    Algorithm, OathType, PutParams, Slot,
 };
 
 fn hex(s: &str) -> Vec<u8> {
@@ -324,6 +324,15 @@ fn put_of_an_hotp_credential_has_no_counter_and_no_prefix() {
             "51 0A 69 73 73 5F 23 5F 61 63 63 74",
         ))
     );
+}
+
+#[test]
+fn reset_has_no_slot_and_no_data() {
+    // Captured: Key B answered the five-byte form 9000 once touched, and its
+    // accounts were gone. Constructed: the four-byte form Feitian's client
+    // sends after a 6700, which Key B did not answer.
+    assert_eq!(reset(), hex("00 07 00 00 00"));
+    assert_eq!(reset_legacy(), hex("00 07 00 00"));
 }
 
 #[test]
