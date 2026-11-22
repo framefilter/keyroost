@@ -198,6 +198,13 @@ with no touch was seen on Key B. What the applet does
 with the true length in the `53` TLV has not been tried, nor what it does
 with a name it already holds: `keyroost` never sends one.)*
 
+Feitian's client can add a third TLV, `5C 01 01`, when it stores a credential
+that is to need a touch. *(Client.)* `keyroost` does not send it. On Key B a
+credential stored with `5C 01 00` and one stored with `5C 01 01` both needed
+a touch for a code, answering `6984` after about three seconds without one,
+the same as a credential stored with no `5C` at all: the TLV made no
+difference that could be seen there. *(Measured, Key B.)*
+
 ### DELETE (`08`)
 
 ```
@@ -208,12 +215,28 @@ The key removes the credential once it is touched. With no touch it answers
 `6984` and the credential stays. *(Measured, default slot: the removal on
 Key A and Key B, the answer with no touch on Key B.)*
 
+### RESET (`07`)
+
+```
+00 07 00 00 00
+```
+
+No slot and no data. The key wipes the applet's credentials once it is
+touched; with no touch it answers `6984`. *(Measured, Key B: two credentials
+in the default slot were gone afterwards, and the `51` value of the SELECT
+answer was the same before and after. A second RESET of the empty applet was
+answered `9000` as well. Whether it also clears the keyboard slots, and what
+it does on a slot with an access code, is not measured.)*
+
+Feitian's client answers a `6700` here with the four bytes `00 07 00 00`, as
+for LIST. *(Client. Key B did not answer `6700`.)* `keyroost` does the same.
+
 ## Status words
 
 | SW | Meaning | |
 |---|---|---|
 | `9000` | Success | *Measured* |
-| `6984` | CALCULATE, PUT, DELETE: no touch arrived | *Measured* |
+| `6984` | CALCULATE, PUT, DELETE, RESET: no touch arrived | *Measured* |
 | `6982` | The slot has an access code that must be presented first | *Client* |
 | `6700` | LIST: use the four-byte form | *Client* |
 | `6A84` | No space left | *Client* |
@@ -234,7 +257,7 @@ Key A and Key B, the answer with no touch on Key B.)*
 
 ## Not implemented
 
-Known from Feitian's client and left out until measured: the applet's RESET
-(`07`), the per-slot access codes (`A3`), the touch flag a PUT can carry
-(`5C`), and the commands that swap the keyboard slots or pick which credential
-a slot types. Static passwords and challenge-response secrets are not handled.
+Known from Feitian's client and left out until measured: the per-slot access
+codes (`A3`), and the commands that swap the keyboard slots or pick which
+credential a slot types. The touch TLV a PUT can carry (`5C`) is not sent:
+see PUT. Static passwords and challenge-response secrets are not handled.

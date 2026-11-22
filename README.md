@@ -134,20 +134,19 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 - **Feitian OTP (Feitian FIDO keys)** — list, read, add, import and delete
   the TOTP/HOTP accounts in the OTP applet Feitian keys carry, over the
   smart-card interface (`feitian info` / `list` / `code` / `add` /
-  `import` / `delete`, or the GUI's Feitian OTP tab). The key computes a
-  code, and saves or deletes an account, once it is touched. Its own
+  `import` / `delete` / `reset`, or the GUI's Feitian OTP tab). The key
+  computes a code, saves or deletes an account, and wipes the applet, once
+  it is touched. Its own
   protocol, documented in
   [`docs/PROTOCOL-feitianotp.md`](docs/PROTOCOL-feitianotp.md).
 - **One-shot factory reset** — `keyroostctl factory-reset` (and a card on
   the GUI device Overview tab) resets every applet keyroost can reset on a key
-  in turn: OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. Feitian OTP accounts
-  are not reset (it says so before asking and with the result); remove them
-  with `keyroostctl feitian delete` or the app's Feitian OTP tab. In a terminal you confirm by
+  in turn: OATH, OpenPGP, Token2 OTP, Feitian OTP, PIV, then FIDO2. In a terminal you confirm by
   typing `reset`; a script passes `--yes`. On a USB key the FIDO2 step ends
   with an unplug/replug (detected automatically) and a touch; a card in a smart-card reader is instead
   reset in place (no replug, no touch — the card is power-cycled in the
-  reader). The Token2 OTP step, and the OATH step on a Nitrokey 3, ask for a
-  touch on the key. A FIDO2 key with no serial number is reset only while it
+  reader). The Token2 OTP and Feitian OTP steps, and the OATH step on a
+  Nitrokey 3, ask for a touch on the key. A FIDO2 key with no serial number is reset only while it
   is the only key plugged in; otherwise keyroost names the keys to unplug
   before anything is wiped. Only manufacturer-intended resets are used, and
   each step reports its own outcome rather than being folded into one

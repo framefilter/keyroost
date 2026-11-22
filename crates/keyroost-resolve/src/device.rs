@@ -1790,6 +1790,10 @@ pub enum ResetStep {
     Oath,
     OpenPgp,
     Token2Otp,
+    /// The Feitian OTP applet's own RESET
+    /// (`keyroost_transport::FeitianOtpSession::reset`): it wipes the
+    /// applet's accounts once the key is touched.
+    FeitianOtp,
     /// Resetting the PIV applet — `keyroost_transport::PivSession::
     /// factory_reset` decides on its own, from a live fingerprint, exactly
     /// which mechanism this ends up running: a PIV-only reset (several
@@ -1816,6 +1820,7 @@ impl ResetStep {
             ResetStep::OpenPgp => "OpenPGP",
             ResetStep::Piv => "PIV",
             ResetStep::Token2Otp => "OTP",
+            ResetStep::FeitianOtp => "FEITIAN-OTP",
             ResetStep::Fido => "FIDO2",
         }
     }
@@ -1849,6 +1854,9 @@ pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     if caps.has(Caps::OTP) {
         steps.push(ResetStep::Token2Otp);
     }
+    if caps.has(Caps::FEITIAN_OTP) {
+        steps.push(ResetStep::FeitianOtp);
+    }
     if caps.has(Caps::PIV) {
         steps.push(ResetStep::Piv);
     }
@@ -1859,17 +1867,6 @@ pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
         steps.push(ResetStep::Fido);
     }
     steps
-}
-
-/// What a factory reset leaves on a key with these capabilities, in the words
-/// both front ends use, or `None` when it leaves nothing. The Feitian OTP
-/// applet has no step: its RESET is known only from Feitian's client and was
-/// never run by keyroost. Each front end follows the line with where to
-/// remove what stays (`feitian delete`, the Feitian OTP tab), in the
-/// confirmation and in the result.
-pub fn factory_reset_keeps(caps: Caps) -> Option<&'static str> {
-    caps.has(Caps::FEITIAN_OTP)
-        .then_some("Feitian OTP accounts are not reset")
 }
 
 /// Remove [`ResetStep::Piv`] from an already-built [`factory_reset_plan`]
@@ -3028,18 +3025,26 @@ mod tests {
         assert_eq!(ft.cap_badges(), vec!["PGP", "PIV", "FEITIAN-OTP"]);
     }
 
-    /// A factory reset has no Feitian OTP step, so it says what it leaves.
+    /// A Feitian key's OTP applet has a reset step of its own, with the
+    /// other card applets and before PIV and FIDO2.
     #[test]
-    fn factory_reset_names_the_feitian_otp_accounts_it_leaves() {
+    fn factory_reset_has_a_feitian_otp_step() {
         let mut caps = Caps::default();
         caps.insert(Caps::PGP);
-        assert_eq!(factory_reset_keeps(caps), None);
-        caps.insert(Caps::FEITIAN_OTP);
         assert_eq!(factory_reset_plan(caps), vec![ResetStep::OpenPgp]);
+        for c in [Caps::FEITIAN_OTP, Caps::PIV, Caps::FIDO2] {
+            caps.insert(c);
+        }
         assert_eq!(
-            factory_reset_keeps(caps),
-            Some("Feitian OTP accounts are not reset")
+            factory_reset_plan(caps),
+            vec![
+                ResetStep::OpenPgp,
+                ResetStep::FeitianOtp,
+                ResetStep::Piv,
+                ResetStep::Fido
+            ]
         );
+        assert_eq!(ResetStep::FeitianOtp.label(), "FEITIAN-OTP");
     }
 
     #[test]

@@ -2223,14 +2223,6 @@ enum ResetMgmtAuth {
     Pin(zeroize::Zeroizing<String>),
 }
 
-/// What a factory reset of a key with `caps` leaves, and where to remove it
-/// in the app: the shared words ([`keyroost_resolve::factory_reset_keeps`])
-/// and the tab that does it. Shown in the confirmation and with the result.
-fn factory_reset_keeps_note(caps: keyroost_resolve::Caps) -> Option<String> {
-    keyroost_resolve::factory_reset_keeps(caps)
-        .map(|keeps| format!("{keeps}; remove them in the Feitian OTP tab."))
-}
-
 /// The confirmation body for the Factory reset modal: what key, and exactly
 /// which applets get wiped, with the two ceremonies that aren't a plain wipe
 /// spelled out (PIV's actual precondition, per `piv_preview`; FIDO needs a
@@ -2846,6 +2838,14 @@ fn run_card_reset_step(
                 signal_otp_touch(&mut s);
                 s.erase_all().map_err(|e| e.to_string())?;
             }
+            ResetStep::FeitianOtp => {
+                // The key wipes the applet once it is touched; the sweep's
+                // label asks for the touch (see `factory_reset_busy_label`).
+                let name = reader.ok_or("no PC/SC reader for the Feitian OTP applet")?;
+                let mut s =
+                    keyroost_transport::FeitianOtpSession::open(name).map_err(|e| e.to_string())?;
+                s.reset().map_err(|e| e.to_string())?;
+            }
             ResetStep::Fido => {}
         }
         Ok(())
@@ -2856,13 +2856,13 @@ fn run_card_reset_step(
     }
 }
 
-/// The status line while the factory reset's card sweep runs. The OTP erase
-/// always waits for a touch on the key, so the label asks for it up front. The
-/// OATH step asks for one only on some keys (Nitrokey 3); that step raises the
-/// touch banner itself once it knows.
+/// The status line while the factory reset's card sweep runs. The Token2 OTP
+/// erase and the Feitian OTP reset always wait for a touch on the key, so the
+/// label asks for it up front. The OATH step asks for one only on some keys
+/// (Nitrokey 3); that step raises the touch banner itself once it knows.
 fn factory_reset_busy_label(card_steps: &[keyroost_resolve::ResetStep]) -> &'static str {
     use keyroost_resolve::ResetStep;
-    if card_steps.contains(&ResetStep::Token2Otp) {
+    if card_steps.contains(&ResetStep::Token2Otp) || card_steps.contains(&ResetStep::FeitianOtp) {
         "Factory-resetting key \u{2014} touch the key if it blinks\u{2026}"
     } else {
         "Factory-resetting key\u{2026}"
@@ -9148,10 +9148,6 @@ impl App {
                     needs_reset_mgmt_auth,
                     reset_long_running,
                 );
-                let summary = match factory_reset_keeps_note(dev.caps) {
-                    Some(note) => format!("{summary}\n\n{note}"),
-                    None => summary,
-                };
                 let fido_replug = plan.contains(&keyroost_resolve::ResetStep::Fido)
                     && Self::card_reset_reader(Some(dev)).is_none();
                 (summary, fido_replug)
@@ -9447,6 +9443,10 @@ impl App {
                     ResetStep::Token2Otp => {
                         app.otp = OtpState::default();
                         app.otp_tried = false;
+                    }
+                    ResetStep::FeitianOtp => {
+                        app.ftotp = FtotpState::default();
+                        app.ftotp_tried = false;
                     }
                     ResetStep::Fido => {}
                 }
@@ -20052,15 +20052,6 @@ impl App {
                                             .color(color),
                                     );
                                 }
-                                // What no step reset, with the result as in
-                                // the confirmation.
-                                if let Some(note) = factory_reset_keeps_note(dev.caps) {
-                                    ui.label(
-                                        egui::RichText::new(note)
-                                            .font(theme::f_reg(12.5))
-                                            .color(p.warn),
-                                    );
-                                }
                             }
                         });
                     if arm {
@@ -29324,6 +29315,13 @@ mod tests {
             factory_reset_busy_label(&[ResetStep::OpenPgp, ResetStep::Token2Otp])
                 .contains("touch the key")
         );
+        // The Feitian OTP reset waits for a touch too.
+        assert!(factory_reset_busy_label(&[
+            ResetStep::OpenPgp,
+            ResetStep::FeitianOtp,
+            ResetStep::Piv
+        ])
+        .contains("touch the key"));
         assert!(!factory_reset_busy_label(&[ResetStep::OpenPgp, ResetStep::Piv]).contains("touch"));
         // OATH asks for a touch only on some keys; that step raises the
         // banner itself rather than every key's label asking.
@@ -29417,21 +29415,6 @@ mod tests {
         assert_eq!(
             busy_refusal_text(Some("Scanning")),
             "Still working on: Scanning\u{2026} Try again when it finishes."
-        );
-    }
-
-    /// The app says what a factory reset leaves on a Feitian key, in the
-    /// CLI's words, and where to remove it here.
-    #[test]
-    fn factory_reset_says_feitian_otp_accounts_stay() {
-        use keyroost_resolve::Caps;
-        let mut caps = Caps::default();
-        caps.insert(Caps::PIV);
-        assert_eq!(factory_reset_keeps_note(caps), None);
-        caps.insert(Caps::FEITIAN_OTP);
-        assert_eq!(
-            factory_reset_keeps_note(caps).as_deref(),
-            Some("Feitian OTP accounts are not reset; remove them in the Feitian OTP tab.")
         );
     }
 
