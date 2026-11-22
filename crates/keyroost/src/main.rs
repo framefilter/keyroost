@@ -2841,9 +2841,11 @@ fn run_card_reset_step(
             ResetStep::FeitianOtp => {
                 // The key wipes the applet once it is touched; the sweep's
                 // label asks for the touch (see `factory_reset_busy_label`).
-                let name = reader.ok_or("no PC/SC reader for the Feitian OTP applet")?;
-                let mut s =
-                    keyroost_transport::FeitianOtpSession::open(name).map_err(|e| e.to_string())?;
+                // Through the key's reader, or its FIDO HID interface where
+                // it has none, as the Feitian OTP tab reaches it.
+                let target = ftotp_pane::FtotpTarget::of(reader, hid_path)
+                    .ok_or("no interface for the Feitian OTP applet")?;
+                let mut s = target.open().map_err(|e| e.to_string())?;
                 s.reset().map_err(|e| e.to_string())?;
             }
             ResetStep::Fido => {}

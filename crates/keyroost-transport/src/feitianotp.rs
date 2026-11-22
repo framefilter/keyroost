@@ -1,23 +1,57 @@
-//! Feitian OTP (TOTP/HOTP) applet over PC/SC.
+//! Feitian OTP (TOTP/HOTP) applet, over PC/SC or the key's FIDO HID
+//! interface.
 //!
 //! Drives the applet on Feitian FIDO keys with the pure-byte builders and
 //! parsers in [`keyroost_feitianotp`]. It sits next to the Yubico/Trussed
 //! OATH applet's session (`oath.rs`) and reuses the same PC/SC plumbing; the
 //! protocol is its own (`docs/PROTOCOL-feitianotp.md`).
 //!
-//! Not here, because nothing has run them on hardware: the applet's reset
-//! and the slot access codes. A slot that answers `6982` is reported, never
-//! unlocked.
+//! Not here, because nothing has run them on hardware: the slot access
+//! codes. A slot that answers `6982` is reported, never unlocked.
 
 use crate::recover::{self, FirstContact};
 use crate::TransportError;
+use keyroost_ctap::hid::{CtapHidDevice, CTAPHID_MSG};
 use keyroost_feitianotp as fotp;
 use pcsc::Card;
 use zeroize::Zeroizing;
 
-/// An open Feitian OTP applet session on one PC/SC reader.
+/// How a session reaches the applet.
+enum Link {
+    /// The key's smart-card interface (CCID, or NFC) through a PC/SC reader.
+    Card(Card),
+    /// The key's FIDO HID interface: each APDU rides in a `CTAPHID_MSG`, as
+    /// Feitian's client does when there is no smart-card interface to use.
+    Hid(HidLink),
+}
+
+/// The FIDO HID interface while this session has the OTP applet selected on
+/// it. A `CTAPHID_MSG` goes to whichever applet was selected last: with the
+/// OTP applet selected, the key answers a U2F command `6D00`. So when the
+/// session ends, the FIDO applet is selected again, the way the interface
+/// was found.
+struct HidLink(Box<CtapHidDevice>);
+
+/// SELECT of the FIDO applet (`A0 00 00 06 47 2F 00 01`).
+const SELECT_FIDO: [u8; 13] = [
+    0x00, 0xA4, 0x04, 0x00, 0x08, 0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01,
+];
+
+/// How long one exchange over HID may take. A command the key acts on once
+/// touched is answered `6984` only after the key has waited about three and a
+/// half seconds, which is longer than the CTAP layer's own default.
+const HID_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl Drop for HidLink {
+    fn drop(&mut self) {
+        // Best effort: nothing to do about a key that was unplugged.
+        let _ = self.0.transact(CTAPHID_MSG, &SELECT_FIDO);
+    }
+}
+
+/// An open Feitian OTP applet session on one key.
 pub struct FeitianOtpSession {
-    card: Card,
+    link: Link,
     debug: bool,
     /// What the SELECT answer said: version and which slots have an access
     /// code.
@@ -76,7 +110,7 @@ impl FeitianOtpSession {
                 continue;
             }
             let mut session = Self {
-                card,
+                link: Link::Card(card),
                 debug,
                 select_info: fotp::SelectInfo::default(),
             };
@@ -86,11 +120,38 @@ impl FeitianOtpSession {
                     return Ok(session);
                 }
                 Err(e) => {
-                    recover::release(session.card);
+                    if let Link::Card(card) = session.link {
+                        recover::release(card);
+                    }
                     contact.retry_or_fail(e)?;
                 }
             }
         }
+    }
+
+    /// Open the applet through the key's FIDO HID interface at `path`, for a
+    /// key with no smart-card interface this computer can use.
+    ///
+    /// Each APDU is sent as it is in a `CTAPHID_MSG`. There is no
+    /// transaction here as there is over PC/SC: another program talking to
+    /// the same interface can put a command of its own between two of this
+    /// session's. On Windows only an administrator can open this interface.
+    pub fn open_hid(path: &std::path::Path) -> Result<Self, TransportError> {
+        let (mut hid, _) = CtapHidDevice::open(path).map_err(hid_error)?;
+        hid.set_timeout(HID_EXCHANGE_TIMEOUT);
+        let mut session = Self {
+            link: Link::Hid(HidLink(Box::new(hid))),
+            debug: false,
+            select_info: fotp::SelectInfo::default(),
+        };
+        session.select()?;
+        Ok(session)
+    }
+
+    /// Whether this session runs over the FIDO HID interface rather than a
+    /// PC/SC reader.
+    pub fn over_hid(&self) -> bool {
+        matches!(self.link, Link::Hid(_))
     }
 
     /// The applet version from SELECT, when it is three bytes.
@@ -123,7 +184,7 @@ impl FeitianOtpSession {
         for name in names {
             if let Ok(card) = crate::connect_shared(&ctx, name.as_c_str()) {
                 let mut session = FeitianOtpSession {
-                    card,
+                    link: Link::Card(card),
                     debug: false,
                     select_info: fotp::SelectInfo::default(),
                 };
@@ -133,7 +194,9 @@ impl FeitianOtpSession {
                 // Release without resetting (pcsc's `Drop` hard-codes
                 // ResetCard): probing must not disturb cards other sessions
                 // hold open.
-                let _ = session.card.disconnect(pcsc::Disposition::LeaveCard);
+                if let Link::Card(card) = session.link {
+                    let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+                }
             }
         }
         Ok(out)
@@ -264,21 +327,72 @@ impl FeitianOtpSession {
     /// `61xx` continuations, returning `(payload, sw)`.
     fn transmit_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
         let (cmd_sensitive, resp_sensitive) = trace_sensitivity(apdu);
+        let card = match &mut self.link {
+            Link::Card(card) => card,
+            // One switch hides both directions on this link, so an exchange
+            // with either half private is sent private.
+            Link::Hid(hid) => {
+                return transmit_hid(&mut hid.0, apdu, cmd_sensitive || resp_sensitive)
+            }
+        };
         let io = crate::AppletIo {
             label: "feitian",
             more_data_sw: fotp::SW_MORE_DATA,
             get_response: fotp::get_response,
             describe: None,
         };
-        crate::transmit_applet(
-            &self.card,
-            self.debug,
-            &io,
-            apdu,
-            cmd_sensitive,
-            resp_sensitive,
-        )
+        crate::transmit_applet(card, self.debug, &io, apdu, cmd_sensitive, resp_sensitive)
     }
+}
+
+/// A HID failure as this session's error.
+fn hid_error(e: keyroost_ctap::hid::HidTransportError) -> TransportError {
+    TransportError::FeitianOtpHid(e.to_string())
+}
+
+/// One APDU exchange over the FIDO HID interface, with the same `61xx`
+/// reassembly as over PC/SC. `private` keeps the payloads out of the CTAP
+/// trace in both directions.
+fn transmit_hid(
+    hid: &mut CtapHidDevice,
+    apdu: &[u8],
+    private: bool,
+) -> Result<(Vec<u8>, u16), TransportError> {
+    // The PUT body holds the seed: the copy in flight is wiped.
+    let mut to_send = Zeroizing::new(apdu.to_vec());
+    let mut acc = Vec::new();
+    // As many continuations as a full listing could ever need.
+    for _ in 0..64 {
+        let answer = if private {
+            hid.transact_private(CTAPHID_MSG, &to_send)
+        } else {
+            hid.transact(CTAPHID_MSG, &to_send)
+        }
+        .map_err(hid_error)?;
+        if answer.len() < 2 {
+            return Err(TransportError::ShortResponse {
+                label: "feitian",
+                got: answer.len(),
+                expected_min: 2,
+            });
+        }
+        let (data, sw) = answer.split_at(answer.len() - 2);
+        match crate::advance_exchange(
+            fotp::SW_MORE_DATA,
+            fotp::get_response,
+            &to_send,
+            data,
+            sw[0],
+            sw[1],
+            &mut acc,
+        ) {
+            crate::Continuation::Send(next) => to_send = Zeroizing::new(next),
+            crate::Continuation::Done => return Ok((acc, u16::from_be_bytes([sw[0], sw[1]]))),
+        }
+    }
+    Err(TransportError::MalformedResponse(
+        "applet continuation exceeded the chunk limit",
+    ))
 }
 
 fn unix_now() -> u64 {

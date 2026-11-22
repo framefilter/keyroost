@@ -1042,7 +1042,10 @@ impl App {
                 })
             }
             StoreKind::FeitianOtp => {
-                let Some(reader) = dev.reader.clone() else {
+                let Some(target) = crate::ftotp_pane::FtotpTarget::of(
+                    dev.reader.as_deref(),
+                    dev.hid_path.as_deref(),
+                ) else {
                     self.import_set_preview(
                         id,
                         &dest,
@@ -1051,7 +1054,7 @@ impl App {
                     return;
                 };
                 Box::new(move || {
-                    let mut s = match keyroost_transport::FeitianOtpSession::open(&reader) {
+                    let mut s = match target.open() {
                         Ok(s) => s,
                         Err(e) => return Preview::Failed(e.to_string()),
                     };
@@ -1406,14 +1409,17 @@ impl App {
                 })
             }
             StoreKind::FeitianOtp => {
-                let Some(reader) = dev.reader.clone() else {
+                let Some(target) = crate::ftotp_pane::FtotpTarget::of(
+                    dev.reader.as_deref(),
+                    dev.hid_path.as_deref(),
+                ) else {
                     self.import_add_refused(NO_SMART_CARD_FEITIAN);
                     return;
                 };
                 self.spawn_job_on(Some(&on), label, move || {
                     let mut on_progress = on_progress;
                     let added = (|| {
-                        let mut s = match keyroost_transport::FeitianOtpSession::open(&reader) {
+                        let mut s = match target.open() {
                             Ok(s) => s,
                             Err(e) => return Added::Failed(e.to_string()),
                         };

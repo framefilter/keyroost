@@ -43,8 +43,21 @@ purpose.
 - **Interface:** the key's smart-card interface: CCID over USB, or NFC. The
   applet is selected by AID. *(Measured.)*
 - **APDUs:** short ISO 7816. Both keys answer over T=1. *(Measured.)*
-- Feitian's desktop client can also carry the same APDUs over the FIDO HID
-  interface when no CCID reader is available. *(Client.)* `keyroost` does not.
+- **FIDO HID:** the same APDUs also go through the key's FIDO HID interface,
+  each one as it is in a `CTAPHID_MSG`. Feitian's client uses that when there
+  is no CCID reader, and so does `keyroost`, for a key with no reader on this
+  computer or one whose reader can't be opened. *(Measured, Key B: SELECT,
+  LIST, PUT, CALCULATE and DELETE, with the same answers as over PC/SC.)*
+  - Short APDUs only: the SELECT in extended-length form is answered `6700`.
+    *(Measured.)*
+  - A `CTAPHID_MSG` reaches whichever applet was selected last. With this
+    applet selected, U2F's VERSION is answered `6D00`; after a SELECT of the
+    FIDO applet (`A0 00 00 06 47 2F 00 01`) it answers `U2F_V2` again. So
+    `keyroost` selects the FIDO applet again when it is done. *(Measured.)*
+  - A command that waits for a touch is answered `6984` only after the key's
+    three and a half seconds, with nothing sent meanwhile, so an exchange is
+    given longer than CTAP's usual read timeout. *(Measured.)*
+  - Windows lets only an administrator open this interface.
 - **Windows:** Key B's card can stay unresponsive after plug-in. The reader's
   cold reset fails, and connecting answers `SCARD_W_UNRESPONSIVE_CARD`, or
   `SCARD_E_PROTO_MISMATCH` about ten seconds after a warm reset. This is the
