@@ -388,7 +388,7 @@ impl OpenPgpSession {
     /// Map a non-OK status word from a PIN-presenting command to a
     /// tries-remaining [`TransportError::OpenPgpPinRejected`] when it signals a
     /// wrong PIN (`63Cx`, or `6982`/`6983` followed by a PW-status read), else a
-    /// generic APDU error labelled `label`.
+    /// generic APDU error labeled `label`.
     fn pin_rejected(&mut self, sw: u16, pw_ref: u8, label: &'static str) -> TransportError {
         if let Some(n) = crate::sw_tries_remaining(sw) {
             return TransportError::OpenPgpPinRejected {
@@ -1353,7 +1353,7 @@ fn crt_flag_name(crt: pgp::KeyCrt) -> &'static str {
     }
 }
 
-/// Map an OpenPGP status word to success or a labelled APDU error.
+/// Map an OpenPGP status word to success or a labeled APDU error.
 fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     if sw == pgp::SW_OK {
         Ok(())

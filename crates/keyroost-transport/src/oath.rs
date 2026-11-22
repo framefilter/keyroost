@@ -429,7 +429,7 @@ fn version_of(v: &[u8]) -> Option<(u8, u8, u8)> {
     }
 }
 
-/// Map an OATH status word to success or a labelled APDU error.
+/// Map an OATH status word to success or a labeled APDU error.
 fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     if sw == oath::SW_OK {
         Ok(())

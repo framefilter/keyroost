@@ -695,9 +695,9 @@ pub struct SelectInfo {
     pub version: Vec<u8>,
     /// The value under tag `51`, eight bytes on the measured keys. Feitian's
     /// client calls it the challenge and salts a slot's access-code key with
-    /// it. It stays the same across SELECTs and card resets, but it is not
-    /// fixed for a key's lifetime: one key answered a different value a day
-    /// later, with two more accounts stored.
+    /// it. Within a day it stayed the same across SELECTs and card resets.
+    /// Two captures of this model a day apart held different values; whether
+    /// one key's value changes is not established.
     pub challenge: Vec<u8>,
     /// The access byte (`7B`), one bit per slot ([`Slot::access_bit`]).
     /// `None` when the answer carried none.

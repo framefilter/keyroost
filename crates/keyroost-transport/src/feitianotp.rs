@@ -371,7 +371,7 @@ fn touch_answer(
     slot_answer(label, slot, sw)
 }
 
-/// Map a status word to success or a labelled APDU error.
+/// Map a status word to success or a labeled APDU error.
 fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     if sw == fotp::SW_OK {
         Ok(())
