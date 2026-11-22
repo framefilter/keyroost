@@ -2739,7 +2739,9 @@ fn run_card_reset_step(
             keyroost_transport::PivSession::with_transaction(
                 name,
                 |s| -> Result<StepOutcome, TransportError> {
-                    Ok(match s.factory_reset(current) {
+                    // A card that may wait for a touch before it resets PIV.
+                    let may_ask = s.reset_may_ask_touch();
+                    Ok(match with_touch_hint(may_ask, || s.factory_reset(current)) {
                 Ok(keyroost_transport::FactoryResetOutcome::Wiped) => StepOutcome::Wiped,
                 // The device-wide mechanism ran cleanly -- more than just PIV
                 // was wiped, so the report should say so rather than naming
@@ -13975,7 +13977,11 @@ impl App {
                     // nothing cached survives it — so `s.state()` below is
                     // already the post-reset state; there's nothing left to
                     // clear by hand.
-                    s.force_reset_if_known_supported(None, false)?;
+                    //
+                    // A card that may wait for a touch before it resets gets
+                    // the "touch the key if it blinks" banner for the reset.
+                    let may_ask = s.reset_may_ask_touch();
+                    with_touch_hint(may_ask, || s.force_reset_if_known_supported(None, false))?;
                     defaults = piv_reset_defaults_note(&s.quirks());
                     let status = s.status()?;
                     Ok((status, s.state()))

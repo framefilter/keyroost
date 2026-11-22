@@ -664,7 +664,49 @@ pub enum PivQuirk {
     /// resets every key it manages with this instruction, after blocking
     /// both. `keyroostctl piv reset` ran that whole sequence on the same
     /// key.
+    ///
+    /// A Feitian key of another model (USB `096E:086A`,
+    /// [`AppletFingerprint::FeitianOtpAid`]) answers the reset `6984` where
+    /// this one answers `6982`, both with nothing blocked and with only the
+    /// PIN blocked, so on a card with this quirk
+    /// `keyroost_transport::PivSession::reset` reads `6984` as "not allowed
+    /// yet" too. The rest of that key's reset is under
+    /// [`Self::ResetMayWaitForTouch`].
     ResetUsesInsFc,
+    /// With the PIN and the PUK blocked, the card waits for a touch before
+    /// it carries out [`PivExtension::Reset`], and answers `6985` when none
+    /// comes. `keyroost_transport::PivSession::force_reset` then sends the
+    /// reset again, a few times, and the CLI and the app ask for the touch
+    /// (`PivSession::reset_may_ask_touch`).
+    ///
+    /// Hardware-observed on a Feitian key (USB `096E:086A`), 2026-11-22:
+    /// `00 FC 00 00 00` is answered `6984` at once with nothing blocked and
+    /// with only the PIN blocked. With both blocked and the key left alone
+    /// it is answered `6985` after 10.2 s; sent again and the key touched,
+    /// `9000` after 2.7 s, with a new CHUID and both counters back at 3.
+    /// `keyroostctl piv reset` then ran the whole sequence on the same key.
+    /// The ePass FIDO-NFC of [`Self::ResetUsesInsFc`] resets with no touch.
+    ResetMayWaitForTouch,
+    /// The retry-counter query, a VERIFY with no data, is answered `6700` in
+    /// its four-byte form (`00 20 00 80`); the card takes it with an `Lc` of
+    /// zero ([`crate::verify_pin_status_lc`]). The transport sends the
+    /// second form when the first is answered `6700`.
+    ///
+    /// Hardware-observed on a Feitian key (USB `096E:086A`), 2026-11-22: the
+    /// four-byte form `6700`; the five-byte form `63C3`, for the PIN and
+    /// (reference `0x81`) for the PUK, twice in a row with the count
+    /// unchanged, so it uses no try.
+    RetryQueryTakesLc,
+    /// [`PivExtension::ImportKey`] goes out as an ISO 7816-4 command chain
+    /// from the start, never as one extended-length APDU.
+    ///
+    /// Hardware-observed on a Feitian key (USB `096E:086A`), 2026-11-22: an
+    /// RSA-1024 and an RSA-2048 key, each sent whole in one extended-length
+    /// `E3`, were answered `9000`, and the key the slot then held failed the
+    /// self-test both ways (the decryption is no PKCS#1 block, the signature
+    /// does not verify). The same two keys sent chained (`CLA 10`, 254-byte
+    /// parts) passed it. Feitian's own client sends the import chained.
+    ImportKeyGoesChained,
     /// [`PivExtension::SetPinPukRetries`] is `INS 0xFE` on this card
     /// ([`crate::set_pin_retries_feitian`]), not Yubico's `INS 0xFA`, with the
     /// same parameters and the same preconditions (management-key
@@ -1041,6 +1083,7 @@ fn applet_verdicts(
             AppletFingerprint::Generic => GENERIC_APPLET_VERDICTS,
             AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_APPLET_VERDICTS,
             AppletFingerprint::Feitian => FEITIAN_APPLET_VERDICTS,
+            AppletFingerprint::FeitianOtpAid => FEITIAN_OTP_AID_APPLET_VERDICTS,
             AppletFingerprint::IdPrime => IDPRIME_APPLET_VERDICTS,
             AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => {
                 TRUSSED_NITROKEY_APPLET_VERDICTS
@@ -1094,6 +1137,7 @@ fn firmware_verdicts(
             AppletFingerprint::Generic => GENERIC_FIRMWARE_VERDICTS,
             AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_FIRMWARE_VERDICTS,
             AppletFingerprint::Feitian => FEITIAN_FIRMWARE_VERDICTS,
+            AppletFingerprint::FeitianOtpAid => FEITIAN_OTP_AID_FIRMWARE_VERDICTS,
             AppletFingerprint::IdPrime => IDPRIME_FIRMWARE_VERDICTS,
             AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => {
                 TRUSSED_NITROKEY_FIRMWARE_VERDICTS
@@ -1161,6 +1205,7 @@ fn applet_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
         AppletFingerprint::Generic => GENERIC_APPLET_QUIRKS,
         AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_APPLET_QUIRKS,
         AppletFingerprint::Feitian => FEITIAN_APPLET_QUIRKS,
+        AppletFingerprint::FeitianOtpAid => FEITIAN_OTP_AID_APPLET_QUIRKS,
         AppletFingerprint::IdPrime => IDPRIME_APPLET_QUIRKS,
         AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => TRUSSED_NITROKEY_APPLET_QUIRKS,
         AppletFingerprint::UTrust(UTrustVariant::Generic) => UTRUST_GENERIC_APPLET_QUIRKS,
@@ -1202,6 +1247,7 @@ fn firmware_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
         AppletFingerprint::Generic => GENERIC_FIRMWARE_QUIRKS,
         AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_FIRMWARE_QUIRKS,
         AppletFingerprint::Feitian => FEITIAN_FIRMWARE_QUIRKS,
+        AppletFingerprint::FeitianOtpAid => FEITIAN_OTP_AID_FIRMWARE_QUIRKS,
         AppletFingerprint::IdPrime => IDPRIME_FIRMWARE_QUIRKS,
         AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => TRUSSED_NITROKEY_FIRMWARE_QUIRKS,
         AppletFingerprint::UTrust(UTrustVariant::Generic) => UTRUST_GENERIC_FIRMWARE_QUIRKS,
@@ -1242,6 +1288,7 @@ fn axis_merge_mode(fingerprint: AppletFingerprint) -> AxisMergeMode {
         AppletFingerprint::Generic => GENERIC_AXIS_MERGE_MODE,
         AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_AXIS_MERGE_MODE,
         AppletFingerprint::Feitian => FEITIAN_AXIS_MERGE_MODE,
+        AppletFingerprint::FeitianOtpAid => FEITIAN_OTP_AID_AXIS_MERGE_MODE,
         AppletFingerprint::IdPrime => IDPRIME_AXIS_MERGE_MODE,
         AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => TRUSSED_NITROKEY_AXIS_MERGE_MODE,
         AppletFingerprint::UTrust(UTrustVariant::Generic) => UTRUST_GENERIC_AXIS_MERGE_MODE,
@@ -3206,6 +3253,136 @@ const FEITIAN_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const FEITIAN_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// [`AppletFingerprint::FeitianOtpAid`]'s cross-axis merge mode — see
+/// [`AxisMergeMode`]'s doc.
+const FEITIAN_OTP_AID_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
+/// [`AppletFingerprint::FeitianOtpAid`]'s applet-axis known-support table.
+/// All of it was measured on one key (USB `096E:086A`, 2026-11-22), first
+/// with a WinSCard script and then with `keyroostctl` itself. The card
+/// reports no applet version (GET VERSION answers `6A86`), so every row sits
+/// at the universal `[]` sentinel, on the reasoning
+/// [`FEITIAN_APPLET_VERDICTS`]'s doc gives for its own rows there.
+///
+/// The card takes the instructions and tags of [`AppletFingerprint::Feitian`]
+/// — the reset (`FC`), the retry counts (`FE`), the management key (`CF`),
+/// the import (`E3`), the slot policies (`BA`/`BC`, read back with `EC`) —
+/// and answers Yubico's `F6`, `F7`, `F8`, `F9` and `FF` `6D00`. What it does
+/// with them is not the same:
+///
+/// - Key types, [`PivExtension::SlotKeyAlgorithm`] and
+///   [`PivExtension::ImportKey`]: an RSA-1024, an RSA-2048 and a P-256 key
+///   were each generated and each imported, and passed the slot self-test
+///   (sign, and decrypt or key agreement). GENERATE answers `6A81` for
+///   P-384, for RSA-3072 and RSA-4096 under the bytes `21` and `22`, and
+///   for P-521, Ed25519 and X25519; the import answers `6A86` for P-384,
+///   RSA-3072 and RSA-4096. P-521, Ed25519 and X25519 were not sent as an
+///   import, the card not generating them. The import goes out chained —
+///   see [`PivQuirk::ImportKeyGoesChained`].
+/// - [`PivExtension::SetManagementKey`]: a 3DES key and each AES size. The
+///   card took one of each in turn (3DES, AES-128, AES-256, AES-192, 3DES)
+///   and authenticated with each before taking the next.
+///   [`AppletFingerprint::Feitian`] keeps to 3DES.
+/// - [`PivExtension::SetPinPukRetries`]: 5 and 4, read back, then 3 and 3;
+///   a PUK changed beforehand was the default one again afterwards.
+/// - [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`]: keys
+///   generated with always/never, never/never and once/cached each read
+///   back as asked. Whether the card then keeps to a policy was not tried
+///   on this key.
+/// - [`PivExtension::Reset`]: see [`PivQuirk::ResetMayWaitForTouch`].
+///
+/// [`PivExtension::ResetGlobal`] and
+/// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
+/// are as in `GENERIC_APPLET_VERDICTS` — see its doc.
+/// [`PivExtension::PinManagementAuth`] has no row: it was not tried.
+const FEITIAN_OTP_AID_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ResetGlobal,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::Reset,
+            PivExtension::SetManagementKey,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+            PivExtension::SetPinPukRetries,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+            PivExtension::GetMetadata,
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupported,
+        }],
+    },
+];
+
+/// See [`YUBIKEY_FIRMWARE_VERDICTS`]'s doc — empty.
+const FEITIAN_OTP_AID_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
+
+/// [`AppletFingerprint::FeitianOtpAid`]'s applet-axis quirks:
+/// [`AppletFingerprint::Feitian`]'s — the factory management key, PIN and
+/// PUK were each accepted by the key these were measured on (USB
+/// `096E:086A`), and it takes that fingerprint's instructions and tags —
+/// plus what is its own: the touch its reset waits for
+/// ([`PivQuirk::ResetMayWaitForTouch`]), the form its retry-counter query
+/// takes ([`PivQuirk::RetryQueryTakesLc`]) and how an import must be sent
+/// ([`PivQuirk::ImportKeyGoesChained`]).
+const FEITIAN_OTP_AID_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
+    version: &[],
+    quirks: &[
+        PivQuirk::Default9bManagementKey(FEITIAN_DEFAULT_MGMT_KEY),
+        FEITIAN_DEFAULT_PIN_PUK,
+        PivQuirk::ResetUsesInsFc,
+        PivQuirk::ResetMayWaitForTouch,
+        PivQuirk::RetryQueryTakesLc,
+        PivQuirk::ImportKeyGoesChained,
+        PivQuirk::SetPinRetriesUsesInsFe,
+        PivQuirk::SetManagementKeyUsesInsCf,
+        PivQuirk::SlotPolicyUsesTagsBaBc,
+    ],
+}];
+
+/// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
+const FEITIAN_OTP_AID_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+
 /// Gemalto/Thales IDPrime's cross-axis merge mode — see [`AxisMergeMode`]'s
 /// doc.
 const IDPRIME_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
@@ -4249,7 +4426,9 @@ fn axis_floor(
 pub fn import_layout(fingerprint: AppletFingerprint) -> crate::ImportLayout {
     match fingerprint {
         AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => crate::ImportLayout::NitrokeyRsa,
-        AppletFingerprint::Feitian => crate::ImportLayout::Feitian,
+        AppletFingerprint::Feitian | AppletFingerprint::FeitianOtpAid => {
+            crate::ImportLayout::Feitian
+        }
         _ => crate::ImportLayout::Yubico,
     }
 }
@@ -7592,6 +7771,130 @@ mod tests {
                 ),
                 FeatureGate::Unverified,
                 "{ext:?} at a reported version well above v[0]"
+            );
+        }
+    }
+
+    #[test]
+    fn feitian_otp_aid_rows_are_what_the_086a_key_did() {
+        // Hardware-observed on a Feitian key (USB 096E:086A) that reports no
+        // applet version — see `FEITIAN_OTP_AID_APPLET_VERDICTS`.
+        let fp = AppletFingerprint::FeitianOtpAid;
+        for v in [None, Some(&[][..])] {
+            for ext in [
+                PivExtension::Reset,
+                PivExtension::SetPinPukRetries,
+                PivExtension::SetManagementKey,
+                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+                PivExtension::SlotPinPolicy,
+                PivExtension::SlotTouchPolicy,
+            ] {
+                assert_eq!(
+                    resolve(ext, fp, v, None),
+                    FeatureGate::Supported,
+                    "{ext:?} {v:?}"
+                );
+            }
+            // What the card generated and took as an import...
+            for alg in [KeyAlg::Rsa1024, KeyAlg::Rsa2048, KeyAlg::EccP256] {
+                for ext in [
+                    PivExtension::SlotKeyAlgorithm(alg),
+                    PivExtension::ImportKey(alg),
+                ] {
+                    assert_eq!(
+                        resolve(ext, fp, v, None),
+                        FeatureGate::Supported,
+                        "{ext:?} {v:?}"
+                    );
+                }
+            }
+            // ...and what it answered `6A81` (GENERATE) or `6A86` (import).
+            for alg in [
+                KeyAlg::Rsa3072,
+                KeyAlg::Rsa4096,
+                KeyAlg::EccP384,
+                KeyAlg::EccP521,
+                KeyAlg::Ed25519,
+                KeyAlg::X25519,
+            ] {
+                for ext in [
+                    PivExtension::SlotKeyAlgorithm(alg),
+                    PivExtension::ImportKey(alg),
+                ] {
+                    assert_eq!(
+                        resolve(ext, fp, v, None),
+                        FeatureGate::Unsupported,
+                        "{ext:?} {v:?}"
+                    );
+                }
+            }
+            for ext in [
+                PivExtension::MoveKey,
+                PivExtension::DeleteKey,
+                PivExtension::GetMetadata,
+                PivExtension::ResetGlobal,
+                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+            ] {
+                assert_eq!(
+                    resolve(ext, fp, v, None),
+                    FeatureGate::Unsupported,
+                    "{ext:?} {v:?}"
+                );
+            }
+        }
+        // The two Feitian fingerprints differ both ways: the ePass FIDO-NFC
+        // holds a P-384 key and keeps to a 3DES management key.
+        let other = AppletFingerprint::Feitian;
+        assert_eq!(
+            resolve(
+                PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+                other,
+                None,
+                None
+            ),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+                other,
+                None,
+                None
+            ),
+            FeatureGate::Unsupported
+        );
+    }
+
+    #[test]
+    fn feitian_otp_aid_quirks_are_feitians_and_three_of_its_own() {
+        let own = [
+            PivQuirk::ResetMayWaitForTouch,
+            PivQuirk::RetryQueryTakesLc,
+            PivQuirk::ImportKeyGoesChained,
+        ];
+        let otp = resolve_quirks(AppletFingerprint::FeitianOtpAid, None, None);
+        let feitian = resolve_quirks(AppletFingerprint::Feitian, None, None);
+        for quirk in &feitian {
+            assert!(otp.contains(quirk), "{quirk:?}");
+        }
+        for quirk in &own {
+            assert!(otp.contains(quirk), "{quirk:?}");
+            assert!(!feitian.contains(quirk), "{quirk:?}");
+        }
+        assert_eq!(otp.len(), feitian.len() + own.len());
+        // The same import instruction, and no algorithm byte of its own: it
+        // holds neither RSA-3072 nor RSA-4096.
+        assert_eq!(
+            import_layout(AppletFingerprint::FeitianOtpAid),
+            crate::ImportLayout::Feitian
+        );
+        for alg in [KeyAlg::Rsa3072, KeyAlg::Rsa4096] {
+            assert_eq!(
+                slot_key_algorithm_apdu_id_override(AppletFingerprint::FeitianOtpAid, alg, None),
+                None
             );
         }
     }

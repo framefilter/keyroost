@@ -837,6 +837,20 @@ pub fn verify_pin_status() -> Vec<u8> {
     vec![0x00, Instruction::Verify.code(), 0x00, PIN_REF_APPLICATION]
 }
 
+/// [`verify_pin_status`] with an `Lc` of zero: `00 20 00 80 00`. Some cards
+/// answer the four-byte form `6700` and take this one
+/// ([`compat::PivQuirk::RetryQueryTakesLc`]).
+#[must_use]
+pub fn verify_pin_status_lc() -> Vec<u8> {
+    vec![
+        0x00,
+        Instruction::Verify.code(),
+        0x00,
+        PIN_REF_APPLICATION,
+        0x00,
+    ]
+}
+
 /// Yubico GET VERSION (case 2): 3-byte `major.minor.patch`.
 #[must_use]
 pub fn get_version() -> Vec<u8> {
@@ -2897,6 +2911,13 @@ mod tests {
     #[test]
     fn verify_status_is_case1() {
         assert_eq!(verify_pin_status(), vec![0x00, 0x20, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn verify_status_with_lc_is_the_form_the_086a_key_answered() {
+        // Hardware-observed on a Feitian key (USB 096E:086A), 2026-11-22:
+        // answered 63C3; the four-byte form above was answered 6700.
+        assert_eq!(verify_pin_status_lc(), vec![0x00, 0x20, 0x00, 0x80, 0x00]);
     }
 
     #[test]

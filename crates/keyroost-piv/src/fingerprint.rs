@@ -29,6 +29,17 @@
 /// criterion and every other one is cheaper to check first.
 pub const FEITIAN_RID: [u8; 5] = [0xD1, 0x56, 0x00, 0x01, 0x32];
 
+/// The AID of the OTP application Feitian's security keys carry, under
+/// [`FEITIAN_RID`]. [`AppletFingerprint::FeitianOtpAid`] is recognised
+/// solely by whether the card accepts a SELECT for this whole AID — the
+/// transport layer SELECTs it (then re-SELECTs PIV) only when nothing else,
+/// not even [`FEITIAN_RID`] alone, already fingerprinted the applet, and
+/// before [`IDPRIME_SECONDARY_PIV_AID`]: the PIV application of the key this
+/// was seen on (USB `096E:086A`) answers that AID `9000` too, with the very
+/// answer it gives the PIV SELECT, and answers the RID alone `6A82`.
+/// (Hardware-observed, 2026-11-22.)
+pub const FEITIAN_OTP_AID: [u8; 9] = [0xD1, 0x56, 0x00, 0x01, 0x32, 0x83, 0x26, 0x01, 0x01];
+
 /// An obscure second PIV applet instance some Gemalto/Thales IDPrime cards
 /// register under, alongside the standard PIV AID — see
 /// <https://blog.rchapman.org/posts/Smart_card_installing_Hello_World_on_a_Gemalto_IDPrime_PIV_2.0_card>.
@@ -1150,6 +1161,14 @@ pub enum AppletFingerprint {
     /// "does a specific applet exist" fingerprinting method, rather than an
     /// ATR/select text hint.
     Feitian,
+    /// Feitian security keys that select no application by Feitian's RID
+    /// alone — recognised purely by whether the card can select the OTP
+    /// application under that RID ([`FEITIAN_OTP_AID`]), the same "does a
+    /// specific applet exist" method. Seen on a key with USB ID `096E:086A`.
+    /// Its PIV application takes the instructions [`Self::Feitian`]'s does,
+    /// but holds other key types and resets differently, hence a
+    /// fingerprint of its own — see `compat`'s tables for the two.
+    FeitianOtpAid,
     /// HID's Crescendo product line — <https://www.hidglobal.com/product-mix/crescendo>.
     HidCrescendo(HidCrescendoVariant),
     /// Gemalto/Thales IDPrime PIV cards — recognised purely by whether the
@@ -1259,6 +1278,7 @@ impl core::fmt::Display for AppletFingerprint {
             AppletFingerprint::ArekinathPivApplet(v) => write!(f, "ArekinathPivApplet::{v}"),
             AppletFingerprint::AuthentrendATKey => write!(f, "AuthentrendATKey"),
             AppletFingerprint::Feitian => write!(f, "Feitian"),
+            AppletFingerprint::FeitianOtpAid => write!(f, "FeitianOtpAid"),
             AppletFingerprint::HidCrescendo(v) => write!(f, "HidCrescendo::{v}"),
             AppletFingerprint::IdPrime => write!(f, "IdPrime"),
             AppletFingerprint::Trussed(v) => write!(f, "Trussed::{v}"),
@@ -1335,7 +1355,7 @@ impl AppletFingerprint {
                 "Swissbit iShield 1 Series"
             }
             AppletFingerprint::AuthentrendATKey => "Authentrend ATKey Series",
-            AppletFingerprint::Feitian => "Feitian Security Key",
+            AppletFingerprint::Feitian | AppletFingerprint::FeitianOtpAid => "Feitian Security Key",
             AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic) => {
                 "HID Crescendo ActivId"
             }
@@ -1465,29 +1485,33 @@ pub fn wants_swissbit_probe(select_identity: Option<&str>) -> bool {
     select_identity.is_some_and(|s| s.to_ascii_lowercase().contains("openfips201"))
 }
 
-/// Resolve an [`AppletFingerprint`] from the fingerprint text plus the three
+/// Resolve an [`AppletFingerprint`] from the fingerprint text plus the four
 /// live-probe bits — all "can a specific applet be selected by AID at all"
 /// checks ([`wants_swissbit_probe`]'s [`SWISSBIT_RID`],
-/// `feitian_rid_selectable`'s [`FEITIAN_RID`], and `idprime_aid_selectable`'s
-/// [`IDPRIME_SECONDARY_PIV_AID`]) — the transport layer can supply. Comparisons are
+/// `feitian_rid_selectable`'s [`FEITIAN_RID`], `feitian_otp_selectable`'s
+/// [`FEITIAN_OTP_AID`], and `idprime_aid_selectable`'s
+/// [`IDPRIME_SECONDARY_PIV_AID`]) — the transport layer can supply.
+/// Comparisons are
 /// case-insensitive throughout, per the fingerprinting scheme. When more
 /// than one fingerprint's criteria are satisfied, the one backed by the most
 /// criteria wins — realised here as a priority order from most-specific to
 /// least, since with the duplicate uTrust definition dropped no two entries
-/// can actually tie. `feitian_rid_selectable` and, after it,
-/// `idprime_aid_selectable` sit at the very end of that order: each is the
-/// sole criterion for its own identity ([`AppletFingerprint::Feitian`] /
+/// can actually tie. `feitian_rid_selectable`, `feitian_otp_selectable` and,
+/// after them, `idprime_aid_selectable` sit at the very end of that order:
+/// each is the sole criterion for its own identity
+/// ([`AppletFingerprint::Feitian`] / [`AppletFingerprint::FeitianOtpAid`] /
 /// [`AppletFingerprint::IdPrime`]), so a caller only needs to have actually
 /// performed that probe (an extra SELECT round trip) when every other branch
-/// here — including the other one of the two — would otherwise fall through
-/// to `Generic`. Passing `false` for a probe that wasn't run is exactly as
-/// safe as any other unanswered criterion.
+/// here — including the earlier ones of the three — would otherwise fall
+/// through to `Generic`. Passing `false` for a probe that wasn't run is
+/// exactly as safe as any other unanswered criterion.
 #[must_use]
 pub fn classify(
     atr_identity: Option<&str>,
     select_identity: Option<&str>,
     swissbit_rid_selectable: bool,
     feitian_rid_selectable: bool,
+    feitian_otp_selectable: bool,
     idprime_aid_selectable: bool,
 ) -> AppletFingerprint {
     let atr = atr_identity.map(str::to_ascii_lowercase);
@@ -1538,6 +1562,8 @@ pub fn classify(
         AppletFingerprint::AuthentrendATKey
     } else if feitian_rid_selectable {
         AppletFingerprint::Feitian
+    } else if feitian_otp_selectable {
+        AppletFingerprint::FeitianOtpAid
     } else if idprime_aid_selectable {
         AppletFingerprint::IdPrime
     } else {
@@ -1719,13 +1745,14 @@ mod tests {
     #[test]
     fn classify_falls_back_to_generic() {
         assert_eq!(
-            classify(None, None, false, false, false),
+            classify(None, None, false, false, false, false),
             AppletFingerprint::Generic
         );
         assert_eq!(
             classify(
                 Some("something unknown"),
                 Some("also unknown"),
+                false,
                 false,
                 false,
                 false
@@ -1738,38 +1765,63 @@ mod tests {
     fn classify_feitian_only_via_the_rid_probe() {
         // The probe bit alone, no other fingerprinting text, is enough.
         assert_eq!(
-            classify(None, None, false, true, false),
+            classify(None, None, false, true, false, false),
             AppletFingerprint::Feitian
         );
         // It's the lowest-priority criterion: any other match wins over it.
         assert_eq!(
-            classify(Some("YubiKey"), None, false, true, false),
+            classify(Some("YubiKey"), None, false, true, false, false),
             AppletFingerprint::YubiKey
         );
         // Without the probe (or a false result from it), an otherwise
         // unidentified card stays Generic.
         assert_eq!(
-            classify(None, None, false, false, false),
+            classify(None, None, false, false, false, false),
             AppletFingerprint::Generic
         );
+    }
+
+    #[test]
+    fn classify_feitian_otp_aid_only_via_its_own_probe() {
+        // The probe bit alone is enough, and it comes before IdPrime's: the
+        // key it was seen on answers that AID too.
+        assert_eq!(
+            classify(None, None, false, false, true, false),
+            AppletFingerprint::FeitianOtpAid
+        );
+        assert_eq!(
+            classify(None, None, false, false, true, true),
+            AppletFingerprint::FeitianOtpAid
+        );
+        // A card that selects the RID alone is the other Feitian fingerprint.
+        assert_eq!(
+            classify(None, None, false, true, true, false),
+            AppletFingerprint::Feitian
+        );
+        // Any other match wins over it.
+        assert_eq!(
+            classify(Some("YubiKey"), None, false, false, true, false),
+            AppletFingerprint::YubiKey
+        );
+        assert_eq!(FEITIAN_OTP_AID[..5], FEITIAN_RID);
     }
 
     #[test]
     fn classify_idprime_only_via_the_aid_probe() {
         // The probe bit alone, no other fingerprinting text, is enough.
         assert_eq!(
-            classify(None, None, false, false, true),
+            classify(None, None, false, false, false, true),
             AppletFingerprint::IdPrime
         );
         // It's lower priority than even Feitian's own catch-all probe.
         assert_eq!(
-            classify(None, None, false, true, true),
+            classify(None, None, false, true, false, true),
             AppletFingerprint::Feitian
         );
         // Without the probe (or a false result from it), an otherwise
         // unidentified card stays Generic.
         assert_eq!(
-            classify(None, None, false, false, false),
+            classify(None, None, false, false, false, false),
             AppletFingerprint::Generic
         );
     }
@@ -1777,18 +1829,25 @@ mod tests {
     #[test]
     fn classify_arekinath_any_and_swissbit_variant() {
         assert_eq!(
-            classify(None, Some("PivApplet/1.10"), false, false, false),
+            classify(None, Some("PivApplet/1.10"), false, false, false, false),
             AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic)
         );
         // Case-insensitive on both fields, and the ATR identity narrows to
         // the Swissbit variant.
         assert_eq!(
-            classify(Some("iShield"), Some("pivapplet/2.0"), false, false, false),
+            classify(
+                Some("iShield"),
+                Some("pivapplet/2.0"),
+                false,
+                false,
+                false,
+                false
+            ),
             AppletFingerprint::ArekinathPivApplet(ArekinathVariant::SwissbitIShield1)
         );
         // "PivApplet" without a "/" doesn't satisfy the base 2-criteria match.
         assert_eq!(
-            classify(None, Some("PivApplet"), false, false, false),
+            classify(None, Some("PivApplet"), false, false, false, false),
             AppletFingerprint::Generic
         );
     }
@@ -1796,7 +1855,7 @@ mod tests {
     #[test]
     fn classify_authentrend_atkey() {
         assert_eq!(
-            classify(None, Some("ATPIV v3"), false, false, false),
+            classify(None, Some("ATPIV v3"), false, false, false, false),
             AppletFingerprint::AuthentrendATKey
         );
     }
@@ -1804,11 +1863,11 @@ mod tests {
     #[test]
     fn classify_hid_crescendo_variants_by_atr() {
         assert_eq!(
-            classify(Some("C2300"), None, false, false, false),
+            classify(Some("C2300"), None, false, false, false, false),
             AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300)
         );
         assert_eq!(
-            classify(Some("C4000"), None, false, false, false),
+            classify(Some("C4000"), None, false, false, false, false),
             AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000)
         );
     }
@@ -1818,13 +1877,21 @@ mod tests {
         // Matched via the select identity, with an ATR that names neither
         // recognised model (or none at all) — the generic `Generic` variant.
         assert_eq!(
-            classify(None, Some("HID Global ActivID PIV"), false, false, false),
+            classify(
+                None,
+                Some("HID Global ActivID PIV"),
+                false,
+                false,
+                false,
+                false
+            ),
             AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic)
         );
         assert_eq!(
             classify(
                 Some("something else"),
                 Some("HID Global ActivID PIV"),
+                false,
                 false,
                 false,
                 false
@@ -1842,12 +1909,13 @@ mod tests {
                 Some("Nitrokey PIV Authenticator"),
                 false,
                 false,
+                false,
                 false
             ),
             AppletFingerprint::Trussed(TrussedVariant::Nitrokey)
         );
         assert_eq!(
-            classify(Some("Nitrokey"), None, false, false, false),
+            classify(Some("Nitrokey"), None, false, false, false, false),
             AppletFingerprint::Generic
         );
     }
@@ -1855,16 +1923,16 @@ mod tests {
     #[test]
     fn classify_openfips201_any_and_swissbit_variant() {
         assert_eq!(
-            classify(None, Some("OpenFIPS201"), false, false, false),
+            classify(None, Some("OpenFIPS201"), false, false, false, false),
             AppletFingerprint::OpenFips201(OpenFips201Variant::Generic)
         );
         assert_eq!(
-            classify(None, Some("OpenFIPS201"), true, false, false),
+            classify(None, Some("OpenFIPS201"), true, false, false, false),
             AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2)
         );
         // The probe bit alone (no OpenFIPS201 select identity) matches nothing.
         assert_eq!(
-            classify(None, None, true, false, false),
+            classify(None, None, true, false, false, false),
             AppletFingerprint::Generic
         );
     }
@@ -1872,11 +1940,11 @@ mod tests {
     #[test]
     fn classify_token2_either_spelling() {
         assert_eq!(
-            classify(Some("TK\0PIV v1"), None, false, false, false),
+            classify(Some("TK\0PIV v1"), None, false, false, false, false),
             AppletFingerprint::Token2
         );
         assert_eq!(
-            classify(Some("TK PIV v1"), None, false, false, false),
+            classify(Some("TK PIV v1"), None, false, false, false, false),
             AppletFingerprint::Token2
         );
     }
@@ -1884,21 +1952,21 @@ mod tests {
     #[test]
     fn classify_thetis_needs_both_substrings_case_insensitively() {
         assert_eq!(
-            classify(Some("PIV 8888888"), None, false, false, false),
+            classify(Some("PIV 8888888"), None, false, false, false, false),
             AppletFingerprint::Thetis
         );
         // Case-insensitive on the ATR identity, same as every other branch.
         assert_eq!(
-            classify(Some("piv 8888888"), None, false, false, false),
+            classify(Some("piv 8888888"), None, false, false, false, false),
             AppletFingerprint::Thetis
         );
         // Either substring alone isn't enough.
         assert_eq!(
-            classify(Some("PIV only"), None, false, false, false),
+            classify(Some("PIV only"), None, false, false, false, false),
             AppletFingerprint::Generic
         );
         assert_eq!(
-            classify(Some("8888888 only"), None, false, false, false),
+            classify(Some("8888888 only"), None, false, false, false, false),
             AppletFingerprint::Generic
         );
     }
@@ -1920,7 +1988,7 @@ mod tests {
         let identity = atr_identity(&historical);
         assert_eq!(identity.as_deref(), Some("TK\0PIV\u{4}\u{2}8888888"));
         assert_eq!(
-            classify(identity.as_deref(), None, false, false, false),
+            classify(identity.as_deref(), None, false, false, false, false),
             AppletFingerprint::Token2
         );
     }
@@ -1928,11 +1996,11 @@ mod tests {
     #[test]
     fn classify_utrust_and_yubikey() {
         assert_eq!(
-            classify(Some("uTrust"), None, false, false, false),
+            classify(Some("uTrust"), None, false, false, false, false),
             AppletFingerprint::UTrust(UTrustVariant::Generic)
         );
         assert_eq!(
-            classify(Some("YubiKey"), None, false, false, false),
+            classify(Some("YubiKey"), None, false, false, false, false),
             AppletFingerprint::YubiKey
         );
     }
@@ -1957,6 +2025,7 @@ mod tests {
                 "Authentrend ATKey Series",
             ),
             (AppletFingerprint::Feitian, "Feitian Security Key"),
+            (AppletFingerprint::FeitianOtpAid, "Feitian Security Key"),
             (
                 AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
                 "HID Crescendo ActivId",
@@ -2025,6 +2094,10 @@ mod tests {
             "UTrust::Gov"
         );
         assert_eq!(AppletFingerprint::Feitian.to_string(), "Feitian");
+        assert_eq!(
+            AppletFingerprint::FeitianOtpAid.to_string(),
+            "FeitianOtpAid"
+        );
         assert_eq!(AppletFingerprint::IdPrime.to_string(), "IdPrime");
         assert_eq!(AppletFingerprint::Thetis.to_string(), "Thetis");
         assert_eq!(AppletFingerprint::YubiKey.to_string(), "YubiKey");

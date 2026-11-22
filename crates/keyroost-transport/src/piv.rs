@@ -41,6 +41,34 @@ fn reset_command(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> Vec<u8> {
     }
 }
 
+/// Whether `sw` is a card's "RESET is not allowed yet" answer. A YubiKey
+/// answers the unmet "PIN and PUK must already be blocked" precondition with
+/// 6985 (conditions of use not satisfied), not 6983 per Yubico's own docs —
+/// see `SW_CONDITIONS_NOT_SATISFIED`. Other fingerprints have been observed
+/// using 6983 for the identical precondition, and others still 6982
+/// (security status not satisfied). A Feitian card
+/// ([`keyroost_piv::compat::PivQuirk::ResetUsesInsFc`]) answers 6982 or, on
+/// another model, 6984; that last one is read this way on such a card only.
+fn reset_not_allowed(sw: u16, quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> bool {
+    sw == piv::SW_AUTH_BLOCKED
+        || sw == piv::SW_CONDITIONS_NOT_SATISFIED
+        || sw == piv::SW_SECURITY_NOT_SATISFIED
+        || (sw == 0x6984 && quirks.contains(&keyroost_piv::compat::PivQuirk::ResetUsesInsFc))
+}
+
+/// How many times [`PivSession::force_reset`] sends the reset to a card that
+/// may wait for a touch before it resets
+/// ([`keyroost_piv::compat::PivQuirk::ResetMayWaitForTouch`]), once the PIN
+/// and the PUK are blocked. The measured card waits ten seconds each time.
+const RESET_TOUCH_TRIES: u32 = 3;
+
+/// What [`PivSession::force_reset`] reports when such a card was sent the
+/// reset [`RESET_TOUCH_TRIES`] times and answered "not allowed" each time.
+const RESET_UNTOUCHED: &str = "the key was not touched, so PIV was NOT reset: with the PIN and \
+     PUK blocked this key waits for a touch before it resets. Its keys and certificates \
+     are still there, and its PIN and PUK are blocked. Run the reset again and touch \
+     the key when it blinks.";
+
 /// The APDU that sets the PIN and PUK retry counts on a card with these
 /// quirks: Yubico's `INS 0xFA`, or a Feitian card's `INS 0xFE`
 /// ([`keyroost_piv::compat::PivQuirk::SetPinRetriesUsesInsFe`]). Same
@@ -2184,16 +2212,19 @@ impl<'tx> PivSession<'tx> {
         let swissbit_rid_selectable = fingerprint::wants_swissbit_probe(select_identity.as_deref())
             && self.probe_swissbit_rid();
 
-        // `feitian_rid_selectable` and `idprime_aid_selectable` are each the
-        // sole criterion for their own identity, so they're only worth their
-        // own SELECT round trip when nothing else already fingerprints the
-        // applet — check with both probe bits false first, and only run each
-        // probe (then re-classify) when that still leaves `Generic`, Feitian
-        // before IdPrime.
+        // `feitian_rid_selectable`, `feitian_otp_selectable` and
+        // `idprime_aid_selectable` are each the sole criterion for their own
+        // identity, so they're only worth their own SELECT round trip when
+        // nothing else already fingerprints the applet — check with every
+        // probe bit false first, and only run each probe (then re-classify)
+        // when that still leaves `Generic`: Feitian's RID, then Feitian's
+        // OTP application, then IdPrime, whose AID a Feitian key's PIV
+        // application was seen to answer too.
         let id = fingerprint::classify(
             atr_identity.as_deref(),
             select_identity.as_deref(),
             swissbit_rid_selectable,
+            false,
             false,
             false,
         );
@@ -2204,6 +2235,7 @@ impl<'tx> PivSession<'tx> {
                 swissbit_rid_selectable,
                 self.probe_feitian_rid(),
                 false,
+                false,
             )
         } else {
             id
@@ -2213,6 +2245,19 @@ impl<'tx> PivSession<'tx> {
                 atr_identity.as_deref(),
                 select_identity.as_deref(),
                 swissbit_rid_selectable,
+                false,
+                self.probe_feitian_otp_aid(),
+                false,
+            )
+        } else {
+            id
+        };
+        let id = if id == fingerprint::AppletFingerprint::Generic {
+            fingerprint::classify(
+                atr_identity.as_deref(),
+                select_identity.as_deref(),
+                swissbit_rid_selectable,
+                false,
                 false,
                 self.probe_idprime_aid(),
             )
@@ -2441,6 +2486,24 @@ impl<'tx> PivSession<'tx> {
     fn probe_feitian_rid(&mut self) -> bool {
         let selectable = matches!(
             self.transmit_full_raw(&piv::select_by_aid(&keyroost_piv::fingerprint::FEITIAN_RID)),
+            Ok((_, sw)) if sw == piv::SW_OK
+        );
+        let _ = self.select();
+        selectable
+    }
+
+    /// SELECT [`keyroost_piv::fingerprint::FEITIAN_OTP_AID`] and report
+    /// whether the card accepted it, then unconditionally re-SELECT PIV
+    /// afterward (mirrors [`Self::probe_feitian_rid`], against the whole AID
+    /// of the OTP application under that RID). Only called when nothing
+    /// else, not even the RID alone, already fingerprinted the applet, and
+    /// before [`Self::probe_idprime_aid`] — see the call site in
+    /// `Self::applet_fingerprint`.
+    fn probe_feitian_otp_aid(&mut self) -> bool {
+        let selectable = matches!(
+            self.transmit_full_raw(&piv::select_by_aid(
+                &keyroost_piv::fingerprint::FEITIAN_OTP_AID
+            )),
             Ok((_, sw)) if sw == piv::SW_OK
         );
         let _ = self.select();
@@ -2768,9 +2831,21 @@ impl<'tx> PivSession<'tx> {
         if let Some(cached) = self.state.pin_retries_cache {
             return cached;
         }
-        let Ok((_, sw)) = self.transmit_full(&piv::verify_pin_status()) else {
+        let Ok((_, mut sw)) = self.transmit_full(&piv::verify_pin_status()) else {
             return PinReading::default();
         };
+        // A card that takes the query only with an `Lc` of zero answers the
+        // four bytes above "wrong length" (`PivQuirk::RetryQueryTakesLc`).
+        if sw == piv::SW_WRONG_LENGTH
+            && self
+                .quirks()
+                .contains(&keyroost_piv::compat::PivQuirk::RetryQueryTakesLc)
+        {
+            let Ok((_, again)) = self.transmit_full(&piv::verify_pin_status_lc()) else {
+                return PinReading::default();
+            };
+            sw = again;
+        }
         let reading = pin_reading_from_sw(sw);
         self.state.pin_retries_cache = Some(reading);
         reading
@@ -2828,6 +2903,15 @@ impl<'tx> PivSession<'tx> {
             version.as_deref(),
             version_firmware.as_deref(),
         )
+    }
+
+    /// True when this card may wait for a touch before it resets PIV
+    /// ([`keyroost_piv::compat::PivQuirk::ResetMayWaitForTouch`]), so a
+    /// caller can ask for one before [`Self::force_reset`],
+    /// [`Self::force_reset_if_known_supported`] or [`Self::factory_reset`].
+    pub fn reset_may_ask_touch(&mut self) -> bool {
+        self.quirks()
+            .contains(&keyroost_piv::compat::PivQuirk::ResetMayWaitForTouch)
     }
 
     /// The [`keyroost_piv::compat::FeatureGate`] for one of this session's
@@ -4424,7 +4508,7 @@ impl<'tx> PivSession<'tx> {
         alg_id: u8,
         body: &[u8],
     ) -> Result<(), TransportError> {
-        let link = self.long_link();
+        let link = import_link(self.long_link(), &self.quirks());
         let layout = keyroost_piv::compat::import_layout(self.fingerprint());
         let sent = send_import_key(link, layout, slot, alg_id, body, &mut |apdu| {
             self.transmit_full(apdu)
@@ -5489,18 +5573,12 @@ impl<'tx> PivSession<'tx> {
                 }
             }
         }
-        let command = reset_command(&self.quirks());
+        let quirks = self.quirks();
+        let command = reset_command(&quirks);
         let (_, sw) = self.transmit_full(&command)?;
-        // A YubiKey answers RESET's "PIN and PUK must already be blocked"
-        // precondition with 6985 (conditions of use not satisfied), not 6983
-        // per Yubico's own docs — see SW_CONDITIONS_NOT_SATISFIED. Other
-        // fingerprints have been observed using 6983 for the identical
-        // precondition, and others still 6982 (security status not
-        // satisfied) — all three map to the same outcome here.
-        if sw == piv::SW_AUTH_BLOCKED
-            || sw == piv::SW_CONDITIONS_NOT_SATISFIED
-            || sw == piv::SW_SECURITY_NOT_SATISFIED
-        {
+        // The status words a card answers an unmet precondition with all map
+        // to the same outcome here — see `reset_not_allowed`.
+        if reset_not_allowed(sw, &quirks) {
             return Err(TransportError::PivResetNotAllowed);
         }
         ok_or_write("piv reset", sw)?;
@@ -5952,9 +6030,31 @@ impl<'tx> PivSession<'tx> {
         //    so honestly: that is the one exit that leaves a card nothing here
         //    can rescue. An unspecific status word is not that exit and keeps
         //    the caller's "re-run the factory reset" hint.
-        self.reset(pre_reset_mgmt_auth)
-            .map(|()| FactoryResetOutcome::Wiped)
-            .map_err(map_reset_stage_error)
+        //
+        //    A card that may wait for a touch before it resets
+        //    (`PivQuirk::ResetMayWaitForTouch`) answers "not allowed" when
+        //    none came, so there that answer is not the final word: the
+        //    reset is sent again, each try giving the card its own wait for
+        //    the touch, and a card left untouched is reported as that.
+        let tries = if self
+            .quirks()
+            .contains(&keyroost_piv::compat::PivQuirk::ResetMayWaitForTouch)
+        {
+            RESET_TOUCH_TRIES
+        } else {
+            1
+        };
+        let mut sent = 1;
+        loop {
+            match self.reset(pre_reset_mgmt_auth) {
+                Ok(()) => return Ok(FactoryResetOutcome::Wiped),
+                Err(TransportError::PivResetNotAllowed) if sent < tries => sent += 1,
+                Err(TransportError::PivResetNotAllowed) if tries > 1 => {
+                    return Err(TransportError::PivResetIncomplete(RESET_UNTOUCHED));
+                }
+                Err(e) => return Err(map_reset_stage_error(e)),
+            }
+        }
     }
 
     /// Reset PIV via whichever mechanism this fingerprint's
@@ -6274,6 +6374,22 @@ fn key_import_retry_sw(sw: u16) -> bool {
     matches!(sw, piv::SW_WRONG_LENGTH | SW_LAST_COMMAND_EXPECTED | 0x6A80)
 }
 
+/// The link an IMPORT ASYMMETRIC KEY goes out on: `link`, chained from the
+/// start for a card that must not be sent the import as one extended-length
+/// APDU ([`keyroost_piv::compat::PivQuirk::ImportKeyGoesChained`]).
+fn import_link(link: LongLink, quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> LongLink {
+    if link.chain_upfront.is_none()
+        && quirks.contains(&keyroost_piv::compat::PivQuirk::ImportKeyGoesChained)
+    {
+        LongLink {
+            chain_upfront: Some("this card's import is sent chained"),
+            ..link
+        }
+    } else {
+        link
+    }
+}
+
 /// Send an IMPORT ASYMMETRIC KEY `body` for `slot`, each APDU through `send`.
 /// A failure after an attempt that failed at the reader (and was retried
 /// chained) is [`TransportError::PivWriteUnconfirmed`]: the key may be on the
@@ -6465,6 +6581,7 @@ fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
         _ if aid == piv::AID_FULL => Some("NIST PIV Card Application"),
         _ if aid == piv::AID => Some("NIST PIV Card Application"),
         _ if aid == fingerprint::FEITIAN_RID => Some("Feitian RID"),
+        _ if aid == fingerprint::FEITIAN_OTP_AID => Some("Feitian OTP application"),
         _ if aid == fingerprint::SWISSBIT_RID => Some("Swissbit RID"),
         _ if aid == fingerprint::IDPRIME_SECONDARY_PIV_AID => Some("IdPrime secondary PIV AID"),
         _ if aid == fingerprint::NITROKEY_ADMIN_AID => Some("Nitrokey admin AID"),
@@ -6630,9 +6747,9 @@ fn describe_apdu(apdu: &[u8]) -> String {
         Some(piv::Instruction::ImportKey) if apdu.len() <= 4 => {
             "SET PIN RETRIES (feitian)".to_string()
         }
-        // A bodyless VERIFY (`00 20 00 80`, no Lc) queries the PIN retry
-        // counter rather than presenting a PIN.
-        Some(piv::Instruction::Verify) if apdu.len() <= 4 => {
+        // A bodyless VERIFY (`00 20 00 80`, no Lc, or with an Lc of zero)
+        // queries the PIN retry counter rather than presenting a PIN.
+        Some(piv::Instruction::Verify) if apdu.len() <= 4 || apdu[4..] == [0x00] => {
             "VERIFY (retry-counter query)".to_string()
         }
         Some(known) => known.name().to_string(),
@@ -7393,6 +7510,10 @@ mod tests {
             describe_apdu(&piv::verify_pin_status()),
             "VERIFY (retry-counter query)"
         );
+        assert_eq!(
+            describe_apdu(&piv::verify_pin_status_lc()),
+            "VERIFY (retry-counter query)"
+        );
         assert!(describe_apdu(&piv::verify_pin(b"12345678").unwrap()).starts_with("VERIFY"));
         // The two resets are told apart by whose instruction it is.
         assert_eq!(describe_apdu(&piv::reset()), "RESET (yubico extension)");
@@ -7435,6 +7556,49 @@ mod tests {
         // Unknown / malformed fall back rather than panic.
         assert_eq!(describe_apdu(&[0x00, 0x99, 0x00, 0x00]), "INS 0x99");
         assert_eq!(describe_apdu(&[]), "(malformed APDU)");
+    }
+
+    #[test]
+    fn a_feitian_card_may_answer_an_unmet_reset_precondition_6984() {
+        use keyroost_piv::compat::resolve_quirks;
+        use keyroost_piv::fingerprint::AppletFingerprint;
+        // Hardware-observed: the ePass FIDO-NFC answers 6982, a 096E:086A
+        // key 6984, each with nothing blocked and with only the PIN blocked.
+        let yubikey = resolve_quirks(AppletFingerprint::YubiKey, Some(&[5, 7, 4]), None);
+        for fingerprint in [AppletFingerprint::Feitian, AppletFingerprint::FeitianOtpAid] {
+            let feitian = resolve_quirks(fingerprint, None, None);
+            for sw in [0x6982, 0x6983, 0x6984, 0x6985] {
+                assert!(reset_not_allowed(sw, &feitian), "{fingerprint} {sw:04X}");
+            }
+            for sw in [0x9000, 0x6D00, 0x6A86] {
+                assert!(!reset_not_allowed(sw, &feitian), "{fingerprint} {sw:04X}");
+            }
+        }
+        // 6984 is read that way on such a card only.
+        for sw in [0x6982, 0x6983, 0x6985] {
+            assert!(reset_not_allowed(sw, &yubikey), "{sw:04X}");
+        }
+        assert!(!reset_not_allowed(0x6984, &yubikey));
+    }
+
+    #[test]
+    fn an_import_is_chained_from_the_start_on_a_card_that_needs_it() {
+        use keyroost_piv::compat::resolve_quirks;
+        use keyroost_piv::fingerprint::AppletFingerprint;
+        let link = LongLink {
+            traced: false,
+            chain_upfront: None,
+        };
+        let needs = resolve_quirks(AppletFingerprint::FeitianOtpAid, None, None);
+        let other = resolve_quirks(AppletFingerprint::Feitian, None, None);
+        assert!(import_link(link, &needs).chain_upfront.is_some());
+        assert!(import_link(link, &other).chain_upfront.is_none());
+        // A link that chains anyway keeps its own reason.
+        let t0 = LongLink {
+            traced: false,
+            chain_upfront: Some("T=0"),
+        };
+        assert_eq!(import_link(t0, &needs).chain_upfront, Some("T=0"));
     }
 
     #[test]
