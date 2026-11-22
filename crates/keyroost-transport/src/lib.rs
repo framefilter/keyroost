@@ -44,9 +44,9 @@ pub(crate) fn establish_context() -> Result<Context, PcscError> {
 /// Connect to `reader`, shared, on any protocol: what every session and
 /// probe here does first.
 ///
-/// On Windows the card of a Feitian ePass FIDO-NFC (USB `096E:0853`, reader
-/// "FS CCID 0") can stay unresponsive after plug-in: the reader's cold reset
-/// fails, and `SCardConnect` answers `SCARD_W_UNRESPONSIVE_CARD`, or
+/// On Windows the card of a Feitian ePass FIDO NFC Plus (USB `096E:0853`,
+/// reader "FS CCID 0") can stay unresponsive after plug-in: the reader's cold
+/// reset fails, and `SCardConnect` answers `SCARD_W_UNRESPONSIVE_CARD`, or
 /// `SCARD_E_PROTO_MISMATCH` some ten seconds after an earlier warm reset.
 /// Nothing on the key is reachable then: OpenPGP, PIV and Feitian OTP all go
 /// undetected. A warm reset on a direct connection brings the card up. So
@@ -56,8 +56,8 @@ pub(crate) fn establish_context() -> Result<Context, PcscError> {
 ///
 /// Measured on one PC (Windows 11, the inbox CCID driver), where the same
 /// key went from no applet detected to all three with this retry; reported
-/// on other PCs. A Feitian key with USB `096E:086A` connected without it
-/// there. Why the cold reset fails is not established.
+/// on other PCs. A Feitian BioPass FIDO Pro (USB `096E:086A`) connected
+/// without it there. Why the cold reset fails is not established.
 ///
 /// The reset changes the card's state, so it is traced: a `connect` line
 /// when it is tried and one with its outcome, under `--debug` /

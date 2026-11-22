@@ -3,11 +3,12 @@
 //! Every byte string here says where it comes from:
 //!
 //! - **captured**: bytes exchanged with a physical key, with the raw output
-//!   kept. Key B is a Feitian ePass FIDO-NFC (USB `096E:0853`, OTP applet
-//!   1.0.2). Two keys of that model were read: one over direct CCID on
-//!   2026-11-18, the other over PC/SC on 2026-11-19.
+//!   kept. Key B is a Feitian ePass FIDO NFC Plus (USB `096E:0853`, OTP
+//!   applet 1.0.2). Two keys of that model were read: one over direct CCID
+//!   on 2026-11-18, the other over PC/SC on 2026-11-19.
 //! - **recorded**: bytes noted from a physical key whose raw capture was not
-//!   kept. Key A is a Feitian FIDO key (USB `096E:086A`, OTP applet 1.0.1).
+//!   kept. Key A is a Feitian BioPass FIDO Pro (USB `096E:086A`, OTP applet
+//!   1.0.1).
 //! - **constructed**: bytes written out by hand from the wire format of
 //!   Feitian's own client, which the Libre Key Companion Android client
 //!   (an independent implementation) pins identically. Not captured.

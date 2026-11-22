@@ -13,16 +13,24 @@ period.
 Every fact below is marked with where it comes from:
 
 - **Measured**: seen in an exchange with a physical key.
-  - *Key A*: USB `096E:086A`, OTP applet 1.0.1. Read with Libre Key Companion
-    (Android, USB CCID), and with `keyroostctl` over PC/SC on Windows
-    (`feitian info`, `list`, `add`, `code` and `delete`).
-  - *Key B*: Feitian ePass FIDO-NFC, USB `096E:0853`, OTP applet 1.0.2. Read
-    with Libre Key Companion (Android, USB CCID), over direct CCID, and with
-    `keyroostctl` over PC/SC on Windows (every `feitian` command). Two keys
-    of this model were read. Apart from the value under tag `51` they
+  - *Key A*: Feitian BioPass FIDO Pro, USB `096E:086A`, OTP applet 1.0.1.
+    Read with Libre Key Companion (Android, USB CCID), and with `keyroostctl`
+    over PC/SC on Windows (`feitian info`, `list`, `add`, `code` and
+    `delete`).
+  - *Key B*: Feitian ePass FIDO NFC Plus, USB `096E:0853`, OTP applet 1.0.2.
+    Read with Libre Key Companion (Android, USB CCID), over direct CCID, and
+    with `keyroostctl` over PC/SC on Windows (every `feitian` command). Two
+    keys of this model were read. Apart from the value under tag `51` they
     answered alike in what both were asked: SELECT and LIST over PC/SC, and
     the wait for a touch. Which of the two an exchange was made with was not
     always noted.
+
+  The product names are what the keys report. Feitian's client names a
+  model with `80 E3 EE 80 00`; the second byte under tag `81` of the answer
+  is `08` on Key A and `02` on a Key B, the numbers that client calls
+  BioPass FIDO Pro and ePass FIDO-NFC Plus, and tag `92` holds the COS
+  version Feitian publishes for each product (4.7.17 and 1.826). That read
+  was made on Key A and on one of the two Key B.
 - **Client**: what Feitian's own client applications send or expect. Not yet
   exercised on hardware by this project.
 
