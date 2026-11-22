@@ -2015,7 +2015,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
             // client reads the serial it shows with; the key answers it
             // whichever application is selected. Without it such a key is
             // known by the serial field of its OpenPGP AID below, which is
-            // `00000001` on the measured key and part of the AID Feitian's
+            // `00000001` on both keys measured and part of the AID Feitian's
             // client selects that application by, so it does not tell one
             // key from another; and a Feitian key with no OpenPGP
             // application has no serial at all. Names saved under that AID
