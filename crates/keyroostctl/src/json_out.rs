@@ -436,18 +436,19 @@ pub(crate) struct OathCodeJson {
 }
 
 /// `keyroostctl feitian --json list` — one account of the Feitian OTP applet.
-/// Mirrors the human line `<name>  [<type>/<algorithm>]`, with `  (slot N)`
-/// after it for an account in a keyboard slot.
+/// Mirrors the human line `<app:account>  [<type>/<algorithm>]  <period>s`,
+/// with `  (slot N)` after it for an account in a keyboard slot.
 #[derive(Serialize)]
 pub(crate) struct FtotpAccountJson {
-    /// The name as stored on the key: what `feitian code` and `feitian delete`
-    /// take.
+    /// The name as stored on the key, period prefix included.
     pub name: String,
     /// "default", "1" or "2".
     pub slot: &'static str,
-    /// The issuer part of the stored name, when it has one.
-    pub issuer: Option<String>,
-    /// The account part of the stored name.
+    /// The app part of the stored name (empty when it has none): what
+    /// `feitian code --app` and `feitian delete --app` take, as `otp list`'s
+    /// `app` is.
+    pub app: String,
+    /// The account part of the stored name: what `--account` takes.
     pub account: String,
     /// "TOTP" or "HOTP".
     #[serde(rename = "type")]

@@ -199,28 +199,11 @@ impl FtotpAddDialog {
         } else {
             fotp::OathType::Hotp
         };
-        let stored = fotp::stored_name(issuer, account, oath_type, self.period)
+        // The same name check, in the same words, as `keyroostctl feitian
+        // add`.
+        let stored = fotp::checked_stored_name(issuer, account, oath_type, self.period)
             .map_err(|e| e.to_string())?;
-        // The key splits a name at `_#_`: one that would come back as
-        // another issuer and account is refused, as the import does.
-        let parts = fotp::parse_name(&stored, oath_type);
-        if parts.issuer != issuer || parts.account != account {
-            // The same words as `keyroostctl feitian add`, here and below.
-            return Err(format!(
-                "the name would read back differently on the key: it keeps issuer and \
-                 account apart with {}, and this name has that in it",
-                fotp::ISSUER_SEPARATOR
-            ));
-        }
         let limits = keyroost_import::plan::limits(keyroost_import::plan::Store::FeitianOtp);
-        if let Some(max) = limits.name_max.filter(|max| stored.len() > *max) {
-            return Err(format!(
-                "the name is {} bytes as stored ({:?}); keyroost stores names of up to \
-                 {max} bytes on this key",
-                stored.len(),
-                stored
-            ));
-        }
         let secret = match keyroost_proto::codec::base32_decode(self.secret.trim()) {
             Ok(s) if !s.is_empty() => zeroize::Zeroizing::new(s),
             Ok(_) => return Err("Enter a Base32 secret for this account.".into()),
@@ -441,35 +424,25 @@ impl App {
         let period = row.period.max(1);
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading code \u{2014} touch your key\u{2026}", move || {
-            let now = unix_now();
-            let result = (|| -> Result<String, TransportError> {
+            // A TOTP code comes with its window; one whose window ended while
+            // the key waited for the touch is refused by the session, in the
+            // same words as `keyroostctl feitian code`.
+            let result = (|| -> Result<(String, Option<u64>), TransportError> {
                 let mut session = FeitianOtpSession::open(&reader)?;
-                let answer = if hotp {
-                    session.calculate_hotp(slot, &stored)?
+                Ok(if hotp {
+                    (session.calculate_hotp(slot, &stored)?.code, None)
                 } else {
-                    session.calculate_totp(slot, &stored, now, period)?
-                };
-                Ok(answer.code)
+                    let (answer, window) = session.calculate_totp_now(slot, &stored, period)?;
+                    (answer.code, Some(window))
+                })
             })();
-            let window = (!hotp).then(|| now / u64::from(period));
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     app.log_moved_on(for_device.as_ref(), "reading a Feitian OTP code", &result);
                     return;
                 }
                 match result {
-                    Ok(mut code) => {
-                        // The code is for the window the read started in; the
-                        // touch may have come after it ended.
-                        if window.is_some_and(|w| w != unix_now() / u64::from(period)) {
-                            wipe(&mut code);
-                            app.ftotp_failed(
-                                "that code's time window ended while the key waited for the \
-                                 touch; read it again"
-                                    .into(),
-                            );
-                            return;
-                        }
+                    Ok((mut code, window)) => {
                         match app
                             .ftotp
                             .rows
@@ -838,7 +811,7 @@ impl App {
                     // A narrow window must not break a label mid-word; the
                     // fields take the squeeze instead.
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                    ui.label("Issuer");
+                    ui.label("Issuer / app");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.ftotp.add.issuer)
                             .margin(theme::TEXT_EDIT_MARGIN),

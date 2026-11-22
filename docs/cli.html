@@ -535,10 +535,10 @@ keyroostctl fido pin status --json</code></pre>
       <tr><th>Command</th><th>What it does</th></tr>
       <tr><td><code>keyroostctl feitian info</code></td><td>Show the applet version and which slots have an access code</td></tr>
       <tr><td><code>keyroostctl feitian list</code></td><td>List the accounts stored on the key</td></tr>
-      <tr><td><code>keyroostctl feitian code</code></td><td>Print the current code for an account. The key computes it once it is touched</td></tr>
+      <tr><td><code>keyroostctl feitian code</code></td><td>Print the current code for one account, identified by app and account. The key computes it once it is touched</td></tr>
       <tr><td><code>keyroostctl feitian add</code></td><td>Add a TOTP or HOTP account to the key&#x27;s default slot</td></tr>
       <tr><td><code>keyroostctl feitian import</code></td><td>Add every code in an authenticator export to this key&#x27;s default slot</td></tr>
-      <tr><td><code>keyroostctl feitian delete</code></td><td>Delete an account by name. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl feitian delete</code></td><td>Delete one account by app and account. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
     </table></div>
     <h3 id="ref-openpgp">openpgp</h3>
     <p class="kr-muted">Manage the OpenPGP card applet: info, keys, sign, decrypt, PINs, cardholder details, and reset</p>
