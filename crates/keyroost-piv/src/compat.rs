@@ -600,7 +600,9 @@ pub enum PivQuirk {
     /// 123456, PUK 12345678 (Yubico's PIV introduction). Token2: PIN 865362
     /// (Token2's own PIV tool, `token2/fido2-manage`,
     /// token2-piv-gui/src-tauri/src/commands.rs) and PUK 86536286 (a PIN+ R3.4
-    /// reset to it, checked on the key).
+    /// reset to it, checked on the key). Feitian: PIN 12345678 and PUK
+    /// 12345678 (Feitian's SK Manager manual; both checked on an ePass
+    /// FIDO-NFC after a PIV reset).
     DefaultPinPuk {
         /// The default PIN.
         pin: &'static str,
@@ -770,6 +772,18 @@ const YUBIKEY_DEFAULT_PIN_PUK: PivQuirk = PivQuirk::DefaultPinPuk {
 const TOKEN2_DEFAULT_PIN_PUK: PivQuirk = PivQuirk::DefaultPinPuk {
     pin: "865362",
     puk: "86536286",
+};
+
+/// Feitian's default PIV PIN and PUK (see [`PivQuirk::DefaultPinPuk`]), both
+/// `12345678`, as its SK Manager manual gives them
+/// (<https://fido.ftsafe.com/feitian-sk-manager-tool-user-manual/>, the source
+/// [`FEITIAN_DEFAULT_MGMT_KEY`] cites). Checked on an ePass FIDO-NFC (USB
+/// `096E:0853`) after a PIV reset: the PIN was accepted, `123456` was not, and
+/// RESET RETRY COUNTER accepted the PUK. On the every-version row, as
+/// Feitian's default management key is.
+const FEITIAN_DEFAULT_PIN_PUK: PivQuirk = PivQuirk::DefaultPinPuk {
+    pin: "12345678",
+    puk: "12345678",
 };
 
 /// One or more extensions' shared known-support verdicts within one
@@ -3031,10 +3045,31 @@ const FEITIAN_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// ASYMMETRIC KEYPAIR rejects all five. The separate row below,
 /// [`KeyAlg::Rsa1024`]/[`KeyAlg::Rsa2048`]/[`KeyAlg::EccP256`]/
 /// [`KeyAlg::EccP384`], is `Verdict::KnownSupported` instead — the same unit
-/// accepts all four — so it can't join that row; both stay pinned to the
-/// exact tested version `[0]` rather than widened to a major version the way
-/// [`AUTHENTREND_ATKEY_APPLET_VERDICTS`] does — only a v0 unit has been
-/// probed here, so no claim is made about any other version either way.
+/// accepts all four — so it can't join that row. The known-unsupported row
+/// stays pinned to the exact tested version `[0]` rather than widened to a
+/// major version the way [`AUTHENTREND_ATKEY_APPLET_VERDICTS`] does. The
+/// known-supported row sits at the `[]` sentinel since a second unit was
+/// measured: an ePass FIDO-NFC (USB `096E:0853`) that reports no applet
+/// version at all generated all four in several slots, and each key then
+/// signed, and decrypted or agreed, correctly in the slot self-test. At `[0]`
+/// that row left such a unit unverified, a known-supported verdict saying
+/// nothing about versions before it.
+///
+/// [`PivExtension::ImportKey`], for every [`KeyAlg`]:
+/// `Verdict::KnownUnsupportedSince` at the `[]` sentinel, on the reasoning
+/// HID Crescendo's rows use. keyroost imports a key with Yubico's IMPORT
+/// ASYMMETRIC KEY (`INS 0xFE`); on this card that byte is another command.
+/// Hardware-observed on the same ePass FIDO-NFC: `00 FE 03 03` with no data
+/// is answered `6982` with no session, `6982` again after management-key
+/// authentication, and `9000` once the PIN is verified as well, after which
+/// the PIN is no longer verified and both try counters read 3. Feitian's own
+/// client software lists `0xFE` as its "set PIN retries" and imports a key
+/// with `INS 0xE3`, which the card answers `6A86` for those same parameters.
+/// keyroost verifies the PIN before it sends the import, so the command
+/// would reach the card in exactly the state that accepts it, with the
+/// algorithm and slot bytes where the two counts go; the import itself was
+/// therefore not sent. Unsupported from keyroost's point of view until it
+/// speaks the card's own import.
 const FEITIAN_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
         extensions: &[
@@ -3082,8 +3117,25 @@ const FEITIAN_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
         ],
         verdicts: &[VersionVerdict {
-            version: &[0],
+            version: &[],
             verdict: Verdict::KnownSupported,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
         }],
     },
 ];
@@ -3093,12 +3145,14 @@ const FEITIAN_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 
 /// Feitian's applet-axis quirks: this vendor ships its own vendor-specific
 /// PIV factory-default management key rather than mimicking YubiKey's — see
-/// [`FEITIAN_DEFAULT_MGMT_KEY`]'s doc — and its own instruction byte for the
-/// PIV reset — see [`PivQuirk::ResetUsesInsFc`].
+/// [`FEITIAN_DEFAULT_MGMT_KEY`]'s doc — its own default PIN and PUK — see
+/// [`FEITIAN_DEFAULT_PIN_PUK`]'s — and its own instruction byte for the PIV
+/// reset — see [`PivQuirk::ResetUsesInsFc`].
 const FEITIAN_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
     version: &[],
     quirks: &[
         PivQuirk::Default9bManagementKey(FEITIAN_DEFAULT_MGMT_KEY),
+        FEITIAN_DEFAULT_PIN_PUK,
         PivQuirk::ResetUsesInsFc,
     ],
 }];
@@ -5832,10 +5886,20 @@ mod tests {
         );
     }
 
-    /// A reset's PIN and PUK are known for YubiKey (every applet version)
-    /// and Token2, and not invented for a card keyroost has no source for.
+    /// A reset's PIN and PUK are known for YubiKey (every applet version),
+    /// Token2 and Feitian, and not invented for a card keyroost has no source
+    /// for.
     #[test]
     fn default_pin_and_puk_after_a_reset() {
+        // Feitian's are its manual's, checked on a unit that reports no
+        // applet version; the entry is on the every-version row.
+        for version in [None, Some(&[0][..]), Some(&[5, 7, 4][..])] {
+            assert_eq!(
+                default_pin_puk(&resolve_quirks(AppletFingerprint::Feitian, version, None)),
+                Some(("12345678", "12345678")),
+                "Feitian at {version:?}"
+            );
+        }
         for version in [&[2][..], &[3, 1], &[4, 3, 5], &[5, 7, 4]] {
             assert_eq!(
                 default_pin_puk(&resolve_quirks(
@@ -6855,6 +6919,60 @@ mod tests {
             ),
             FeatureGate::Unverified
         );
+    }
+
+    #[test]
+    fn feitian_refuses_import() {
+        // keyroost's import is Yubico's `INS 0xFE`, which this card takes as
+        // another command (see `FEITIAN_APPLET_VERDICTS`'s doc): every
+        // algorithm is refused up front, whatever version is read, the four
+        // the card can generate included.
+        let fp = AppletFingerprint::Feitian;
+        for alg in KeyAlg::ALL {
+            for v in [None, Some(&[][..]), Some(&[0][..]), Some(&[2, 0][..])] {
+                assert_eq!(
+                    resolve(PivExtension::ImportKey(alg), fp, v, None),
+                    FeatureGate::Unsupported,
+                    "{alg:?} {v:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn feitian_generates_its_four_algorithms_with_no_reported_version() {
+        // Hardware-observed on a unit that reports no applet version: the
+        // known-supported row sits at the `[]` sentinel, so that unit is not
+        // left unverified. The other five stay known unsupported there, by
+        // the `[0]` row's reach backward.
+        let fp = AppletFingerprint::Feitian;
+        for alg in [
+            KeyAlg::Rsa1024,
+            KeyAlg::Rsa2048,
+            KeyAlg::EccP256,
+            KeyAlg::EccP384,
+        ] {
+            for v in [None, Some(&[0][..]), Some(&[1][..])] {
+                assert_eq!(
+                    resolve(PivExtension::SlotKeyAlgorithm(alg), fp, v, None),
+                    FeatureGate::Supported,
+                    "{alg:?} {v:?}"
+                );
+            }
+        }
+        for alg in [
+            KeyAlg::Rsa3072,
+            KeyAlg::Rsa4096,
+            KeyAlg::EccP521,
+            KeyAlg::Ed25519,
+            KeyAlg::X25519,
+        ] {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, None, None),
+                FeatureGate::Unsupported,
+                "{alg:?}"
+            );
+        }
     }
 
     #[test]
