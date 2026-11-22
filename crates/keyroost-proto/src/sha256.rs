@@ -7,9 +7,8 @@
 //! (incremental `update`/`finalize`, same MD-style padding).
 //!
 //! The hasher also derives OpenPGP card PINs (the card's KDF setting), so
-//! the block buffer, the chaining state and each block's message schedule
-//! are overwritten with zeros once they are done with: on drop, and after
-//! every compression (see [`crate::wipe`]).
+//! its block buffer and chaining state are zeroed on drop, and each block's
+//! message schedule when that block's compression is done.
 
 const BLOCK_SIZE: usize = 64;
 
