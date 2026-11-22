@@ -4,4 +4,4 @@
   sent Feitian's commands: `piv reset` and the app's reset work (the key
   asks for a touch), the PIN tries show, and keys are generated and
   imported as RSA-1024, RSA-2048 or P-256, the types it holds. Checked
-  on one key with the command line. ([#279])
+  on one key with the command line. ([#274])
