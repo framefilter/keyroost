@@ -15,14 +15,14 @@ Every fact below is marked with where it comes from:
 - **Measured**: seen in an exchange with a physical key.
   - *Key A*: USB `096E:086A`, OTP applet 1.0.1. Read with Libre Key Companion
     (Android, USB CCID), and with `keyroostctl` over PC/SC on Windows
-    (`feitian info`, `list`, `add`, `code` and `delete`).
+    (`feitian info`, `list`, `add`, `code` and `delete`; not `reset`).
   - *Key B*: Feitian ePass FIDO-NFC, USB `096E:0853`, OTP applet 1.0.2. Read
     with Libre Key Companion (Android, USB CCID), over direct CCID, and with
     `keyroostctl` over PC/SC on Windows (every `feitian` command). Two keys
     of this model were read. Apart from the value under tag `51` they
-    answered alike in what both were asked: SELECT and LIST over PC/SC, and
-    the wait for a touch. Which of the two an exchange was made with was not
-    always noted.
+    answered alike in what both were asked: SELECT and LIST over PC/SC and
+    over FIDO HID, and the wait for a touch. Which of the two an exchange
+    was made with was not always noted.
 - **Client**: what Feitian's own client applications send or expect. Not yet
   exercised on hardware by this project.
 
@@ -38,17 +38,20 @@ purpose.
 - **FIDO HID:** the same APDUs also go through the key's FIDO HID interface,
   each one as it is in a `CTAPHID_MSG`. Feitian's client uses that when there
   is no CCID reader, and so does `keyroost`, for a key with no reader on this
-  computer or one whose reader can't be opened. *(Measured, Key B: SELECT,
-  LIST, PUT, CALCULATE and DELETE, with the same answers as over PC/SC.)*
+  computer or one whose reader can't be opened. *(Measured, Key A and Key B:
+  SELECT, LIST, PUT, CALCULATE and DELETE, with the same answers as over
+  PC/SC.)*
   - Short APDUs only: the SELECT in extended-length form is answered `6700`.
     *(Measured.)*
   - A `CTAPHID_MSG` reaches whichever applet was selected last. With this
     applet selected, U2F's VERSION is answered `6D00`; after a SELECT of the
     FIDO applet (`A0 00 00 06 47 2F 00 01`) it answers `U2F_V2` again. So
     `keyroost` selects the FIDO applet again when it is done. *(Measured.)*
-  - A command that waits for a touch is answered `6984` only after the key's
-    three and a half seconds, with nothing sent meanwhile, so an exchange is
-    given longer than CTAP's usual read timeout. *(Measured.)*
+  - A command that waits for a touch is answered `6984` only once the key
+    has waited for it (see CALCULATE), with nothing sent meanwhile. CTAP's
+    usual read timeout runs out first, so an exchange is given longer.
+    *(Measured.)* Feitian's client reads for up to 30 seconds per exchange
+    there. *(Client.)*
   - Windows lets only an administrator open this interface.
 - **Windows:** Key B's card can stay unresponsive after plug-in. The reader's
   cold reset fails, and connecting answers `SCARD_W_UNRESPONSIVE_CARD`, or
@@ -83,7 +86,8 @@ answered the same value when it was first read and when it was read again on
 2026-11-19 and on 2026-11-22. The two keys of Key B's model answer different
 values from each other: one answered its value on 2026-11-18 and on
 2026-11-22, the other on 2026-11-19 and on 2026-11-22, across repeated
-SELECTs and card resets. *(Measured.)*
+SELECTs and card resets and, on that second key, a RESET of the applet.
+*(Measured.)*
 
 These keys do not host the Yubico OATH applet. A SELECT of its AID
 (`A0 00 00 05 27 21 01`) is answered `6700` by Key A and `6D00` by Key B, not
