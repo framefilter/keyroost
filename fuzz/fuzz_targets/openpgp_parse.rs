@@ -15,6 +15,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = keyroost_openpgp::parse_cardholder_related_data(data);
     let _ = keyroost_openpgp::parse_cardholder_name(data);
     let _ = keyroost_openpgp::parse_url(data);
+    let _ = keyroost_openpgp::kdf_supported_in(data);
     // The KDF setting decides how PINs are hashed; a parsed one must also
     // derive without panicking. Large counts are skipped to keep each run
     // fast (a setting may ask for 65 MB of hashing).
