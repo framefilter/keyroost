@@ -394,6 +394,9 @@ pub enum TransportError {
     /// uses that answer for a slot that has an access code; keyroost has no
     /// way to enter one.
     FeitianOtpAccessCode { slot: &'static str },
+    /// A Feitian OTP TOTP code came back for a time window that had ended
+    /// while the key waited for its touch. The code was wiped, not returned.
+    FeitianOtpWindowEnded,
     /// The RSA key's public exponent is wider than the OpenPGP card's declared
     /// exponent field (`e_bits`). Caught before building the import (the pure
     /// builder would otherwise panic); guards against a malformed card
@@ -754,6 +757,11 @@ impl fmt::Display for TransportError {
                 "the key refused (SW=6982) for slot {slot}. Feitian's software answers \
                  this way for a slot protected by an access code, which keyroost \
                  cannot enter"
+            ),
+            TransportError::FeitianOtpWindowEnded => write!(
+                f,
+                "that code's time window ended while the key waited for the touch; \
+                 read it again"
             ),
             TransportError::OpenPgpExponentTooWide => write!(
                 f,

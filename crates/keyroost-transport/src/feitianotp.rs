@@ -175,6 +175,23 @@ impl FeitianOtpSession {
         self.calculate(slot, &apdu)
     }
 
+    /// [`Self::calculate_totp`] for the time window current now. The clock is
+    /// read when the command is sent and again once the key answered: the
+    /// key computes only once it is touched, and a code whose window ended
+    /// while it waited is wiped and refused
+    /// ([`TransportError::FeitianOtpWindowEnded`]), never returned. Returns
+    /// the code and its window (unix time / `period`).
+    pub fn calculate_totp_now(
+        &mut self,
+        slot: fotp::Slot,
+        name: &str,
+        period: u32,
+    ) -> Result<(fotp::OtpCode, u64), TransportError> {
+        let asked = unix_now();
+        let code = self.calculate_totp(slot, name, asked, period)?;
+        same_window(code, asked, unix_now(), period)
+    }
+
     /// Compute the next HOTP for the credential stored as `name` in `slot`.
     /// The key advances its own counter.
     pub fn calculate_hotp(
@@ -250,6 +267,30 @@ impl FeitianOtpSession {
             resp_sensitive,
         )
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `code`, computed for the window `asked` falls in, with that window, while
+/// `now` is still in it; else wiped and refused.
+fn same_window(
+    mut code: fotp::OtpCode,
+    asked: u64,
+    now: u64,
+    period: u32,
+) -> Result<(fotp::OtpCode, u64), TransportError> {
+    let period = u64::from(period.max(1));
+    let window = asked / period;
+    if now / period != window {
+        zeroize::Zeroize::zeroize(&mut code.code);
+        return Err(TransportError::FeitianOtpWindowEnded);
+    }
+    Ok((code, window))
 }
 
 /// Read every slot through `exchange` (one APDU in, `(payload, sw)` out).
@@ -371,6 +412,26 @@ fn trace_sensitivity(apdu: &[u8]) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A TOTP code is kept only while the window it was asked for lasts: a
+    /// touch that comes after the window ended gets a refusal, not a code
+    /// that no server takes any more.
+    #[test]
+    fn a_totp_code_whose_window_ended_during_the_touch_is_refused() {
+        let code = || fotp::OtpCode {
+            digits: 6,
+            code: "123456".into(),
+        };
+        let (got, window) = same_window(code(), 1_000, 1_019, 30).unwrap();
+        assert_eq!((got.code.as_str(), window), ("123456", 1_000 / 30));
+        assert_eq!(same_window(code(), 1_000, 1_000, 60).unwrap().1, 1_000 / 60);
+        let err = same_window(code(), 1_019, 1_020, 30).err().unwrap();
+        assert!(matches!(err, TransportError::FeitianOtpWindowEnded));
+        assert_eq!(
+            err.to_string(),
+            "that code's time window ended while the key waited for the touch; read it again"
+        );
+    }
 
     /// Answers each command from a script and records what was sent.
     struct Script {
