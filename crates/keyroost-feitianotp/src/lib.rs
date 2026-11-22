@@ -554,6 +554,73 @@ pub fn stored_name(
     Ok(out)
 }
 
+/// The longest stored name keyroost writes, in bytes, with the `30:` prefix
+/// and the `_#_` separator counted: Libre Key Companion's limit, the tightest
+/// of the known clients. The applet's own limit is not measured.
+/// `keyroost_import::plan::limits` mirrors it for imports.
+pub const NAME_MAX: usize = 64;
+
+/// Why [`checked_stored_name`] refused a name.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameError {
+    /// [`stored_name`] refused it: an empty account, or a period the name
+    /// can't carry.
+    Build(BuildError),
+    /// The name has [`ISSUER_SEPARATOR`] in it where the key would split it,
+    /// so it would come back as another app and account.
+    ReadsBackDifferently,
+    /// The stored name is longer than [`NAME_MAX`].
+    TooLong { stored: String },
+}
+
+impl core::fmt::Display for NameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            NameError::Build(e) => write!(f, "{e}"),
+            NameError::ReadsBackDifferently => write!(
+                f,
+                "the name would read back differently on the key: it keeps the app \
+                 and the account apart with {ISSUER_SEPARATOR}, and this name has that \
+                 in it"
+            ),
+            NameError::TooLong { stored } => write!(
+                f,
+                "the name is {} bytes as stored ({stored:?}); keyroost stores names of \
+                 up to {NAME_MAX} bytes on this key",
+                stored.len()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NameError {}
+
+/// [`stored_name`], refused unless the key would read the name back as the
+/// same app and account, and unless it fits [`NAME_MAX`]. The one check
+/// `keyroostctl feitian add` and the app's add form both run, so they refuse
+/// the same names in the same words.
+///
+/// # Errors
+/// See [`NameError`].
+pub fn checked_stored_name(
+    issuer: Option<&str>,
+    account: &str,
+    oath_type: OathType,
+    period: u32,
+) -> Result<String, NameError> {
+    let issuer = issuer.filter(|i| !i.is_empty());
+    let stored = stored_name(issuer, account, oath_type, period).map_err(NameError::Build)?;
+    let parts = parse_name(&stored, oath_type);
+    if parts.issuer != issuer || parts.account != account {
+        return Err(NameError::ReadsBackDifferently);
+    }
+    if stored.len() > NAME_MAX {
+        return Err(NameError::TooLong { stored });
+    }
+    Ok(stored)
+}
+
 // ---------------------------------------------------------------------------
 // Response parsing
 // ---------------------------------------------------------------------------
@@ -890,6 +957,39 @@ mod tests {
                 Err(BuildError::UnsupportedPeriod(period))
             );
         }
+    }
+
+    #[test]
+    fn checked_stored_name_refuses_what_would_not_read_back() {
+        let check = |i: Option<&str>, a: &str| checked_stored_name(i, a, OathType::Totp, 30);
+        assert_eq!(check(Some("GitHub"), "alice").unwrap(), "30:GitHub_#_alice");
+        assert_eq!(check(Some(""), "alice").unwrap(), "30:alice");
+        // The separator inside either part would move the key's split.
+        assert_eq!(
+            check(Some("a_#_b"), "c"),
+            Err(NameError::ReadsBackDifferently)
+        );
+        assert_eq!(check(None, "a_#_b"), Err(NameError::ReadsBackDifferently));
+        assert!(NameError::ReadsBackDifferently.to_string().contains("_#_"));
+        assert_eq!(
+            check(None, ""),
+            Err(NameError::Build(BuildError::EmptyName))
+        );
+        // The limit counts the prefix and the separator: 3 + 1 + 3 + 57 = 64.
+        let fits = "a".repeat(57);
+        assert_eq!(check(Some("x"), &fits).unwrap().len(), NAME_MAX);
+        let over = format!("{fits}a");
+        let err = check(Some("x"), &over).unwrap_err();
+        assert_eq!(
+            err,
+            NameError::TooLong {
+                stored: format!("30:x_#_{over}")
+            }
+        );
+        assert!(err
+            .to_string()
+            .starts_with("the name is 65 bytes as stored"));
+        assert!(err.to_string().ends_with("up to 64 bytes on this key"));
     }
 
     #[test]

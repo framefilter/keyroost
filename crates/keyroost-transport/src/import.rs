@@ -1317,8 +1317,19 @@ mod tests {
             );
             let parts = fotp::parse_name(&planned, oath_type);
             assert_eq!((parts.issuer, parts.account), (i, a), "{planned}");
+            // What `feitian add` and the app's add form accept, the plan
+            // names the same way.
+            assert_eq!(
+                fotp::checked_stored_name(i, a, oath_type, period).as_ref(),
+                Ok(&planned)
+            );
         }
         assert_eq!(fotp::ISSUER_SEPARATOR, "_#_");
+        // The import's name limit mirrors the byte layer's.
+        assert_eq!(
+            keyroost_import::plan::limits(keyroost_import::plan::Store::FeitianOtp).name_max,
+            Some(fotp::NAME_MAX)
+        );
     }
 
     #[test]
