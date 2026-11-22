@@ -374,6 +374,23 @@ pub(crate) struct OpenpgpStatusJson {
     pub cardholder_name: Option<String>,
     /// Public-key URL (`5F50`); `null` when unreadable, `""` when unset.
     pub url: Option<String>,
+    /// The KDF setting (whether PINs reach the card hashed): `"on"`,
+    /// `"off"`, `"not-supported"` or `"unrecognized"`; `null` when it
+    /// couldn't be read. See [`kdf_json`].
+    pub kdf: Option<&'static str>,
+}
+
+/// JSON word for [`OpenpgpStatusJson::kdf`]: the text `KDF:` line's state
+/// without its detail (the hash, or what wasn't recognized).
+pub(crate) fn kdf_json(kdf: Option<&keyroost_transport::OpenPgpKdf>) -> Option<&'static str> {
+    use keyroost_transport::OpenPgpKdf;
+    match kdf? {
+        OpenPgpKdf::On(_) => Some("on"),
+        OpenPgpKdf::Off => Some("off"),
+        OpenPgpKdf::NotSupported => Some("not-supported"),
+        OpenPgpKdf::Unrecognized(_) => Some("unrecognized"),
+        _ => None,
+    }
 }
 
 /// JSON form of a tri-state public text field (`cardholder_name`, `url`):
@@ -1172,6 +1189,7 @@ mod tests {
             ("signature_count", "number|null"),
             ("cardholder_name", "string|null"),
             ("url", "string|null"),
+            ("kdf", "string|null"),
         ];
         let status = |serial: Option<u32>, fpr: Option<String>| OpenpgpStatusJson {
             aid: "D276".into(),
@@ -1191,6 +1209,7 @@ mod tests {
             signature_count: fpr.as_ref().map(|_| 9),
             cardholder_name: None,
             url: None,
+            kdf: Some("on"),
         };
         let v = to_v(&status(Some(0x0000_0001), Some("AB".into())));
         assert_shape(&v, &shape);
@@ -1201,6 +1220,23 @@ mod tests {
         let v = to_v(&status(None, None));
         assert_shape(&v, &shape);
         assert!(v["serial"].is_null());
+    }
+
+    #[test]
+    fn kdf_json_words() {
+        use keyroost_openpgp::{KdfError, KdfHash};
+        use keyroost_transport::OpenPgpKdf;
+        assert_eq!(kdf_json(Some(&OpenPgpKdf::On(KdfHash::Sha512))), Some("on"));
+        assert_eq!(kdf_json(Some(&OpenPgpKdf::Off)), Some("off"));
+        assert_eq!(
+            kdf_json(Some(&OpenPgpKdf::NotSupported)),
+            Some("not-supported")
+        );
+        assert_eq!(
+            kdf_json(Some(&OpenPgpKdf::Unrecognized(KdfError::UnknownHash(9)))),
+            Some("unrecognized")
+        );
+        assert_eq!(kdf_json(None), None);
     }
 
     #[test]

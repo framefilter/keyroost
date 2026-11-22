@@ -10405,6 +10405,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                     signature_count: status.signature_count,
                     cardholder_name: json_out::optional_text_json(status.cardholder_name.clone()),
                     url: json_out::optional_text_json(status.url.clone()),
+                    kdf: json_out::kdf_json(status.kdf.as_ref()),
                 })?;
                 return Ok(());
             }
@@ -10431,6 +10432,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 status.tries_rc,
                 status.tries_pw3
             );
+            outln!("KDF:            {}", kdf_text(status.kdf.as_ref()));
             match status.signature_count {
                 Some(n) => outln!("Signatures:     {}", n),
                 None => outln!("Signatures:     (unavailable)"),
@@ -13615,6 +13617,12 @@ fn fingerprint_text(fpr: &[u8; 20], key_present: Option<bool>) -> String {
     } else {
         hex_encode(fpr)
     }
+}
+
+/// The value of the `openpgp info` "KDF" line (gpg's "KDF setting"):
+/// whether PINs reach the card hashed. A failed read is "(unavailable)".
+fn kdf_text(kdf: Option<&keyroost_transport::OpenPgpKdf>) -> String {
+    kdf.map_or_else(|| "(unavailable)".to_string(), |k| k.label())
 }
 
 fn run_name(cmd: &NameCmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -25600,6 +25608,33 @@ mod cli_tests {
     }
 
     #[test]
+    fn kdf_line_for_each_state() {
+        use keyroost_transport::OpenPgpKdf;
+        let cases = [
+            (
+                Some(OpenPgpKdf::On(keyroost_openpgp::KdfHash::Sha256)),
+                "on (SHA-256)",
+            ),
+            (
+                Some(OpenPgpKdf::On(keyroost_openpgp::KdfHash::Sha512)),
+                "on (SHA-512)",
+            ),
+            (Some(OpenPgpKdf::Off), "off"),
+            (Some(OpenPgpKdf::NotSupported), "not supported"),
+            (
+                Some(OpenPgpKdf::Unrecognized(
+                    keyroost_openpgp::KdfError::UnknownAlgorithm(0x05),
+                )),
+                "unrecognized setting (algorithm 0x05)",
+            ),
+            (None, "(unavailable)"),
+        ];
+        for (kdf, text) in cases {
+            assert_eq!(kdf_text(kdf.as_ref()), text);
+        }
+    }
+
+    #[test]
     fn fingerprint_text_notes_a_key_without_a_fingerprint() {
         let zero = [0u8; 20];
         let some = [0xABu8; 20];
@@ -25633,6 +25668,7 @@ mod cli_tests {
             signature_count: Some(7),
             cardholder_name: Some("Doe<<John".into()),
             url: None,
+            kdf: None,
         };
         assert_json_has_keys(
             &o,
@@ -25647,6 +25683,7 @@ mod cli_tests {
                 "signature_count",
                 "cardholder_name",
                 "url",
+                "kdf",
             ],
         );
     }

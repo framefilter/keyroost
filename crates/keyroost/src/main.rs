@@ -25318,7 +25318,8 @@ impl App {
                 ui.colored_label(p.ok, notice);
                 ui.add_space(6.0);
             }
-            // Applet-wide status: AID / serial / PIN retries / signatures made.
+            // Applet-wide status: AID / serial / PIN retries / KDF setting /
+            // signatures made.
             // The three per-key algorithm+fingerprint rows live under the sub-tab
             // strip now, not here.
             if let Some(status) = &self.openpgp.status {
@@ -25328,6 +25329,12 @@ impl App {
                 let sigs = status
                     .signature_count
                     .map_or("\u{2014}".to_string(), |n| n.to_string());
+                // Whether PINs reach the card hashed, as `openpgp info`
+                // words it.
+                let kdf = status
+                    .kdf
+                    .as_ref()
+                    .map_or("\u{2014}".to_string(), |k| k.label());
                 ui.label(
                     egui::RichText::new(format!(
                         "AID {} \u{00B7} Serial {serial}",
@@ -25339,7 +25346,8 @@ impl App {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(format!(
-                        "PIN retries PW1={} RC={} PW3={} \u{00B7} Signatures made {sigs}",
+                        "PIN retries PW1={} RC={} PW3={} \u{00B7} KDF {kdf} \u{00B7} \
+                         Signatures made {sigs}",
                         status.tries_pw1, status.tries_rc, status.tries_pw3
                     ))
                     .font(theme::f_reg(12.5))
