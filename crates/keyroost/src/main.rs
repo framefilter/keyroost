@@ -812,6 +812,28 @@ fn same_hid_connection(a: &HidIdentity, b: &HidIdentity) -> bool {
     }
 }
 
+/// Whether `cand` is a connection the armed reset's frozen snapshot does not
+/// hold: one that was not there when the armed key left.
+fn fresh_hid_connection(prev: &[HidIdentity], cand: &HidIdentity) -> bool {
+    !prev.iter().any(|p| same_hid_connection(p, cand))
+}
+
+/// Drop the armed key's own node from the snapshot once a poll has seen it
+/// gone.
+///
+/// Where the path is the only identity ([`same_hid_connection`]'s fallback),
+/// a key replugged into the same USB port comes back on the very path it
+/// left: Windows builds the HID path of a key with no USB serial from the
+/// port it sits in (seen on Windows 11: one key, one port, the same path
+/// across every replug of a session). Left in the snapshot, that entry makes
+/// the returning key read as "there all along", and the armed reset never
+/// fires; the dialog waits for a replug that already happened. The node was
+/// seen to be gone, so a device on that path afterwards is a new connection.
+/// Whether it is the armed key is still decided by its identity, as before.
+fn forget_departed_node(prev: &mut Vec<HidIdentity>, departed: &std::path::Path) {
+    prev.retain(|p| p.path != departed);
+}
+
 /// The device an open rename field is bound to, pinned when the field opens so
 /// a background rescan can't retarget the save. See [`App::rename_target`].
 #[derive(Clone)]
@@ -10057,17 +10079,24 @@ impl App {
     /// and Windows, so this reaches IOKit / the Win32 HID stack. Keep it out of
     /// unit tests — take [`Self::arm_fido_reset_with`] and pass a list instead.
     fn fido_devices() -> Vec<FidoHid> {
-        keyroost_hid::enumerate()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(HidDevice::is_fido)
-            .map(|h| FidoHid {
-                path: h.path,
-                serial: h.serial_number,
-                ids: (h.vendor_id, h.product_id),
-                usb_device: h.usb_device,
-            })
-            .collect()
+        Self::scan_fido_devices().unwrap_or_default()
+    }
+
+    /// The FIDO HID devices connected right now, or `None` when the scan
+    /// itself failed. A failed scan says nothing about what is connected, so
+    /// the armed-reset poll must not read it as "the armed key is gone".
+    fn scan_fido_devices() -> Option<Vec<FidoHid>> {
+        keyroost_hid::enumerate().ok().map(|hids| {
+            hids.into_iter()
+                .filter(HidDevice::is_fido)
+                .map(|h| FidoHid {
+                    path: h.path,
+                    serial: h.serial_number,
+                    ids: (h.vendor_id, h.product_id),
+                    usb_device: h.usb_device,
+                })
+                .collect()
+        })
     }
 
     /// The resolver's stable identity for the FIDO HID device at `path`, read
@@ -10146,7 +10175,12 @@ impl App {
             }
             return;
         }
-        let current = Self::fido_devices();
+        // A failed scan is skipped, not read as an empty list: that would
+        // count as the unplug, and the key, still connected, would then be
+        // taken for the re-insert and sent a reset with no replug behind it.
+        let Some(current) = Self::scan_fido_devices() else {
+            return;
+        };
         let mut fire: Option<std::path::PathBuf> = None;
         let mut refuse: Option<String> = None;
         if let Some(arm) = self.reset_arm.as_mut() {
@@ -10171,7 +10205,12 @@ impl App {
                 // after removal.
                 let present = |p: &std::path::PathBuf| current.iter().any(|d| &d.path == p);
                 match &arm.target_path {
-                    Some(t) if !present(t) => arm.saw_removal = true,
+                    Some(t) if !present(t) => {
+                        arm.saw_removal = true;
+                        // Gone, so the same path later is a new connection
+                        // (a same-port replug on Windows keeps the path).
+                        forget_departed_node(&mut arm.prev_devices, t);
+                    }
                     _ => {}
                 }
                 if arm.saw_removal && arm.serial_less {
@@ -10180,10 +10219,7 @@ impl App {
                     let cand = current
                         .iter()
                         .filter(|d| arm.target_ids == Some(d.ids) && d.serial.is_none())
-                        .find(|d| {
-                            let id = HidIdentity::of(d);
-                            !arm.prev_devices.iter().any(|p| same_hid_connection(p, &id))
-                        });
+                        .find(|d| fresh_hid_connection(&arm.prev_devices, &HidIdentity::of(d)));
                     if let Some(d) = cand {
                         let now =
                             keyroost_resolve::enumerate_with(&keyroost_resolve::EnumerateOptions {
@@ -10212,10 +10248,7 @@ impl App {
                     fire = current
                         .iter()
                         .filter(|d| arm.target_ids.is_none() || arm.target_ids == Some(d.ids))
-                        .filter(|d| {
-                            let id = HidIdentity::of(d);
-                            !arm.prev_devices.iter().any(|p| same_hid_connection(p, &id))
-                        })
+                        .filter(|d| fresh_hid_connection(&arm.prev_devices, &HidIdentity::of(d)))
                         .find(|d| {
                             let cand_eff = Self::fido_effective_serial(&d.path);
                             reset_reinsert_matches(
@@ -35575,6 +35608,60 @@ mod tests {
         };
         assert!(same_hid_connection(&a, &replugged_same_path));
         assert!(!same_hid_connection(&a, &same_node_other_path));
+    }
+
+    /// A key with no USB serial, replugged into the same port on Windows,
+    /// comes back on the path it left, and its devnode can't tell the two
+    /// attaches apart. While the armed key's node sits in the snapshot the
+    /// returning key is "not fresh" and the reset never fires. Once a poll
+    /// has seen that node gone it is dropped, so the same path counts as the
+    /// re-insert; a key that stayed plugged in still does not.
+    #[test]
+    fn a_same_port_replug_is_fresh_once_the_armed_node_was_seen_gone() {
+        let node = |id: &str| Some(keyroost_hid::UsbDeviceKey::win_node(id));
+        let armed = HidIdentity {
+            path: r"\\?\HID#VID_096E&PID_0853&MI_02#8&1A&0&0000#{4d1e55b2}".into(),
+            usb_device: node(r"USB\VID_096E&PID_0853\6&11223344&0&2"),
+        };
+        let stayed = HidIdentity {
+            path: r"\\?\HID#VID_096E&PID_0853&MI_02#8&2B&0&0000#{4d1e55b2}".into(),
+            usb_device: node(r"USB\VID_096E&PID_0853\6&11223344&0&3"),
+        };
+        let mut snapshot = vec![armed.clone(), stayed.clone()];
+        assert!(
+            !fresh_hid_connection(&snapshot, &armed),
+            "still connected: no replug has happened"
+        );
+
+        forget_departed_node(&mut snapshot, &armed.path);
+
+        assert!(
+            fresh_hid_connection(&snapshot, &armed),
+            "seen gone, back on the same path: this is the re-insert"
+        );
+        assert!(
+            !fresh_hid_connection(&snapshot, &stayed),
+            "a key that never left is not a re-insert"
+        );
+    }
+
+    /// Where the kernel tells attaches apart (Linux bus/address), dropping
+    /// the departed node changes nothing: the returning key was already
+    /// fresh, and a device that kept its address is still not.
+    #[test]
+    fn forgetting_the_departed_node_leaves_bus_address_identity_alone() {
+        let at = |path: &str, addr: u8| HidIdentity {
+            path: path.into(),
+            usb_device: Some(keyroost_hid::UsbDeviceKey::BusAddr(1, addr)),
+        };
+        let mut snapshot = vec![at("/dev/hidraw0", 8), at("/dev/hidraw1", 4)];
+        let back = at("/dev/hidraw0", 9);
+        assert!(fresh_hid_connection(&snapshot, &back));
+
+        forget_departed_node(&mut snapshot, std::path::Path::new("/dev/hidraw0"));
+
+        assert!(fresh_hid_connection(&snapshot, &back));
+        assert!(!fresh_hid_connection(&snapshot, &at("/dev/hidraw1", 4)));
     }
 }
 
