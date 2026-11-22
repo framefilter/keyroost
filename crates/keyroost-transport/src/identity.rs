@@ -297,6 +297,57 @@ pub fn trussed_admin_firmware(reader: &str, debug: bool) -> Option<String> {
     )
 }
 
+/// The COS version of the Feitian key on `reader`, as text
+/// ([`keyroost_feitianotp::cos_version_text`]): what Feitian states for a
+/// key, where its CTAPHID INIT bytes are another number. `None` if the
+/// reader can't be opened, the key refuses its device-information read, or
+/// the answer carries no version.
+///
+/// No application is selected for it: the read is the key's own and leaves
+/// the selected application as it is. The answer holds the key's serial, so
+/// the trace gives its length and status word only.
+pub fn feitian_cos_version(reader: &str, debug: bool) -> Option<String> {
+    if keyroost_proto::is_molto2_reader(reader) {
+        return None;
+    }
+    let shown = keyroost_proto::trace::reader_name(reader);
+    let ctx = crate::establish_context().ok()?;
+    let name = std::ffi::CString::new(reader).ok()?;
+    let card = match crate::connect_shared(&ctx, &name) {
+        Ok(c) => c,
+        Err(e) => {
+            trace::line(debug, || {
+                format_line(
+                    Dir::Note,
+                    "identity",
+                    &format!("{shown} connect failed: {e}"),
+                )
+            });
+            return None;
+        }
+    };
+    let command = keyroost_feitianotp::device_info();
+    trace::line(debug, || {
+        format_line(Dir::Sent, "identity", &format!("{shown} {}", hex(&command)))
+    });
+    let answer =
+        crate::exchange_apdu(&card, &command, 0x61, || vec![0x00, 0xC0, 0x00, 0x00, 0x00]).ok();
+    // LeaveCard: never reset a card another session may hold.
+    let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+    let (data, sw) = answer?;
+    trace::line(debug, || {
+        format_line(
+            Dir::Received,
+            "identity",
+            &format!("{shown} [{} bytes] {sw:04X}", data.len()),
+        )
+    });
+    if sw != 0x9000 {
+        return None;
+    }
+    keyroost_feitianotp::cos_version_text(&keyroost_feitianotp::parse_device_info(&data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

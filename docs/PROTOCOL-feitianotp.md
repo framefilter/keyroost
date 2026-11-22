@@ -134,6 +134,47 @@ Client.)* keyroost used to show that field as the serial of a Feitian key
 with OpenPGP, and showed none for one without. Key A is one without: it
 answers the OpenPGP SELECT `6700`. *(Measured.)*
 
+## The key's device information
+
+```
+80 E3 EE 80 00
+```
+
+Like the serial read, this is the key's command and not the OTP applet's. A
+Key B answered it with nothing selected and with each of its applications
+selected, Key A with PIV selected. *(Measured, Key A and one Key B,
+2026-11-22 and 23.)* It is the command Feitian's client names a key's model
+with. *(Client.)*
+
+The answer is `80`, a second byte, and then TLVs with one-byte tags and
+lengths. The second byte is not a length to go by: it counts the TLVs on Key
+A and the whole answer on Key B. keyroost reads the TLVs to the end of the
+answer, as Feitian's client does. *(Measured; the client's reading is
+Client.)*
+
+| Tag | Key A | Key B | What |
+|---|---|---|---|
+| `81` | `04 08` | `02 02` | The second byte is the product: Feitian's client names `08` "BioPass FIDO Pro" and `02` "ePass FIDO-NFC Plus". *(Client.)* |
+| `82` | nine ASCII digits | nine ASCII digits | The serial that the serial read above gives. |
+| `84` | `47 17 00` | `07 04 00` | Also each key's USB release number. Feitian's client shows the first two bytes as the COS version. *(Client.)* |
+| `92` | `47 17 00` | `01 08 26` | The COS version Feitian publishes for the product: 4.7.17 for the BioPass FIDO Pro, 1.826 for the ePass FIDO NFC Plus. |
+
+The other tags (`83`, `85`, `86`, and on Key A `87` to `90`) are not read.
+*(Measured.)*
+
+The COS version is the version of the key as a whole. Feitian's version
+table gives it beside a number for each application: for the ePass FIDO NFC
+Plus, COS 1.826 with FIDO 9134, PIV 9166, OpenPGP 7386 and OTP 9126; for the
+BioPass FIDO Pro, COS 4.7.17. *(Feitian's published versions.)*
+
+keyroost shows the value under `92` as a Feitian key's firmware version, in
+the app's key header and in `fido info`: the way Feitian publishes it for
+those two versions of those two products, and for any other as the three
+bytes read (`01.08.27`), since the two published forms do not group their
+digits alike. It does not show a Feitian key's CTAPHID INIT version bytes
+(`1.0.1` on Key A), which are neither value. With no smart-card reader for
+the key, no firmware is shown.
+
 ## Slots
 
 Every command after SELECT names a slot in P2.

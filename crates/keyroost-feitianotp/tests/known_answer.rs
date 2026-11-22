@@ -22,9 +22,10 @@
 //! None of the expected bytes were produced by this crate.
 
 use keyroost_feitianotp::{
-    calculate_hotp, calculate_totp, delete, device_serial, list, list_legacy, parse_calculate,
-    parse_device_serial, parse_list, parse_name, parse_select, put, reset, reset_legacy, select,
-    stored_name, totp_challenge, Algorithm, OathType, PutParams, Slot,
+    calculate_hotp, calculate_totp, cos_version_text, delete, device_info, device_serial, list,
+    list_legacy, parse_calculate, parse_device_info, parse_device_serial, parse_list, parse_name,
+    parse_select, put, reset, reset_legacy, select, stored_name, totp_challenge, Algorithm,
+    DeviceInfo, OathType, PutParams, Slot,
 };
 
 fn hex(s: &str) -> Vec<u8> {
@@ -116,6 +117,71 @@ fn serial_answer_of_key_b() {
         parse_device_serial(&hex("31 32 33 34 35 36 37 38 39 00 00 00")).as_deref(),
         Some("123456789")
     );
+}
+
+#[test]
+fn device_information_of_key_a_and_key_b() {
+    // Captured 2026-11-22 and 23, with made-up digits for the serial under
+    // tag 82: Key B (ePass FIDO NFC Plus), whose second byte is the whole
+    // answer's length, and Key A (BioPass FIDO Pro), whose second byte is
+    // the TLVs' length.
+    assert_eq!(device_info(), hex("80 E3 EE 80 00"));
+    let key_b = parse_device_info(&hex(
+        "80 2C 81 02 02 02 82 09 31 32 33 34 35 36 37 38 39 83 02 00 00 \
+         84 03 07 04 00 85 08 20 26 03 16 15 18 50 00 86 01 70 92 03 01 08 26",
+    ));
+    assert_eq!(
+        key_b,
+        DeviceInfo {
+            product: Some(0x02),
+            cos: Some([0x01, 0x08, 0x26]),
+        }
+    );
+    let key_a = parse_device_info(&hex(
+        "80 3D 81 02 04 08 82 09 31 32 33 34 35 36 37 38 39 83 02 00 00 \
+         84 03 47 17 00 85 08 20 25 03 05 11 16 53 00 86 01 60 \
+         87 07 00 00 00 00 00 3F 04 88 01 00 89 02 00 00 90 01 00 92 03 47 17 00",
+    ));
+    assert_eq!(
+        key_a,
+        DeviceInfo {
+            product: Some(0x08),
+            cos: Some([0x47, 0x17, 0x00]),
+        }
+    );
+    // The versions Feitian publishes for the two products.
+    assert_eq!(cos_version_text(&key_b).as_deref(), Some("1.826"));
+    assert_eq!(cos_version_text(&key_a).as_deref(), Some("4.7.17"));
+}
+
+#[test]
+fn a_cos_version_feitian_has_not_published_is_shown_as_read() {
+    // Constructed. Another version of a known product, the same bytes on
+    // another product, and no product at all: the bytes, two digits each.
+    for (product, cos, text) in [
+        (Some(0x02), [0x01, 0x08, 0x27], "01.08.27"),
+        (Some(0x05), [0x47, 0x17, 0x00], "47.17.00"),
+        (None, [0x01, 0x08, 0x26], "01.08.26"),
+    ] {
+        let info = DeviceInfo {
+            product,
+            cos: Some(cos),
+        };
+        assert_eq!(cos_version_text(&info).as_deref(), Some(text));
+    }
+    // No version, no text: the tag missing, not three bytes, a TLV cut
+    // short before it, no `80` in front, nothing at all.
+    for answer in [
+        "80 04 81 02 02 02",
+        "80 04 92 02 01 08",
+        "80 08 81 02 02 02 92 03 01 08",
+        "81 02 02 02 92 03 01 08 26",
+        "",
+    ] {
+        let info = parse_device_info(&hex(answer));
+        assert_eq!(info.cos, None, "{answer}");
+        assert_eq!(cos_version_text(&info), None, "{answer}");
+    }
 }
 
 #[test]

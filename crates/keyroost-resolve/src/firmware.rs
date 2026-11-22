@@ -15,6 +15,12 @@
 //!   firmware by release (`R3.4`) and identifies it from the first five
 //!   digits of the key's serial number, per its published "PIN+ Serial
 //!   Number Prefix Reference" ([`token2_release`]).
+//! * Feitian: bytes that are not the version Feitian states for a key (a
+//!   BioPass FIDO Pro's say `1.0.1`). Feitian publishes a key's COS
+//!   version (`4.7.17` for that one), which is the version of the key as a
+//!   whole: its applications carry numbers of their own. The key reports
+//!   it in its device information, read over its smart-card reader
+//!   (`keyroost_transport::identity::feitian_cos_version`).
 //!
 //! [`key_firmware`] applies these rules for one key; the CLI's `fido info`
 //! and the app's key header both show what it returns.
@@ -28,12 +34,16 @@ const SOLO2_PID: u16 = 0xbeee;
 /// Token2's USB vendor ID.
 const TOKEN2_VID: u16 = keyroost_proto::USB_VID;
 
+/// Feitian's USB vendor ID.
+const FEITIAN_VID: u16 = 0x096e;
+
 /// The firmware to show for the FIDO key at HID `path`, whose CTAPHID INIT
 /// reported `version`: the INIT version read the vendor's way
 /// ([`init_firmware`]); for a Token2, the release its serial names (the
-/// row's `serial` when the scan read it, else read over USB); when INIT
-/// says 0.0.0 (a Nitrokey 3), what the admin application reports over
-/// `reader`. `None` when the key doesn't say, or isn't found by `path`.
+/// row's `serial` when the scan read it, else read over USB); for a
+/// Feitian key, the COS version it reports over `reader`; when INIT says
+/// 0.0.0 (a Nitrokey 3), what the admin application reports over `reader`.
+/// `None` when the key doesn't say, or isn't found by `path`.
 ///
 /// May ask the key (the Token2 serial, the admin application), so run it
 /// off the UI thread, with no other handle to the key open: macOS opens
@@ -64,15 +74,21 @@ pub fn key_firmware(
         };
         return release.map(str::to_owned);
     }
+    if vendor_id == FEITIAN_VID {
+        // With no reader the key has no way to say it here, and its INIT
+        // bytes are not shown in its place.
+        return reader.and_then(|r| keyroost_transport::identity::feitian_cos_version(r, debug));
+    }
     reader.and_then(|r| keyroost_transport::identity::trussed_admin_firmware(r, debug))
 }
 
 /// The firmware a key's CTAPHID INIT version bytes state, read the way
-/// its vendor writes them; `None` when they don't state it (a Token2's, or
-/// all zeros, as on a Nitrokey 3), so the caller asks the key another way.
+/// its vendor writes them; `None` when they don't state it (a Token2's, a
+/// Feitian key's, or all zeros, as on a Nitrokey 3), so the caller asks the
+/// key another way.
 pub fn init_firmware(vendor_id: u16, product_id: u16, version: (u8, u8, u8)) -> Option<String> {
     let (major, minor, build) = version;
-    if vendor_id == TOKEN2_VID || version == (0, 0, 0) {
+    if vendor_id == TOKEN2_VID || vendor_id == FEITIAN_VID || version == (0, 0, 0) {
         return None;
     }
     if (vendor_id, product_id) == (SOLOKEYS_VID, SOLO2_PID) {
@@ -204,6 +220,9 @@ mod tests {
         );
         // Token2 and all-zero bytes don't state it.
         assert_eq!(init_firmware(0x349e, 0x0024, (2, 1, 2)), None);
+        // A Feitian key's INIT bytes are not its COS version (a BioPass FIDO
+        // Pro: INIT 1.0.1, COS 4.7.17), so they are not shown.
+        assert_eq!(init_firmware(0x096e, 0x086a, (1, 0, 1)), None);
         assert_eq!(init_firmware(0x20a0, 0x42b2, (0, 0, 0)), None);
     }
 
