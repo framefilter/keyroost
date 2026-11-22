@@ -578,7 +578,7 @@ fn to_otp(
     write_and_report(file, &again, &mut writer)
 }
 
-/// `ftotp import`: into the Feitian OTP applet's default slot, on the same
+/// `feitian import`: into the Feitian OTP applet's default slot, on the same
 /// plan, preview, question, write and report as the other imports. The file
 /// password is the only secret (the applet has no password of its own that
 /// keyroost can enter). Order: check its source, read the file, select and
@@ -856,7 +856,7 @@ pub(crate) fn import_json(
     ImportJson {
         destination: match plan.store {
             Store::Token2Otp => "otp",
-            Store::FeitianOtp => "ftotp",
+            Store::FeitianOtp => "feitian",
             Store::Molto2 => "molto2",
             Store::Oath(_) => "oath",
         },

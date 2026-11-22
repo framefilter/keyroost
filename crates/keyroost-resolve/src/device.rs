@@ -39,7 +39,7 @@ impl Caps {
     /// whose FIDO SELECT didn't name CTAP2 is only marked unverified, not
     /// this: it keeps its FIDO2 reset step.
     pub const FIDO_PROTOCOL_UNKNOWN: Caps = Caps(1 << 8);
-    /// The OTP applet on Feitian FIDO keys (the `ftotp` group): its own
+    /// The OTP applet on Feitian FIDO keys (the `feitian` group): its own
     /// protocol, neither the OATH applet nor Token2's.
     pub const FEITIAN_OTP: Caps = Caps(1 << 9);
 
@@ -196,7 +196,7 @@ impl Device {
             (Caps::PGP, "PGP"),
             (Caps::PIV, "PIV"),
             (Caps::OTP, "OTP"),
-            (Caps::FEITIAN_OTP, "FTOTP"),
+            (Caps::FEITIAN_OTP, "FEITIAN-OTP"),
         ] {
             if self.caps.has(c) {
                 v.push((label, self.cap_state(c)));
@@ -3000,6 +3000,21 @@ mod tests {
         )];
         let yk = &correlate(&yk_hid, &yk_probe, &Keyring::default())[0];
         assert_eq!(yk.cap_badges(), vec!["FIDO2", "OATH", "PGP", "PIV"]);
+
+        // The Feitian OTP applet badges in the app's words, after the rest.
+        let mut ft_probe = probe(
+            "FS CCID 0",
+            false,
+            false,
+            true,
+            true,
+            None,
+            Some(9),
+            Some(5),
+        );
+        ft_probe.has_feitian_otp = true;
+        let ft = &correlate(&[], &[ft_probe], &Keyring::default())[0];
+        assert_eq!(ft.cap_badges(), vec!["PGP", "PIV", "FEITIAN-OTP"]);
     }
 
     #[test]

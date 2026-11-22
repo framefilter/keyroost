@@ -529,16 +529,16 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl otp fingerprint enable</code></td><td>Enable fingerprint protection for OTP. Needs the current OTP PIN. After this, codes can be unlocked by a fingerprint touch as well as the PIN</td></tr>
       <tr><td><code>keyroostctl otp fingerprint disable</code></td><td>Disable fingerprint protection for OTP. Needs the current OTP PIN</td></tr>
     </table></div>
-    <h3 id="ref-ftotp">ftotp</h3>
+    <h3 id="ref-feitian">feitian</h3>
     <p class="kr-muted">Show codes and manage the OTP accounts on a Feitian FIDO key</p>
     <div class="kr-table-wrap"><table class="kr-table">
       <tr><th>Command</th><th>What it does</th></tr>
-      <tr><td><code>keyroostctl ftotp info</code></td><td>Show the applet version and which slots have an access code</td></tr>
-      <tr><td><code>keyroostctl ftotp list</code></td><td>List the accounts stored on the key</td></tr>
-      <tr><td><code>keyroostctl ftotp code</code></td><td>Print the current code for an account. The key computes it once it is touched</td></tr>
-      <tr><td><code>keyroostctl ftotp add</code></td><td>Add a TOTP or HOTP account to the key&#x27;s default slot</td></tr>
-      <tr><td><code>keyroostctl ftotp import</code></td><td>Add every code in an authenticator export to this key&#x27;s default slot</td></tr>
-      <tr><td><code>keyroostctl ftotp delete</code></td><td>Delete an account by name. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl feitian info</code></td><td>Show the applet version and which slots have an access code</td></tr>
+      <tr><td><code>keyroostctl feitian list</code></td><td>List the accounts stored on the key</td></tr>
+      <tr><td><code>keyroostctl feitian code</code></td><td>Print the current code for an account. The key computes it once it is touched</td></tr>
+      <tr><td><code>keyroostctl feitian add</code></td><td>Add a TOTP or HOTP account to the key&#x27;s default slot</td></tr>
+      <tr><td><code>keyroostctl feitian import</code></td><td>Add every code in an authenticator export to this key&#x27;s default slot</td></tr>
+      <tr><td><code>keyroostctl feitian delete</code></td><td>Delete an account by name. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
     </table></div>
     <h3 id="ref-openpgp">openpgp</h3>
     <p class="kr-muted">Manage the OpenPGP card applet: info, keys, sign, decrypt, PINs, cardholder details, and reset</p>

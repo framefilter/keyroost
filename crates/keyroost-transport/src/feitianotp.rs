@@ -57,7 +57,7 @@ impl FeitianOtpSession {
     pub fn open_traced(reader_name: &str, debug: bool) -> Result<Self, TransportError> {
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let mut contact = FirstContact::new(reader_name, debug, "ftotp");
+        let mut contact = FirstContact::new(reader_name, debug, "feitian");
         loop {
             let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
             let mut card = match crate::connect_shared(&ctx, &cstr) {
@@ -192,14 +192,14 @@ impl FeitianOtpSession {
         apdu: &[u8],
     ) -> Result<fotp::OtpCode, TransportError> {
         let (data, sw) = self.transmit_for_touch(apdu)?;
-        touch_answer("ftotp calculate", "compute the code", slot, sw)?;
+        touch_answer("feitian calculate", "compute the code", slot, sw)?;
         fotp::parse_calculate(&data).map_err(TransportError::FeitianOtpParse)
     }
 
     /// Store a credential. The key stores it once it is touched.
     pub fn put(&mut self, params: &fotp::PutParams<'_>) -> Result<(), TransportError> {
         let sw = self.put_status(params)?;
-        touch_answer("ftotp put", "save the account", params.slot, sw)
+        touch_answer("feitian put", "save the account", params.slot, sw)
     }
 
     /// PUT and return the raw status word, for callers that read the key's
@@ -215,7 +215,7 @@ impl FeitianOtpSession {
     /// Remove the credential stored as `name` in `slot`.
     pub fn delete(&mut self, slot: fotp::Slot, name: &str) -> Result<(), TransportError> {
         let sw = self.delete_status(slot, name)?;
-        touch_answer("ftotp delete", "delete the account", slot, sw)
+        touch_answer("feitian delete", "delete the account", slot, sw)
     }
 
     /// DELETE and return the raw status word.
@@ -236,7 +236,7 @@ impl FeitianOtpSession {
     fn transmit_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
         let (cmd_sensitive, resp_sensitive) = trace_sensitivity(apdu);
         let io = crate::AppletIo {
-            label: "ftotp",
+            label: "feitian",
             more_data_sw: fotp::SW_MORE_DATA,
             get_response: fotp::get_response,
             describe: None,
@@ -264,7 +264,7 @@ fn list_all(
         (data, sw) = exchange(&fotp::list_legacy())?;
         legacy = true;
     }
-    slot_answer("ftotp list", fotp::Slot::Default, sw)?;
+    slot_answer("feitian list", fotp::Slot::Default, sw)?;
     let default =
         fotp::parse_list(&data, fotp::Slot::Default).map_err(TransportError::FeitianOtpParse)?;
 
@@ -519,14 +519,14 @@ mod tests {
     fn no_touch_names_what_was_asked() {
         let slot = fotp::Slot::Default;
         assert!(matches!(
-            touch_answer("ftotp put", "save the account", slot, 0x6984),
+            touch_answer("feitian put", "save the account", slot, 0x6984),
             Err(TransportError::FeitianOtpNoTouch {
                 action: "save the account"
             })
         ));
-        assert!(touch_answer("ftotp put", "save the account", slot, 0x9000).is_ok());
+        assert!(touch_answer("feitian put", "save the account", slot, 0x9000).is_ok());
         assert!(matches!(
-            touch_answer("ftotp put", "save the account", slot, 0x6982),
+            touch_answer("feitian put", "save the account", slot, 0x6982),
             Err(TransportError::FeitianOtpAccessCode { slot: "default" })
         ));
         let msg = TransportError::FeitianOtpNoTouch {

@@ -179,7 +179,7 @@ enum Cmd {
     /// Talks to the key over the smart-card interface (PC/SC). This is
     /// Feitian's own OTP applet, distinct from the Yubico/Trussed applet the
     /// `oath` group manages and from Token2's (`otp`).
-    Ftotp {
+    Feitian {
         #[command(subcommand)]
         cmd: FtotpCmd,
     },
@@ -2331,7 +2331,7 @@ enum FtotpCmd {
     /// Print the current code for an account. The key computes it once it is
     /// touched.
     Code {
-        /// Account name as `ftotp list` shows it (e.g. "30:issuer_#_account").
+        /// Account name as `feitian list` shows it (e.g. "30:issuer_#_account").
         name: String,
         /// The slot the account is in (default: wherever the name is found).
         #[arg(long, short = 's', value_enum)]
@@ -2344,7 +2344,7 @@ enum FtotpCmd {
     /// The seed comes from an environment variable, stdin or, with neither,
     /// a hidden prompt — never argv; --encoding says how it is written
     /// (base32 unless --encoding hex). The key keeps the period in the
-    /// account's name: `ftotp list` shows it as "30:issuer_#_account".
+    /// account's name: `feitian list` shows it as "30:issuer_#_account".
     Add {
         /// Account name (the login at the service).
         #[arg(long)]
@@ -2410,7 +2410,7 @@ enum FtotpCmd {
     },
     /// Delete an account by name. Irreversible: asks first (`--yes` to skip).
     Delete {
-        /// Account name as `ftotp list` shows it.
+        /// Account name as `feitian list` shows it.
         name: String,
         /// The slot the account is in (default: wherever the name is found).
         #[arg(long, short = 's', value_enum)]
@@ -2446,7 +2446,7 @@ impl FtotpSlotArg {
     }
 }
 
-/// `ftotp add --digits`: the applet takes 6 or 8.
+/// `feitian add --digits`: the applet takes 6 or 8.
 fn parse_ftotp_digits(s: &str) -> Result<u8, String> {
     match s {
         "6" => Ok(6),
@@ -2455,7 +2455,7 @@ fn parse_ftotp_digits(s: &str) -> Result<u8, String> {
     }
 }
 
-/// `ftotp add --period`: the name on the key holds 30 or 60.
+/// `feitian add --period`: the name on the key holds 30 or 60.
 fn parse_ftotp_period(s: &str) -> Result<u32, String> {
     match s {
         "30" => Ok(30),
@@ -6171,7 +6171,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The Feitian OTP applet is one more CCID applet reached over PC/SC.
-    if let Cmd::Ftotp { cmd } = cmd {
+    if let Cmd::Feitian { cmd } = cmd {
         run_ftotp(cmd, cli.debug)?;
         return Ok(());
     }
@@ -17247,7 +17247,7 @@ mod cli_tests {
             ("oath delete", IRREVERSIBLE),
             ("oath reset", IRREVERSIBLE),
             ("otp delete", IRREVERSIBLE),
-            ("ftotp delete", IRREVERSIBLE),
+            ("feitian delete", IRREVERSIBLE),
             ("otp reset", IRREVERSIBLE),
             ("otp button clear", IRREVERSIBLE),
             ("openpgp reset", IRREVERSIBLE),
@@ -17286,7 +17286,7 @@ mod cli_tests {
             "name clear",
             "oath import",
             "otp import",
-            "ftotp import",
+            "feitian import",
         ];
         let tree = all_commands();
         for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {
@@ -17434,7 +17434,7 @@ mod cli_tests {
                 "fido",
                 "oath",
                 "otp",
-                "ftotp",
+                "feitian",
                 "openpgp",
                 "piv",
                 "molto",

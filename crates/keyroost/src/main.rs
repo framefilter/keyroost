@@ -19834,7 +19834,7 @@ impl App {
             if dev.caps.has(Caps::FEITIAN_OTP) {
                 ui.add_space(14.0);
                 theme::card_frame(p).show(ui, |ui| {
-                    if self.card_head(ui, p, "Feitian OTP", "ftotp") {
+                    if self.card_head(ui, p, "Feitian OTP", "feitian") {
                         self.cap_tab = CapTab::Ftotp;
                     }
                     ui.add_space(8.0);

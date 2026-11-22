@@ -18,7 +18,7 @@ Every fact below is marked with where it comes from:
     (SELECT).
   - *Key B*: Feitian ePass FIDO-NFC, USB `096E:0853`, OTP applet 1.0.2. Read
     with Libre Key Companion (Android, USB CCID), over direct CCID, and with
-    `keyroostctl` over PC/SC on Windows (every `ftotp` command).
+    `keyroostctl` over PC/SC on Windows (every `feitian` command).
 - **Client**: what Feitian's own client applications send or expect. Not yet
   exercised on hardware by this project.
 

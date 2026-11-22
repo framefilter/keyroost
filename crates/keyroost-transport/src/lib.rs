@@ -1832,7 +1832,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
             // Feitian OTP applet: selected by its own AID, like the others.
             // A Feitian key answers the Yubico OATH AID above with 6700 or
             // 6D00, so `has_oath` is already false for it.
-            probe.has_feitian_otp = answers("ftotp", keyroost_feitianotp::select());
+            probe.has_feitian_otp = answers("feitian", keyroost_feitianotp::select());
             // Single-profile programmable token: it has no distinctive reader
             // name and no applet to SELECT, so identify it by its info response.
             // Only flag it when the returned serial matches a known model prefix

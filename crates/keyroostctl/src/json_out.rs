@@ -435,12 +435,12 @@ pub(crate) struct OathCodeJson {
     pub code: String,
 }
 
-/// `keyroostctl ftotp --json list` — one account of the Feitian OTP applet.
+/// `keyroostctl feitian --json list` — one account of the Feitian OTP applet.
 /// Mirrors the human line `<name>  [<type>/<algorithm>]`, with `  (slot N)`
 /// after it for an account in a keyboard slot.
 #[derive(Serialize)]
 pub(crate) struct FtotpAccountJson {
-    /// The name as stored on the key: what `ftotp code` and `ftotp delete`
+    /// The name as stored on the key: what `feitian code` and `feitian delete`
     /// take.
     pub name: String,
     /// "default", "1" or "2".
@@ -459,7 +459,7 @@ pub(crate) struct FtotpAccountJson {
     pub period: Option<u32>,
 }
 
-/// `keyroostctl ftotp --json info` — what the applet says when selected.
+/// `keyroostctl feitian --json info` — what the applet says when selected.
 #[derive(Serialize)]
 pub(crate) struct FtotpInfoJson {
     /// The applet version, e.g. "1.0.2"; `null` when the key didn't say.
@@ -467,7 +467,7 @@ pub(crate) struct FtotpInfoJson {
     pub slots: Vec<FtotpSlotJson>,
 }
 
-/// One slot in `ftotp --json info`.
+/// One slot in `feitian --json info`.
 #[derive(Serialize)]
 pub(crate) struct FtotpSlotJson {
     /// "default", "1" or "2".

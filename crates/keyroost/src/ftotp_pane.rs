@@ -186,7 +186,7 @@ struct FtotpNew {
 }
 
 impl FtotpAddDialog {
-    /// Check the form the way `keyroostctl ftotp add` checks its flags,
+    /// Check the form the way `keyroostctl feitian add` checks its flags,
     /// before anything is sent to the key.
     fn validate(&self) -> Result<FtotpNew, String> {
         let account = self.account.trim();
@@ -205,7 +205,7 @@ impl FtotpAddDialog {
         // another issuer and account is refused, as the import does.
         let parts = fotp::parse_name(&stored, oath_type);
         if parts.issuer != issuer || parts.account != account {
-            // The same words as `keyroostctl ftotp add`, here and below.
+            // The same words as `keyroostctl feitian add`, here and below.
             return Err(format!(
                 "the name would read back differently on the key: it keeps issuer and \
                  account apart with {}, and this name has that in it",
@@ -582,7 +582,7 @@ impl App {
                     let mut session =
                         FeitianOtpSession::open(&reader).map_err(|e| e.to_string())?;
                     // A name the key no longer holds is refused before anything
-                    // is sent, as `keyroostctl ftotp delete` does.
+                    // is sent, as `keyroostctl feitian delete` does.
                     let listing = session.list().map_err(|e| e.to_string())?;
                     if !listing
                         .credentials
@@ -647,7 +647,7 @@ impl App {
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
-                app.help_dot(ui, p, "ftotp");
+                app.help_dot(ui, p, "feitian");
             },
             |app, ui| {
                 if theme::button(ui, p, BtnKind::Primary, "+ Add account").clicked() {
