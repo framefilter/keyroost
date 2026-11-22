@@ -58,26 +58,78 @@ pub(crate) fn establish_context() -> Result<Context, PcscError> {
 /// key went from no applet detected to all three with this retry; reported
 /// on other PCs. A Feitian key with USB `096E:086A` connected without it
 /// there. Why the cold reset fails is not established.
+///
+/// The reset changes the card's state, so it is traced: a `connect` line
+/// when it is tried and one with its outcome, under `--debug` /
+/// `KEYROOST_PROBE_DEBUG` and in the app's activity log.
 pub(crate) fn connect_shared(
     context: &Context,
     reader: &std::ffi::CStr,
 ) -> Result<Card, PcscError> {
-    let first = context.connect(reader, ShareMode::Shared, Protocols::ANY);
+    let connect = || context.connect(reader, ShareMode::Shared, Protocols::ANY);
     #[cfg(windows)]
-    if matches!(
-        first,
-        Err(PcscError::UnresponsiveCard | PcscError::ProtoMismatch)
-    ) && is_feitian_reader(&reader.to_string_lossy())
-        && warm_reset(context, reader)
     {
-        return context.connect(reader, ShareMode::Shared, Protocols::ANY);
+        retry_after_warm_reset(
+            &reader.to_string_lossy(),
+            connect(),
+            || warm_reset(context, reader),
+            connect,
+        )
     }
-    first
+    #[cfg(not(windows))]
+    {
+        connect()
+    }
+}
+
+/// [`connect_shared`]'s retry, apart from PC/SC so it is tested on every
+/// system: `first` is the connect's outcome, `reset` warm-resets the card
+/// (`false` when it couldn't), and `again` connects once more. Only a
+/// Feitian reader's `UnresponsiveCard` or `ProtoMismatch` gets the reset;
+/// everything else is returned as it came, untraced. When the reset can't
+/// be done, the first error stands.
+#[cfg(any(windows, test))]
+fn retry_after_warm_reset<T>(
+    reader: &str,
+    first: Result<T, PcscError>,
+    reset: impl FnOnce() -> bool,
+    again: impl FnOnce() -> Result<T, PcscError>,
+) -> Result<T, PcscError> {
+    let error = match first {
+        Err(e @ (PcscError::UnresponsiveCard | PcscError::ProtoMismatch))
+            if is_feitian_reader(reader) =>
+        {
+            e
+        }
+        other => return other,
+    };
+    let shown = keyroost_proto::trace::reader_name(reader);
+    connect_note(&format!(
+        "{shown}: {error:?}; warm reset of the card, then connect again"
+    ));
+    if !reset() {
+        connect_note(&format!("{shown}: warm reset not done; {error:?} stands"));
+        return Err(error);
+    }
+    let result = again();
+    match &result {
+        Ok(_) => connect_note(&format!("{shown}: connected after the warm reset")),
+        Err(e) => connect_note(&format!("{shown}: {e:?} after the warm reset")),
+    }
+    result
+}
+
+/// One connect trace line in the shared grammar: on stderr under `--debug`
+/// or `KEYROOST_PROBE_DEBUG` (the probe trace switch, which `--debug` turns
+/// on), and into the activity log's capture when one is open.
+#[cfg(any(windows, test))]
+fn connect_note(body: &str) {
+    keyroost_proto::trace::emit(probe_trace_on(), || format_line(Dir::Note, "connect", body));
 }
 
 /// A Feitian key's own reader, by the names Windows gives them ("FS CCID 0",
 /// "FT CCID 0").
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn is_feitian_reader(name: &str) -> bool {
     name.starts_with("FS CCID") || name.starts_with("FT CCID")
 }
@@ -2675,9 +2727,75 @@ mod reader_poll_tests {
 mod redaction_tests {
     use super::*;
 
+    /// The warm reset is traced when it is tried and with its outcome; any
+    /// other reader or error is returned untouched, with no reset and no
+    /// line.
+    #[test]
+    fn the_warm_reset_retry_is_traced() {
+        let run = |reader: &str,
+                   first: Result<u8, PcscError>,
+                   reset_ok: bool,
+                   again: Result<u8, PcscError>| {
+            let mut reset_called = false;
+            keyroost_proto::trace::begin();
+            let out = retry_after_warm_reset(
+                reader,
+                first,
+                || {
+                    reset_called = true;
+                    reset_ok
+                },
+                || again,
+            );
+            let lines = keyroost_proto::trace::take().unwrap_or_default();
+            (out, reset_called, lines)
+        };
+
+        let (out, reset, lines) = run("FS CCID 0", Err(PcscError::UnresponsiveCard), true, Ok(7));
+        assert_eq!((out, reset), (Ok(7), true));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("! connect"), "{lines:?}");
+        assert!(
+            lines[0].ends_with(
+                "FS CCID 0: UnresponsiveCard; warm reset of the card, then connect again"
+            ),
+            "{lines:?}"
+        );
+        assert!(lines[1].ends_with("FS CCID 0: connected after the warm reset"));
+
+        // The reset can't be done: the first error stands, and says so.
+        let (out, _, lines) = run("FT CCID 1", Err(PcscError::ProtoMismatch), false, Ok(7));
+        assert_eq!(out, Err(PcscError::ProtoMismatch));
+        assert!(lines[1].ends_with("FT CCID 1: warm reset not done; ProtoMismatch stands"));
+
+        // The second connect fails too: its error is returned and traced.
+        let (out, _, lines) = run(
+            "FS CCID 0",
+            Err(PcscError::UnresponsiveCard),
+            true,
+            Err(PcscError::RemovedCard),
+        );
+        assert_eq!(out, Err(PcscError::RemovedCard));
+        assert!(lines[1].ends_with("FS CCID 0: RemovedCard after the warm reset"));
+
+        // Another reader, or another error: nothing reset, nothing traced.
+        for (reader, first) in [
+            (
+                "Yubico YubiKey OTP+FIDO+CCID 0",
+                Err(PcscError::UnresponsiveCard),
+            ),
+            ("FS CCID 0", Err(PcscError::NoSmartcard)),
+            ("FS CCID 0", Ok(1)),
+        ] {
+            let (out, reset, lines) = run(reader, first, true, Ok(9));
+            assert_eq!(out, first, "{reader}");
+            assert!(!reset, "{reader}");
+            assert!(lines.is_empty(), "{reader}: {lines:?}");
+        }
+    }
+
     /// The warm-reset retry is for a Feitian key's own reader only: no
     /// other reader is reset because a connect failed.
-    #[cfg(windows)]
     #[test]
     fn only_feitian_readers_get_the_warm_reset_retry() {
         assert!(is_feitian_reader("FS CCID 0"));
