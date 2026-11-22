@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "CTAP HID transport, CBOR codec, and high-level CTAP2 commands for FIDO authenticators."
+# The hardware smoke test needs a path-only dev-dependency; not shipped.
+exclude = ["examples/vault_smoke.rs"]
 
 [lints]
 workspace = true
@@ -64,3 +66,10 @@ hidapi = { version = "2.6", default-features = false, features = [
     "macos-shared-device",
     "windows-native",
 ] }
+
+[dev-dependencies]
+# The hardware smoke test (examples/vault_smoke.rs) seals and opens real
+# vaults; keyroost-vault does not depend on this crate, so there is no cycle.
+# Path-only on purpose: `cargo publish` strips it, so publishing this crate
+# never waits on keyroost-vault (the example is left out of the package).
+keyroost-vault = { path = "../keyroost-vault" }
