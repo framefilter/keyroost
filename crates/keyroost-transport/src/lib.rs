@@ -2406,14 +2406,48 @@ pub(crate) fn hex_dump(bytes: &[u8]) -> String {
 /// does not. Debug traces are exactly what users paste into bug reports —
 /// they must never carry PINs or key material.
 pub(crate) fn dump_cmd(apdu: &[u8], sensitive: bool) -> String {
-    if !sensitive || apdu.len() <= 5 {
+    dump_cmd_redacted(apdu, sensitive.into())
+}
+
+/// How much of a command APDU a `--debug` trace hides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmdRedact {
+    /// Nothing: the whole APDU in hex.
+    Nothing,
+    /// The data field; the 5-byte header (with Lc) stays.
+    Body,
+    /// The data field and its length byte: for PIN commands, where Lc is
+    /// the PIN's length (old + new for a change). Only CLA INS P1 P2 stay.
+    LengthAndBody,
+}
+
+impl From<bool> for CmdRedact {
+    fn from(sensitive: bool) -> Self {
+        if sensitive {
+            CmdRedact::Body
+        } else {
+            CmdRedact::Nothing
+        }
+    }
+}
+
+/// [`dump_cmd`] with the redaction spelled out. An APDU without a data
+/// field (5 bytes or fewer) always dumps in full.
+pub(crate) fn dump_cmd_redacted(apdu: &[u8], redact: CmdRedact) -> String {
+    if apdu.len() <= 5 {
         return hex_dump(apdu);
     }
-    format!(
-        "{} [{} data bytes redacted]",
-        hex_dump(&apdu[..5]),
-        apdu.len() - 5
-    )
+    match redact {
+        CmdRedact::Nothing => hex_dump(apdu),
+        CmdRedact::Body => format!(
+            "{} [{} data bytes redacted]",
+            hex_dump(&apdu[..5]),
+            apdu.len() - 5
+        ),
+        CmdRedact::LengthAndBody => {
+            format!("{} [length and data redacted]", hex_dump(&apdu[..4]))
+        }
+    }
 }
 
 /// Caps on `61xx` / GET RESPONSE reassembly across the CCID sessions. A
@@ -2616,7 +2650,8 @@ pub(crate) fn advance_exchange(
 
 /// One applet APDU exchange with `61xx`-continuation reassembly, shared by the
 /// OATH, OpenPGP, and PIV sessions (each computes its own sensitivity
-/// predicates). `cmd_sensitive` redacts command bodies from `--debug` traces;
+/// predicates). `cmd_redact` says how much of each command a `--debug` trace
+/// hides;
 /// `resp_sensitive` redacts every response chunk of the reassembly loop
 /// (sticky, so GET RESPONSE chunks of a secret payload stay hidden). The
 /// transmitted copy is zeroized so PIN/key bodies don't linger on the heap.
@@ -2625,7 +2660,7 @@ pub(crate) fn transmit_applet(
     debug: bool,
     io: &AppletIo,
     apdu: &[u8],
-    cmd_sensitive: bool,
+    cmd_redact: CmdRedact,
     resp_sensitive: bool,
 ) -> Result<(Vec<u8>, u16), TransportError> {
     let mut acc = Vec::new();
@@ -2642,7 +2677,11 @@ pub(crate) fn transmit_applet(
             });
         }
         trace::line(debug, || {
-            format_line(Dir::Sent, io.label, &dump_cmd(&to_send, cmd_sensitive))
+            format_line(
+                Dir::Sent,
+                io.label,
+                &dump_cmd_redacted(&to_send, cmd_redact),
+            )
         });
         let mut buf = [0u8; 4096];
         let resp = card
@@ -3105,6 +3144,35 @@ mod redaction_tests {
         assert_eq!(dump_cmd(&apdu, false), hex_dump(&apdu));
         let get_response = [0x00, 0xC0, 0x00, 0x00, 0x00];
         assert_eq!(dump_cmd(&get_response, true), hex_dump(&get_response));
+    }
+
+    #[test]
+    fn pin_commands_hide_the_length_byte_too() {
+        // The same VERIFY: with the length hidden, nothing tells a 6-digit
+        // PIN from an 8-digit one.
+        let six = [
+            0x00, 0x20, 0x00, 0x81, 0x06, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+        ];
+        let mut eight = six.to_vec();
+        eight[4] = 0x08;
+        eight.extend_from_slice(b"78");
+        for apdu in [&six[..], &eight] {
+            assert_eq!(
+                dump_cmd_redacted(apdu, CmdRedact::LengthAndBody),
+                "00 20 00 81 [length and data redacted]"
+            );
+        }
+        // A bodiless APDU (GET RESPONSE) still dumps whole.
+        let get_response = [0x00, 0xC0, 0x00, 0x00, 0x00];
+        assert_eq!(
+            dump_cmd_redacted(&get_response, CmdRedact::LengthAndBody),
+            hex_dump(&get_response)
+        );
+        assert_eq!(dump_cmd_redacted(&six, CmdRedact::Nothing), hex_dump(&six));
+        assert_eq!(
+            dump_cmd_redacted(&six, CmdRedact::Body),
+            dump_cmd(&six, true)
+        );
     }
 
     #[test]

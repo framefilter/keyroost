@@ -5999,7 +5999,7 @@ impl<'tx> PivSession<'tx> {
             self.traced,
             &IO,
             apdu,
-            cmd_sensitive,
+            cmd_sensitive.into(),
             resp_sensitive,
         )
     }

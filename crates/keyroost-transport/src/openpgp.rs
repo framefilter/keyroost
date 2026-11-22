@@ -1132,15 +1132,10 @@ impl OpenPgpSession {
     /// Transmit one APDU and reassemble a response the card splits across `61xx`
     /// continuations (`GET RESPONSE`), returning `(payload, sw)`.
     fn transmit_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
-        // VERIFY (20), CHANGE REFERENCE DATA (24), RESET RETRY COUNTER (2C)
-        // carry plaintext PINs; PUT DATA odd (DB) carries imported private
-        // keys. PSO:DECIPHER (2A 80 86) *responses* are the recovered
+        // PSO:DECIPHER (2A 80 86) *responses* are the recovered
         // plaintext — and so are the GET RESPONSE chunks that follow, hence
         // the sticky flag for the whole reassembly loop.
-        let cmd_sensitive = matches!(
-            apdu.get(1),
-            Some(0x20) | Some(0x24) | Some(0x2C) | Some(0xDB)
-        );
+        let cmd_redact = cmd_redact(apdu);
         // The Token2 serial read (status's `otp_applet_serial`) answers with
         // the printed serial, hidden on every path that reads it.
         let resp_sensitive =
@@ -1156,7 +1151,7 @@ impl OpenPgpSession {
             self.debug,
             &IO,
             apdu,
-            cmd_sensitive,
+            cmd_redact,
             resp_sensitive,
         )
     }
@@ -1379,6 +1374,22 @@ fn crt_flag_name(crt: pgp::KeyCrt) -> &'static str {
         pgp::KeyCrt::Sign => "sign",
         pgp::KeyCrt::Decrypt => "decrypt",
         pgp::KeyCrt::Auth => "auth",
+    }
+}
+
+/// How much of `apdu` a `--debug` trace hides. VERIFY (20), CHANGE
+/// REFERENCE DATA (24), RESET RETRY COUNTER (2C) and PUT DATA of the
+/// resetting code (DA 00 D3) carry PINs: their body and also their length
+/// byte, which is the PIN's length (both PINs' for a change), so a shared
+/// trace doesn't narrow a PIN down. PUT DATA odd (DB) carries imported
+/// private keys: its body.
+fn cmd_redact(apdu: &[u8]) -> crate::CmdRedact {
+    match apdu.get(1..4) {
+        Some([0x20 | 0x24 | 0x2C, ..]) | Some([0xDA, 0x00, 0xD3]) => {
+            crate::CmdRedact::LengthAndBody
+        }
+        Some([0xDB, ..]) => crate::CmdRedact::Body,
+        _ => crate::CmdRedact::Nothing,
     }
 }
 
@@ -2385,6 +2396,36 @@ mod tests {
         assert!(cached_kdf(&mut cache, &mut tx).is_err());
         assert!(cached_kdf(&mut cache, &mut tx).is_err());
         assert!(cache.is_none());
+    }
+
+    #[test]
+    fn pin_commands_hide_their_length_in_traces() {
+        use crate::CmdRedact::{Body, LengthAndBody, Nothing};
+        assert_eq!(
+            cmd_redact(&pgp::verify(pgp::PW1_SIGN, b"123456")),
+            LengthAndBody
+        );
+        assert_eq!(
+            cmd_redact(&pgp::change_reference_data(pgp::PW3_ADMIN, b"a", b"b")),
+            LengthAndBody
+        );
+        assert_eq!(
+            cmd_redact(&pgp::reset_retry_counter(b"123456")),
+            LengthAndBody
+        );
+        assert_eq!(
+            cmd_redact(&pgp::put_data(0x00D3, b"12345678")),
+            LengthAndBody
+        );
+        // Key import keeps its header; everything else is shown whole.
+        assert_eq!(
+            cmd_redact(&[0x00, 0xDB, 0x3F, 0xFF, 0x02, 0x4D, 0x00]),
+            Body
+        );
+        assert_eq!(cmd_redact(&pgp::put_url(b"https://example.org")), Nothing);
+        assert_eq!(cmd_redact(&pgp::get_kdf()), Nothing);
+        assert_eq!(cmd_redact(&pgp::select()), Nothing);
+        assert_eq!(cmd_redact(&[]), Nothing);
     }
 
     #[test]

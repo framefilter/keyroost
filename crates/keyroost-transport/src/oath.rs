@@ -405,7 +405,7 @@ impl OathSession {
             self.debug,
             &io,
             apdu,
-            cmd_sensitive,
+            cmd_sensitive.into(),
             resp_sensitive,
         )
     }
