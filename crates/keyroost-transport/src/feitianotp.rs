@@ -38,8 +38,9 @@ const SELECT_FIDO: [u8; 13] = [
 ];
 
 /// How long one exchange over HID may take. A command the key acts on once
-/// touched is answered `6984` only after the key has waited about three and a
-/// half seconds, which is longer than the CTAP layer's own default.
+/// touched is answered `6984` only after the key has waited for the touch,
+/// 3.2 or 5.2 seconds on the two models timed, which is longer than the CTAP
+/// layer's own default.
 const HID_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Drop for HidLink {
