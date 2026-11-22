@@ -27,6 +27,20 @@ fn block_attempts_cap(reported: Option<u8>) -> u32 {
     reported.map(u32::from).unwrap_or(10).min(20) + 2
 }
 
+/// The APDU that resets the PIV application on a card with these quirks:
+/// Yubico's `INS 0xFB`, unless the card is known to use another byte for the
+/// same reset. A Feitian card's is `INS 0xFC`
+/// ([`keyroost_piv::compat::PivQuirk::ResetUsesInsFc`]), with the same
+/// preconditions and the same status words, so nothing else about
+/// [`PivSession::reset`] or [`PivSession::force_reset`] differs for it.
+fn reset_command(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> Vec<u8> {
+    if quirks.contains(&keyroost_piv::compat::PivQuirk::ResetUsesInsFc) {
+        piv::reset_feitian()
+    } else {
+        piv::reset()
+    }
+}
+
 /// A throwaway 8-ASCII-digit credential for the loops that deliberately block a
 /// PIN/PUK during a factory reset, drawn fresh from the host RNG and never equal
 /// to `previous`.
@@ -5340,7 +5354,9 @@ impl<'tx> PivSession<'tx> {
 
     /// Reset the PIV application to factory defaults. Always sends the bare
     /// RESET APDU and reports whatever the card says — this method does
-    /// nothing to detect or satisfy either precondition below itself:
+    /// nothing to detect or satisfy either precondition below itself. The
+    /// APDU is Yubico's `INS 0xFB`, or `INS 0xFC` on a fingerprint that
+    /// carries [`keyroost_piv::compat::PivQuirk::ResetUsesInsFc`] (Feitian):
     ///
     /// * The widespread YubiKey-mimicking convention: succeeds only when
     ///   **both** the PIN and PUK are already blocked (the card enforces
@@ -5411,7 +5427,8 @@ impl<'tx> PivSession<'tx> {
                 }
             }
         }
-        let (_, sw) = self.transmit_full(&piv::reset())?;
+        let command = reset_command(&self.quirks());
+        let (_, sw) = self.transmit_full(&command)?;
         // A YubiKey answers RESET's "PIN and PUK must already be blocked"
         // precondition with 6985 (conditions of use not satisfied), not 6983
         // per Yubico's own docs — see SW_CONDITIONS_NOT_SATISFIED. Other
@@ -7304,9 +7321,44 @@ mod tests {
             "VERIFY (retry-counter query)"
         );
         assert!(describe_apdu(&piv::verify_pin(b"12345678").unwrap()).starts_with("VERIFY"));
+        // The two resets are told apart by whose instruction it is.
+        assert_eq!(describe_apdu(&piv::reset()), "RESET (yubico extension)");
+        assert_eq!(describe_apdu(&piv::reset_feitian()), "RESET (feitian)");
         // Unknown / malformed fall back rather than panic.
         assert_eq!(describe_apdu(&[0x00, 0x99, 0x00, 0x00]), "INS 0x99");
         assert_eq!(describe_apdu(&[]), "(malformed APDU)");
+    }
+
+    #[test]
+    fn the_reset_command_follows_the_cards_quirks() {
+        use keyroost_piv::compat::resolve_quirks;
+        use keyroost_piv::fingerprint::AppletFingerprint;
+        // A Feitian card is sent its own instruction, whether or not it
+        // reports an applet version (the unit it was measured on does not).
+        for version in [None, Some(&[0][..])] {
+            assert_eq!(
+                reset_command(&resolve_quirks(AppletFingerprint::Feitian, version, None)),
+                vec![0x00, 0xFC, 0x00, 0x00, 0x00],
+                "Feitian at {version:?}"
+            );
+        }
+        // Every other card is still sent Yubico's.
+        for fingerprint in [
+            AppletFingerprint::Generic,
+            AppletFingerprint::YubiKey,
+            AppletFingerprint::Token2,
+            AppletFingerprint::Thetis,
+        ] {
+            assert_eq!(
+                reset_command(&resolve_quirks(fingerprint, Some(&[5, 7, 4]), None)),
+                vec![0x00, 0xFB, 0x00, 0x00],
+                "{fingerprint:?}"
+            );
+        }
+        assert_eq!(
+            reset_command(&BTreeSet::new()),
+            vec![0x00, 0xFB, 0x00, 0x00]
+        );
     }
 
     #[test]

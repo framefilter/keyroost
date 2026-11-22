@@ -202,7 +202,9 @@ pub enum PivExtension {
     /// here first, then checks whether [`resolve_quirks`] reports
     /// [`PivQuirk::ResetNeedsManagementAuth`] (the HID Crescendo
     /// alternative); its absence carries a meaning of its own — see that
-    /// quirk's doc. This extension is PIV-scoped only — see
+    /// quirk's doc. A card whose reset is a different instruction byte with
+    /// the same preconditions carries [`PivQuirk::ResetUsesInsFc`] (Feitian).
+    /// This extension is PIV-scoped only — see
     /// [`Self::ResetGlobal`] for the distinction from a reset that also takes
     /// other applets with it.
     Reset,
@@ -641,6 +643,26 @@ pub enum PivQuirk {
     /// while leaving the AES key in place, so the recovery is to change the
     /// management key back to 3DES first and retry.
     ResetFailsIfManagementKeyIsAes,
+    /// [`PivExtension::Reset`] is `INS 0xFC` on this card
+    /// ([`crate::reset_feitian`], `00 FC 00 00 00`), not Yubico's `INS 0xFB`.
+    /// Everything around the instruction is as on a YubiKey: the card
+    /// accepts it only once the PIN and the PUK are both blocked, so
+    /// `keyroost_transport::PivSession::force_reset` runs unchanged with
+    /// this one command swapped in.
+    ///
+    /// Hardware-observed on a Feitian ePass FIDO-NFC (USB `096E:0853`),
+    /// 2026-11-22: Yubico's `00 FB 00 00` is answered `6A86`; `00 FC 00 00
+    /// 00` is answered `6982` with neither counter spent, `6982` again with
+    /// only the PIN blocked (three wrong PINs through VERIFY: `63C2`,
+    /// `63C1`, `63C0`), and `9000` once the PUK is blocked too, with both
+    /// counters back at 3 afterwards. A wrong PUK counts against the PUK
+    /// through RESET RETRY COUNTER (`63C2`, `63C1`, `63C0`) as it does
+    /// through the VERIFY with reference `0x81` that Feitian's own client
+    /// software uses. That software (its Android SDK and its desktop tool)
+    /// resets every key it manages with this instruction, after blocking
+    /// both. `keyroostctl piv reset` ran that whole sequence on the same
+    /// key.
+    ResetUsesInsFc,
     /// [`PivExtension::SlotPinPolicy`] is supported on this device in
     /// principle — GENERATE ASYMMETRIC KEYPAIR accepts the `0xAA` tag — but
     /// the specific `Once` value is rejected. A caller offering the PIN
@@ -2964,6 +2986,22 @@ const FEITIAN_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// reverse-engineered it, so from keyroost's point of view the extension
 /// stays unsupported regardless of what the device itself can do.
 ///
+/// [`PivExtension::Reset`], the PIV-scoped reset, is a different matter:
+/// `Verdict::KnownSupported`, through Feitian's own instruction byte — see
+/// [`PivQuirk::ResetUsesInsFc`] for the hardware observation (an ePass
+/// FIDO-NFC, USB `096E:0853`). That unit reports no applet version at all
+/// (GET VERSION answers `9000` with no data), so the row sits at the
+/// universal `[]` sentinel rather than at the `[0]` the rows below were
+/// observed at: a known-supported verdict says nothing about versions
+/// before it, and the unit it was seen on has none to pin it to. It
+/// therefore covers every Feitian applet version, which rests on that one
+/// unit plus Feitian's own client software sending the same reset to every
+/// key it manages. The deliberate PIN/PUK burn this verdict allows is still
+/// only reached after the card itself has answered the bare reset with one
+/// of the "not allowed yet" status words
+/// (`keyroost_transport::PivSession::force_reset`), so a Feitian card that
+/// does not know the instruction is not burned.
+///
 /// The [`PivExtension::SetManagementKey`]/[`PivExtension::SetPinPukRetries`]/
 /// [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`]/
 /// [`PivExtension::GetMetadata`] rows below are hardware-observed
@@ -3009,6 +3047,13 @@ const FEITIAN_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         }],
     },
     ExtensionVerdicts {
+        extensions: &[PivExtension::Reset],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    ExtensionVerdicts {
         extensions: &[
             PivExtension::SetManagementKey,
             PivExtension::SetPinPukRetries,
@@ -3048,10 +3093,14 @@ const FEITIAN_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 
 /// Feitian's applet-axis quirks: this vendor ships its own vendor-specific
 /// PIV factory-default management key rather than mimicking YubiKey's — see
-/// [`FEITIAN_DEFAULT_MGMT_KEY`]'s doc.
+/// [`FEITIAN_DEFAULT_MGMT_KEY`]'s doc — and its own instruction byte for the
+/// PIV reset — see [`PivQuirk::ResetUsesInsFc`].
 const FEITIAN_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
     version: &[],
-    quirks: &[PivQuirk::Default9bManagementKey(FEITIAN_DEFAULT_MGMT_KEY)],
+    quirks: &[
+        PivQuirk::Default9bManagementKey(FEITIAN_DEFAULT_MGMT_KEY),
+        PivQuirk::ResetUsesInsFc,
+    ],
 }];
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
@@ -6785,28 +6834,74 @@ mod tests {
             resolve(PivExtension::Reset, AppletFingerprint::Generic, None, None),
             FeatureGate::Unverified
         );
-        // Feitian carries a `ResetGlobal` row and several others (see
-        // `FEITIAN_APPLET_VERDICTS`'s doc) but no `PivExtension::Reset` row at
-        // all — proving a fingerprint with genuine data on one extension
-        // carries none of it over to a sibling extension it hasn't recorded.
+        // `Generic` itself carries a `ResetGlobal` row (see
+        // `GENERIC_APPLET_VERDICTS`'s doc) but no `PivExtension::Reset` row at
+        // all — so the assertion above already proves a fingerprint with
+        // genuine data on one extension carries none of it over to a sibling
+        // extension it hasn't recorded.
         // (Neither Thetis nor Token2 demonstrate this themselves any more:
         // both now have their own genuine `KnownSupported` Reset rows at
         // 5.112.0 — see
         // `thetis_5_112_0_reset_and_set_pin_puk_retries_are_supported` and
-        // `token2_5_112_0_reset_is_supported` instead.)
+        // `token2_5_112_0_reset_is_supported` instead. Feitian doesn't
+        // either: it now has its own genuine `KnownSupported` Reset row —
+        // see `feitian_reset_is_supported_through_its_own_instruction`.)
         assert_eq!(
             resolve(
                 PivExtension::Reset,
-                AppletFingerprint::Feitian,
+                AppletFingerprint::Generic,
                 Some(&[0]),
                 None,
             ),
             FeatureGate::Unverified
         );
-        assert!(
-            !resolve_quirks(AppletFingerprint::Feitian, Some(&[0]), None)
-                .contains(&PivQuirk::ResetNeedsManagementAuth)
+    }
+
+    #[test]
+    fn feitian_reset_is_supported_through_its_own_instruction() {
+        // Hardware-observed on a unit that reports no applet version at all
+        // — see `PivQuirk::ResetUsesInsFc`'s and `FEITIAN_APPLET_VERDICTS`'s
+        // docs. The row sits at the `[]` sentinel, so it resolves the same
+        // with no reported version (that unit) and at any reported one.
+        let fp = AppletFingerprint::Feitian;
+        for version in [None, Some(&[0][..]), Some(&[1][..]), Some(&[5, 7, 4][..])] {
+            assert_eq!(
+                resolve(PivExtension::Reset, fp, version, None),
+                FeatureGate::Supported,
+                "Reset at {version:?}"
+            );
+            let quirks = resolve_quirks(fp, version, None);
+            assert!(
+                quirks.contains(&PivQuirk::ResetUsesInsFc),
+                "the reset instruction at {version:?}"
+            );
+            // The card wants its PIN and PUK blocked, not a management-key
+            // session: the bare reset was refused with nothing blocked and
+            // accepted once both were, with no authentication in between.
+            assert!(
+                !quirks.contains(&PivQuirk::ResetNeedsManagementAuth),
+                "no management auth at {version:?}"
+            );
+        }
+        // The device-wide reset is a separate row and stays unsupported.
+        assert_eq!(
+            resolve(PivExtension::ResetGlobal, fp, None, None),
+            FeatureGate::Unsupported
         );
+        // No other fingerprint sends this instruction.
+        for other in [
+            AppletFingerprint::Generic,
+            AppletFingerprint::YubiKey,
+            AppletFingerprint::Token2,
+            AppletFingerprint::Thetis,
+            AppletFingerprint::Trussed(TrussedVariant::Nitrokey),
+        ] {
+            assert!(
+                !resolve_quirks(other, Some(&[5, 7, 4]), Some(&[1, 8, 3]))
+                    .contains(&PivQuirk::ResetUsesInsFc),
+                "{other:?}"
+            );
+        }
     }
 
     #[test]

@@ -124,6 +124,10 @@ pub enum Instruction {
     SetPinRetries = 0xFA,
     /// Yubico extension: RESET the PIV application (only when PIN and PUK blocked).
     Reset = 0xFB,
+    /// Feitian's RESET of the PIV application (only when PIN and PUK blocked):
+    /// its own instruction byte, on cards where `0xFB` is not the reset. See
+    /// [`reset_feitian`].
+    ResetFeitian = 0xFC,
     /// Yubico extension: ATTEST — a self-signed certificate for a slot's key,
     /// proving on-card generation (fw 4.3+). On firmware older than 5.3 (GET
     /// METADATA's policy support), this certificate's key-policy extension is
@@ -162,6 +166,7 @@ impl Instruction {
             0xFF => Self::SetManagementKey,
             0xFA => Self::SetPinRetries,
             0xFB => Self::Reset,
+            0xFC => Self::ResetFeitian,
             0xF9 => Self::Attest,
             0xFE => Self::ImportKey,
             _ => return None,
@@ -189,6 +194,7 @@ impl Instruction {
             Self::SetManagementKey => "SET MANAGEMENT KEY (yubico extension)",
             Self::SetPinRetries => "SET PIN RETRIES (yubico extension)",
             Self::Reset => "RESET (yubico extension)",
+            Self::ResetFeitian => "RESET (feitian)",
             Self::Attest => "ATTEST (yubico extension)",
             Self::ImportKey => "IMPORT ASYMMETRIC KEY (yubico extension)",
         }
@@ -1962,6 +1968,19 @@ pub fn reset() -> Vec<u8> {
     vec![0x00, Instruction::Reset.code(), 0x00, 0x00]
 }
 
+/// Feitian's RESET: wipe the PIV application back to factory defaults, on a
+/// card whose reset is `INS 0xFC` rather than Yubico's `0xFB` (see
+/// [`compat::PivQuirk::ResetUsesInsFc`]). Five bytes, as Feitian's own client
+/// software sends it.
+///
+/// Measured on a Feitian ePass FIDO-NFC (USB `096E:0853`): with neither the
+/// PIN nor the PUK blocked the card answers `6982`; with both blocked it
+/// answers `9000`, and both try counters are back at 3 afterwards.
+#[must_use]
+pub fn reset_feitian() -> Vec<u8> {
+    vec![0x00, Instruction::ResetFeitian.code(), 0x00, 0x00, 0x00]
+}
+
 /// Yubico ATTEST (case 2): request the self-signed attestation certificate for
 /// the key in `key_ref`'s slot. `P1` is the slot's key reference, `P2` is
 /// `0x00`; no data field. Requires firmware 4.3+. The certificate can exceed
@@ -2495,6 +2514,7 @@ mod tests {
             Instruction::SetManagementKey,
             Instruction::SetPinRetries,
             Instruction::Reset,
+            Instruction::ResetFeitian,
             Instruction::Attest,
             Instruction::ImportKey,
         ] {
@@ -2997,6 +3017,16 @@ mod tests {
         assert_eq!(set_pin_retries(5, 3), vec![0x00, 0xFA, 0x05, 0x03]);
         assert_eq!(reset(), vec![0x00, 0xFB, 0x00, 0x00]);
         assert_eq!(get_metadata(0x9B), vec![0x00, 0xF7, 0x00, 0x9B]);
+    }
+
+    #[test]
+    fn feitian_reset_is_the_command_the_key_answered() {
+        // Captured, 2026-11-22, Feitian ePass FIDO-NFC (USB 096E:0853): this
+        // command was answered 6982 with the PIN and PUK not blocked, and
+        // 9000 once both were. The expected bytes are the ones sent then, not
+        // produced by this crate.
+        assert_eq!(reset_feitian(), vec![0x00, 0xFC, 0x00, 0x00, 0x00]);
+        assert_eq!(Instruction::ResetFeitian.name(), "RESET (feitian)");
     }
 
     #[test]
