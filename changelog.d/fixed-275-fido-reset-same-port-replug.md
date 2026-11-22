@@ -4,4 +4,4 @@
   replug: the reset window kept waiting and no reset was sent. It is
   now taken for the replug, with the key's identity checked as before.
   `fido reset` on the command line was not affected. Checked on
-  Windows 11 with an ePass FIDO-NFC. ([#275])
+  Windows 11 with an ePass FIDO NFC Plus. ([#275])
