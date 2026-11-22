@@ -3,5 +3,5 @@
   these keys: with the PIN verified they accept it, as a change to the
   PIN and PUK retry counts. `piv key import` and the app's import now
   send a Feitian key its own import command instead. Seen on an ePass
-  FIDO-NFC with harmless values; a real import was not sent the old
-  way. ([#274])
+  FIDO NFC Plus with harmless values; a real import was not sent the
+  old way. ([#274])
