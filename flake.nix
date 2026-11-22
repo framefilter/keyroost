@@ -40,6 +40,11 @@
                 crateCargo.package.name
               ];
 
+              cargoTestFlags = [
+                "-p"
+                crateCargo.package.name
+              ];
+
               buildType = if debug then "debug" else "release";
               dontStrip = debug;
 
