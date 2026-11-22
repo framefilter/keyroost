@@ -179,6 +179,9 @@ impl Drop for FtotpAddDialog {
 struct FtotpNew {
     /// The name as it will be stored (period prefix and separator included).
     stored: String,
+    /// The app (empty when none) and account it holds.
+    app: String,
+    account: String,
     secret: zeroize::Zeroizing<Vec<u8>>,
     oath_type: fotp::OathType,
     algorithm: fotp::Algorithm,
@@ -221,6 +224,8 @@ impl FtotpAddDialog {
         }
         Ok(FtotpNew {
             stored,
+            app: issuer.unwrap_or("").to_owned(),
+            account: account.to_owned(),
             secret,
             oath_type,
             algorithm: if self.sha256 {
@@ -231,6 +236,24 @@ impl FtotpAddDialog {
             digits: self.digits,
         })
     }
+}
+
+/// Why the add form refuses `app` / `account`: the default slot (where it
+/// writes) already holds that account, under any type or period. The words
+/// of `keyroostctl feitian add`, pointing at the list's Delete button.
+fn add_refusal(listing: &FeitianOtpListing, app: &str, account: &str) -> Option<String> {
+    listing
+        .credentials
+        .iter()
+        .any(|c| {
+            c.slot == fotp::Slot::Default && fotp::holds_account(&c.name, c.oath_type, app, account)
+        })
+        .then(|| {
+            format!(
+                "{} (delete it first with its Delete button)",
+                fotp::already_on_key(app, account)
+            )
+        })
 }
 
 /// Per-selection state for the Feitian OTP pane.
@@ -527,19 +550,12 @@ impl App {
                 let result = (|| -> Result<(), String> {
                     let mut session =
                         FeitianOtpSession::open(&reader).map_err(|e| e.to_string())?;
-                    // What the key does with a second account of the same name
-                    // is not known, so one is never sent.
+                    // One app and account is one account, whatever its type or
+                    // period, as for `keyroostctl feitian add` and the import:
+                    // the key never gets a second code for an account it holds.
                     let listing = session.list().map_err(|e| e.to_string())?;
-                    if listing
-                        .credentials
-                        .iter()
-                        .any(|c| c.slot == fotp::Slot::Default && c.name == new.stored)
-                    {
-                        return Err(format!(
-                            "an account named {:?} is already on the key; nothing was added \
-                             (delete it first to replace it)",
-                            new.stored
-                        ));
+                    if let Some(refusal) = add_refusal(&listing, &new.app, &new.account) {
+                        return Err(refusal);
                     }
                     session
                         .put(&fotp::PutParams {
@@ -1154,6 +1170,44 @@ mod tests {
             "slot default: no access code  \u{00b7}  slot 1: access code set  \u{00b7}  \
              slot 2: (unavailable)"
         );
+    }
+
+    /// The add form never writes a second code for an account the default
+    /// slot holds, whatever its type or period, as `feitian add`.
+    #[test]
+    fn the_add_form_refuses_an_account_already_there() {
+        let listing = |entries: Vec<fotp::Credential>| FeitianOtpListing {
+            credentials: entries,
+            skipped: 0,
+            unread: Vec::new(),
+            legacy: false,
+        };
+        for c in [
+            cred(
+                "60:GitHub_#_alice",
+                fotp::OathType::Totp,
+                fotp::Algorithm::Sha1,
+            ),
+            cred(
+                "GitHub_#_alice",
+                fotp::OathType::Hotp,
+                fotp::Algorithm::Sha1,
+            ),
+        ] {
+            assert_eq!(
+                add_refusal(&listing(vec![c]), "GitHub", "alice").as_deref(),
+                Some(
+                    "an account \"GitHub:alice\" is already on the key; nothing was added \
+                     (delete it first with its Delete button)"
+                )
+            );
+        }
+        let other = cred(
+            "30:GitHub_#_alicia",
+            fotp::OathType::Totp,
+            fotp::Algorithm::Sha1,
+        );
+        assert_eq!(add_refusal(&listing(vec![other]), "GitHub", "alice"), None);
     }
 
     #[test]

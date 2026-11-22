@@ -962,6 +962,11 @@ entry:
   "Solo 2 doesn't take SHA-512 codes"). keyroost never changes an entry to
   make it fit. Steam codes are skipped on every key.
 
+On a Feitian key, one app and account is one code, whatever its type or
+period: an entry whose app and account the key already holds is **exists**
+(or **replace**), and replacing removes the old code under its own stored
+name. `feitian add` refuses such an account in the same way.
+
 Imported codes can require a touch, as `add --touch` does: `--touch` for
 every code the import writes, or `--touch-for NAME` (repeat it) for the
 codes named as the preview shows them (in the GUI, "Require touch for every

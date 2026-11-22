@@ -1738,7 +1738,8 @@ impl App {
                         Some(StoreKind::FeitianOtp) => {
                             ui.checkbox(
                                 &mut d.replace,
-                                "Replace codes already on the key that have the same name",
+                                "Replace codes already on the key that have the same app and \
+                                 account",
                             );
                         }
                         Some(StoreKind::Oath | StoreKind::Token2Otp) => {
