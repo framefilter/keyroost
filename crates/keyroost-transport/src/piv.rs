@@ -6532,8 +6532,9 @@ fn reset_route(
 /// (CLA INS P1 P2 Lc) stays visible either way. VERIFY (`0x20`), CHANGE
 /// REFERENCE DATA (`0x24`), RESET RETRY COUNTER (`0x2C`) carry PINs/PUKs;
 /// GENERAL AUTHENTICATE (`0x87`) carries the decrypted witness/challenge;
-/// SET MANAGEMENT KEY (`0xFF`) carries the raw new key; IMPORT ASYMMETRIC
-/// KEY (`0xFE`) carries a private key, in every link of a chained import.
+/// SET MANAGEMENT KEY (`0xFF`, and a Feitian card's `0xCF`) carries the raw
+/// new key; IMPORT ASYMMETRIC KEY (`0xFE`, and a Feitian card's `0xE3`)
+/// carries a private key, in every link of a chained import.
 /// The same VERIFY
 /// (`0x20`) INS covers HID Crescendo's ACA VERIFY PIN
 /// ([`PivSession::verify_pin_hid_crescendo_aca`]) too, just at a different
@@ -6570,6 +6571,8 @@ fn piv_cmd_sensitive(apdu: &[u8]) -> bool {
                 | Some(0x87)
                 | Some(0xFF)
                 | Some(0xFE)
+                | Some(0xCF)
+                | Some(0xE3)
                 | Some(0x82)
         ),
     }
@@ -7705,7 +7708,7 @@ mod tests {
         // Secret-bearing: PINs/PUKs, GENERAL AUTHENTICATE, SET MANAGEMENT
         // KEY, and the two HID ACA instructions that carry key-derived or
         // raw key material.
-        for ins in [0x20u8, 0x24, 0x2C, 0x87, 0xFF, 0x82, 0xD8] {
+        for ins in [0x20u8, 0x24, 0x2C, 0x87, 0xFF, 0xCF, 0x82, 0xD8] {
             assert!(
                 piv_cmd_sensitive(&[0x00, ins, 0x00, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]),
                 "INS {ins:#04X} should be redacted"
@@ -7759,6 +7762,30 @@ mod tests {
         for apdu in &chained {
             assert!(piv_cmd_sensitive(apdu));
         }
+        // A Feitian card's import and its management-key command carry the
+        // same things under other instruction bytes.
+        let feitian = piv::import_key_for(
+            piv::ImportLayout::Feitian,
+            Slot::Authentication,
+            0x11,
+            &body,
+        );
+        let dump = crate::dump_cmd(&feitian, piv_cmd_sensitive(&feitian));
+        assert!(dump.contains("redacted"), "{dump}");
+        assert!(!dump.contains("5A 5A"), "{dump}");
+        for apdu in &piv::import_key_chained_for(
+            piv::ImportLayout::Feitian,
+            Slot::Authentication,
+            0x07,
+            &[0x5A; 600],
+            254,
+        ) {
+            assert!(piv_cmd_sensitive(apdu));
+        }
+        let key = piv::set_management_key_feitian(MgmtAlg::TripleDes, &[0x5A; 24]);
+        let dump = crate::dump_cmd(&key, piv_cmd_sensitive(&key));
+        assert!(dump.contains("redacted"), "{dump}");
+        assert!(!dump.contains("5A 5A"), "{dump}");
     }
 
     /// A single-APDU `send` answering from `script` in order (`9000` once it
