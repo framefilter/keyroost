@@ -25,6 +25,12 @@
 use keyroost_proto::apdu::{build_apdu, build_apdu_get};
 use zeroize::Zeroizing;
 
+mod kdf;
+pub use kdf::{
+    get_kdf, parse_kdf, Kdf, KdfError, KdfHash, KdfParams, PinRole, EXT_CAP_KDF, KDF_MAX_COUNT,
+    TAG_KDF,
+};
+
 // ---------------------------------------------------------------------------
 // Application identifier
 // ---------------------------------------------------------------------------
@@ -2186,6 +2192,7 @@ pub type Fingerprint = [u8; 20];
 /// Algorithm-attribute blobs (`C1`/`C2`/`C3`) are kept raw; the first byte (the
 /// algorithm id, e.g. `01` = RSA, `12` = ECDH, `13` = ECDSA, `16` = EdDSA) is
 /// exposed via [`AppRelatedData::sig_algo_id`] and friends.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppRelatedData {
     /// Full AID bytes from `4F` (typically 16 bytes).
@@ -2204,6 +2211,10 @@ pub struct AppRelatedData {
     pub fingerprint_dec: Fingerprint,
     /// Authentication-key fingerprint (`C5`, bytes 40..60).
     pub fingerprint_aut: Fingerprint,
+    /// Whether the Extended Capabilities (`C0`) announce the KDF setting
+    /// ([`EXT_CAP_KDF`]): the card has a KDF-DO ([`TAG_KDF`]) to read. A
+    /// card without `C0` doesn't.
+    pub kdf_supported: bool,
 }
 
 impl AppRelatedData {
@@ -2229,7 +2240,9 @@ impl AppRelatedData {
 /// `buf` may be either the raw value of the `6E` object *or* the full `6E`
 /// envelope; both are accepted. Required sub-objects are `4F` (AID), `C1`/`C2`/
 /// `C3` (algorithm attributes), `C4` (PW status), and `C5` (60-byte
-/// fingerprints); a missing one yields [`ParseError::MissingTag`].
+/// fingerprints); a missing one yields [`ParseError::MissingTag`]. `C0`
+/// (Extended Capabilities) is optional; without it the card is taken not to
+/// support the KDF setting.
 pub fn parse_application_related_data(buf: &[u8]) -> Result<AppRelatedData, ParseError> {
     let top = parse_tlvs(buf)?;
     // Accept either the bare value or the wrapping 6E envelope.
@@ -2271,6 +2284,10 @@ pub fn parse_application_related_data(buf: &[u8]) -> Result<AppRelatedData, Pars
     fingerprint_dec.copy_from_slice(&fpr[20..40]);
     fingerprint_aut.copy_from_slice(&fpr[40..60]);
 
+    let kdf_supported = find_nested(&tlvs, TAG_EXTENDED_CAPABILITIES)
+        .and_then(|c0| c0.first())
+        .is_some_and(|b| b & EXT_CAP_KDF != 0);
+
     Ok(AppRelatedData {
         aid,
         algo_attr_sig,
@@ -2280,6 +2297,7 @@ pub fn parse_application_related_data(buf: &[u8]) -> Result<AppRelatedData, Pars
         fingerprint_sig,
         fingerprint_dec,
         fingerprint_aut,
+        kdf_supported,
     })
 }
 
@@ -2824,6 +2842,35 @@ mod tests {
         assert_eq!(a.pw_status.tries_pw3, 3);
         // No keys generated yet -> sig fingerprint all zeros.
         assert_eq!(a.fingerprint_sig, [0u8; 20]);
+        // C0 7D...: bit 1 of byte 0 announces the KDF setting.
+        assert!(a.kdf_supported);
+    }
+
+    #[test]
+    fn kdf_support_comes_from_extended_capabilities() {
+        // The realistic ARD with C0 byte 0 swapped: 7E has no KDF bit, and
+        // a 6E without C0 at all doesn't announce it either.
+        let build = |c0: Option<u8>| {
+            let mut disc = Vec::new();
+            if let Some(b) = c0 {
+                push(&mut disc, 0xC0, &[b, 0, 0, 0xFF, 0, 0xFF, 0, 0, 0, 0xFF]);
+            }
+            push(&mut disc, 0xC1, &[0x01, 0x08, 0x00, 0x00, 0x20, 0x00]);
+            push(&mut disc, 0xC2, &[0x01, 0x08, 0x00, 0x00, 0x20, 0x00]);
+            push(&mut disc, 0xC3, &[0x01, 0x08, 0x00, 0x00, 0x20, 0x00]);
+            push(&mut disc, 0xC4, &[0x01, 0x7F, 0x7F, 0x7F, 0x03, 0x00, 0x03]);
+            push(&mut disc, 0xC5, &[0u8; 60]);
+            let mut inner = Vec::new();
+            push(&mut inner, 0x4F, &[0u8; 16]);
+            push(&mut inner, 0x73, &disc);
+            parse_application_related_data(&inner)
+                .unwrap()
+                .kdf_supported
+        };
+        assert!(build(Some(0x7F)));
+        assert!(build(Some(0x01)));
+        assert!(!build(Some(0x7E)));
+        assert!(!build(None));
     }
 
     // --- Signature counter (7A / 93) -------------------------------------
