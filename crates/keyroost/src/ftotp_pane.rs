@@ -11,6 +11,7 @@
 //! (`docs/PROTOCOL-feitianotp.md`). So the list shows no codes: each is read
 //! with its own button, and a TOTP code stays until its time window ends.
 
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use keyroost_feitianotp as fotp;
@@ -24,6 +25,48 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// What the pane says for a key with neither a reader nor a FIDO HID path.
+pub(crate) const NO_INTERFACE: &str =
+    "the selected key has no smart-card reader and no FIDO HID interface keyroost can open";
+
+/// Where the Feitian OTP applet of one key is reached. A session opens the
+/// endpoint of the key that was picked, never the first that answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FtotpTarget {
+    /// The key's smart-card reader.
+    Reader(String),
+    /// A key with both: its reader, and its FIDO HID interface when the
+    /// reader can't be opened.
+    ReaderThenHid(String, PathBuf),
+    /// A key with no reader here: its FIDO HID interface, which carries the
+    /// same commands (as `keyroostctl feitian` does for such a key).
+    Hid(PathBuf),
+}
+
+impl FtotpTarget {
+    /// The target for a key with this reader and this FIDO HID path.
+    pub(crate) fn of(reader: Option<&str>, hid_path: Option<&Path>) -> Option<Self> {
+        match (reader, hid_path) {
+            (Some(r), Some(p)) => Some(FtotpTarget::ReaderThenHid(r.to_owned(), p.to_owned())),
+            (Some(r), None) => Some(FtotpTarget::Reader(r.to_owned())),
+            (None, Some(p)) => Some(FtotpTarget::Hid(p.to_owned())),
+            (None, None) => None,
+        }
+    }
+
+    /// Open a session on this endpoint. With both interfaces, a reader that
+    /// can't be opened is followed by the HID interface; if that fails too,
+    /// the reader's error is the one returned.
+    pub(crate) fn open(&self) -> Result<FeitianOtpSession, TransportError> {
+        match self {
+            FtotpTarget::Reader(r) => FeitianOtpSession::open(r),
+            FtotpTarget::Hid(p) => FeitianOtpSession::open_hid(p),
+            FtotpTarget::ReaderThenHid(r, p) => FeitianOtpSession::open(r)
+                .or_else(|card_err| FeitianOtpSession::open_hid(p).map_err(|_| card_err)),
+        }
+    }
 }
 
 /// One account in the list.
@@ -381,14 +424,15 @@ impl App {
         self.ftotp.error = Some(err);
     }
 
-    /// The selected key's own smart-card reader. `Err` when nothing is
-    /// selected or the key has none, so no other key's reader is opened.
-    fn ftotp_reader(&self) -> Result<String, String> {
-        self.selected_device()
-            .ok_or_else(|| "no key selected".to_string())?
-            .reader
-            .clone()
-            .ok_or_else(|| "the selected key has no smart-card reader".to_string())
+    /// Where to reach the applet on the selected key: its own smart-card
+    /// reader, or its FIDO HID interface. `Err` when nothing is selected or
+    /// the key has neither, so no other key is opened.
+    fn ftotp_target(&self) -> Result<FtotpTarget, String> {
+        let dev = self
+            .selected_device()
+            .ok_or_else(|| "no key selected".to_string())?;
+        FtotpTarget::of(dev.reader.as_deref(), dev.hid_path.as_deref())
+            .ok_or_else(|| NO_INTERFACE.to_string())
     }
 
     /// Read the pane again from scratch. The pane's part of a Refresh.
@@ -399,7 +443,7 @@ impl App {
     /// List the accounts on the selected key. Needs no touch.
     pub(crate) fn load_ftotp_accounts(&mut self) {
         self.ftotp.error = None;
-        let reader = match self.ftotp_reader() {
+        let target = match self.ftotp_target() {
             Ok(r) => r,
             Err(e) => {
                 self.ftotp.error = Some(e);
@@ -410,7 +454,7 @@ impl App {
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading Feitian OTP accounts\u{2026}", move || {
             let result = (|| -> Result<FtotpLoad, TransportError> {
-                let mut session = FeitianOtpSession::open(&reader)?;
+                let mut session = target.open()?;
                 let version = session.version();
                 let access = INFO_SLOTS
                     .iter()
@@ -468,7 +512,7 @@ impl App {
     pub(crate) fn read_ftotp_code(&mut self, slot: fotp::Slot, stored: String) {
         self.ftotp.error = None;
         self.ftotp.info = None;
-        let reader = match self.ftotp_reader() {
+        let target = match self.ftotp_target() {
             Ok(r) => r,
             Err(e) => {
                 self.ftotp.error = Some(e);
@@ -491,7 +535,7 @@ impl App {
             // the key waited for the touch is refused by the session, in the
             // same words as `keyroostctl feitian code`.
             let result = (|| -> Result<(String, Option<u64>), TransportError> {
-                let mut session = FeitianOtpSession::open(&reader)?;
+                let mut session = target.open()?;
                 Ok(if hotp {
                     (session.calculate_hotp(slot, &stored)?.code, None)
                 } else {
@@ -538,7 +582,7 @@ impl App {
                 return;
             }
         };
-        let reader = match self.ftotp_reader() {
+        let target = match self.ftotp_target() {
             Ok(r) => r,
             Err(e) => {
                 self.ftotp.error = Some(e);
@@ -550,8 +594,7 @@ impl App {
             "Adding account \u{2014} touch your key\u{2026}",
             move || {
                 let result = (|| -> Result<(), String> {
-                    let mut session =
-                        FeitianOtpSession::open(&reader).map_err(|e| e.to_string())?;
+                    let mut session = target.open().map_err(|e| e.to_string())?;
                     // One app and account is one account, whatever its type or
                     // period, as for `keyroostctl feitian add` and the import:
                     // the key never gets a second code for an account it holds.
@@ -596,7 +639,7 @@ impl App {
     pub(crate) fn delete_ftotp_account(&mut self, slot: fotp::Slot, stored: String) {
         self.ftotp.error = None;
         self.ftotp.info = None;
-        let reader = match self.ftotp_reader() {
+        let target = match self.ftotp_target() {
             Ok(r) => r,
             Err(e) => {
                 self.ftotp.error = Some(e);
@@ -608,8 +651,7 @@ impl App {
             "Deleting account \u{2014} touch your key\u{2026}",
             move || {
                 let result = (|| -> Result<(), String> {
-                    let mut session =
-                        FeitianOtpSession::open(&reader).map_err(|e| e.to_string())?;
+                    let mut session = target.open().map_err(|e| e.to_string())?;
                     // A name the key no longer holds is refused before anything
                     // is sent, as `keyroostctl feitian delete` does.
                     let listing = session.list().map_err(|e| e.to_string())?;
@@ -651,7 +693,7 @@ impl App {
     pub(crate) fn reset_ftotp(&mut self) {
         self.ftotp.error = None;
         self.ftotp.info = None;
-        let reader = match self.ftotp_reader() {
+        let target = match self.ftotp_target() {
             Ok(r) => r,
             Err(e) => {
                 self.ftotp.error = Some(e);
@@ -662,7 +704,8 @@ impl App {
         self.spawn_job(
             "Resetting Feitian OTP \u{2014} touch your key\u{2026}",
             move || {
-                let result = FeitianOtpSession::open(&reader)
+                let result = target
+                    .open()
                     .and_then(|mut session| session.reset())
                     .map_err(|e| e.to_string());
                 Box::new(move |app: &mut App| {
@@ -1306,6 +1349,30 @@ mod tests {
             fotp::Algorithm::Sha1,
         );
         assert_eq!(add_refusal(&listing(vec![other]), "GitHub", "alice"), None);
+    }
+
+    /// The applet is reached through the picked key's own reader, through
+    /// its FIDO HID interface where it has no reader, and through the reader
+    /// first where it has both. A key with neither gets no target at all.
+    #[test]
+    fn the_target_is_the_picked_keys_reader_or_its_hid_interface() {
+        let hid = Path::new("/dev/hidraw3");
+        assert_eq!(
+            FtotpTarget::of(Some("FS CCID 0"), None),
+            Some(FtotpTarget::Reader("FS CCID 0".into()))
+        );
+        assert_eq!(
+            FtotpTarget::of(None, Some(hid)),
+            Some(FtotpTarget::Hid(hid.to_owned()))
+        );
+        assert_eq!(
+            FtotpTarget::of(Some("FS CCID 0"), Some(hid)),
+            Some(FtotpTarget::ReaderThenHid(
+                "FS CCID 0".into(),
+                hid.to_owned()
+            ))
+        );
+        assert_eq!(FtotpTarget::of(None, None), None);
     }
 
     #[test]

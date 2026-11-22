@@ -71,7 +71,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "feitian" => &Help {
             title: "Feitian OTP",
-            body: "TOTP/HOTP codes stored in this Feitian key's own OTP applet, read through its smart-card interface. The list shows without a touch. The key gives a code, saves an account or deletes one only when you touch it, so each code is read with its own button. The seeds stay on the key.",
+            body: "TOTP/HOTP codes stored in this Feitian key's own OTP applet, read through its smart-card interface, or over USB where the key has no smart-card reader here. The list shows without a touch. The key gives a code, saves an account or deletes one only when you touch it, so each code is read with its own button. The seeds stay on the key.",
             slug: "",
         },
         "mds" => &Help {

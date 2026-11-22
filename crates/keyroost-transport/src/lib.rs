@@ -449,6 +449,10 @@ pub enum TransportError {
     /// A Feitian OTP TOTP code came back for a time window that had ended
     /// while the key waited for its touch. The code was wiped, not returned.
     FeitianOtpWindowEnded,
+    /// The key's FIDO HID interface, which can carry the Feitian OTP
+    /// applet's commands in place of a smart-card reader, could not be
+    /// opened or did not complete an exchange.
+    FeitianOtpHid(String),
     /// The RSA key's public exponent is wider than the OpenPGP card's declared
     /// exponent field (`e_bits`). Caught before building the import (the pure
     /// builder would otherwise panic); guards against a malformed card
@@ -815,6 +819,9 @@ impl fmt::Display for TransportError {
                 "that code's time window ended while the key waited for the touch; \
                  read it again"
             ),
+            TransportError::FeitianOtpHid(e) => {
+                write!(f, "Feitian OTP over the key's FIDO HID interface: {e}")
+            }
             TransportError::OpenPgpExponentTooWide => write!(
                 f,
                 "the key's RSA public exponent is wider than this OpenPGP card's \

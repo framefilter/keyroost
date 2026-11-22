@@ -949,6 +949,14 @@ pub fn correlate_with(
                 caps.insert(Caps::OTP);
                 unverified.insert(Caps::OTP);
             }
+            if hid.vendor_id == FEITIAN_VID {
+                // The same for a Feitian key with no reader bound: its OTP
+                // applet answers through the FIDO HID interface too, so the
+                // surface is offered, unverified. A key with a reader is left
+                // to what its probe found.
+                caps.insert(Caps::FEITIAN_OTP);
+                unverified.insert(Caps::FEITIAN_OTP);
+            }
             let vendor = vendor_name(hid.vendor_id).to_string();
             let model = if is_token2 {
                 keyroost_proto::token2_pid_label(hid.product_id)
@@ -1783,6 +1791,9 @@ fn mark_fido_protocol(
 pub fn enumerate() -> Result<Vec<Device>, String> {
     enumerate_with(&EnumerateOptions::default())
 }
+
+/// Feitian's USB vendor id.
+const FEITIAN_VID: u16 = 0x096e;
 
 /// One applet-reset step in a whole-device factory reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3023,6 +3034,37 @@ mod tests {
         ft_probe.has_feitian_otp = true;
         let ft = &correlate(&[], &[ft_probe], &Keyring::default())[0];
         assert_eq!(ft.cap_badges(), vec!["PGP", "PIV", "FEITIAN-OTP"]);
+    }
+
+    /// A Feitian key seen only as a FIDO HID device is offered the OTP
+    /// surface, unverified: its applet answers through that interface too.
+    /// Another vendor's HID-only key is not.
+    #[test]
+    fn a_hid_only_feitian_key_is_offered_feitian_otp_unverified() {
+        let hids = [hid(
+            0x096e,
+            0x0853,
+            "/dev/hidraw4",
+            Some("S9"),
+            Some(1),
+            Some(4),
+        )];
+        let d = &correlate(&hids, &[], &Keyring::default())[0];
+        assert_eq!(d.cap_state(Caps::FEITIAN_OTP), CapState::Unverified);
+        assert!(
+            crate::select::Need::FeitianOtp.admits(d),
+            "over its HID path"
+        );
+        let hids = [hid(
+            0x1050,
+            0x0407,
+            "/dev/hidraw5",
+            Some("S8"),
+            Some(1),
+            Some(5),
+        )];
+        let d = &correlate(&hids, &[], &Keyring::default())[0];
+        assert!(!d.caps.has(Caps::FEITIAN_OTP));
     }
 
     /// A Feitian key's OTP applet has a reset step of its own, with the

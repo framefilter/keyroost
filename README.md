@@ -133,7 +133,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   enrollment itself is done through the key's FIDO2 fingerprint setup.
 - **Feitian OTP (Feitian FIDO keys)** — list, read, add, import and delete
   the TOTP/HOTP accounts in the OTP applet Feitian keys carry, over the
-  smart-card interface (`feitian info` / `list` / `code` / `add` /
+  smart-card interface, or over USB (HID) for a key with no smart-card
+  reader here (`feitian info` / `list` / `code` / `add` /
   `import` / `delete` / `reset`, or the GUI's Feitian OTP tab). The key
   computes a code, saves or deletes an account, and wipes the applet, once
   it is touched. Its own
