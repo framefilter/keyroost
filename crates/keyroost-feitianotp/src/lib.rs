@@ -379,75 +379,53 @@ pub fn parse_device_serial(data: &[u8]) -> Option<String> {
 /// Like [`device_serial`] this is the key's command, not the OTP applet's:
 /// one key answered it with nothing selected and with each of its
 /// applications selected. It is the command Feitian's own client names a
-/// key's model with. The answer is read by [`parse_device_info`].
+/// key's model with. The COS version in the answer is read by
+/// [`parse_device_cos`].
 #[must_use]
 pub fn device_info() -> Vec<u8> {
     vec![0x80, 0xE3, 0xEE, 0x80, 0x00]
 }
 
-/// What keyroost reads from an answer to [`device_info`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DeviceInfo {
-    /// The product: the second byte under tag `81`. Feitian's client names
-    /// `02` "ePass FIDO-NFC Plus" and `08` "BioPass FIDO Pro".
-    pub product: Option<u8>,
-    /// The COS version: the three bytes under tag `92`.
-    pub cos: Option<[u8; 3]>,
-}
-
-/// Read an answer to [`device_info`]: `80`, a second byte, then TLVs with
-/// one-byte tags and lengths. The second byte is not a length to go by (it
-/// counts the TLVs on one measured key and the whole answer on another), so
-/// the TLVs are read to the end of the answer, as Feitian's client reads
-/// them. A field that is missing or not of its length is `None`, and so is
-/// every field of an answer that does not start `80`; a TLV cut short ends
-/// the reading.
+/// The COS version in an answer to [`device_info`]: the three bytes under
+/// tag `92`.
+///
+/// The answer is `80`, a second byte, then TLVs with one-byte tags and
+/// lengths. The second byte is not a length to go by (it counts the TLVs on
+/// one measured key and the whole answer on another), so the TLVs are read
+/// to the end of the answer, as Feitian's client reads them.
+///
+/// The bytes are the version Feitian's product list gives for the product
+/// (<https://fido.ftsafe.com/products/>, under "COS/Applet version"), digit
+/// for digit: `01 08 26` on an ePass FIDO NFC Plus, listed as COS 1.826,
+/// and `47 17 00` on a BioPass FIDO Pro, listed as COS 4.7.17. Tag `84` of
+/// the same answer, which Feitian's older client shows as the COS version,
+/// is the USB release number instead (`07 04 00` on that ePass).
+///
+/// `None` when the answer does not start `80`, has no such tag, holds
+/// another number of bytes under it, or ends inside a TLV before it.
 #[must_use]
-pub fn parse_device_info(data: &[u8]) -> DeviceInfo {
-    let mut info = DeviceInfo::default();
+pub fn parse_device_cos(data: &[u8]) -> Option<[u8; 3]> {
     let mut rest = match data {
         [0x80, _len, rest @ ..] => rest,
-        _ => return info,
+        _ => return None,
     };
     while let [tag, len, tail @ ..] = rest {
-        let Some(value) = tail.get(..usize::from(*len)) else {
-            break;
-        };
-        match *tag {
-            0x81 => info.product = value.get(1).copied(),
-            0x92 => info.cos = value.try_into().ok(),
-            _ => {}
+        let value = tail.get(..usize::from(*len))?;
+        if *tag == 0x92 {
+            return value.try_into().ok();
         }
         rest = &tail[value.len()..];
     }
-    info
+    None
 }
 
-/// The COS versions Feitian publishes, with the product and the bytes under
-/// tag `92` that a key of that product gave: an ePass FIDO NFC Plus
-/// (`01 08 26`, published as 1.826) and a BioPass FIDO Pro (`47 17 00`,
-/// published as 4.7.17).
-const PUBLISHED_COS: &[(u8, [u8; 3], &str)] = &[
-    (0x02, [0x01, 0x08, 0x26], "1.826"),
-    (0x08, [0x47, 0x17, 0x00], "4.7.17"),
-];
-
-/// The COS version in `info`, as text: the way Feitian publishes it where
-/// this version of this product is one it publishes, and otherwise
-/// the three bytes as read, two digits each (`01.08.27`). The two published
-/// versions do not group their digits alike, so no rule is made up for a
-/// version Feitian's form of is not known. `None` when `info` has no COS
-/// version.
+/// A COS version as keyroost shows it: the three bytes as read, two digits
+/// each, `01.08.26` and `47.17.00`. Feitian writes those two 1.826 and
+/// 4.7.17, grouping the same digits differently for the two products, so
+/// keyroost does not regroup them.
 #[must_use]
-pub fn cos_version_text(info: &DeviceInfo) -> Option<String> {
-    let cos = info.cos?;
-    let published = PUBLISHED_COS
-        .iter()
-        .find(|(product, bytes, _)| info.product == Some(*product) && *bytes == cos);
-    Some(match published {
-        Some((_, _, text)) => (*text).to_owned(),
-        None => format!("{:02X}.{:02X}.{:02X}", cos[0], cos[1], cos[2]),
-    })
+pub fn cos_version_text(cos: [u8; 3]) -> String {
+    format!("{:02X}.{:02X}.{:02X}", cos[0], cos[1], cos[2])
 }
 
 /// Build a `LIST` APDU for one slot: `00 17 00 <slot> 00`. An empty slot

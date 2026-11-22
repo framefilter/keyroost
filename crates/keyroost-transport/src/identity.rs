@@ -345,7 +345,7 @@ pub fn feitian_cos_version(reader: &str, debug: bool) -> Option<String> {
     if sw != 0x9000 {
         return None;
     }
-    keyroost_feitianotp::cos_version_text(&keyroost_feitianotp::parse_device_info(&data))
+    keyroost_feitianotp::parse_device_cos(&data).map(keyroost_feitianotp::cos_version_text)
 }
 
 #[cfg(test)]

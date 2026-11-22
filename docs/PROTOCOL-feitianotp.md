@@ -162,18 +162,21 @@ Client.)*
 The other tags (`83`, `85`, `86`, and on Key A `87` to `90`) are not read.
 *(Measured.)*
 
-The COS version is the version of the key as a whole. Feitian's version
-table gives it beside a number for each application: for the ePass FIDO NFC
-Plus, COS 1.826 with FIDO 9134, PIV 9166, OpenPGP 7386 and OTP 9126; for the
-BioPass FIDO Pro, COS 4.7.17. *(Feitian's published versions.)*
+Feitian's product list (<https://fido.ftsafe.com/products/>) gives each
+product a COS version under "COS/Applet version", and for some a version for
+each application beside it: for the ePass FIDO NFC Plus (K9D, K40 Plus), COS
+1.826 with FIDO 9134, PIV 9166, openPGP 7386 and OTP 9126; for the BioPass
+FIDO Pro (K49 Pro, K50 Pro), COS 4.7.17. Those are the digits under `92` on
+the two keys. The list has a second row named ePass FIDO NFC Plus (K9, K40)
+with COS 3.3.01; no key with that version was read. *(Feitian's product
+list.)*
 
 keyroost shows the value under `92` as a Feitian key's firmware version, in
-the app's key header and in `fido info`: the way Feitian publishes it for
-those two versions of those two products, and for any other as the three
-bytes read (`01.08.27`), since the two published forms do not group their
-digits alike. It does not show a Feitian key's CTAPHID INIT version bytes
-(`1.0.1` on Key A), which are neither value. With no smart-card reader for
-the key, no firmware is shown.
+the app's key header and in `fido info`, as the three bytes read, two digits
+each: `47.17.00` and `01.08.26`. Feitian groups those digits differently for
+the two products, so keyroost does not regroup them. It does not show a
+Feitian key's CTAPHID INIT version bytes (`1.0.1` on Key A), which are
+neither value. With no smart-card reader for the key, no firmware is shown.
 
 ## Slots
 

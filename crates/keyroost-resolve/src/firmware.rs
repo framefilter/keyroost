@@ -15,12 +15,14 @@
 //!   firmware by release (`R3.4`) and identifies it from the first five
 //!   digits of the key's serial number, per its published "PIN+ Serial
 //!   Number Prefix Reference" ([`token2_release`]).
-//! * Feitian: bytes that are not the version Feitian states for a key (a
-//!   BioPass FIDO Pro's say `1.0.1`). Feitian publishes a key's COS
-//!   version (`4.7.17` for that one), which is the version of the key as a
-//!   whole: its applications carry numbers of their own. The key reports
-//!   it in its device information, read over its smart-card reader
-//!   (`keyroost_transport::identity::feitian_cos_version`).
+//! * Feitian: bytes that are not the version Feitian lists for a key (a
+//!   BioPass FIDO Pro's say `1.0.1`). Feitian's product list
+//!   (<https://fido.ftsafe.com/products/>) gives each key a COS version,
+//!   apart from the versions of its applications, and the key reports it
+//!   in its device information, read over its smart-card reader
+//!   (`keyroost_transport::identity::feitian_cos_version`). It is shown as
+//!   the three bytes read, `47.17.00` for that key, where Feitian writes
+//!   4.7.17.
 //!
 //! [`key_firmware`] applies these rules for one key; the CLI's `fido info`
 //! and the app's key header both show what it returns.
