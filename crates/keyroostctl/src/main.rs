@@ -26105,6 +26105,9 @@ mod cli_tests {
                     },
                 ..
             } => yes,
+            Cmd::Feitian {
+                cmd: FtotpCmd::Delete { yes, .. } | FtotpCmd::Import { yes, .. },
+            } => yes,
             Cmd::Fido {
                 cmd:
                     FidoCmd::Credential {
@@ -26342,6 +26345,8 @@ mod cli_tests {
             &["keyroostctl", "otp", "import", "--in", "f.json"],
             &["keyroostctl", "otp", "button", "set", "--seed", "stdin"],
             &["keyroostctl", "otp", "button", "clear"],
+            &["keyroostctl", "feitian", "delete", "--account", "a"],
+            &["keyroostctl", "feitian", "import", "--in", "f.json"],
             &["keyroostctl", "fido", "credential", "delete", "00"],
             &["keyroostctl", "fido", "fingerprint", "delete", "00"],
             &[
