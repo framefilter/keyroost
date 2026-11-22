@@ -6923,7 +6923,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Map a PIV status word to success or a labelled APDU error.
+/// Map a PIV status word to success or a labeled APDU error.
 fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     if sw == piv::SW_OK {
         Ok(())

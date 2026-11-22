@@ -2621,7 +2621,7 @@ mod tests {
     fn merged_card_row_offers_otp_as_unverified_when_the_probe_declined() {
         // The probe SELECTed the OTP applet and got a decline, but the vendor
         // hint still offers the surface (#95: the applet may live on a channel
-        // the probe cannot see). Offered — and labelled unverified, because
+        // the probe cannot see). Offered — and labeled unverified, because
         // neither answer was proven.
         let probes = [probe(
             "Token2 PIN+ 00 00",

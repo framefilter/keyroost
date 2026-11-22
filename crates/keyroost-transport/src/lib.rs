@@ -1896,7 +1896,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
             // Single-profile programmable token: it has no distinctive reader
             // name and no applet to SELECT, so identify it by its info response.
             // Only flag it when the returned serial matches a known model prefix
-            // — a generic NFC card that happens to answer won't be mislabelled.
+            // — a generic NFC card that happens to answer won't be mislabeled.
             // Skip if an applet already matched (a FIDO/OATH key isn't a prog
             // token), keeping the get_info off cards that clearly aren't one.
             if !probe.has_fido && !probe.has_oath && !probe.has_piv && !probe.has_openpgp {

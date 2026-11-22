@@ -14968,7 +14968,7 @@ fn cap_tab_label(t: CapTab) -> &'static str {
     }
 }
 
-/// A labelled password field row for the inline PIN form.
+/// A labeled password field row for the inline PIN form.
 /// New==confirm guard for the PIV credential modal. Returns the inline error
 /// message when the new secret and its confirmation differ, or `None` when they
 /// match (or the flow has no confirm field, i.e. `UnblockPin`). Empty fields are
@@ -23349,7 +23349,7 @@ impl App {
                             // Generating into an occupied slot silently destroys
                             // the existing private key (irreversible). Warn in
                             // red before the auth field, mirroring the delete
-                            // cards; the submit button is relabelled below.
+                            // cards; the submit button is relabeled below.
                             if let Some(warning) = piv_replace_warning(
                                 selected_occupancy,
                                 &self.piv.selected_slot.to_slot().label(),
@@ -28598,7 +28598,7 @@ fn sanitize_title(s: &str) -> String {
         .collect()
 }
 
-/// One labelled editor row in the Molto2 form: fixed-width label + a field.
+/// One labeled editor row in the Molto2 form: fixed-width label + a field.
 fn editor_row(ui: &mut egui::Ui, p: &Palette, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         ui.add_sized(
