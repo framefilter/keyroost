@@ -1281,7 +1281,7 @@ pub enum ImportLayout {
     /// [`Self::Yubico`], sent with instruction `E3` and with the policies
     /// under Feitian's tags ([`PolicyTags::Feitian`]). On these cards `FE`,
     /// Yubico's import instruction, sets the PIN and PUK retry counts.
-    /// Measured on an ePass FIDO-NFC: an RSA-2048 key (chained) and a P-256
+    /// Measured on an ePass FIDO NFC Plus: an RSA-2048 key (chained) and a P-256
     /// key went in this way, and each then signed with a signature that
     /// verified against its public half.
     Feitian,
@@ -2135,7 +2135,7 @@ pub fn set_pin_retries(pin_tries: u8, puk_tries: u8) -> Vec<u8> {
 /// byte that is Yubico's key import ([`Instruction::ImportKey`]). Needs
 /// management-key authentication and a verified PIN, like Yubico's.
 ///
-/// Measured on an ePass FIDO-NFC: with counts 5 and 5 both counters read 5
+/// Measured on an ePass FIDO NFC Plus: with counts 5 and 5 both counters read 5
 /// afterwards, and 3 and 3 put them back; a PIN changed beforehand no longer
 /// verified afterwards and the default PIN did. Yubico's `FA` answers `6D00`
 /// there.
@@ -2148,7 +2148,7 @@ pub fn set_pin_retries_feitian(pin_tries: u8, puk_tries: u8) -> Vec<u8> {
 /// the body Yubico's has. Needs management-key authentication. There is no
 /// touch-required form.
 ///
-/// Measured on an ePass FIDO-NFC with a 3DES key: the new key then
+/// Measured on an ePass FIDO NFC Plus with a 3DES key: the new key then
 /// authenticated and the old one answered `6A80`. With an AES algorithm byte
 /// the card answered `6A80` and changed nothing, so on that card only 3DES
 /// is of use. Yubico's `FF` answers `6D00` there.
@@ -2227,7 +2227,7 @@ pub fn reset() -> Vec<u8> {
 /// [`compat::PivQuirk::ResetUsesInsFc`]). Five bytes, as Feitian's own client
 /// software sends it.
 ///
-/// Measured on a Feitian ePass FIDO-NFC (USB `096E:0853`): with neither the
+/// Measured on a Feitian ePass FIDO NFC Plus (USB `096E:0853`): with neither the
 /// PIN nor the PUK blocked the card answers `6982`; with both blocked it
 /// answers `9000`, and both try counters are back at 3 afterwards.
 #[must_use]
@@ -2915,7 +2915,7 @@ mod tests {
 
     #[test]
     fn verify_status_with_lc_is_the_form_the_086a_key_answered() {
-        // Hardware-observed on a Feitian key (USB 096E:086A), 2026-11-22:
+        // Hardware-observed on a Feitian BioPass FIDO Pro (USB 096E:086A), 2026-11-22:
         // answered 63C3; the four-byte form above was answered 6700.
         assert_eq!(verify_pin_status_lc(), vec![0x00, 0x20, 0x00, 0x80, 0x00]);
     }
@@ -3285,7 +3285,7 @@ mod tests {
 
     #[test]
     fn feitian_reset_is_the_command_the_key_answered() {
-        // Captured, 2026-11-22, Feitian ePass FIDO-NFC (USB 096E:0853): this
+        // Captured, 2026-11-22, Feitian ePass FIDO NFC Plus (USB 096E:0853): this
         // command was answered 6982 with the PIN and PUK not blocked, and
         // 9000 once both were. The expected bytes are the ones sent then, not
         // produced by this crate.
@@ -3295,7 +3295,7 @@ mod tests {
 
     #[test]
     fn feitian_commands_are_the_ones_the_key_answered() {
-        // Captured, 2026-11-22, Feitian ePass FIDO-NFC (USB 096E:0853). The
+        // Captured, 2026-11-22, Feitian ePass FIDO NFC Plus (USB 096E:0853). The
         // expected bytes are the ones sent then, not produced by this crate.
         // Retry counts 5 and 4: `9000`, and the PIN counter then read 5.
         assert_eq!(set_pin_retries_feitian(5, 4), vec![0x00, 0xFE, 0x05, 0x04]);

@@ -2212,19 +2212,16 @@ impl<'tx> PivSession<'tx> {
         let swissbit_rid_selectable = fingerprint::wants_swissbit_probe(select_identity.as_deref())
             && self.probe_swissbit_rid();
 
-        // `feitian_rid_selectable`, `feitian_otp_selectable` and
-        // `idprime_aid_selectable` are each the sole criterion for their own
-        // identity, so they're only worth their own SELECT round trip when
-        // nothing else already fingerprints the applet — check with every
-        // probe bit false first, and only run each probe (then re-classify)
-        // when that still leaves `Generic`: Feitian's RID, then Feitian's
-        // OTP application, then IdPrime, whose AID a Feitian key's PIV
-        // application was seen to answer too.
+        // `feitian_rid_selectable` and `idprime_aid_selectable` are each the
+        // sole criterion for their own identity, so they're only worth their
+        // own SELECT round trip when nothing else already fingerprints the
+        // applet — check with both probe bits false first, and only run each
+        // probe (then re-classify) when that still leaves `Generic`, Feitian
+        // before IdPrime.
         let id = fingerprint::classify(
             atr_identity.as_deref(),
             select_identity.as_deref(),
             swissbit_rid_selectable,
-            false,
             false,
             false,
         );
@@ -2235,7 +2232,6 @@ impl<'tx> PivSession<'tx> {
                 swissbit_rid_selectable,
                 self.probe_feitian_rid(),
                 false,
-                false,
             )
         } else {
             id
@@ -2245,24 +2241,20 @@ impl<'tx> PivSession<'tx> {
                 atr_identity.as_deref(),
                 select_identity.as_deref(),
                 swissbit_rid_selectable,
-                false,
-                self.probe_feitian_otp_aid(),
-                false,
-            )
-        } else {
-            id
-        };
-        let id = if id == fingerprint::AppletFingerprint::Generic {
-            fingerprint::classify(
-                atr_identity.as_deref(),
-                select_identity.as_deref(),
-                swissbit_rid_selectable,
-                false,
                 false,
                 self.probe_idprime_aid(),
             )
         } else {
             id
+        };
+        // A Feitian key says which product it is, and the rows are the
+        // product's: Feitian's keys take the same instructions and do not
+        // hold the same key types.
+        let id = match id {
+            fingerprint::AppletFingerprint::Feitian(_) => {
+                fingerprint::AppletFingerprint::Feitian(self.probe_feitian_model())
+            }
+            other => other,
         };
         // Yubico's GET VERSION extension, fetched only now that `id` is
         // classified — a HID Crescendo (either family) is documented and
@@ -2483,31 +2475,38 @@ impl<'tx> PivSession<'tx> {
     /// call site in `Self::applet_fingerprint` — since a Feitian RID match
     /// is the lowest-priority, catch-all criterion and every other one is
     /// cheaper to check first.
+    ///
+    /// A card that refuses the RID alone is asked for
+    /// [`keyroost_piv::fingerprint::FEITIAN_OTP_AID`], the OTP application
+    /// under that RID: a Feitian key that selects no application by a
+    /// partial AID still selects that one.
     fn probe_feitian_rid(&mut self) -> bool {
-        let selectable = matches!(
-            self.transmit_full_raw(&piv::select_by_aid(&keyroost_piv::fingerprint::FEITIAN_RID)),
-            Ok((_, sw)) if sw == piv::SW_OK
-        );
+        let mut selects = |aid: &[u8]| {
+            matches!(
+                self.transmit_full_raw(&piv::select_by_aid(aid)),
+                Ok((_, sw)) if sw == piv::SW_OK
+            )
+        };
+        let selectable = selects(&keyroost_piv::fingerprint::FEITIAN_RID)
+            || selects(&keyroost_piv::fingerprint::FEITIAN_OTP_AID);
         let _ = self.select();
         selectable
     }
 
-    /// SELECT [`keyroost_piv::fingerprint::FEITIAN_OTP_AID`] and report
-    /// whether the card accepted it, then unconditionally re-SELECT PIV
-    /// afterward (mirrors [`Self::probe_feitian_rid`], against the whole AID
-    /// of the OTP application under that RID). Only called when nothing
-    /// else, not even the RID alone, already fingerprinted the applet, and
-    /// before [`Self::probe_idprime_aid`] — see the call site in
-    /// `Self::applet_fingerprint`.
-    fn probe_feitian_otp_aid(&mut self) -> bool {
-        let selectable = matches!(
-            self.transmit_full_raw(&piv::select_by_aid(
-                &keyroost_piv::fingerprint::FEITIAN_OTP_AID
-            )),
-            Ok((_, sw)) if sw == piv::SW_OK
-        );
+    /// Ask a Feitian key which product it is
+    /// ([`keyroost_piv::fingerprint::FEITIAN_DEVICE_INFO`]), then
+    /// unconditionally re-SELECT PIV afterward. Only called once
+    /// [`Self::probe_feitian_rid`] has said the card is Feitian's.
+    /// [`keyroost_piv::fingerprint::FeitianModel::Generic`] when the read is
+    /// refused or names no product this crate has rows for.
+    fn probe_feitian_model(&mut self) -> keyroost_piv::fingerprint::FeitianModel {
+        use keyroost_piv::fingerprint::{feitian_model, FeitianModel, FEITIAN_DEVICE_INFO};
+        let model = match self.transmit_full_raw(&FEITIAN_DEVICE_INFO) {
+            Ok((data, sw)) if sw == piv::SW_OK => feitian_model(&data),
+            _ => FeitianModel::Generic,
+        };
         let _ = self.select();
-        selectable
+        model
     }
 
     /// SELECT [`keyroost_piv::fingerprint::IDPRIME_SECONDARY_PIV_AID`] and report whether
@@ -6158,10 +6157,12 @@ impl<'tx> PivSession<'tx> {
         // returns recovered plaintext — redact uniformly so a future caller
         // can't leak through a trace.
         // The Token2 serial read (`probe_token2_otp_serial`) answers with the
-        // printed serial, hidden on every path that reads it.
+        // printed serial, hidden on every path that reads it. So does a
+        // Feitian key's device information (`probe_feitian_model`).
         let resp_sensitive = apdu.get(1) == Some(&0x87)
             || (pin_protected && apdu.get(1) == Some(&0xCB))
-            || crate::token2otp::reads_serial(apdu);
+            || crate::token2otp::reads_serial(apdu)
+            || apdu == keyroost_piv::fingerprint::FEITIAN_DEVICE_INFO;
         // `describe` makes `transmit_applet` bracket every transmitted APDU —
         // the caller's command and each GET RESPONSE / Le-corrected reissue —
         // with a `>` line naming the command and a `<` line reading its status
@@ -6710,6 +6711,12 @@ fn describe_apdu(apdu: &[u8]) -> String {
     let Some(&ins) = apdu.get(1) else {
         return "(malformed APDU)".to_string();
     };
+    // A Feitian key's device-information read has the instruction byte of
+    // the card's import, under another class; named here so that the trace
+    // does not call it an import.
+    if apdu == keyroost_piv::fingerprint::FEITIAN_DEVICE_INFO {
+        return "DEVICE INFO (feitian)".to_string();
+    }
     match piv::Instruction::from_code(ins) {
         // A SELECT's data field is the raw AID/RID itself (no `5C` wrapper,
         // unlike GET DATA / PUT DATA below) — name it whenever it's an AID
@@ -7505,6 +7512,12 @@ mod tests {
             describe_apdu(&piv::move_key(Slot::Retired(1), Slot::Authentication)),
             "MOVE KEY (yubico extension)"
         );
+        // A Feitian key's device-information read is not an import, though
+        // it has the import's instruction byte.
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::FEITIAN_DEVICE_INFO),
+            "DEVICE INFO (feitian)"
+        );
         // Bodyless VERIFY is a retry-counter query.
         assert_eq!(
             describe_apdu(&piv::verify_pin_status()),
@@ -7562,10 +7575,13 @@ mod tests {
     fn a_feitian_card_may_answer_an_unmet_reset_precondition_6984() {
         use keyroost_piv::compat::resolve_quirks;
         use keyroost_piv::fingerprint::AppletFingerprint;
-        // Hardware-observed: the ePass FIDO-NFC answers 6982, a 096E:086A
+        // Hardware-observed: the ePass FIDO NFC Plus answers 6982, a 096E:086A
         // key 6984, each with nothing blocked and with only the PIN blocked.
         let yubikey = resolve_quirks(AppletFingerprint::YubiKey, Some(&[5, 7, 4]), None);
-        for fingerprint in [AppletFingerprint::Feitian, AppletFingerprint::FeitianOtpAid] {
+        for fingerprint in [
+            AppletFingerprint::Feitian(keyroost_piv::fingerprint::FeitianModel::EPassFidoNfcPlus),
+            AppletFingerprint::Feitian(keyroost_piv::fingerprint::FeitianModel::BioPassFidoPro),
+        ] {
             let feitian = resolve_quirks(fingerprint, None, None);
             for sw in [0x6982, 0x6983, 0x6984, 0x6985] {
                 assert!(reset_not_allowed(sw, &feitian), "{fingerprint} {sw:04X}");
@@ -7589,8 +7605,16 @@ mod tests {
             traced: false,
             chain_upfront: None,
         };
-        let needs = resolve_quirks(AppletFingerprint::FeitianOtpAid, None, None);
-        let other = resolve_quirks(AppletFingerprint::Feitian, None, None);
+        let needs = resolve_quirks(
+            AppletFingerprint::Feitian(keyroost_piv::fingerprint::FeitianModel::BioPassFidoPro),
+            None,
+            None,
+        );
+        let other = resolve_quirks(
+            AppletFingerprint::Feitian(keyroost_piv::fingerprint::FeitianModel::EPassFidoNfcPlus),
+            None,
+            None,
+        );
         assert!(import_link(link, &needs).chain_upfront.is_some());
         assert!(import_link(link, &other).chain_upfront.is_none());
         // A link that chains anyway keeps its own reason.
@@ -7607,7 +7631,13 @@ mod tests {
         use keyroost_piv::fingerprint::AppletFingerprint;
         // A Feitian card, with or without a reported applet version.
         for version in [None, Some(&[0][..])] {
-            let quirks = resolve_quirks(AppletFingerprint::Feitian, version, None);
+            let quirks = resolve_quirks(
+                AppletFingerprint::Feitian(
+                    keyroost_piv::fingerprint::FeitianModel::EPassFidoNfcPlus,
+                ),
+                version,
+                None,
+            );
             assert_eq!(
                 set_pin_retries_command(&quirks, 5, 4),
                 vec![0x00, 0xFE, 0x05, 0x04],
@@ -7644,7 +7674,13 @@ mod tests {
         // reports an applet version (the unit it was measured on does not).
         for version in [None, Some(&[0][..])] {
             assert_eq!(
-                reset_command(&resolve_quirks(AppletFingerprint::Feitian, version, None)),
+                reset_command(&resolve_quirks(
+                    AppletFingerprint::Feitian(
+                        keyroost_piv::fingerprint::FeitianModel::EPassFidoNfcPlus
+                    ),
+                    version,
+                    None
+                )),
                 vec![0x00, 0xFC, 0x00, 0x00, 0x00],
                 "Feitian at {version:?}"
             );
