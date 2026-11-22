@@ -496,9 +496,25 @@ fn feitian_delete<I: FeitianIo + ?Sized>(
         .filter(|k| same_account(k, n, hotp))
         .map(|k| k.0.clone())
         .collect();
+    let mut removed: Vec<String> = Vec::new();
     for stored in old {
-        feitian_result("delete the account", io.delete(&stored))?;
+        if let Err(e) = feitian_result("delete the account", io.delete(&stored)) {
+            if removed.is_empty() {
+                return Err(e);
+            }
+            // Some old names are already gone: say which, so nobody
+            // believes the key still holds them.
+            return Err(StoreError::Failed(format!(
+                "removed {} from the key, then couldn't remove \"{stored}\": {e}",
+                removed
+                    .iter()
+                    .map(|r| format!("\"{r}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         on_key.retain(|k| k.0 != stored);
+        removed.push(stored);
     }
     Ok(())
 }
@@ -1297,6 +1313,22 @@ mod tests {
         assert!(matches!(out[0], Outcome::RemovedNotAdded(_)), "{out:?}");
         assert_eq!(out[1], Outcome::NotTried);
         assert!(s.names().is_empty());
+    }
+
+    #[test]
+    fn feitian_replace_that_fails_on_a_later_delete_names_what_was_removed() {
+        let io = ScriptedFeitian {
+            delete: VecDeque::from([0x9000, 0x6A80]),
+            ..Default::default()
+        };
+        let (out, s) = run_feitian(&file(1), &["30:I0_#_a", "60:I0_#_a"], true, io);
+        let Outcome::Failed(why) = &out[0] else {
+            panic!("{out:?}");
+        };
+        assert!(why.contains("removed \"30:I0_#_a\""), "{why}");
+        assert!(why.contains("couldn't remove \"60:I0_#_a\""), "{why}");
+        assert_eq!(s.names(), vec!["60:I0_#_a"]);
+        assert!(!s.io.calls.iter().any(|c| c.starts_with("put")));
     }
 
     #[test]
