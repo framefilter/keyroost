@@ -242,6 +242,9 @@ pub struct FtotpState {
     pub loaded: bool,
     /// The applet's version, from the last read.
     pub version: Option<(u8, u8, u8)>,
+    /// Whether each slot has an access code, from the last read, default
+    /// slot first (`None`: the key didn't say).
+    pub access: Vec<(fotp::Slot, Option<bool>)>,
     /// What the last listing could not show (see [`partial_note`]).
     pub partial: Option<String>,
     pub add: FtotpAddDialog,
@@ -295,10 +298,39 @@ fn partial_note(listing: &FeitianOtpListing) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
+/// The slots in the order `keyroostctl feitian info` shows them: the default
+/// slot, where Feitian's apps store accounts, first.
+const INFO_SLOTS: [fotp::Slot; 3] = [
+    fotp::Slot::Default,
+    fotp::Slot::Keyboard1,
+    fotp::Slot::Keyboard2,
+];
+
+/// Each slot's access-code state in `keyroostctl feitian info`'s words, in
+/// one line: `slot default: no access code · slot 1: access code set · …`.
+pub(crate) fn access_line(access: &[(fotp::Slot, Option<bool>)]) -> String {
+    access
+        .iter()
+        .map(|(slot, set)| {
+            format!(
+                "slot {}: {}",
+                slot.label(),
+                match set {
+                    Some(true) => "access code set",
+                    Some(false) => "no access code",
+                    None => "(unavailable)",
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("  \u{00b7}  ")
+}
+
 /// Result of a successful pane load.
 struct FtotpLoad {
     rows: Vec<FtotpRow>,
     version: Option<(u8, u8, u8)>,
+    access: Vec<(fotp::Slot, Option<bool>)>,
     partial: Option<String>,
 }
 
@@ -355,8 +387,13 @@ impl App {
             let result = (|| -> Result<FtotpLoad, TransportError> {
                 let mut session = FeitianOtpSession::open(&reader)?;
                 let version = session.version();
+                let access = INFO_SLOTS
+                    .iter()
+                    .map(|s| (*s, session.access_code_set(*s)))
+                    .collect();
                 let listing = session.list()?;
                 Ok(FtotpLoad {
+                    access,
                     rows: listing
                         .credentials
                         .iter()
@@ -387,6 +424,7 @@ impl App {
                         }
                         app.ftotp.rows = load.rows;
                         app.ftotp.version = load.version;
+                        app.ftotp.access = load.access;
                         app.ftotp.partial = load.partial;
                         app.ftotp.loaded = true;
                         app.ftotp.error = None;
@@ -633,11 +671,32 @@ impl App {
                     // toggle was left at.
                     app.secret_reveal.insert("ftotp-add-secret", false);
                 }
+                ui.add_space(6.0);
+                if theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked() {
+                    if let Some(id) = app.selected_device.clone() {
+                        app.import_pick_file(crate::import_flow::Origin::View(
+                            crate::import_flow::DestKey {
+                                device: id,
+                                store: crate::import_flow::StoreKind::FeitianOtp,
+                            },
+                        ));
+                    }
+                }
             },
         );
         if let Some((a, b, c)) = self.ftotp.version {
             ui.label(
                 egui::RichText::new(format!("applet {a}.{b}.{c}"))
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+            );
+        }
+        // Which slots have an access code, as `keyroostctl feitian info`
+        // shows it: a slot with one answers 6982, which keyroost can't
+        // unlock.
+        if !self.ftotp.access.is_empty() {
+            ui.label(
+                egui::RichText::new(access_line(&self.ftotp.access))
                     .font(theme::f_reg(11.5))
                     .color(p.txt3),
             );
@@ -1080,6 +1139,21 @@ mod tests {
         let mut d = form("x", "alice", "JBSWY3DPEHPK3PXP");
         d.digits = 7;
         assert_eq!(err(&d), "codes on this key have 6 or 8 digits");
+    }
+
+    /// The access-code line uses `keyroostctl feitian info`'s words, default
+    /// slot first.
+    #[test]
+    fn the_access_line_says_each_slot_in_the_cli_words() {
+        assert_eq!(
+            access_line(&[
+                (fotp::Slot::Default, Some(false)),
+                (fotp::Slot::Keyboard1, Some(true)),
+                (fotp::Slot::Keyboard2, None),
+            ]),
+            "slot default: no access code  \u{00b7}  slot 1: access code set  \u{00b7}  \
+             slot 2: (unavailable)"
+        );
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub enum StoreKind {
     Molto2,
     Oath,
     Token2Otp,
+    /// The OTP applet on Feitian keys (default slot).
+    FeitianOtp,
 }
 
 /// One destination in the dialog: a connected key plus one of its stores.
@@ -97,9 +99,10 @@ pub struct FileNotice {
 }
 
 /// Every capable store of every connected key, in device-list order; per key
-/// Molto2, then OATH, then Token2 OTP. From `Caps::TOTP`, `Caps::OATH`,
-/// `Caps::OTP`. (`Caps::PROG`, the single-profile token, isn't a
-/// destination: it holds one code, programmed by hand.)
+/// Molto2, then OATH, then Token2 OTP, then Feitian OTP. From `Caps::TOTP`,
+/// `Caps::OATH`, `Caps::OTP`, `Caps::FEITIAN_OTP`. (`Caps::PROG`, the
+/// single-profile token, isn't a destination: it holds one code, programmed
+/// by hand.)
 pub fn destinations(devices: &[Device]) -> Vec<DestKey> {
     let mut out = Vec::new();
     for d in devices {
@@ -107,6 +110,7 @@ pub fn destinations(devices: &[Device]) -> Vec<DestKey> {
             (Caps::TOTP, StoreKind::Molto2),
             (Caps::OATH, StoreKind::Oath),
             (Caps::OTP, StoreKind::Token2Otp),
+            (Caps::FEITIAN_OTP, StoreKind::FeitianOtp),
         ] {
             if d.caps.has(cap) {
                 out.push(DestKey {
@@ -208,6 +212,7 @@ pub fn store_of(kind: StoreKind, vendor: &str, version: Option<(u8, u8, u8)>) ->
         StoreKind::Molto2 => Store::Molto2,
         StoreKind::Oath => Store::Oath(OathFamily::from_vendor(vendor, version)),
         StoreKind::Token2Otp => Store::Token2Otp,
+        StoreKind::FeitianOtp => Store::FeitianOtp,
     }
 }
 
@@ -244,12 +249,14 @@ pub fn entry_line(item: &keyroost_import::ImportItem) -> (String, bool) {
     }
 }
 
-/// `<display name> — Authenticator (OATH)` / `— OTP storage` / `— Molto2 slots`.
+/// `<display name> — Authenticator (OATH)` / `— OTP storage` / `— Molto2
+/// slots` / `— Feitian OTP`.
 pub fn dest_label(device_name: &str, store: StoreKind) -> String {
     let what = match store {
         StoreKind::Oath => "Authenticator (OATH)",
         StoreKind::Token2Otp => "OTP storage",
         StoreKind::Molto2 => "Molto2 slots",
+        StoreKind::FeitianOtp => "Feitian OTP",
     };
     format!("{device_name} \u{2014} {what}")
 }
@@ -311,6 +318,10 @@ pub const MOLTO_SLOTS_FAILED: &str =
 
 /// Shown for an OATH destination with no smart-card reader.
 pub const NO_SMART_CARD: &str = "This key has no smart-card interface to reach its OATH codes.";
+
+/// Shown for a Feitian OTP destination with no smart-card reader.
+pub const NO_SMART_CARD_FEITIAN: &str =
+    "This key has no smart-card interface to reach its Feitian OTP codes.";
 
 /// Shown for a Token2 key supplied without the on-device OTP function.
 pub const NO_OTP_FUNCTION: &str = "This key was supplied without the on-device OTP \
@@ -892,6 +903,7 @@ impl App {
             match self.cap_tab {
                 CapTab::Oath => Some(StoreKind::Oath),
                 CapTab::Otp => Some(StoreKind::Token2Otp),
+                CapTab::Ftotp => Some(StoreKind::FeitianOtp),
                 _ => None,
             }
         };
@@ -1025,6 +1037,26 @@ impl App {
                             Preview::Failed(NO_OTP_FUNCTION.to_owned())
                         }
                         Err(e) if had_pin => Preview::Refused(e.to_string()),
+                        Err(e) => Preview::Failed(e.to_string()),
+                    }
+                })
+            }
+            StoreKind::FeitianOtp => {
+                let Some(reader) = dev.reader.clone() else {
+                    self.import_set_preview(
+                        id,
+                        &dest,
+                        Preview::Failed(NO_SMART_CARD_FEITIAN.into()),
+                    );
+                    return;
+                };
+                Box::new(move || {
+                    let mut s = match keyroost_transport::FeitianOtpSession::open(&reader) {
+                        Ok(s) => s,
+                        Err(e) => return Preview::Failed(e.to_string()),
+                    };
+                    match keyroost_transport::import::read_feitian_existing(&mut s) {
+                        Ok(ex) => Preview::Read(ex, None),
                         Err(e) => Preview::Failed(e.to_string()),
                     }
                 })
@@ -1208,7 +1240,14 @@ impl App {
         };
         // A Nitrokey 3 may ask for a touch for each code it replaces, and
         // asks for one to save each code that requires a touch.
-        let label = if shown.notes.iter().any(|n| {
+        let label = if dest.store == StoreKind::FeitianOtp {
+            // A Feitian key stores each code once it is touched, as
+            // `keyroostctl feitian import` says.
+            format!(
+                "Adding codes to {} \u{2014} touch the key for each code as it blinks\u{2026}",
+                dev.title()
+            )
+        } else if shown.notes.iter().any(|n| {
             matches!(
                 n,
                 keyroost_import::plan::Note::Nitrokey3TouchToReplace
@@ -1366,6 +1405,38 @@ impl App {
                     Box::new(move |app: &mut App| app.import_finish(id, &dest, added))
                 })
             }
+            StoreKind::FeitianOtp => {
+                let Some(reader) = dev.reader.clone() else {
+                    self.import_add_refused(NO_SMART_CARD_FEITIAN);
+                    return;
+                };
+                self.spawn_job_on(Some(&on), label, move || {
+                    let mut on_progress = on_progress;
+                    let added = (|| {
+                        let mut s = match keyroost_transport::FeitianOtpSession::open(&reader) {
+                            Ok(s) => s,
+                            Err(e) => return Added::Failed(e.to_string()),
+                        };
+                        let ex = match keyroost_transport::import::read_feitian_existing(&mut s) {
+                            Ok(ex) => ex,
+                            Err(e) => return Added::Failed(e.to_string()),
+                        };
+                        let mut again = plan_for(&file, Store::FeitianOtp, 0, ex.clone(), replace);
+                        again.set_touch(|r| touch_all || touch.contains(&r.index));
+                        if !again.same_rows(&shown) {
+                            return Added::Changed(ex, None);
+                        }
+                        let mut w =
+                            keyroost_transport::import::FeitianImportStore::new(&mut s, &ex);
+                        let report =
+                            keyroost_import::run::run(&file, &again, &mut w, &mut on_progress);
+                        let line = report.summary(&again);
+                        Added::Done(report, line)
+                    })();
+                    drop(file);
+                    Box::new(move |app: &mut App| app.import_finish(id, &dest, added))
+                })
+            }
         };
         if let Some(d) = self.import_flow.dialog.as_mut() {
             if queued {
@@ -1397,6 +1468,7 @@ impl App {
                 match dest.store {
                     StoreKind::Oath => self.load_oath_creds(),
                     StoreKind::Token2Otp => self.load_otp_entries(),
+                    StoreKind::FeitianOtp => self.load_ftotp_accounts(),
                     StoreKind::Molto2 => {}
                 }
             }
@@ -1661,6 +1733,14 @@ impl App {
                         });
                     }
                     match d.dest.as_ref().map(|k| k.store) {
+                        // A Feitian key has no per-code touch setting: it
+                        // asks for a touch for every code it gives.
+                        Some(StoreKind::FeitianOtp) => {
+                            ui.checkbox(
+                                &mut d.replace,
+                                "Replace codes already on the key that have the same name",
+                            );
+                        }
                         Some(StoreKind::Oath | StoreKind::Token2Otp) => {
                             ui.checkbox(
                                 &mut d.replace,
@@ -2130,6 +2210,7 @@ mod tests {
             dev("molto", &[Caps::TOTP]),
             dev("fido-only", &[Caps::FIDO2, Caps::PIV]),
             dev("prog", &[Caps::PROG]),
+            dev("feitian", &[Caps::FIDO2, Caps::PGP, Caps::FEITIAN_OTP]),
         ];
         assert_eq!(
             destinations(&devices),
@@ -2137,7 +2218,16 @@ mod tests {
                 dk("both", StoreKind::Oath),
                 dk("both", StoreKind::Token2Otp),
                 dk("molto", StoreKind::Molto2),
+                dk("feitian", StoreKind::FeitianOtp),
             ]
+        );
+        assert_eq!(
+            dest_label("ePass", StoreKind::FeitianOtp),
+            "ePass \u{2014} Feitian OTP"
+        );
+        assert_eq!(
+            store_of(StoreKind::FeitianOtp, "Feitian", None),
+            Store::FeitianOtp
         );
         assert_eq!(
             dest_label("YubiKey", StoreKind::Oath),
