@@ -2011,6 +2011,37 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                     });
                 }
             }
+            // A Feitian key's own serial, read with the command Feitian's
+            // client reads the serial it shows with; the key answers it
+            // whichever application is selected. Without it such a key is
+            // known by the serial field of its OpenPGP AID below, which is
+            // `00000001` on the measured key and part of the AID Feitian's
+            // client selects that application by, so it does not tell one
+            // key from another; and a Feitian key with no OpenPGP
+            // application has no serial at all. Names saved under that AID
+            // serial are not carried over (`former_serial` stays unset): it
+            // would hand one key's name to the next.
+            if probe.has_feitian_otp && probe.serial.is_none() {
+                if let Ok((data, s1, s2)) =
+                    transmit_apdu(&card, &keyroost_feitianotp::device_serial())
+                {
+                    let serial = if sw_ok(s1, s2) {
+                        keyroost_feitianotp::parse_device_serial(&data)
+                    } else {
+                        None
+                    };
+                    if trace {
+                        probe_note(&match &serial {
+                            Some(sn) => format!("feitian serial -> {:?}", abbreviate(sn)),
+                            None => format!(
+                                "feitian serial -> {s1:02X}{s2:02X}, {} byte(s): not used",
+                                data.len()
+                            ),
+                        });
+                    }
+                    probe.serial = serial;
+                }
+            }
             // OpenPGP present: read the AID once. Capture the manufacturer ID
             // (card-content vendor signal, #83) always; use the embedded
             // 4-byte serial only as a fallback if a vendor full-serial read
