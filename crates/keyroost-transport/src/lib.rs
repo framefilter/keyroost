@@ -127,11 +127,13 @@ fn connect_note(body: &str) {
     keyroost_proto::trace::emit(probe_trace_on(), || format_line(Dir::Note, "connect", body));
 }
 
-/// A Feitian key's own reader, by the names Windows gives them ("FS CCID 0",
-/// "FT CCID 0").
+/// The reader of the key the warm reset was measured on: Windows names it
+/// "FS CCID 0". The other Feitian reader name seen ("FT CCID 0", a BioPass
+/// FIDO Pro) connects normally and never needed the reset, so it isn't
+/// matched.
 #[cfg(any(windows, test))]
 fn is_feitian_reader(name: &str) -> bool {
-    name.starts_with("FS CCID") || name.starts_with("FT CCID")
+    name.starts_with("FS CCID")
 }
 
 /// Warm-reset the card in `reader` over a direct connection, which needs no
@@ -2764,9 +2766,9 @@ mod redaction_tests {
         assert!(lines[1].ends_with("FS CCID 0: connected after the warm reset"));
 
         // The reset can't be done: the first error stands, and says so.
-        let (out, _, lines) = run("FT CCID 1", Err(PcscError::ProtoMismatch), false, Ok(7));
+        let (out, _, lines) = run("FS CCID 1", Err(PcscError::ProtoMismatch), false, Ok(7));
         assert_eq!(out, Err(PcscError::ProtoMismatch));
-        assert!(lines[1].ends_with("FT CCID 1: warm reset not done; ProtoMismatch stands"));
+        assert!(lines[1].ends_with("FS CCID 1: warm reset not done; ProtoMismatch stands"));
 
         // The second connect fails too: its error is returned and traced.
         let (out, _, lines) = run(
@@ -2799,8 +2801,9 @@ mod redaction_tests {
     #[test]
     fn only_feitian_readers_get_the_warm_reset_retry() {
         assert!(is_feitian_reader("FS CCID 0"));
-        assert!(is_feitian_reader("FT CCID 1"));
+        assert!(is_feitian_reader("FS CCID 1"));
         for other in [
+            "FT CCID 0",
             "Yubico YubiKey OTP+FIDO+CCID 0",
             "TOKEN2 Molto2 0",
             "FSCCID 0",
