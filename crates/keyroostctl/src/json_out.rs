@@ -381,16 +381,11 @@ pub(crate) struct OpenpgpStatusJson {
 }
 
 /// JSON word for [`OpenpgpStatusJson::kdf`]: the text `KDF:` line's state
-/// without its detail (the hash, or what wasn't recognized).
+/// without its detail (the hash, or what wasn't recognized). The words come
+/// from `OpenPgpKdf::state_word`, an exhaustive match in its own crate, so
+/// a new state can't turn into `null` unnoticed.
 pub(crate) fn kdf_json(kdf: Option<&keyroost_transport::OpenPgpKdf>) -> Option<&'static str> {
-    use keyroost_transport::OpenPgpKdf;
-    match kdf? {
-        OpenPgpKdf::On(_) => Some("on"),
-        OpenPgpKdf::Off => Some("off"),
-        OpenPgpKdf::NotSupported => Some("not-supported"),
-        OpenPgpKdf::Unrecognized(_) => Some("unrecognized"),
-        _ => None,
-    }
+    kdf.map(keyroost_transport::OpenPgpKdf::state_word)
 }
 
 /// JSON form of a tri-state public text field (`cardholder_name`, `url`):
