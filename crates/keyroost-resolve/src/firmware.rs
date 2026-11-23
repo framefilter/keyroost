@@ -22,7 +22,8 @@
 //!   in its device information, read over its smart-card reader
 //!   (`keyroost_transport::identity::feitian_cos_version`). It is shown as
 //!   the three bytes read, `47.17.00` for that key, where Feitian writes
-//!   4.7.17.
+//!   4.7.17. When that read gives nothing (no reader for the key here, or
+//!   a key that doesn't answer it), the INIT bytes are shown as they are.
 //!
 //! [`key_firmware`] applies these rules for one key; the CLI's `fido info`
 //! and the app's key header both show what it returns.
@@ -43,7 +44,8 @@ const FEITIAN_VID: u16 = 0x096e;
 /// reported `version`: the INIT version read the vendor's way
 /// ([`init_firmware`]); for a Token2, the release its serial names (the
 /// row's `serial` when the scan read it, else read over USB); for a
-/// Feitian key, the COS version it reports over `reader`; when INIT says
+/// Feitian key, the COS version it reports over `reader`, else its INIT
+/// bytes as they are; when INIT says
 /// 0.0.0 (a Nitrokey 3), what the admin application reports over `reader`.
 /// `None` when the key doesn't say, or isn't found by `path`.
 ///
@@ -77,11 +79,21 @@ pub fn key_firmware(
         return release.map(str::to_owned);
     }
     if vendor_id == FEITIAN_VID {
-        // With no reader the key has no way to say it here, and its INIT
-        // bytes are not shown in its place.
-        return reader.and_then(|r| keyroost_transport::identity::feitian_cos_version(r, debug));
+        let cos = reader.and_then(|r| keyroost_transport::identity::feitian_cos_version(r, debug));
+        return feitian_firmware(cos, version);
     }
     reader.and_then(|r| keyroost_transport::identity::trussed_admin_firmware(r, debug))
+}
+
+/// A Feitian key's firmware: the COS version it reported (`cos`) when the
+/// read gave one; else its CTAPHID INIT bytes as they are, which is what
+/// keyroost showed before it read the COS version. `None` when neither
+/// says anything (INIT 0.0.0).
+fn feitian_firmware(cos: Option<String>, version: (u8, u8, u8)) -> Option<String> {
+    cos.or_else(|| {
+        let (major, minor, build) = version;
+        (version != (0, 0, 0)).then(|| format!("{major}.{minor}.{build}"))
+    })
 }
 
 /// The firmware a key's CTAPHID INIT version bytes state, read the way
@@ -226,6 +238,18 @@ mod tests {
         // Pro: INIT 1.0.1, COS 4.7.17), so they are not shown.
         assert_eq!(init_firmware(0x096e, 0x086a, (1, 0, 1)), None);
         assert_eq!(init_firmware(0x20a0, 0x42b2, (0, 0, 0)), None);
+    }
+
+    /// The COS version a Feitian key reports wins; without one, its INIT
+    /// bytes are shown as before.
+    #[test]
+    fn a_feitian_key_shows_its_cos_version_else_its_init_bytes() {
+        assert_eq!(
+            feitian_firmware(Some("47.17.00".into()), (1, 0, 1)).as_deref(),
+            Some("47.17.00")
+        );
+        assert_eq!(feitian_firmware(None, (1, 0, 1)).as_deref(), Some("1.0.1"));
+        assert_eq!(feitian_firmware(None, (0, 0, 0)), None);
     }
 
     #[test]
