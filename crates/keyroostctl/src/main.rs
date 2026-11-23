@@ -7778,21 +7778,32 @@ impl std::fmt::Display for NoReplugSeen {
 impl std::error::Error for NoReplugSeen {}
 
 /// How many scans in a row must miss the armed key's node before the replug
-/// wait takes it as unplugged.
+/// wait takes it as unplugged; see [`REPLUG_REMOVAL_FLOOR`] for the time they
+/// must span.
 ///
 /// A scan can come back without a key that is still connected: Windows leaves
 /// out a HID interface it could not open, Linux one whose sysfs entry could not
 /// be read, and on some platforms a failed scan is reported as an empty list
 /// rather than an error. Since the armed path coming back counts as the replug,
 /// one such scan followed by a normal one would read as an unplug and replug
-/// that never happened. A real unplug takes far longer than two polls.
+/// that never happened.
 const REPLUG_REMOVAL_SCANS: u8 = 2;
+
+/// How long the armed key's node must have been missing, from the first scan
+/// that missed it, before the replug wait takes it as unplugged. Half a second
+/// is well above how long a scan glitch lasts and far below what a person
+/// takes to pull a key out and push it back in. It applies to "left" only:
+/// once that is settled, the key coming back ends the wait at the first scan
+/// that shows it, so none of it is taken from the window after power-up in
+/// which the key accepts the reset.
+const REPLUG_REMOVAL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Watches successive HID scans for the armed key's node to disappear and a
 /// FIDO node to (re)appear afterwards.
 ///
-/// "Disappear" means missing from [`REPLUG_REMOVAL_SCANS`] scans in a row; a
-/// scan that shows the node again starts the count over. "Reappeared" means the
+/// "Disappear" means missing from [`REPLUG_REMOVAL_SCANS`] scans in a row and
+/// for [`REPLUG_REMOVAL_FLOOR`]; a scan that shows the node again starts that
+/// over. "Reappeared" means the
 /// armed path itself coming back, or a node that was not there when the wait
 /// started (a replugged key may come back under a new path). A key that was
 /// already connected elsewhere is never mistaken for the replug, and nothing
@@ -7802,6 +7813,8 @@ struct ReplugWatch<'a> {
     baseline: Option<Vec<std::path::PathBuf>>,
     /// Scans in a row without the armed node, until the removal is confirmed.
     absent_scans: u8,
+    /// When the first of those scans was taken (time since the wait began).
+    absent_since: Option<std::time::Duration>,
     removed: bool,
 }
 
@@ -7811,21 +7824,26 @@ impl<'a> ReplugWatch<'a> {
             armed,
             baseline: None,
             absent_scans: 0,
+            absent_since: None,
             removed: false,
         }
     }
 
-    /// Feed one successful scan of FIDO HID node paths; true once the replug
-    /// is complete.
-    fn observe(&mut self, nodes: &[std::path::PathBuf]) -> bool {
+    /// Feed one successful scan of FIDO HID node paths, taken `at` (time since
+    /// the wait began); true once the replug is complete.
+    fn observe(&mut self, nodes: &[std::path::PathBuf], at: std::time::Duration) -> bool {
         let baseline = self.baseline.get_or_insert_with(|| nodes.to_vec());
         if !self.removed {
             if nodes.iter().any(|n| n == self.armed) {
                 self.absent_scans = 0;
+                self.absent_since = None;
                 return false;
             }
-            self.absent_scans += 1;
-            if self.absent_scans < REPLUG_REMOVAL_SCANS {
+            let since = *self.absent_since.get_or_insert(at);
+            self.absent_scans = self.absent_scans.saturating_add(1);
+            if self.absent_scans < REPLUG_REMOVAL_SCANS
+                || at.saturating_sub(since) < REPLUG_REMOVAL_FLOOR
+            {
                 return false;
             }
             self.removed = true;
@@ -7852,7 +7870,7 @@ fn wait_for_replug(
         // A failed scan says nothing about the key: skip it rather than read
         // it as "the armed node is gone" (or as an empty baseline).
         if let Some(nodes) = fido_nodes() {
-            if watch.observe(&nodes) {
+            if watch.observe(&nodes, elapsed()) {
                 return Ok(());
             }
         }
@@ -19567,11 +19585,14 @@ mod cli_tests {
                 &["/dev/hidraw3"],
                 &[],
                 &[],
+                &[],
                 &["/dev/hidraw3"],
             ],
         );
         assert!(r.is_ok());
-        assert_eq!(t, REPLUG_POLL * 4);
+        // Missing at 600, 900 and 1200 ms (the floor met at 1200), back at
+        // 1500 ms: the wait ends at that scan.
+        assert_eq!(t, REPLUG_POLL * 5);
         // Renumbered on the way back, with another key present throughout.
         let (r, _) = scripted_replug_wait(
             "/dev/hidraw3",
@@ -19627,24 +19648,71 @@ mod cli_tests {
         assert!(r.is_err());
     }
 
+    fn nodes(n: &[&str]) -> Vec<std::path::PathBuf> {
+        n.iter().map(std::path::PathBuf::from).collect()
+    }
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
     #[test]
     fn replug_watch_confirms_the_removal_over_two_scans_in_a_row() {
-        let nodes = |n: &[&str]| -> Vec<std::path::PathBuf> {
-            n.iter().map(std::path::PathBuf::from).collect()
-        };
         let mut watch = ReplugWatch::new(Path::new("/dev/hidraw3"));
-        assert!(!watch.observe(&nodes(&["/dev/hidraw3"])));
-        assert!(!watch.observe(&nodes(&[])));
+        assert!(!watch.observe(&nodes(&["/dev/hidraw3"]), ms(0)));
+        assert!(!watch.observe(&nodes(&[]), ms(300)));
         assert!(
             !watch.removed,
             "one scan without the node is not the unplug"
         );
-        assert!(!watch.observe(&nodes(&["/dev/hidraw3"])));
+        assert!(!watch.observe(&nodes(&["/dev/hidraw3"]), ms(2000)));
         assert_eq!(watch.absent_scans, 0, "the node back starts the count over");
-        assert!(!watch.observe(&nodes(&[])));
-        assert!(!watch.observe(&nodes(&[])));
+        assert!(!watch.observe(&nodes(&[]), ms(2300)));
+        assert!(!watch.observe(&nodes(&[]), ms(2800)));
+        assert!(watch.removed, "two scans over 500 ms");
+        assert!(watch.observe(&nodes(&["/dev/hidraw3"]), ms(2810)));
+    }
+
+    /// Two scans without the node milliseconds apart are not the unplug,
+    /// however many of them there are.
+    #[test]
+    fn replug_watch_does_not_take_two_quick_misses_for_the_unplug() {
+        let mut watch = ReplugWatch::new(Path::new("/dev/hidraw3"));
+        assert!(!watch.observe(&nodes(&["/dev/hidraw3"]), ms(0)));
+        for at in [10, 20, 30, 490] {
+            assert!(!watch.observe(&nodes(&[]), ms(at)));
+        }
+        assert!(!watch.removed, "480 ms is under the floor");
+        assert!(!watch.observe(&nodes(&["/dev/hidraw3"]), ms(500)));
+        assert!(!watch.removed);
+    }
+
+    /// Missing for half a second over two scans is the unplug, and the key
+    /// back ends the wait at the very next scan, however soon.
+    #[test]
+    fn replug_watch_takes_half_a_second_without_the_node_for_the_unplug() {
+        let mut watch = ReplugWatch::new(Path::new("/dev/hidraw3"));
+        assert!(!watch.observe(&nodes(&["/dev/hidraw3"]), ms(0)));
+        assert!(!watch.observe(&nodes(&[]), ms(100)));
+        assert!(!watch.observe(&nodes(&[]), ms(600)));
         assert!(watch.removed);
-        assert!(watch.observe(&nodes(&["/dev/hidraw3"])));
+        assert!(watch.observe(&nodes(&["/dev/hidraw3"]), ms(610)));
+    }
+
+    /// A scan that shows the node starts the timing over: misses on either
+    /// side of it don't add up.
+    #[test]
+    fn replug_watch_restarts_the_timing_on_a_sighting() {
+        let mut watch = ReplugWatch::new(Path::new("/dev/hidraw3"));
+        assert!(!watch.observe(&nodes(&["/dev/hidraw3"]), ms(0)));
+        assert!(!watch.observe(&nodes(&[]), ms(100)));
+        assert!(!watch.observe(&nodes(&[]), ms(400)));
+        assert!(!watch.observe(&nodes(&["/dev/hidraw3"]), ms(500)));
+        assert!(!watch.observe(&nodes(&[]), ms(700)));
+        assert!(!watch.observe(&nodes(&[]), ms(1000)));
+        assert!(!watch.removed, "300 ms since the last sighting");
+        assert!(!watch.observe(&nodes(&["/dev/hidraw3"]), ms(1100)));
+        assert!(!watch.removed);
     }
 
     #[test]
