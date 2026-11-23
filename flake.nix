@@ -33,6 +33,14 @@
               src = ./.;
               cargoLock = {
                 lockFile = ./Cargo.lock;
+                # Temporary, with the `[patch.crates-io]` section of the root
+                # Cargo.toml: a dependency taken from git needs the hash of
+                # its tree here (the checkout with submodules, as `fetchgit`
+                # makes it). To drop it: delete this attribute together with
+                # that section.
+                outputHashes = {
+                  "hidapi-2.6.7" = "sha256-dr1lnPcDOZftRkaO3Bss3CLFQU96zfuwMvmZWdC/Czg=";
+                };
               };
 
               cargoBuildFlags = [
