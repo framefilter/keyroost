@@ -208,6 +208,20 @@ plan's two-key manual steps were never executed):
   linking for the PC/SC path (and the dlopen item above changes that calculus).
   Think it through before committing.
 
+- **Turning an OpenPGP card's KDF setting on or off** from keyroost, in the
+  CLI and the app together. Since [#276](https://github.com/framefilter/keyroost/issues/276)
+  keyroost honors the setting (`gpg --card-edit` → `kdf-setup`) but doesn't
+  change it. Changing it resets the PINs, and how differs by card: GnuPG
+  leaves that to YubiKey and Gnuk cards, which reset their PINs themselves
+  when the setting is written; on other cards it runs its own sequence from
+  the host first (CHANGE REFERENCE DATA 83 → VERIFY 83 → RESET RETRY COUNTER
+  81 → clear the resetting code D3 → PUT DATA F9). An interruption partway
+  leaves the PINs and the setting out of step, so the order and the way back
+  need hardware evidence per vendor before anything is built. A YubiKey
+  refuses the change while keys are on the card. Needs "off" as well as "on",
+  and wording that says plainly the PINs go back to their defaults (user
+  123456, admin 12345678).
+
 - **Require green CI on `main`** — deliberately deferred; the remaining piece
   of full branch protection. Require-PR, linear history and squash-only merges
   landed 2026-08-24 (see Standing decisions), with an admin bypass so the

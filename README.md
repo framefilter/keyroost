@@ -63,7 +63,9 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   generation timestamp so GnuPG recognizes the key; sign (SHA-256 or SHA-1); decrypt; authenticate (a client/SSH
   signature with the Authentication key via INTERNAL AUTHENTICATE); set
   cardholder name / URL; change the user / admin PIN and unblock a locked PIN;
-  factory-reset the applet.
+  factory-reset the applet. On a card whose KDF setting was turned on with
+  `gpg --card-edit` → `kdf-setup`, keyroost sends PINs hashed as the setting
+  asks; it honors the setting but doesn't turn it on or off.
 - **PIV (SP 800-73-4)** — full management: status (detected applet,
   applet/firmware version, serial, PIN retries, which slots hold a certificate
   or a key, including any retired slots 82–95 in use), on-card key generation (RSA, ECC P-256/384/521, Ed25519,

@@ -344,7 +344,14 @@ impl FeitianOtpSession {
             get_response: fotp::get_response,
             describe: None,
         };
-        crate::transmit_applet(card, self.debug, &io, apdu, cmd_sensitive, resp_sensitive)
+        crate::transmit_applet(
+            card,
+            self.debug,
+            &io,
+            apdu,
+            cmd_sensitive.into(),
+            resp_sensitive,
+        )
     }
 }
 
