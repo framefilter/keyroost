@@ -752,12 +752,20 @@ struct ResetArm {
     /// key" prompt above all — has to check that this is still the key on
     /// screen before saying anything.
     for_device: Option<DeviceId>,
-    /// FIDO HID devices present at the previous poll, to diff against (path
-    /// mode) — see [`HidIdentity`] for why this isn't a plain `Vec<PathBuf>`.
+    /// The FIDO HID devices a re-insert is diffed against (path mode) — see
+    /// [`HidIdentity`] for why this isn't a plain `Vec<PathBuf>`. Refreshed
+    /// on every poll that sees the armed key; frozen once a poll no longer
+    /// does, so it is the last list taken while the key was still there.
+    /// Where a same-port replug keeps the HID path (Windows), the armed key's
+    /// own entry is dropped once the unplug is confirmed
+    /// ([`forget_departed_node`]).
     prev_devices: Vec<HidIdentity>,
     /// True once the armed key has been unplugged; the next fresh insertion then
     /// fires the reset.
     saw_removal: bool,
+    /// Successful scans in a row that did not show the armed key, while the
+    /// unplug is not yet confirmed. See [`removal_scans_needed`].
+    absent_scans: u8,
     /// The key has no serial of either kind, so it was armed only because
     /// nothing else was connected, and a re-insert fires only while that
     /// still holds ([`keyroost_resolve::serial_less_reinsert`]).
@@ -782,8 +790,11 @@ struct ResetArm {
 /// per-attach counter, so it's what [`same_hid_connection`] compares first.
 /// `hidapi` (macOS) exposes no USB topology, and the Windows devnode is
 /// persistent across a replug (it names the device, not the attach), so
-/// identity there falls back to the path — no better than before on those
-/// platforms, but no worse either.
+/// identity there falls back to the path. On macOS the path is per attach,
+/// which is enough. On Windows it is not: a key with no USB serial comes back
+/// on the path it left when it goes back into the same port, so there the
+/// armed key's entry is dropped once its unplug is confirmed
+/// ([`forget_departed_node`]).
 #[derive(Clone)]
 struct HidIdentity {
     path: std::path::PathBuf,
@@ -818,8 +829,8 @@ fn fresh_hid_connection(prev: &[HidIdentity], cand: &HidIdentity) -> bool {
     !prev.iter().any(|p| same_hid_connection(p, cand))
 }
 
-/// Drop the armed key's own node from the snapshot once a poll has seen it
-/// gone.
+/// Drop the armed key's own node from the snapshot once its unplug is
+/// confirmed. Called only where [`SAME_PORT_REPLUG_KEEPS_PATH`] holds.
 ///
 /// Where the path is the only identity ([`same_hid_connection`]'s fallback),
 /// a key replugged into the same USB port comes back on the very path it
@@ -830,8 +841,181 @@ fn fresh_hid_connection(prev: &[HidIdentity], cand: &HidIdentity) -> bool {
 /// fires; the dialog waits for a replug that already happened. The node was
 /// seen to be gone, so a device on that path afterwards is a new connection.
 /// Whether it is the armed key is still decided by its identity, as before.
+///
+/// An entry identified by USB bus/address is kept: the kernel gives a
+/// replugged key a new address, so that entry never stood in a real
+/// re-insert's way, and keeping it means a key that only went missing from
+/// a scan and came back at the same address is still not fresh.
 fn forget_departed_node(prev: &mut Vec<HidIdentity>, departed: &std::path::Path) {
-    prev.retain(|p| p.path != departed);
+    use keyroost_hid::UsbDeviceKey::BusAddr;
+    prev.retain(|p| p.path != departed || matches!(p.usb_device, Some(BusAddr(..))));
+}
+
+/// Whether a key replugged into the same USB port can come back on the HID
+/// path it left. True on Windows (see [`forget_departed_node`]); on Linux a
+/// replug gets a new USB bus/address and on macOS a new path, so there a
+/// returning key is a fresh connection without any help.
+const SAME_PORT_REPLUG_KEEPS_PATH: bool = cfg!(windows);
+
+/// How many successful scans in a row must miss the armed key before the
+/// armed-reset poll takes it as unplugged.
+///
+/// A scan can come back without a key that is still connected: Windows
+/// leaves out a HID interface it could not open, Linux one whose sysfs
+/// entry could not be read, and on some platforms a failed scan is reported
+/// as an empty list rather than an error. Where a same-port replug keeps
+/// the path, the unplug also drops the key from the snapshot, so one such
+/// scan would let the still-connected key pass for the re-insert on the
+/// next poll and be sent a reset with no replug behind it. Two scans in a
+/// row are asked for there. Elsewhere the snapshot keeps the key's entry
+/// and a key that never left is never fresh, so one scan is enough, as
+/// before.
+fn removal_scans_needed(same_port_keeps_path: bool) -> u8 {
+    if same_port_keeps_path {
+        2
+    } else {
+        1
+    }
+}
+
+/// What one poll of an armed reset decided.
+#[derive(Debug, PartialEq)]
+enum ResetPoll {
+    /// Nothing to do yet.
+    Wait,
+    /// The armed key is back: send the reset to this path.
+    Fire(std::path::PathBuf),
+    /// The reset will not happen; this says why.
+    Refuse(String),
+}
+
+impl ResetArm {
+    /// One poll of the armed reset against a HID scan: track the armed key's
+    /// unplug and decide whether a device now connected is its re-insert.
+    /// [`App::poll_reset_arm`] feeds it the live scan and acts on the answer;
+    /// tests feed it scripted ones.
+    ///
+    /// `scan` is `None` when the scan failed, and is then skipped: read as an
+    /// empty list it would count as the unplug, and the key, still connected,
+    /// could then be taken for the re-insert. `effective_serial` reads the
+    /// resolver's identity of the device at a path (CCID-read, e.g. a
+    /// YubiKey's), and `resolve` the full device list the serial-less rule
+    /// needs; both reach PC/SC live, so they run only for a fresh connection
+    /// after the unplug. `same_port_keeps_path` is
+    /// [`SAME_PORT_REPLUG_KEEPS_PATH`] outside tests.
+    fn poll(
+        &mut self,
+        scan: Option<&[FidoHid]>,
+        mut effective_serial: impl FnMut(&std::path::Path) -> Option<String>,
+        mut resolve: impl FnMut() -> Vec<keyroost_resolve::Device>,
+        same_port_keeps_path: bool,
+    ) -> ResetPoll {
+        let Some(current) = scan else {
+            return ResetPoll::Wait;
+        };
+        let needed = removal_scans_needed(same_port_keeps_path);
+        let mut fire: Option<std::path::PathBuf> = None;
+        if let Some(target_serial) = self.target_serial.clone() {
+            // HID-serial mode: identity is port-independent.
+            let here = current
+                .iter()
+                .find(|d| d.serial.as_deref() == Some(target_serial.as_str()));
+            match here {
+                None if !self.saw_removal => {
+                    self.absent_scans = self.absent_scans.saturating_add(1);
+                    if self.absent_scans >= needed {
+                        self.saw_removal = true; // unplugged
+                    }
+                }
+                None => {}
+                Some(d) if self.saw_removal => fire = Some(d.path.clone()),
+                Some(_) => self.absent_scans = 0,
+            }
+        } else {
+            // Effective-serial mode (no HID serial, e.g. most YubiKeys):
+            // the armed path leaving is the unplug; a fresh *connection*
+            // (see `HidIdentity` — not just a path unseen before, since a
+            // hidraw minor number can be recycled straight back onto the
+            // replugged key) is accepted as the re-insert only when its
+            // stable identity matches the armed key's. The CCID probe
+            // runs only for a model-matching fresh connection, and only
+            // after removal.
+            let present = |p: &std::path::PathBuf| current.iter().any(|d| &d.path == p);
+            match &self.target_path {
+                Some(t) if !self.saw_removal && !present(t) => {
+                    self.absent_scans = self.absent_scans.saturating_add(1);
+                    if self.absent_scans >= needed {
+                        self.saw_removal = true;
+                        if same_port_keeps_path {
+                            // Gone, so the same path later is a new
+                            // connection (a same-port replug on Windows
+                            // keeps the path).
+                            forget_departed_node(&mut self.prev_devices, t);
+                        }
+                    }
+                }
+                Some(t) if !self.saw_removal && present(t) => self.absent_scans = 0,
+                _ => {}
+            }
+            if self.saw_removal && self.serial_less {
+                // Same USB ids, a fresh connection, no serial of its own;
+                // then it fires only as the one device connected.
+                let cand = current
+                    .iter()
+                    .filter(|d| self.target_ids == Some(d.ids) && d.serial.is_none())
+                    .find(|d| fresh_hid_connection(&self.prev_devices, &HidIdentity::of(d)));
+                if let Some(d) = cand {
+                    let now = resolve();
+                    match keyroost_resolve::serial_less_reinsert(&d.path, &now) {
+                        keyroost_resolve::SerialLessReinsert::Fire => {
+                            fire = Some(d.path.clone());
+                        }
+                        keyroost_resolve::SerialLessReinsert::Wait => {}
+                        keyroost_resolve::SerialLessReinsert::Refuse => {
+                            let others: Vec<String> = now
+                                .iter()
+                                .filter(|r| r.hid_path.as_deref() != Some(d.path.as_path()))
+                                .map(|r| r.name.clone().unwrap_or_else(|| r.model_title()))
+                                .collect();
+                            return ResetPoll::Refuse(serial_less_reset_refusal(&others));
+                        }
+                    }
+                }
+            } else if self.saw_removal {
+                fire = current
+                    .iter()
+                    .filter(|d| self.target_ids.is_none() || self.target_ids == Some(d.ids))
+                    .filter(|d| fresh_hid_connection(&self.prev_devices, &HidIdentity::of(d)))
+                    .find(|d| {
+                        let cand_eff = effective_serial(&d.path);
+                        reset_reinsert_matches(
+                            self.target_serial.as_deref(),
+                            self.target_effective_serial.as_deref(),
+                            self.target_ids,
+                            d.serial.as_deref(),
+                            cand_eff.as_deref(),
+                            d.ids,
+                        )
+                    })
+                    .map(|d| d.path.clone());
+            }
+        }
+        match fire {
+            Some(path) => ResetPoll::Fire(path),
+            None => {
+                // Refresh the snapshot only while the armed key is seen.
+                // Once a scan misses it, it stays frozen: a scan that left
+                // the key out must not take its entry with it, and after
+                // removal a fresh connection whose CCID serial isn't
+                // readable yet has to still count as fresh on the next
+                // poll, or the retry could never fire.
+                if !self.saw_removal && self.absent_scans == 0 {
+                    self.prev_devices = current.iter().map(HidIdentity::of).collect();
+                }
+                ResetPoll::Wait
+            }
+        }
+    }
 }
 
 /// The device an open rename field is bound to, pinned when the field opens so
@@ -910,6 +1094,7 @@ impl std::fmt::Display for ForcedPinChange {
 impl std::error::Error for ForcedPinChange {}
 
 /// One FIDO HID device as the armed-reset poll sees it.
+#[derive(Clone)]
 struct FidoHid {
     path: std::path::PathBuf,
     serial: Option<String>,
@@ -9839,6 +10024,7 @@ impl App {
                 for_device: self.selected_device.clone(),
                 prev_devices: devices.iter().map(HidIdentity::of).collect(),
                 saw_removal: false,
+                absent_scans: 0,
                 serial_less,
             });
         }
@@ -10083,8 +10269,13 @@ impl App {
     }
 
     /// The FIDO HID devices connected right now, or `None` when the scan
-    /// itself failed. A failed scan says nothing about what is connected, so
-    /// the armed-reset poll must not read it as "the armed key is gone".
+    /// returned an error. A failed scan says nothing about what is connected,
+    /// so the armed-reset poll skips it rather than read it as "the armed key
+    /// is gone". Not every failure comes back as `None`, though: some
+    /// platforms report a failed scan as an empty or partial list. That is
+    /// why, where an unplug also drops the key from the poll's snapshot, the
+    /// key has to be missing from two scans in a row
+    /// ([`removal_scans_needed`]).
     fn scan_fido_devices() -> Option<Vec<FidoHid>> {
         keyroost_hid::enumerate().ok().map(|hids| {
             hids.into_iter()
@@ -10175,103 +10366,32 @@ impl App {
             }
             return;
         }
-        // A failed scan is skipped, not read as an empty list: that would
-        // count as the unplug, and the key, still connected, would then be
-        // taken for the re-insert and sent a reset with no replug behind it.
-        let Some(current) = Self::scan_fido_devices() else {
+        let scan = Self::scan_fido_devices();
+        let Some(arm) = self.reset_arm.as_mut() else {
             return;
         };
-        let mut fire: Option<std::path::PathBuf> = None;
-        let mut refuse: Option<String> = None;
-        if let Some(arm) = self.reset_arm.as_mut() {
-            if let Some(target_serial) = arm.target_serial.clone() {
-                // HID-serial mode: identity is port-independent.
-                let here = current
-                    .iter()
-                    .find(|d| d.serial.as_deref() == Some(target_serial.as_str()));
-                match here {
-                    None => arm.saw_removal = true, // unplugged
-                    Some(d) if arm.saw_removal => fire = Some(d.path.clone()),
-                    Some(_) => {}
-                }
-            } else {
-                // Effective-serial mode (no HID serial, e.g. most YubiKeys):
-                // the armed path leaving is the unplug; a fresh *connection*
-                // (see `HidIdentity` — not just a path unseen before, since a
-                // hidraw minor number can be recycled straight back onto the
-                // replugged key) is accepted as the re-insert only when its
-                // stable identity matches the armed key's. The CCID probe
-                // runs only for a model-matching fresh connection, and only
-                // after removal.
-                let present = |p: &std::path::PathBuf| current.iter().any(|d| &d.path == p);
-                match &arm.target_path {
-                    Some(t) if !present(t) => {
-                        arm.saw_removal = true;
-                        // Gone, so the same path later is a new connection
-                        // (a same-port replug on Windows keeps the path).
-                        forget_departed_node(&mut arm.prev_devices, t);
-                    }
-                    _ => {}
-                }
-                if arm.saw_removal && arm.serial_less {
-                    // Same USB ids, a fresh connection, no serial of its own;
-                    // then it fires only as the one device connected.
-                    let cand = current
-                        .iter()
-                        .filter(|d| arm.target_ids == Some(d.ids) && d.serial.is_none())
-                        .find(|d| fresh_hid_connection(&arm.prev_devices, &HidIdentity::of(d)));
-                    if let Some(d) = cand {
-                        let now =
-                            keyroost_resolve::enumerate_with(&keyroost_resolve::EnumerateOptions {
-                                skip_key_names: true,
-                                skip_protocol_asks: true,
-                                skip_molto2_reads: true,
-                                ..Default::default()
-                            })
-                            .unwrap_or_default();
-                        match keyroost_resolve::serial_less_reinsert(&d.path, &now) {
-                            keyroost_resolve::SerialLessReinsert::Fire => {
-                                fire = Some(d.path.clone());
-                            }
-                            keyroost_resolve::SerialLessReinsert::Wait => {}
-                            keyroost_resolve::SerialLessReinsert::Refuse => {
-                                let others: Vec<String> = now
-                                    .iter()
-                                    .filter(|r| r.hid_path.as_deref() != Some(d.path.as_path()))
-                                    .map(|r| r.name.clone().unwrap_or_else(|| r.model_title()))
-                                    .collect();
-                                refuse = Some(serial_less_reset_refusal(&others));
-                            }
-                        }
-                    }
-                } else if arm.saw_removal {
-                    fire = current
-                        .iter()
-                        .filter(|d| arm.target_ids.is_none() || arm.target_ids == Some(d.ids))
-                        .filter(|d| fresh_hid_connection(&arm.prev_devices, &HidIdentity::of(d)))
-                        .find(|d| {
-                            let cand_eff = Self::fido_effective_serial(&d.path);
-                            reset_reinsert_matches(
-                                arm.target_serial.as_deref(),
-                                arm.target_effective_serial.as_deref(),
-                                arm.target_ids,
-                                d.serial.as_deref(),
-                                cand_eff.as_deref(),
-                                d.ids,
-                            )
-                        })
-                        .map(|d| d.path.clone());
-                }
+        let verdict = arm.poll(
+            scan.as_deref(),
+            Self::fido_effective_serial,
+            || {
+                keyroost_resolve::enumerate_with(&keyroost_resolve::EnumerateOptions {
+                    skip_key_names: true,
+                    skip_protocol_asks: true,
+                    skip_molto2_reads: true,
+                    ..Default::default()
+                })
+                .unwrap_or_default()
+            },
+            SAME_PORT_REPLUG_KEEPS_PATH,
+        );
+        match verdict {
+            ResetPoll::Wait => {}
+            ResetPoll::Refuse(msg) => {
+                self.reset_arm = None;
+                self.security_keys.reset = ResetDialog::default();
+                self.refuse_fido_reset(msg);
             }
-        }
-        if let Some(msg) = refuse {
-            self.reset_arm = None;
-            self.security_keys.reset = ResetDialog::default();
-            self.refuse_fido_reset(msg);
-            return;
-        }
-        match fire {
-            Some(path) => {
+            ResetPoll::Fire(path) => {
                 // The replug window is one-shot. If the worker is mid-job the
                 // submission is refused — keep the arm (and the stale
                 // prev_devices, so the fresh connection still counts as new)
@@ -10280,17 +10400,6 @@ impl App {
                 if self.submit_reset_path(path) {
                     self.reset_arm = None;
                     self.security_keys.reset = ResetDialog::default();
-                }
-            }
-            None => {
-                if let Some(arm) = self.reset_arm.as_mut() {
-                    // Refresh the snapshot only until the unplug. After
-                    // removal it must stay frozen: a fresh connection whose CCID
-                    // serial isn't readable yet has to still count as fresh
-                    // on the next poll, or the retry could never fire.
-                    if !arm.saw_removal {
-                        arm.prev_devices = current.iter().map(HidIdentity::of).collect();
-                    }
                 }
             }
         }
@@ -30206,6 +30315,7 @@ mod tests {
             for_device: app.selected_device.clone(),
             prev_devices: Vec::new(),
             saw_removal: true,
+            absent_scans: 0,
             serial_less: false,
         });
 
@@ -30237,6 +30347,7 @@ mod tests {
             for_device: Some(for_device.into()),
             prev_devices: Vec::new(),
             saw_removal: true,
+            absent_scans: 0,
             serial_less: false,
         }
     }
@@ -35662,6 +35773,274 @@ mod tests {
 
         assert!(fresh_hid_connection(&snapshot, &back));
         assert!(!fresh_hid_connection(&snapshot, &at("/dev/hidraw1", 4)));
+        assert!(
+            !fresh_hid_connection(&snapshot, &at("/dev/hidraw0", 8)),
+            "the entry is kept: the same address back is the same attach"
+        );
+    }
+
+    // ---- The armed-reset poll, driven through `ResetArm::poll` ----
+
+    const EPASS_IDS: (u16, u16) = (0x096E, 0x0853);
+    const WIN_ARMED: &str = r"\\?\HID#VID_096E&PID_0853&MI_02#8&1A&0&0000#{4d1e55b2}";
+    const WIN_OTHER: &str = r"\\?\HID#VID_1050&PID_0407&MI_01#8&2B&0&0000#{4d1e55b2}";
+
+    /// A Windows-shaped FIDO HID device with no USB serial.
+    fn win_hid(path: &str, port: u8) -> FidoHid {
+        FidoHid {
+            path: path.into(),
+            serial: None,
+            ids: EPASS_IDS,
+            usb_device: Some(keyroost_hid::UsbDeviceKey::win_node(&format!(
+                r"USB\VID_096E&PID_0853\6&11223344&0&{port}"
+            ))),
+        }
+    }
+
+    /// A Linux-shaped FIDO HID device with no USB serial, at a bus/address.
+    fn linux_hid(path: &str, addr: u8) -> FidoHid {
+        FidoHid {
+            path: path.into(),
+            serial: None,
+            ids: EPASS_IDS,
+            usb_device: Some(keyroost_hid::UsbDeviceKey::BusAddr(1, addr)),
+        }
+    }
+
+    /// An arm in effective-serial mode (no HID serial; the resolver reads
+    /// "AAA" from the key's card), set while `connected` was the scan.
+    fn effective_serial_arm(armed: &FidoHid, connected: &[FidoHid]) -> ResetArm {
+        ResetArm {
+            target_serial: None,
+            target_path: Some(armed.path.clone()),
+            target_ids: Some(armed.ids),
+            target_effective_serial: Some("AAA".into()),
+            for_device: Some("serial:AAA".into()),
+            prev_devices: connected.iter().map(HidIdentity::of).collect(),
+            saw_removal: false,
+            absent_scans: 0,
+            serial_less: false,
+        }
+    }
+
+    /// Feed `scans` (`None` = a failed scan) to `arm` in order; the verdicts.
+    /// `serial_at` is the resolver's identity of the device at a path.
+    fn drive(
+        arm: &mut ResetArm,
+        scans: &[Option<Vec<FidoHid>>],
+        serial_at: impl Fn(&std::path::Path) -> Option<String>,
+        same_port_keeps_path: bool,
+    ) -> Vec<ResetPoll> {
+        scans
+            .iter()
+            .map(|scan| {
+                arm.poll(
+                    scan.as_deref(),
+                    &serial_at,
+                    || panic!("the serial-less rule is not part of these runs"),
+                    same_port_keeps_path,
+                )
+            })
+            .collect()
+    }
+
+    /// The key on `WIN_ARMED` is the armed one ("AAA"); anything else is not.
+    fn armed_on_win_path(path: &std::path::Path) -> Option<String> {
+        (path == std::path::Path::new(WIN_ARMED)).then(|| "AAA".to_string())
+    }
+
+    fn never_fires(verdicts: &[ResetPoll]) -> bool {
+        verdicts.iter().all(|v| *v == ResetPoll::Wait)
+    }
+
+    #[test]
+    fn a_failed_scan_leaves_the_arm_and_its_snapshot_untouched() {
+        let armed = win_hid(WIN_ARMED, 2);
+        let other = win_hid(WIN_OTHER, 3);
+        for keeps_path in [true, false] {
+            let mut arm = effective_serial_arm(&armed, &[armed.clone(), other.clone()]);
+            assert_eq!(
+                arm.poll(None, armed_on_win_path, Vec::new, keeps_path),
+                ResetPoll::Wait
+            );
+            assert!(!arm.saw_removal);
+            assert_eq!(arm.absent_scans, 0);
+            let paths: Vec<_> = arm.prev_devices.iter().map(|p| p.path.clone()).collect();
+            assert_eq!(paths, [armed.path.clone(), other.path.clone()]);
+        }
+    }
+
+    /// A scan that leaves out a key that is still connected (an interface
+    /// Windows could not open, a glitch) is not the unplug, and the key is
+    /// never sent a reset for it, however the scans around it go.
+    #[test]
+    fn one_scan_that_omits_a_connected_key_never_fires() {
+        let armed = win_hid(WIN_ARMED, 2);
+        let other = win_hid(WIN_OTHER, 3);
+        let both = Some(vec![armed.clone(), other.clone()]);
+        let omitted = Some(vec![other.clone()]);
+        let mut arm = effective_serial_arm(&armed, &[armed.clone(), other.clone()]);
+        let verdicts = drive(
+            &mut arm,
+            &[
+                both.clone(),
+                omitted.clone(),
+                both.clone(),
+                both.clone(),
+                omitted.clone(),
+                None,
+                both.clone(),
+                Some(Vec::new()),
+                both.clone(),
+                both,
+            ],
+            armed_on_win_path,
+            true,
+        );
+        assert!(never_fires(&verdicts), "{verdicts:?}");
+        assert!(!arm.saw_removal);
+        assert!(
+            arm.prev_devices.iter().any(|p| p.path == armed.path),
+            "the key's entry survives a scan that left it out"
+        );
+    }
+
+    #[test]
+    fn a_key_present_in_every_scan_never_fires() {
+        let armed = win_hid(WIN_ARMED, 2);
+        let other = win_hid(WIN_OTHER, 3);
+        for keeps_path in [true, false] {
+            let mut arm = effective_serial_arm(&armed, &[armed.clone()]);
+            let scans = vec![
+                Some(vec![armed.clone()]),
+                Some(vec![armed.clone(), other.clone()]),
+                Some(vec![other.clone(), armed.clone()]),
+                Some(vec![armed.clone()]),
+            ];
+            let verdicts = drive(&mut arm, &scans, armed_on_win_path, keeps_path);
+            assert!(never_fires(&verdicts), "{verdicts:?}");
+            assert!(!arm.saw_removal);
+        }
+    }
+
+    /// The fix itself: the key unplugged (missing from two scans in a row)
+    /// and plugged back into the same port on Windows comes back on the path
+    /// it left, and is taken for the re-insert.
+    #[test]
+    fn a_real_same_port_replug_on_windows_fires_on_the_armed_path() {
+        let armed = win_hid(WIN_ARMED, 2);
+        let other = win_hid(WIN_OTHER, 3);
+        let mut arm = effective_serial_arm(&armed, &[armed.clone(), other.clone()]);
+        let verdicts = drive(
+            &mut arm,
+            &[
+                Some(vec![armed.clone(), other.clone()]),
+                Some(vec![other.clone()]),
+                None,
+                Some(vec![other.clone()]),
+                Some(vec![other.clone(), armed.clone()]),
+            ],
+            armed_on_win_path,
+            true,
+        );
+        assert_eq!(
+            verdicts.last(),
+            Some(&ResetPoll::Fire(armed.path.clone())),
+            "{verdicts:?}"
+        );
+        assert!(never_fires(&verdicts[..verdicts.len() - 1]));
+        assert!(
+            arm.prev_devices.iter().any(|p| p.path == other.path),
+            "the key that stayed is still in the snapshot"
+        );
+    }
+
+    /// After a real unplug, a different key that arrives on the armed key's
+    /// old path (moved into that port) is a fresh connection but not the
+    /// armed key, so it is not reset.
+    #[test]
+    fn a_different_key_on_the_armed_path_after_removal_does_not_fire() {
+        let armed = win_hid(WIN_ARMED, 2);
+        let mut arm = effective_serial_arm(&armed, &[armed.clone()]);
+        let verdicts = drive(
+            &mut arm,
+            &[
+                Some(vec![armed.clone()]),
+                Some(Vec::new()),
+                Some(Vec::new()),
+                Some(vec![armed.clone()]),
+                Some(vec![armed.clone()]),
+            ],
+            |path| (path == std::path::Path::new(WIN_ARMED)).then(|| "BBB".to_string()),
+            true,
+        );
+        assert!(never_fires(&verdicts), "{verdicts:?}");
+        assert!(arm.saw_removal);
+    }
+
+    /// Linux keeps its old rule: one scan without the key is the unplug, and
+    /// what decides the re-insert is the USB bus/address. A key that only
+    /// went missing from a scan and is back at the same address is the same
+    /// attach, so it is not reset; a real replug (new address) is.
+    #[test]
+    fn on_linux_a_key_back_at_the_same_bus_address_is_not_fresh() {
+        let armed = linux_hid("/dev/hidraw0", 8);
+        let serial_at = |path: &std::path::Path| {
+            (path == std::path::Path::new("/dev/hidraw0")).then(|| "AAA".to_string())
+        };
+        let mut arm = effective_serial_arm(&armed, &[armed.clone()]);
+        let verdicts = drive(
+            &mut arm,
+            &[
+                Some(vec![armed.clone()]),
+                Some(Vec::new()),
+                Some(vec![armed.clone()]),
+                Some(vec![armed.clone()]),
+            ],
+            serial_at,
+            false,
+        );
+        assert!(never_fires(&verdicts), "{verdicts:?}");
+        assert!(arm.saw_removal, "one scan without the key, as before");
+
+        let replugged = linux_hid("/dev/hidraw0", 9);
+        assert_eq!(
+            arm.poll(Some(&[replugged]), serial_at, Vec::new, false),
+            ResetPoll::Fire("/dev/hidraw0".into())
+        );
+    }
+
+    /// The HID-serial mode takes the same two scans on Windows: one scan that
+    /// leaves the key out, then the key again, sends nothing.
+    #[test]
+    fn hid_serial_mode_on_windows_needs_two_scans_without_the_key() {
+        let mut with_serial = win_hid(WIN_ARMED, 2);
+        with_serial.serial = Some("S1".into());
+        let mut arm = effective_serial_arm(&with_serial, &[with_serial.clone()]);
+        arm.target_serial = Some("S1".into());
+        let blip = drive(
+            &mut arm,
+            &[
+                Some(vec![with_serial.clone()]),
+                Some(Vec::new()),
+                Some(vec![with_serial.clone()]),
+            ],
+            |_| None,
+            true,
+        );
+        assert!(never_fires(&blip), "{blip:?}");
+        assert!(!arm.saw_removal);
+        let replug = drive(
+            &mut arm,
+            &[
+                Some(Vec::new()),
+                Some(Vec::new()),
+                Some(vec![with_serial.clone()]),
+            ],
+            |_| None,
+            true,
+        );
+        assert_eq!(replug.last(), Some(&ResetPoll::Fire(with_serial.path)));
     }
 }
 
