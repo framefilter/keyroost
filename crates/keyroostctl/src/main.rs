@@ -7777,16 +7777,31 @@ impl std::fmt::Display for NoReplugSeen {
 
 impl std::error::Error for NoReplugSeen {}
 
+/// How many scans in a row must miss the armed key's node before the replug
+/// wait takes it as unplugged.
+///
+/// A scan can come back without a key that is still connected: Windows leaves
+/// out a HID interface it could not open, Linux one whose sysfs entry could not
+/// be read, and on some platforms a failed scan is reported as an empty list
+/// rather than an error. Since the armed path coming back counts as the replug,
+/// one such scan followed by a normal one would read as an unplug and replug
+/// that never happened. A real unplug takes far longer than two polls.
+const REPLUG_REMOVAL_SCANS: u8 = 2;
+
 /// Watches successive HID scans for the armed key's node to disappear and a
 /// FIDO node to (re)appear afterwards.
 ///
-/// "Reappeared" means the armed path itself coming back, or a node that was
-/// not there when the wait started (a replugged key may come back under a new
-/// path). A key that was already connected elsewhere is never mistaken for the
-/// replug, and nothing counts while the armed node is still present.
+/// "Disappear" means missing from [`REPLUG_REMOVAL_SCANS`] scans in a row; a
+/// scan that shows the node again starts the count over. "Reappeared" means the
+/// armed path itself coming back, or a node that was not there when the wait
+/// started (a replugged key may come back under a new path). A key that was
+/// already connected elsewhere is never mistaken for the replug, and nothing
+/// counts while the armed node is still present.
 struct ReplugWatch<'a> {
     armed: &'a Path,
     baseline: Option<Vec<std::path::PathBuf>>,
+    /// Scans in a row without the armed node, until the removal is confirmed.
+    absent_scans: u8,
     removed: bool,
 }
 
@@ -7795,15 +7810,22 @@ impl<'a> ReplugWatch<'a> {
         ReplugWatch {
             armed,
             baseline: None,
+            absent_scans: 0,
             removed: false,
         }
     }
 
-    /// Feed one scan of FIDO HID node paths; true once the replug is complete.
+    /// Feed one successful scan of FIDO HID node paths; true once the replug
+    /// is complete.
     fn observe(&mut self, nodes: &[std::path::PathBuf]) -> bool {
         let baseline = self.baseline.get_or_insert_with(|| nodes.to_vec());
         if !self.removed {
             if nodes.iter().any(|n| n == self.armed) {
+                self.absent_scans = 0;
+                return false;
+            }
+            self.absent_scans += 1;
+            if self.absent_scans < REPLUG_REMOVAL_SCANS {
                 return false;
             }
             self.removed = true;
@@ -19540,20 +19562,89 @@ mod cli_tests {
         // Same node path back.
         let (r, t) = scripted_replug_wait(
             "/dev/hidraw3",
-            &[&["/dev/hidraw3"], &["/dev/hidraw3"], &[], &["/dev/hidraw3"]],
+            &[
+                &["/dev/hidraw3"],
+                &["/dev/hidraw3"],
+                &[],
+                &[],
+                &["/dev/hidraw3"],
+            ],
         );
         assert!(r.is_ok());
-        assert_eq!(t, REPLUG_POLL * 3);
+        assert_eq!(t, REPLUG_POLL * 4);
         // Renumbered on the way back, with another key present throughout.
         let (r, _) = scripted_replug_wait(
             "/dev/hidraw3",
             &[
                 &["/dev/hidraw1", "/dev/hidraw3"],
                 &["/dev/hidraw1"],
+                &["/dev/hidraw1"],
                 &["/dev/hidraw1", "/dev/hidraw7"],
             ],
         );
         assert!(r.is_ok());
+        // A failed scan between the two that miss the node is skipped, not a
+        // break in the run.
+        let (r, _) = scripted_replug_wait_with_failures(
+            "/dev/hidraw3",
+            &[
+                Some(&["/dev/hidraw3"]),
+                Some(&[]),
+                None,
+                Some(&[]),
+                Some(&["/dev/hidraw3"]),
+            ],
+        );
+        assert!(r.is_ok());
+    }
+
+    /// One scan that leaves out a key that is still connected (an interface
+    /// that could not be opened, a failed scan reported as an empty list) is
+    /// not the unplug, so the key showing up again is not the replug.
+    #[test]
+    fn replug_wait_does_not_take_one_scan_without_the_key_for_the_unplug() {
+        let (r, _) =
+            scripted_replug_wait("/dev/hidraw3", &[&["/dev/hidraw3"], &[], &["/dev/hidraw3"]]);
+        assert!(r.is_err());
+        // Single misses that keep coming never add up to an unplug.
+        let (r, _) = scripted_replug_wait(
+            "/dev/hidraw3",
+            &[
+                &["/dev/hidraw3"],
+                &[],
+                &["/dev/hidraw3"],
+                &[],
+                &["/dev/hidraw3"],
+            ],
+        );
+        assert!(r.is_err());
+        // Nor does a node that was not there at the start, seen in the scan
+        // right after a single miss.
+        let (r, _) = scripted_replug_wait(
+            "/dev/hidraw3",
+            &[&["/dev/hidraw3"], &[], &["/dev/hidraw3", "/dev/hidraw7"]],
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn replug_watch_confirms_the_removal_over_two_scans_in_a_row() {
+        let nodes = |n: &[&str]| -> Vec<std::path::PathBuf> {
+            n.iter().map(std::path::PathBuf::from).collect()
+        };
+        let mut watch = ReplugWatch::new(Path::new("/dev/hidraw3"));
+        assert!(!watch.observe(&nodes(&["/dev/hidraw3"])));
+        assert!(!watch.observe(&nodes(&[])));
+        assert!(
+            !watch.removed,
+            "one scan without the node is not the unplug"
+        );
+        assert!(!watch.observe(&nodes(&["/dev/hidraw3"])));
+        assert_eq!(watch.absent_scans, 0, "the node back starts the count over");
+        assert!(!watch.observe(&nodes(&[])));
+        assert!(!watch.observe(&nodes(&[])));
+        assert!(watch.removed);
+        assert!(watch.observe(&nodes(&["/dev/hidraw3"])));
     }
 
     #[test]
