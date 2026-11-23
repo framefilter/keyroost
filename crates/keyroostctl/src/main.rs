@@ -174,6 +174,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OtpCmd,
     },
+    /// Show codes and manage the OTP accounts on a Feitian FIDO key.
+    ///
+    /// Talks to the key over the smart-card interface (PC/SC). This is
+    /// Feitian's own OTP applet, distinct from the Yubico/Trussed applet the
+    /// `oath` group manages and from Token2's (`otp`).
+    Feitian {
+        #[command(subcommand)]
+        cmd: FtotpCmd,
+    },
     /// Manage the OpenPGP card applet: info, keys, sign, decrypt, PINs,
     /// cardholder details, and reset.
     ///
@@ -211,16 +220,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProgCmd,
     },
-    /// Factory-reset EVERY resettable applet on the selected key: OATH,
-    /// OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a typed
-    /// confirmation (`--yes` to skip).
+    /// Factory-reset every applet keyroost can reset on the selected key:
+    /// OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a
+    /// typed confirmation (`--yes` to skip).
     ///
-    /// Wipes all credentials, codes, keys, and PINs (including a name stored
-    /// on the key); each applet that
+    /// Wipes all credentials, codes, keys, and PINs in those applets
+    /// (including a name stored on the key); each applet that
     /// completes comes back in factory condition, and every step reports its
     /// own outcome. On a USB key the FIDO2 step ends with an unplug/replug +
     /// touch; a card in a smart-card reader is reset in place instead (no
-    /// replug, no touch).
+    /// replug, no touch). Feitian OTP accounts are not reset; remove them
+    /// with `feitian delete`.
     FactoryReset {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -2304,6 +2314,182 @@ enum OathPasswordCmd {
         #[command(flatten)]
         access: OathAccess,
     },
+}
+
+/// Subcommands for the OTP applet on Feitian FIDO keys.
+#[derive(Subcommand)]
+enum FtotpCmd {
+    /// Show the applet version and which slots have an access code.
+    Info {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+    /// List the accounts stored on the key.
+    List {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+    /// Print the current code for one account, identified by app and
+    /// account. The key computes it once it is touched.
+    Code {
+        /// Application/issuer name as stored (may be empty).
+        #[arg(long, default_value = "")]
+        app: String,
+        /// Account name as stored (`--json` list output shows the app and the
+        /// account apart, for a name that has a colon in it).
+        #[arg(long)]
+        account: String,
+        /// Account type (TOTP or HOTP), only needed to tell apart two accounts
+        /// with the same app and account.
+        #[arg(long = "type", value_enum)]
+        oath_type: Option<OathTypeArg>,
+        /// TOTP period in seconds (30 or 60), only needed to tell apart two
+        /// accounts with the same app and account.
+        #[arg(long, value_parser = parse_ftotp_period)]
+        period: Option<u32>,
+        /// The slot the account is in (default: wherever it is found).
+        #[arg(long, short = 's', value_enum)]
+        slot: Option<FtotpSlotArg>,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+    /// Add a TOTP or HOTP account to the key's default slot.
+    ///
+    /// The seed comes from an environment variable, stdin or, with neither,
+    /// a hidden prompt — never argv; --encoding says how it is written
+    /// (base32 unless --encoding hex). The key keeps the period in the
+    /// account's name, stored as "30:app_#_account".
+    Add {
+        /// Application/issuer name (may be empty).
+        #[arg(long, default_value = "")]
+        app: String,
+        /// Account name (the login at the service).
+        #[arg(long)]
+        account: String,
+        /// Account type: time-based (TOTP) or counter-based (HOTP). An HOTP
+        /// account starts its counter at 0.
+        #[arg(long = "type", value_enum, default_value_t = OathTypeArg::Totp)]
+        oath_type: OathTypeArg,
+        /// The seed: env:NAME reads that environment variable, stdin reads
+        /// one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        seed: Option<SecretSource>,
+        /// How --seed is written.
+        #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
+        encoding: SeedEncoding,
+        /// HMAC algorithm.
+        #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
+        algorithm: AlgoArg,
+        /// OTP digit count (6 or 8).
+        #[arg(long, default_value_t = 6, value_parser = parse_ftotp_digits)]
+        digits: u8,
+        /// TOTP period in seconds (30 or 60). Ignored for HOTP.
+        #[arg(long, default_value_t = 30, value_parser = parse_ftotp_period)]
+        period: u32,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+    /// Add every code in an authenticator export to this key's default slot.
+    ///
+    /// FILE is an Aegis export (plain or encrypted), a 2FAS export, a list of
+    /// otpauth:// URIs, or a QR screenshot (including a Google Authenticator
+    /// export). keyroost reads the key first and shows what each code becomes:
+    /// codes already on the key with the same app and account are skipped
+    /// unless --replace, and codes the key can't store are listed with the
+    /// reason. Asks once before writing (`--yes` to skip); with --dry-run
+    /// nothing is written.
+    Import {
+        /// The export to read.
+        #[arg(long = "in", short = 'i', value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// The password of an encrypted Aegis export: env:NAME or stdin
+        /// (hidden when typed at a terminal). With neither, a terminal asks
+        /// when the file needs one.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        file_password: Option<SecretSource>,
+        /// Replace codes already on the key that have the same app and account,
+        /// whatever their type or period. The old code is removed first; if
+        /// adding the new one then fails, the old one is gone.
+        #[arg(long)]
+        replace: bool,
+        /// Show what would be added, replaced or skipped; nothing is written.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Delete one account by app and account. Irreversible: asks first
+    /// (`--yes` to skip).
+    Delete {
+        /// Application/issuer name as stored (may be empty).
+        #[arg(long, default_value = "")]
+        app: String,
+        /// Account name as stored (`--json` list output shows the app and the
+        /// account apart, for a name that has a colon in it).
+        #[arg(long)]
+        account: String,
+        /// Account type (TOTP or HOTP), only needed to tell apart two accounts
+        /// with the same app and account.
+        #[arg(long = "type", value_enum)]
+        oath_type: Option<OathTypeArg>,
+        /// TOTP period in seconds (30 or 60), only needed to tell apart two
+        /// accounts with the same app and account.
+        #[arg(long, value_parser = parse_ftotp_period)]
+        period: Option<u32>,
+        /// The slot the account is in (default: wherever it is found).
+        #[arg(long, short = 's', value_enum)]
+        slot: Option<FtotpSlotArg>,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+/// A slot of the Feitian OTP applet.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum FtotpSlotArg {
+    /// The default slot, where Feitian's apps store accounts.
+    Default,
+    /// Keyboard slot 1.
+    #[value(name = "1")]
+    One,
+    /// Keyboard slot 2.
+    #[value(name = "2")]
+    Two,
+}
+
+impl FtotpSlotArg {
+    fn to_slot(self) -> keyroost_feitianotp::Slot {
+        match self {
+            FtotpSlotArg::Default => keyroost_feitianotp::Slot::Default,
+            FtotpSlotArg::One => keyroost_feitianotp::Slot::Keyboard1,
+            FtotpSlotArg::Two => keyroost_feitianotp::Slot::Keyboard2,
+        }
+    }
+}
+
+/// `feitian add --digits`: the applet takes 6 or 8.
+fn parse_ftotp_digits(s: &str) -> Result<u8, String> {
+    match s {
+        "6" => Ok(6),
+        "8" => Ok(8),
+        _ => Err("the key stores codes of 6 or 8 digits".to_owned()),
+    }
+}
+
+/// `feitian add --period`: the name on the key holds 30 or 60.
+fn parse_ftotp_period(s: &str) -> Result<u32, String> {
+    match s {
+        "30" => Ok(30),
+        "60" => Ok(60),
+        _ => Err("the key keeps a period of 30 or 60 seconds".to_owned()),
+    }
 }
 
 /// How a seed is written: base32 (what services show) or hex.
@@ -6012,6 +6198,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // The Feitian OTP applet is one more CCID applet reached over PC/SC.
+    if let Cmd::Feitian { cmd } = cmd {
+        run_ftotp(cmd, cli.debug)?;
+        return Ok(());
+    }
+
     // OpenPGP likewise talks to a security key's CCID applet over PC/SC.
     if let Cmd::Openpgp { cmd } = cmd {
         run_openpgp(cmd, cli.debug)?;
@@ -6942,6 +7134,9 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
                 if p.has_otp {
                     applets.push("OTP");
                 }
+                if p.has_feitian_otp {
+                    applets.push("Feitian OTP");
+                }
                 let list = if applets.is_empty() {
                     "(none detected)".to_string()
                 } else {
@@ -7236,6 +7431,12 @@ fn run_factory_reset(
     if plan.contains(&ResetStep::Fido) && dev.hid_path.is_some() {
         refuse_serial_less_reset_with_others(&dev)?;
     }
+    // What no step resets is said before the question and again with the
+    // result, as the app does.
+    let keeps = factory_reset_keeps_note(dev.caps);
+    if let Some(note) = &keeps {
+        output::note(note);
+    }
     let asked =
         crate::prompt::confirm_typed_then_read(&dev, yes, "reset", &factory_reset_action(&labels))?;
     // The PIV credential, if one was given, is read now — after the question
@@ -7416,7 +7617,18 @@ fn run_factory_reset(
 
     let (summary, verdict) = factory_reset_summary(&reports);
     outln!("{summary}");
+    if let Some(note) = &keeps {
+        output::note(note);
+    }
     verdict.map_err(Into::into)
+}
+
+/// What a factory reset of a key with `caps` leaves, and how to remove it
+/// here: the shared words ([`keyroost_resolve::factory_reset_keeps`]) and
+/// the command that does it.
+fn factory_reset_keeps_note(caps: keyroost_resolve::Caps) -> Option<String> {
+    keyroost_resolve::factory_reset_keeps(caps)
+        .map(|keeps| format!("{keeps}; remove them with `keyroostctl feitian delete`"))
 }
 
 /// The closing line of a factory reset and whether the command succeeded.
@@ -8665,6 +8877,493 @@ fn oath_type_str(t: keyroost_oath::OathType) -> &'static str {
         keyroost_oath::OathType::Totp => "TOTP",
         keyroost_oath::OathType::Hotp => "HOTP",
     }
+}
+
+fn ftotp_type_str(t: keyroost_feitianotp::OathType) -> &'static str {
+    match t {
+        keyroost_feitianotp::OathType::Totp => "TOTP",
+        keyroost_feitianotp::OathType::Hotp => "HOTP",
+    }
+}
+
+/// `(human, json)` names of a Feitian OTP algorithm, as `oath list` writes
+/// its own.
+fn ftotp_algo_strs(a: keyroost_feitianotp::Algorithm) -> (&'static str, &'static str) {
+    match a {
+        keyroost_feitianotp::Algorithm::Sha1 => ("SHA1", "sha1"),
+        keyroost_feitianotp::Algorithm::Sha256 => ("SHA256", "sha256"),
+    }
+}
+
+/// Open the Feitian OTP applet on the key `reader` selects.
+fn open_ftotp(
+    reader: Option<&str>,
+    debug: bool,
+) -> Result<keyroost_transport::FeitianOtpSession, Box<dyn std::error::Error>> {
+    let name = crate::target::reader_for(Need::FeitianOtp, reader)?;
+    Ok(keyroost_transport::FeitianOtpSession::open_traced(
+        &name, debug,
+    )?)
+}
+
+/// Say on stderr what a Feitian OTP listing leaves out, so it also reaches
+/// `--json` users without changing the output: entries that are not shown,
+/// and keyboard slots that did not answer.
+fn warn_partial_ftotp_listing(listing: &keyroost_transport::FeitianOtpListing) {
+    if listing.skipped > 0 {
+        output::warn(&format!(
+            "{} entr{} on the key {} not shown (not a TOTP or HOTP account, or not \
+             readable); the listing is incomplete",
+            listing.skipped,
+            if listing.skipped == 1 { "y" } else { "ies" },
+            if listing.skipped == 1 { "is" } else { "are" },
+        ));
+    }
+    for (slot, sw) in &listing.unread {
+        output::warn(&format!(
+            "slot {} did not answer (status {sw:04X}); any accounts in it are not listed",
+            slot.label()
+        ));
+    }
+}
+
+/// How `feitian` names an account to the user, as `otp` does: `app:account`,
+/// or the account alone when it has no app.
+fn ftotp_label(app: &str, account: &str) -> String {
+    keyroost_feitianotp::account_label(app, account)
+}
+
+/// Why `feitian add` refuses `app` / `account`: the default slot (where it
+/// writes) already holds that account, under any type or period. Says how
+/// to delete the old one.
+fn ftotp_add_refusal(
+    listing: &keyroost_transport::FeitianOtpListing,
+    app: &str,
+    account: &str,
+) -> Option<String> {
+    use keyroost_feitianotp as fotp;
+    listing
+        .credentials
+        .iter()
+        .any(|c| {
+            c.slot == fotp::Slot::Default && fotp::holds_account(&c.name, c.oath_type, app, account)
+        })
+        .then(|| {
+            let app_flag = if app.is_empty() {
+                String::new()
+            } else {
+                format!(" --app {app:?}")
+            };
+            format!(
+                "{} (delete it first: keyroostctl feitian delete{app_flag} --account {account:?})",
+                fotp::already_on_key(app, account)
+            )
+        })
+}
+
+/// What `feitian code` and `feitian delete` are told besides the app and
+/// account: the optional `--slot`, `--type` and `--period`, which only tell
+/// apart accounts that share an app and account.
+#[derive(Clone, Copy, Default)]
+struct FtotpPick {
+    slot: Option<keyroost_feitianotp::Slot>,
+    oath_type: Option<keyroost_feitianotp::OathType>,
+    period: Option<u32>,
+}
+
+impl FtotpPick {
+    fn new(
+        slot: Option<FtotpSlotArg>,
+        oath_type: Option<OathTypeArg>,
+        period: Option<u32>,
+    ) -> Self {
+        FtotpPick {
+            slot: slot.map(FtotpSlotArg::to_slot),
+            oath_type: oath_type.map(|t| match t {
+                OathTypeArg::Totp => keyroost_feitianotp::OathType::Totp,
+                OathTypeArg::Hotp => keyroost_feitianotp::OathType::Hotp,
+            }),
+            period,
+        }
+    }
+
+    fn admits(&self, c: &keyroost_feitianotp::Credential) -> bool {
+        self.slot.is_none_or(|s| c.slot == s)
+            && self.oath_type.is_none_or(|t| c.oath_type == t)
+            && self.period.is_none_or(|p| ftotp_period(c) == Some(p))
+    }
+}
+
+/// An account's TOTP period (its `30:` / `60:` prefix, else 30); `None` for
+/// HOTP.
+fn ftotp_period(c: &keyroost_feitianotp::Credential) -> Option<u32> {
+    (c.oath_type == keyroost_feitianotp::OathType::Totp)
+        .then(|| keyroost_feitianotp::totp_period(&c.name))
+}
+
+/// `"30:GitHub_#_alice" (TOTP, 30s, slot default)`: one entry, as a refusal
+/// names it.
+fn ftotp_entry_words(c: &keyroost_feitianotp::Credential) -> String {
+    let mut what = vec![ftotp_type_str(c.oath_type).to_owned()];
+    if let Some(p) = ftotp_period(c) {
+        what.push(format!("{p}s"));
+    }
+    what.push(format!("slot {}", c.slot.label()));
+    format!("{:?} ({})", sanitize_terminal(&c.name), what.join(", "))
+}
+
+/// Which of `--slot`, `--type` and `--period` tell `found` apart, as the
+/// refusal words them, or `None` when no flag does (an unprefixed TOTP name
+/// next to a `30:` one, say).
+fn ftotp_flags_that_separate(found: &[&keyroost_feitianotp::Credential]) -> Option<&'static str> {
+    fn distinct<K: PartialEq>(
+        found: &[&keyroost_feitianotp::Credential],
+        key: impl Fn(&keyroost_feitianotp::Credential) -> K,
+    ) -> bool {
+        found
+            .iter()
+            .enumerate()
+            .all(|(i, c)| found[..i].iter().all(|o| key(o) != key(c)))
+    }
+    if distinct(found, |c| c.slot) {
+        Some("--slot")
+    } else if distinct(found, |c| c.oath_type) {
+        Some("--type")
+    } else if distinct(found, ftotp_period) {
+        Some("--period")
+    } else if distinct(found, |c| (c.oath_type, ftotp_period(c))) {
+        Some("--type and --period")
+    } else if distinct(found, |c| (c.slot, c.oath_type, ftotp_period(c))) {
+        Some("--slot, --type and --period")
+    } else {
+        None
+    }
+}
+
+/// The account `--app` / `--account` name in a Feitian OTP listing, narrowed
+/// by `pick`. Matched on the parts of each stored name, as `otp code` and
+/// `otp delete` match an entry: the app exactly, so an empty `--app`
+/// matches only accounts without one. Accounts that share an app and
+/// account (written next to each other by another app: `30:` and `60:` in
+/// front, TOTP and HOTP, or one per slot) are refused and named, never
+/// guessed between, with the flags that tell them apart. `nothing_was`
+/// names what didn't happen ("deleted"), for a command that changes
+/// something.
+fn find_ftotp_account<'a>(
+    listing: &'a keyroost_transport::FeitianOtpListing,
+    app: &str,
+    account: &str,
+    pick: FtotpPick,
+    nothing_was: Option<&str>,
+) -> Result<&'a keyroost_feitianotp::Credential, String> {
+    let label = ftotp_label(app, account);
+    let found: Vec<_> = listing
+        .credentials
+        .iter()
+        .filter(|c| {
+            keyroost_feitianotp::holds_account(&c.name, c.oath_type, app, account) && pick.admits(c)
+        })
+        .collect();
+    let nothing = nothing_was
+        .map(|what| format!("; nothing was {what}"))
+        .unwrap_or_default();
+    match found[..] {
+        [one] => Ok(one),
+        [] => {
+            let mut what = Vec::new();
+            if let Some(t) = pick.oath_type {
+                what.push(ftotp_type_str(t).to_owned());
+            }
+            if let Some(p) = pick.period {
+                what.push(format!("{p}s"));
+            }
+            let what = if what.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", what.join(", "))
+            };
+            Err(format!(
+                "no Feitian OTP account {label:?}{what} {}{nothing}",
+                match pick.slot {
+                    Some(s) => format!("in slot {}", s.label()),
+                    None => "on this key".to_owned(),
+                }
+            ))
+        }
+        _ => {
+            let names = found
+                .iter()
+                .map(|c| ftotp_entry_words(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let hint = match ftotp_flags_that_separate(&found) {
+                Some(flags) => format!("; tell them apart with {flags}"),
+                None => "; no flag tells them apart: use the app's Feitian OTP tab, which \
+                         lists every entry by its stored name"
+                    .to_owned(),
+            };
+            Err(format!(
+                "{} Feitian OTP accounts match {label:?}: {names}{nothing}{hint}",
+                found.len()
+            ))
+        }
+    }
+}
+
+fn run_ftotp(cmd: &FtotpCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_feitianotp as fotp;
+    match cmd {
+        FtotpCmd::Info { reader } => {
+            let session = open_ftotp(reader.as_deref(), debug)?;
+            let version = session.version().map(|(a, b, c)| format!("{a}.{b}.{c}"));
+            // The default slot first: it is the one Feitian's apps use.
+            let slots = [
+                fotp::Slot::Default,
+                fotp::Slot::Keyboard1,
+                fotp::Slot::Keyboard2,
+            ];
+            if json_output() {
+                emit_json(&json_out::FtotpInfoJson {
+                    version,
+                    slots: slots
+                        .iter()
+                        .map(|s| json_out::FtotpSlotJson {
+                            slot: s.label(),
+                            access_code_set: session.access_code_set(*s),
+                        })
+                        .collect(),
+                })?;
+                return Ok(());
+            }
+            let mut rows = vec![(
+                "Applet version".to_owned(),
+                version.unwrap_or_else(|| "(unavailable)".to_owned()),
+            )];
+            for s in slots {
+                rows.push((
+                    format!("Slot {}", s.label()),
+                    match session.access_code_set(s) {
+                        Some(true) => "access code set",
+                        Some(false) => "no access code",
+                        None => "(unavailable)",
+                    }
+                    .to_owned(),
+                ));
+            }
+            let rows: Vec<(&str, String)> =
+                rows.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            outln!("{}", output::kv_block(&rows));
+        }
+        FtotpCmd::List { reader } => {
+            let mut session = open_ftotp(reader.as_deref(), debug)?;
+            let listing = session.list()?;
+            warn_partial_ftotp_listing(&listing);
+            let creds = &listing.credentials;
+            if json_output() {
+                let accounts: Vec<json_out::FtotpAccountJson> = creds
+                    .iter()
+                    .map(|c| {
+                        let parts = fotp::parse_name(&c.name, c.oath_type);
+                        json_out::FtotpAccountJson {
+                            name: c.name.clone(),
+                            slot: c.slot.label(),
+                            app: parts.issuer.unwrap_or("").to_owned(),
+                            account: parts.account.to_owned(),
+                            oath_type: ftotp_type_str(c.oath_type),
+                            algorithm: ftotp_algo_strs(c.algorithm).1,
+                            period: matches!(c.oath_type, fotp::OathType::Totp)
+                                .then(|| fotp::totp_period(&c.name)),
+                        }
+                    })
+                    .collect();
+                emit_json(&json_out::AccountsJson { accounts })?;
+                return Ok(());
+            }
+            if creds.is_empty() {
+                outln!("(no Feitian OTP accounts)");
+            } else {
+                for c in creds {
+                    let parts = fotp::parse_name(&c.name, c.oath_type);
+                    outln!(
+                        "{}  [{}/{}]{}{}",
+                        // Names come from the device; strip escapes.
+                        sanitize_terminal(&ftotp_label(parts.issuer.unwrap_or(""), parts.account)),
+                        ftotp_type_str(c.oath_type),
+                        ftotp_algo_strs(c.algorithm).0,
+                        match c.oath_type {
+                            fotp::OathType::Totp => format!("  {}s", fotp::totp_period(&c.name)),
+                            fotp::OathType::Hotp => String::new(),
+                        },
+                        if c.slot == fotp::Slot::Default {
+                            String::new()
+                        } else {
+                            format!("  (slot {})", c.slot.label())
+                        },
+                    );
+                }
+            }
+        }
+        FtotpCmd::Code {
+            app,
+            account,
+            oath_type,
+            period,
+            slot,
+            reader,
+        } => {
+            let mut session = open_ftotp(reader.as_deref(), debug)?;
+            let listing = session.list()?;
+            let found = find_ftotp_account(
+                &listing,
+                app,
+                account,
+                FtotpPick::new(*slot, *oath_type, *period),
+                None,
+            )?;
+            // The key computes once it is touched, and gives up after a few
+            // seconds without one.
+            crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
+            let code = match found.oath_type {
+                // HOTP uses the key's own counter, which moves on.
+                fotp::OathType::Hotp => session.calculate_hotp(found.slot, &found.name)?,
+                // A code whose window ended while the key waited for the
+                // touch is refused, as in the app.
+                fotp::OathType::Totp => {
+                    session
+                        .calculate_totp_now(
+                            found.slot,
+                            &found.name,
+                            fotp::totp_period(&found.name),
+                        )?
+                        .0
+                }
+            };
+            if json_output() {
+                emit_json(&json_out::OtpCodeJson {
+                    app: app.clone(),
+                    account: account.clone(),
+                    code: code.code.clone(),
+                })?;
+                return Ok(());
+            }
+            outln!("{}", code.code);
+        }
+        FtotpCmd::Add {
+            app,
+            account,
+            oath_type,
+            seed,
+            encoding,
+            algorithm,
+            digits,
+            period,
+            reader,
+        } => {
+            let oath_type = match oath_type {
+                OathTypeArg::Totp => fotp::OathType::Totp,
+                OathTypeArg::Hotp => fotp::OathType::Hotp,
+            };
+            let algorithm = match algorithm {
+                AlgoArg::Sha1 => fotp::Algorithm::Sha1,
+                AlgoArg::Sha256 => fotp::Algorithm::Sha256,
+            };
+            // The same name check as the app's add form: refused when the
+            // key would read it back as another app and account, or when
+            // it is too long.
+            let stored = fotp::checked_stored_name(Some(app), account, oath_type, *period)?;
+            let limits = keyroost_import::plan::limits(keyroost_import::plan::Store::FeitianOtp);
+            let mut sec = Secrets::real();
+            let spec = seed_spec(*encoding);
+            let src = Source::from_flag(seed.as_ref());
+            sec.check(spec, src)?;
+            let dev = crate::target::select(Need::FeitianOtp, reader.as_deref(), None)?;
+            let secret = decode_seed(&sec.read(spec, src)?, *encoding)?;
+            if let Some(max) = limits.secret_max.filter(|max| secret.len() > *max) {
+                return Err(format!(
+                    "the secret is {} bytes; keyroost stores secrets of up to {max} bytes \
+                     on this key",
+                    secret.len()
+                )
+                .into());
+            }
+            crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
+            let reader = crate::target::reader_of(&dev)?;
+            let mut session = keyroost_transport::FeitianOtpSession::open_traced(&reader, debug)?;
+            // One app and account is one account, whatever its type or
+            // period, as in the app and the import: the key never gets a
+            // second code for an account it holds.
+            if let Some(refusal) = ftotp_add_refusal(&session.list()?, app, account) {
+                return Err(refusal.into());
+            }
+            // The key stores an account once it is touched.
+            crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
+            session.put(&fotp::PutParams {
+                slot: fotp::Slot::Default,
+                name: &stored,
+                secret: &secret,
+                oath_type,
+                algorithm,
+                digits: *digits,
+            })?;
+            outln!(
+                "Added Feitian OTP {} account {:?}.",
+                ftotp_type_str(oath_type),
+                ftotp_label(app, account)
+            );
+        }
+        FtotpCmd::Import {
+            file,
+            file_password,
+            replace,
+            dry_run,
+            reader,
+            yes,
+        } => {
+            return code_import::run_feitian_import(
+                reader.as_deref(),
+                file,
+                file_password.as_ref(),
+                *replace,
+                *dry_run,
+                *yes,
+                debug,
+            )
+        }
+        FtotpCmd::Delete {
+            app,
+            account,
+            oath_type,
+            period,
+            slot,
+            reader,
+            yes,
+        } => {
+            let label = ftotp_label(app, account);
+            let dev = crate::target::select(Need::FeitianOtp, reader.as_deref(), None)?;
+            let asked = crate::prompt::confirm_then_read(
+                &dev,
+                *yes,
+                &format!("delete Feitian OTP account {label:?}"),
+            )?;
+            crate::prompt::reverify_if_asked(&dev, asked)?;
+            let reader = crate::target::reader_of(&dev)?;
+            let mut session = keyroost_transport::FeitianOtpSession::open_traced(&reader, debug)?;
+            // A name the key doesn't hold is refused before anything is sent.
+            let listing = session.list()?;
+            let found = find_ftotp_account(
+                &listing,
+                app,
+                account,
+                FtotpPick::new(*slot, *oath_type, *period),
+                Some("deleted"),
+            )?;
+            // The key deletes an account once it is touched.
+            crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
+            session.delete(found.slot, &found.name)?;
+            outln!("Deleted Feitian OTP account {label:?}.");
+        }
+    }
+    Ok(())
 }
 
 /// Run a Molto2 slot sweep until the first read failure: everything read so
@@ -16742,6 +17441,7 @@ mod cli_tests {
             ("oath delete", IRREVERSIBLE),
             ("oath reset", IRREVERSIBLE),
             ("otp delete", IRREVERSIBLE),
+            ("feitian delete", IRREVERSIBLE),
             ("otp reset", IRREVERSIBLE),
             ("otp button clear", IRREVERSIBLE),
             ("openpgp reset", IRREVERSIBLE),
@@ -16780,6 +17480,7 @@ mod cli_tests {
             "name clear",
             "oath import",
             "otp import",
+            "feitian import",
         ];
         let tree = all_commands();
         for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {
@@ -16927,6 +17628,7 @@ mod cli_tests {
                 "fido",
                 "oath",
                 "otp",
+                "feitian",
                 "openpgp",
                 "piv",
                 "molto",
@@ -20087,6 +20789,36 @@ mod cli_tests {
         assert!(
             msg.contains("not bricked"),
             "the user needs to know the card is recoverable: {msg}"
+        );
+    }
+
+    /// A key with the Feitian OTP applet is told what the reset leaves; one
+    /// without hears nothing about it.
+    #[test]
+    fn factory_reset_says_feitian_otp_accounts_stay() {
+        let mut caps = keyroost_resolve::Caps::default();
+        caps.insert(keyroost_resolve::Caps::PIV);
+        assert_eq!(factory_reset_keeps_note(caps), None);
+        caps.insert(keyroost_resolve::Caps::FEITIAN_OTP);
+        assert_eq!(
+            factory_reset_keeps_note(caps).as_deref(),
+            Some(
+                "Feitian OTP accounts are not reset; remove them with \
+                 `keyroostctl feitian delete`"
+            )
+        );
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let help = cmd
+            .find_subcommand("factory-reset")
+            .unwrap()
+            .get_long_about()
+            .unwrap()
+            .to_string();
+        assert!(help.contains("every applet keyroost can reset"), "{help}");
+        assert!(
+            help.contains("Feitian OTP accounts are not reset"),
+            "{help}"
         );
     }
 
@@ -25545,6 +26277,9 @@ mod cli_tests {
                     },
                 ..
             } => yes,
+            Cmd::Feitian {
+                cmd: FtotpCmd::Delete { yes, .. } | FtotpCmd::Import { yes, .. },
+            } => yes,
             Cmd::Fido {
                 cmd:
                     FidoCmd::Credential {
@@ -25782,6 +26517,8 @@ mod cli_tests {
             &["keyroostctl", "otp", "import", "--in", "f.json"],
             &["keyroostctl", "otp", "button", "set", "--seed", "stdin"],
             &["keyroostctl", "otp", "button", "clear"],
+            &["keyroostctl", "feitian", "delete", "--account", "a"],
+            &["keyroostctl", "feitian", "import", "--in", "f.json"],
             &["keyroostctl", "fido", "credential", "delete", "00"],
             &["keyroostctl", "fido", "fingerprint", "delete", "00"],
             &[
@@ -26209,5 +26946,326 @@ mod slot_sweep_tests {
         let (slots, err) = sweep_until_error(reads);
         assert_eq!(slots.len(), 4);
         assert!(err.is_none());
+    }
+}
+
+#[cfg(test)]
+mod feitian_tests {
+    use super::*;
+    use clap::Parser;
+    use keyroost_feitianotp::{Algorithm, Credential, OathType, Slot};
+    use keyroost_transport::FeitianOtpListing;
+
+    fn listing(entries: &[(Slot, &str, OathType)]) -> FeitianOtpListing {
+        FeitianOtpListing {
+            credentials: entries
+                .iter()
+                .map(|(slot, name, oath_type)| Credential {
+                    slot: *slot,
+                    name: (*name).to_owned(),
+                    oath_type: *oath_type,
+                    algorithm: Algorithm::Sha1,
+                })
+                .collect(),
+            skipped: 0,
+            unread: Vec::new(),
+            legacy: false,
+        }
+    }
+
+    fn found<'a>(l: &'a FeitianOtpListing, app: &str, account: &str) -> Result<&'a str, String> {
+        find_ftotp_account(l, app, account, FtotpPick::default(), None).map(|c| c.name.as_str())
+    }
+
+    fn in_slot(slot: Slot) -> FtotpPick {
+        FtotpPick {
+            slot: Some(slot),
+            ..Default::default()
+        }
+    }
+
+    /// `--app` and `--account` match the parts of a stored name, whatever
+    /// period prefix it carries, and HOTP names have none.
+    #[test]
+    fn code_and_delete_match_app_and_account() {
+        let l = listing(&[
+            (Slot::Default, "60:GitHub_#_alice", OathType::Totp),
+            (Slot::Default, "bob", OathType::Hotp),
+            (Slot::Default, "30:carol", OathType::Totp),
+        ]);
+        assert_eq!(found(&l, "GitHub", "alice"), Ok("60:GitHub_#_alice"));
+        assert_eq!(found(&l, "", "bob"), Ok("bob"));
+        assert_eq!(found(&l, "", "carol"), Ok("30:carol"));
+    }
+
+    /// An omitted `--app` is the empty app, as in `otp code` / `otp delete`:
+    /// it matches only accounts stored without one, never guesses one.
+    #[test]
+    fn an_omitted_app_matches_only_accounts_without_one() {
+        let l = listing(&[(Slot::Default, "30:GitHub_#_alice", OathType::Totp)]);
+        assert_eq!(
+            found(&l, "", "alice"),
+            Err("no Feitian OTP account \"alice\" on this key".to_owned())
+        );
+        // Nor does an app match only part of a name.
+        assert!(found(&l, "Git", "alice").is_err());
+        assert!(found(&l, "GitHub", "ali").is_err());
+        // The stored name itself is not a way in either.
+        assert!(found(&l, "", "30:GitHub_#_alice").is_err());
+    }
+
+    #[test]
+    fn not_found_says_where_it_looked_and_that_nothing_changed() {
+        let l = listing(&[(Slot::Keyboard1, "30:GitHub_#_alice", OathType::Totp)]);
+        assert_eq!(
+            find_ftotp_account(
+                &l,
+                "GitHub",
+                "alice",
+                in_slot(Slot::Default),
+                Some("deleted")
+            )
+            .err()
+            .unwrap(),
+            "no Feitian OTP account \"GitHub:alice\" in slot default; nothing was deleted"
+        );
+        assert!(find_ftotp_account(&l, "GitHub", "alice", in_slot(Slot::Keyboard1), None).is_ok());
+        // A type or period that isn't there is said too.
+        let pick = FtotpPick {
+            oath_type: Some(OathType::Totp),
+            period: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(
+            find_ftotp_account(&l, "GitHub", "alice", pick, None)
+                .err()
+                .unwrap(),
+            "no Feitian OTP account \"GitHub:alice\" (TOTP, 60s) on this key"
+        );
+    }
+
+    /// Two accounts with the same app and account (written by another app)
+    /// are refused and named with their type and period, never one picked
+    /// for the user; the refusal says which flag tells them apart.
+    #[test]
+    fn two_matching_accounts_are_refused_and_named() {
+        // Same slot, two periods: --period tells them apart.
+        let l = listing(&[
+            (Slot::Default, "30:GitHub_#_alice", OathType::Totp),
+            (Slot::Default, "60:GitHub_#_alice", OathType::Totp),
+        ]);
+        assert_eq!(
+            find_ftotp_account(&l, "GitHub", "alice", FtotpPick::default(), Some("deleted"))
+                .err()
+                .unwrap(),
+            "2 Feitian OTP accounts match \"GitHub:alice\": \"30:GitHub_#_alice\" (TOTP, 30s, \
+             slot default), \"60:GitHub_#_alice\" (TOTP, 60s, slot default); nothing was \
+             deleted; tell them apart with --period"
+        );
+        let pick = FtotpPick {
+            period: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(
+            find_ftotp_account(&l, "GitHub", "alice", pick, None)
+                .unwrap()
+                .name,
+            "60:GitHub_#_alice"
+        );
+
+        // TOTP next to HOTP: --type.
+        let l = listing(&[
+            (Slot::Default, "30:GitHub_#_alice", OathType::Totp),
+            (Slot::Default, "GitHub_#_alice", OathType::Hotp),
+        ]);
+        let err = found(&l, "GitHub", "alice").unwrap_err();
+        assert!(
+            err.contains("\"GitHub_#_alice\" (HOTP, slot default)"),
+            "{err}"
+        );
+        assert!(err.ends_with("; tell them apart with --type"), "{err}");
+        let pick = FtotpPick {
+            oath_type: Some(OathType::Hotp),
+            ..Default::default()
+        };
+        assert_eq!(
+            find_ftotp_account(&l, "GitHub", "alice", pick, None)
+                .unwrap()
+                .oath_type,
+            OathType::Hotp
+        );
+
+        // Two slots: --slot.
+        let l = listing(&[
+            (Slot::Keyboard1, "30:GitHub_#_alice", OathType::Totp),
+            (Slot::Default, "30:GitHub_#_alice", OathType::Totp),
+        ]);
+        let err = found(&l, "GitHub", "alice").unwrap_err();
+        assert!(err.ends_with("; tell them apart with --slot"), "{err}");
+        let one =
+            find_ftotp_account(&l, "GitHub", "alice", in_slot(Slot::Keyboard1), None).unwrap();
+        assert_eq!(one.slot, Slot::Keyboard1);
+
+        // An unprefixed TOTP name next to a `30:` one: same type, same
+        // period, same slot. No flag can pick; the app's tab can.
+        let l = listing(&[
+            (Slot::Default, "GitHub_#_alice", OathType::Totp),
+            (Slot::Default, "30:GitHub_#_alice", OathType::Totp),
+        ]);
+        let err = found(&l, "GitHub", "alice").unwrap_err();
+        assert!(
+            err.ends_with(
+                "; no flag tells them apart: use the app's Feitian OTP tab, which lists every \
+                 entry by its stored name"
+            ),
+            "{err}"
+        );
+    }
+
+    /// `feitian add` never writes a second code for an account the default
+    /// slot holds, whatever its type or period; it says how to delete it.
+    #[test]
+    fn add_refuses_an_account_already_there_in_any_type_or_period() {
+        for (name, t) in [
+            ("30:GitHub_#_alice", OathType::Totp),
+            ("60:GitHub_#_alice", OathType::Totp),
+            ("GitHub_#_alice", OathType::Totp),
+            ("GitHub_#_alice", OathType::Hotp),
+        ] {
+            let l = listing(&[(Slot::Default, name, t)]);
+            assert_eq!(
+                ftotp_add_refusal(&l, "GitHub", "alice").as_deref(),
+                Some(
+                    "an account \"GitHub:alice\" is already on the key; nothing was added \
+                     (delete it first: keyroostctl feitian delete --app \"GitHub\" --account \
+                     \"alice\")"
+                ),
+                "{name}"
+            );
+        }
+        let l = listing(&[(Slot::Default, "30:alice", OathType::Totp)]);
+        assert!(ftotp_add_refusal(&l, "", "alice")
+            .unwrap()
+            .ends_with("(delete it first: keyroostctl feitian delete --account \"alice\")"));
+        // Another account, or one in a keyboard slot, is no reason.
+        let l = listing(&[
+            (Slot::Default, "30:GitHub_#_alicia", OathType::Totp),
+            (Slot::Keyboard1, "30:GitHub_#_alice", OathType::Totp),
+            (Slot::Default, "30:GitHub_#_alice", OathType::Hotp),
+        ]);
+        assert_eq!(ftotp_add_refusal(&l, "GitHub", "alice"), None);
+    }
+
+    #[test]
+    fn type_and_period_filters_parse_as_add_takes_them() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let cli = parse(&[
+            "keyroostctl",
+            "feitian",
+            "delete",
+            "--app",
+            "A",
+            "--account",
+            "b",
+            "--type",
+            "hotp",
+        ])
+        .ok()
+        .unwrap();
+        match cli.command {
+            Some(Cmd::Feitian {
+                cmd: FtotpCmd::Delete {
+                    oath_type, period, ..
+                },
+            }) => {
+                assert!(matches!(oath_type, Some(OathTypeArg::Hotp)));
+                assert_eq!(period, None);
+            }
+            _ => panic!("not feitian delete"),
+        }
+        let cli = parse(&[
+            "keyroostctl",
+            "feitian",
+            "code",
+            "--account",
+            "b",
+            "--period",
+            "60",
+        ])
+        .ok()
+        .unwrap();
+        match cli.command {
+            Some(Cmd::Feitian {
+                cmd: FtotpCmd::Code {
+                    period, oath_type, ..
+                },
+            }) => assert!(period == Some(60) && oath_type.is_none()),
+            _ => panic!("not feitian code"),
+        }
+        // The same values as `feitian add` takes.
+        assert!(parse(&[
+            "keyroostctl",
+            "feitian",
+            "code",
+            "--account",
+            "b",
+            "--period",
+            "45"
+        ])
+        .is_err());
+    }
+
+    /// The account is named by flags, as in `otp code` / `otp delete`; the
+    /// stored name is no longer an argument.
+    #[test]
+    fn code_and_delete_take_app_and_account_flags() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let cli = parse(&[
+            "keyroostctl",
+            "feitian",
+            "code",
+            "--app",
+            "GitHub",
+            "--account",
+            "alice",
+        ])
+        .ok()
+        .unwrap();
+        match cli.command {
+            Some(Cmd::Feitian {
+                cmd: FtotpCmd::Code { app, account, .. },
+            }) => assert_eq!((app.as_str(), account.as_str()), ("GitHub", "alice")),
+            _ => panic!("not feitian code"),
+        }
+        let cli = parse(&["keyroostctl", "feitian", "delete", "--account", "bob"])
+            .ok()
+            .unwrap();
+        match cli.command {
+            Some(Cmd::Feitian {
+                cmd: FtotpCmd::Delete { app, .. },
+            }) => assert_eq!(app, ""),
+            _ => panic!("not feitian delete"),
+        }
+        assert!(parse(&["keyroostctl", "feitian", "code", "30:alice"]).is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "feitian",
+            "add",
+            "--issuer",
+            "x",
+            "--account",
+            "a"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "feitian",
+            "add",
+            "--app",
+            "x",
+            "--account",
+            "a"
+        ])
+        .is_ok());
     }
 }

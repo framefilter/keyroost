@@ -15,7 +15,7 @@ use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
 use keyroost_proto::trace::{format_line, Dir};
-use pcsc::{Card, Error as PcscError, Protocols, ReaderState, ShareMode, State, Transaction};
+use pcsc::{Card, Error as PcscError, ReaderState, State, Transaction};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use zeroize::Zeroizing;
 
@@ -1467,7 +1467,7 @@ impl<'tx> PivSession<'tx> {
         let mut contact = FirstContact::new(reader_name, traced, "piv");
         loop {
             let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
-            let mut card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
+            let mut card = match crate::connect_shared(&ctx, &cstr) {
                 Ok(card) => card,
                 Err(e) => {
                     contact.retry_or_fail(e.into())?;
@@ -1672,7 +1672,7 @@ impl<'tx> PivSession<'tx> {
             // immediately — before either branch below sends anything, SELECT
             // included, so the transaction genuinely covers the whole session
             // regardless of which branch runs.
-            let mut card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
+            let mut card = match crate::connect_shared(&ctx, &cstr) {
                 Ok(card) => card,
                 Err(e) => {
                     contact.retry_or_fail(e.into())?;
@@ -1970,7 +1970,7 @@ impl<'tx> PivSession<'tx> {
             .collect();
         let mut out = Vec::new();
         for name in names {
-            if let Ok(mut card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+            if let Ok(mut card) = crate::connect_shared(&ctx, name.as_c_str()) {
                 if let Ok(txn) = card.transaction() {
                     let mut session = Self::from_transaction(txn, &name.to_string_lossy(), false);
                     if session.select().is_ok() {
@@ -6923,7 +6923,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Map a PIV status word to success or a labelled APDU error.
+/// Map a PIV status word to success or a labeled APDU error.
 fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     if sw == piv::SW_OK {
         Ok(())

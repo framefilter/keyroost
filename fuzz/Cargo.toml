@@ -30,6 +30,7 @@ keyroost-openpgp = { path = "../crates/keyroost-openpgp" }
 keyroost-pgpkey = { path = "../crates/keyroost-pgpkey" }
 keyroost-piv = { path = "../crates/keyroost-piv" }
 keyroost-token2otp = { path = "../crates/keyroost-token2otp" }
+keyroost-feitianotp = { path = "../crates/keyroost-feitianotp" }
 # winwebauthn is Windows-only for its FFI, but parse_detail_path is pure and
 # compiles/runs on Linux — the audit's KEY-020 surface, fuzzed here.
 keyroost-winwebauthn = { path = "../crates/keyroost-winwebauthn" }
@@ -106,6 +107,13 @@ bench = false
 [[bin]]
 name = "token2otp_parse"
 path = "fuzz_targets/token2otp_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "feitianotp_parse"
+path = "fuzz_targets/feitianotp_parse.rs"
 test = false
 doc = false
 bench = false

@@ -22,7 +22,7 @@ pub struct Help {
 }
 
 /// Look up help content by topic id. Topic ids (use these as the `?` keys):
-///   device, fido2, pin, passkeys, oath, oath-wait, pgp, pgp-keys, pgp-backup, pgp-restore,
+///   device, fido2, pin, passkeys, oath, oath-wait, feitian, pgp, pgp-keys, pgp-backup, pgp-restore,
 ///   pgp-expiry, pgp-card-details, piv,
 ///   molto, custkey, reset, piv-generate, piv-certificate,
 ///   piv-import-key, piv-import-export, piv-delete, piv-test, piv-admin, piv-move,
@@ -68,6 +68,11 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             title: "On-device OTP",
             body: "TOTP/HOTP codes stored on this Token2 key's own OTP applet, read over CCID/NFC. Add entries, read live codes, and (on keys that support it) trigger a code by touching the key. The seeds live on the device and never sync anywhere.",
             slug: "/otp",
+        },
+        "feitian" => &Help {
+            title: "Feitian OTP",
+            body: "TOTP/HOTP codes stored in this Feitian key's own OTP applet, read through its smart-card interface. The list shows without a touch. The key gives a code, saves an account or deletes one only when you touch it, so each code is read with its own button. The seeds stay on the key.",
+            slug: "",
         },
         "mds" => &Help {
             title: "Device metadata (FIDO MDS)",

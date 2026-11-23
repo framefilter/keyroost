@@ -7,6 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod ftotp_pane;
 mod hid_watch;
 mod import_flow;
 mod otp_pane;
@@ -18,6 +19,7 @@ mod qrscan;
 mod screengrab;
 mod settings;
 mod ui;
+use ftotp_pane::FtotpState;
 use otp_pane::OtpState;
 use settings::{Settings, SidebarSetting};
 use ui::device::{self, CapState, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
@@ -620,6 +622,8 @@ enum Reread {
     Piv,
     Pgp,
     Otp,
+    /// The Feitian OTP account list.
+    Ftotp,
     /// The FIDO2 passkey list (unlocked key).
     Passkeys,
     /// The FIDO2 fingerprint list (unlocked key).
@@ -2217,6 +2221,14 @@ fn reset_mgmt_auth_mode_after_toggle(
 enum ResetMgmtAuth {
     Key(zeroize::Zeroizing<Vec<u8>>),
     Pin(zeroize::Zeroizing<String>),
+}
+
+/// What a factory reset of a key with `caps` leaves, and where to remove it
+/// in the app: the shared words ([`keyroost_resolve::factory_reset_keeps`])
+/// and the tab that does it. Shown in the confirmation and with the result.
+fn factory_reset_keeps_note(caps: keyroost_resolve::Caps) -> Option<String> {
+    keyroost_resolve::factory_reset_keeps(caps)
+        .map(|keeps| format!("{keeps}; remove them in the Feitian OTP tab."))
 }
 
 /// The confirmation body for the Factory reset modal: what key, and exactly
@@ -5053,6 +5065,8 @@ struct App {
     piv_compat_ignored: std::collections::HashSet<DeviceId>,
     /// Token2 on-device OTP (TOTP/HOTP) view state.
     otp: OtpState,
+    /// Feitian OTP (TOTP/HOTP) view state.
+    ftotp: FtotpState,
     /// Dark / light theme (persisted via eframe storage).
     mode: Mode,
     /// Accent index into `Palette::ACCENTS` (persisted).
@@ -5089,6 +5103,8 @@ struct App {
     piv_tried: bool,
     /// Same guard for the OTP pane's auto-read.
     otp_tried: bool,
+    /// Same guard for the Feitian OTP pane's auto-read.
+    ftotp_tried: bool,
     /// Same guard for the OpenPGP pane's auto-read.
     pgp_tried: bool,
     /// A Refresh click is waiting for its rescan: when the scan lands with the
@@ -6951,6 +6967,7 @@ impl App {
             || self.otp.pin.is_some()
             || self.otp.rows.iter().any(|r| r.code.is_some())
             || !self.otp.touch_codes.is_empty()
+            || self.ftotp.has_codes()
     }
 
     /// Whether a dialog holds what a typed password opened: the entries of a
@@ -6983,6 +7000,7 @@ impl App {
         out.push(&mut self.reset_mgmt_auth_input);
         out.extend(self.oath.secrets_mut());
         out.extend(self.otp.secrets_mut());
+        out.extend(self.ftotp.secrets_mut());
         out.extend(self.openpgp.secrets_mut());
         out.extend(self.piv.secrets_mut());
         out.push(&mut *self.prog_seed_input);
@@ -7135,6 +7153,12 @@ impl App {
             self.otp.info = Some(idle_locked_msg());
         } else if otp_codes {
             self.otp.info = Some(format!("{} Refresh to show them again.", idle_hidden_msg()));
+        }
+        // Feitian OTP codes each came from a touch: reading one again takes
+        // another.
+        if self.ftotp.has_codes() {
+            self.ftotp.forget_codes();
+            self.ftotp.info = Some(idle_hidden_msg());
         }
         self.log(
             Severity::Info,
@@ -9124,6 +9148,10 @@ impl App {
                     needs_reset_mgmt_auth,
                     reset_long_running,
                 );
+                let summary = match factory_reset_keeps_note(dev.caps) {
+                    Some(note) => format!("{summary}\n\n{note}"),
+                    None => summary,
+                };
                 let fido_replug = plan.contains(&keyroost_resolve::ResetStep::Fido)
                     && Self::card_reset_reader(Some(dev)).is_none();
                 (summary, fido_replug)
@@ -11597,6 +11625,7 @@ impl App {
             CapTab::Piv => Reread::Piv,
             CapTab::Pgp => Reread::Pgp,
             CapTab::Otp => Reread::Otp,
+            CapTab::Ftotp => Reread::Ftotp,
             CapTab::Fido2 => match self.security_keys.subview {
                 FidoSubview::LargeBlobs => Reread::LargeBlobs,
                 // Both lists need an unlocked key; locked, the key's info
@@ -11618,6 +11647,7 @@ impl App {
             Reread::Piv => self.load_piv_status_with_cache(LogKind::User, PivCache::Bypass),
             Reread::Pgp => self.load_openpgp_status(),
             Reread::Otp => self.refresh_otp(),
+            Reread::Ftotp => self.refresh_ftotp(),
             Reread::Passkeys => self.refresh_credentials(),
             Reread::Fingerprints => self.refresh_fingerprints(),
             Reread::LargeBlobs => {
@@ -11942,8 +11972,12 @@ impl App {
         self.oath_tried = false;
         self.piv_tried = false;
         self.otp_tried = false;
+        self.ftotp_tried = false;
         self.pgp_tried = false;
         self.otp = OtpState::default();
+        // Replaced whole: its typed seed, shown codes and pending delete
+        // confirmation all belong to the key that was selected.
+        self.ftotp = FtotpState::default();
         self.molto_reset_confirm = false;
         self.molto_delete_confirm = false;
         self.close_rename();
@@ -14930,10 +14964,11 @@ fn cap_tab_label(t: CapTab) -> &'static str {
         CapTab::Pgp => "OpenPGP",
         CapTab::Piv => "PIV",
         CapTab::Otp => "On-device OTP",
+        CapTab::Ftotp => "Feitian OTP",
     }
 }
 
-/// A labelled password field row for the inline PIN form.
+/// A labeled password field row for the inline PIN form.
 /// New==confirm guard for the PIV credential modal. Returns the inline error
 /// message when the new secret and its confirmation differ, or `None` when they
 /// match (or the flow has no confirm field, i.e. `UnblockPin`). Empty fields are
@@ -16210,8 +16245,8 @@ fn paint_pill(
     bg: egui::Color32,
 ) -> f32 {
     let galley = ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), theme::f_sb(11.0), fg));
-    let pad_x = 8.0;
-    let h = 18.0;
+    let pad_x = PILL_PAD_X;
+    let h = PILL_H;
     let w = galley.size().x + pad_x * 2.0;
     let rect = egui::Rect::from_min_size(left_top, egui::vec2(w, h));
     ui.painter()
@@ -16402,7 +16437,8 @@ fn paint_reattach_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) 
 /// device — fixing the "only the gaps are clickable" inconsistency.
 fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> bool {
     let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, DEVICE_CARD_H), egui::Sense::click());
+    let h = device_card_height(ui, dev, w);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
     paint_device_card(ui, p, dev, rect, selected, resp.hovered());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -16410,8 +16446,82 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
     resp.clicked()
 }
 
-/// Height of one device card in the full list.
+/// Height of one device card in the full list, with its capability pills on
+/// one row.
 const DEVICE_CARD_H: f32 = 68.0;
+
+/// A capability pill's height and its text's side padding ([`paint_pill`]).
+const PILL_H: f32 = 18.0;
+const PILL_PAD_X: f32 = 8.0;
+/// The space between two pills in a row, and between two rows.
+const PILL_GAP: f32 = 5.0;
+const PILL_ROW_GAP: f32 = 4.0;
+/// The least room a pill row leaves to the card's right edge.
+const PILL_EDGE: f32 = 4.0;
+
+/// Where each pill of a row that starts at `0` and may not pass `max_w` goes:
+/// `(row, x)` per width in `widths`. A pill that doesn't fit after another
+/// starts the next row, so the row degrades into two instead of running past
+/// the card; the first pill of a row always stays on it. Pills that fit lie
+/// exactly as one row always has (`PILL_GAP` apart).
+fn pill_rows(widths: &[f32], max_w: f32) -> Vec<(usize, f32)> {
+    let mut out = Vec::with_capacity(widths.len());
+    let (mut row, mut x) = (0usize, 0.0f32);
+    for &w in widths {
+        if x > 0.0 && x + w > max_w {
+            row += 1;
+            x = 0.0;
+        }
+        out.push((row, x));
+        x += w + PILL_GAP;
+    }
+    out
+}
+
+/// The capability pills of `dev` as the card shows them: text, and whether
+/// the capability is unverified (a dimmer "OTP?" pill).
+fn card_pills(dev: &Device) -> Vec<(String, bool)> {
+    dev.cap_badge_states()
+        .into_iter()
+        .map(|(label, state)| {
+            if state == CapState::Unverified {
+                (format!("{label}?"), true)
+            } else {
+                (label.to_owned(), false)
+            }
+        })
+        .collect()
+}
+
+/// How much room a card `card_w` wide gives its row of pills: from the text's
+/// left edge (after the tile and its gap) to just inside the card's edge.
+fn card_pill_span(card_w: f32) -> f32 {
+    let tx = 14.0 + 38.0 + 11.0;
+    (card_w - tx - PILL_EDGE).max(0.0)
+}
+
+/// The pills' rows in a card `card_w` wide.
+fn card_pill_rows(ui: &egui::Ui, dev: &Device, card_w: f32) -> Vec<(usize, f32)> {
+    let widths: Vec<f32> = card_pills(dev)
+        .iter()
+        .map(|(text, _)| {
+            let galley = ui.fonts_mut(|f| {
+                f.layout_no_wrap(text.clone(), theme::f_sb(11.0), egui::Color32::WHITE)
+            });
+            galley.size().x + PILL_PAD_X * 2.0
+        })
+        .collect();
+    pill_rows(&widths, card_pill_span(card_w))
+}
+
+/// A card's height: [`DEVICE_CARD_H`], plus a row for each row of pills that
+/// had to wrap.
+fn device_card_height(ui: &egui::Ui, dev: &Device, card_w: f32) -> f32 {
+    let extra = card_pill_rows(ui, dev, card_w)
+        .last()
+        .map_or(0, |(row, _)| *row);
+    DEVICE_CARD_H + extra as f32 * (PILL_H + PILL_ROW_GAP)
+}
 
 /// The muted line in the key's Overview "Smart cards" card when its smart-card
 /// part has no reader listed (Linux; [`Device::smart_card_unlisted`]). Held back while the scan
@@ -16488,8 +16598,9 @@ fn paint_device_card(
     }
 
     let token = matches!(dev.kind, DeviceKind::Token | DeviceKind::ProgToken);
+    // The tile stays where it is on a one-row card when the pills wrap.
     let tile = egui::Rect::from_min_size(
-        rect.left_top() + egui::vec2(14.0, (h - 38.0) / 2.0),
+        rect.left_top() + egui::vec2(14.0, (DEVICE_CARD_H.min(h) - 38.0) / 2.0),
         egui::vec2(38.0, 38.0),
     );
     paint_device_tile(ui, p, dev, tile);
@@ -16539,16 +16650,18 @@ fn paint_device_card(
     } else {
         (p.txt2, p.raised2)
     };
-    let mut px = tx;
-    for (label, state) in dev.cap_badge_states() {
+    // A row that doesn't fit the card wraps to a second one (the card grows
+    // to hold it, `device_card_height`) instead of running past its edge.
+    let rows = card_pill_rows(ui, dev, rect.width());
+    for ((text, unverified), (row, x)) in card_pills(dev).iter().zip(rows) {
+        let at = egui::pos2(tx + x, py + row as f32 * (PILL_H + PILL_ROW_GAP));
         // An unverified capability (offered on a hint, never checked against
         // the device) renders as a dimmer "OTP?" pill — same vocabulary as the
         // CLI's badge line, so the two never disagree about what was proven.
-        if state == CapState::Unverified {
-            let text = format!("{label}?");
-            px += paint_pill(ui, egui::pos2(px, py), &text, p.txt3, bg) + 5.0;
+        if *unverified {
+            paint_pill(ui, at, text, p.txt3, bg);
         } else {
-            px += paint_pill(ui, egui::pos2(px, py), label, fg, bg) + 5.0;
+            paint_pill(ui, at, text, fg, bg);
         }
     }
 }
@@ -16638,8 +16751,8 @@ fn rail_tile(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> bo
         tip.popup = tip.popup.open(true);
     }
     tip.show(|ui| {
-        let (r, _) =
-            ui.allocate_exact_size(egui::vec2(card_w, DEVICE_CARD_H), egui::Sense::hover());
+        let h = device_card_height(ui, dev, card_w);
+        let (r, _) = ui.allocate_exact_size(egui::vec2(card_w, h), egui::Sense::hover());
         paint_device_card(ui, p, dev, r, false, false);
     });
     if resp.hovered() {
@@ -17043,6 +17156,9 @@ impl eframe::App for App {
                     .rows
                     .iter()
                     .any(|r| r.type_str.eq_ignore_ascii_case("TOTP") && r.code.is_some()))
+            // A Feitian OTP code's countdown, and its removal when the
+            // window ends.
+            || (matches!(self.cap_tab, CapTab::Ftotp) && self.ftotp.shows_totp_code())
             || self
                 .selected_device()
                 .is_some_and(|d| d.kind == DeviceKind::Token);
@@ -18779,6 +18895,7 @@ impl App {
                                             CapTab::Pgp => self.cap_pgp(ui, p),
                                             CapTab::Piv => self.cap_piv(ui, p),
                                             CapTab::Otp => self.cap_otp(ui, p),
+                                            CapTab::Ftotp => self.cap_ftotp(ui, p),
                                         }
                                         // Breathing room below the last card.
                                         ui.add_space(18.0);
@@ -19804,6 +19921,42 @@ impl App {
                     }
                 });
             }
+            if dev.caps.has(Caps::FEITIAN_OTP) {
+                ui.add_space(14.0);
+                theme::card_frame(p).show(ui, |ui| {
+                    if self.card_head(ui, p, "Feitian OTP", "feitian") {
+                        self.cap_tab = CapTab::Ftotp;
+                    }
+                    ui.add_space(8.0);
+                    if self.ftotp.loaded && !self.ftotp.rows.is_empty() {
+                        let total = self.ftotp.rows.len();
+                        for row in self.ftotp.rows.iter().take(2) {
+                            ui.horizontal(|ui| {
+                                theme::pill(ui, row.type_str(), p.txt2, p.raised2);
+                                ui.label(
+                                    egui::RichText::new(row.label())
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt2),
+                                );
+                            });
+                            ui.add_space(4.0);
+                        }
+                        if total > 2 {
+                            ui.label(
+                                egui::RichText::new(format!("+{} more accounts", total - 2))
+                                    .font(theme::f_reg(12.5))
+                                    .color(p.txt3),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Open Feitian OTP to view stored accounts.")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt3),
+                        );
+                    }
+                });
+            }
             if let Some(line) = no_reader_line(dev, self.pending_scans) {
                 ui.add_space(14.0);
                 theme::card_frame(p).show(ui, |ui| {
@@ -19851,9 +20004,9 @@ impl App {
                             });
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Resets every applet on this key ({}) to factory state. \
-                                     Each step reports on its own \u{2014} anything that \
-                                     doesn't complete is listed below.",
+                                    "Resets every applet keyroost can reset on this key \
+                                     ({}) to factory state. Each step reports on its own \
+                                     \u{2014} anything that doesn't complete is listed below.",
                                     plan.iter()
                                         .map(|s| s.label())
                                         .collect::<Vec<_>>()
@@ -19897,6 +20050,15 @@ impl App {
                                         egui::RichText::new(text)
                                             .font(theme::f_reg(12.5))
                                             .color(color),
+                                    );
+                                }
+                                // What no step reset, with the result as in
+                                // the confirmation.
+                                if let Some(note) = factory_reset_keeps_note(dev.caps) {
+                                    ui.label(
+                                        egui::RichText::new(note)
+                                            .font(theme::f_reg(12.5))
+                                            .color(p.warn),
                                     );
                                 }
                             }
@@ -23265,7 +23427,7 @@ impl App {
                             // Generating into an occupied slot silently destroys
                             // the existing private key (irreversible). Warn in
                             // red before the auth field, mirroring the delete
-                            // cards; the submit button is relabelled below.
+                            // cards; the submit button is relabeled below.
                             if let Some(warning) = piv_replace_warning(
                                 selected_occupancy,
                                 &self.piv.selected_slot.to_slot().label(),
@@ -28233,6 +28395,32 @@ impl App {
         }
     }
 
+    /// Fill the Feitian OTP add-form fields from a scanned screen QR. A
+    /// digit count the applet doesn't take (4 or 10) is left as scanned: the
+    /// form's own check refuses it on Add, in words.
+    #[cfg(feature = "qr")]
+    fn ftotp_scan_qr(&mut self) {
+        match self.scan_qr_parsed() {
+            Ok((secret, parsed)) => {
+                self.ftotp.add.secret = secret;
+                if let Some(issuer) = &parsed.issuer {
+                    self.ftotp.add.issuer = issuer.clone();
+                }
+                if let Some(account) = &parsed.account {
+                    self.ftotp.add.account = account.clone();
+                }
+                self.ftotp.add.sha256 = matches!(parsed.algorithm, HmacAlgo::Sha256);
+                self.ftotp.add.digits = parsed.digits as u8;
+                self.ftotp.add.period = match parsed.time_step {
+                    TimeStep::Seconds30 => 30,
+                    TimeStep::Seconds60 => 60,
+                };
+                self.ftotp.add.totp = true; // otpauth://totp
+            }
+            Err(e) => self.log(Severity::Err, format!("scan QR: {e}")),
+        }
+    }
+
     /// Scan a TOTP QR from the screen and fill the prog seed form from it.
     #[cfg(feature = "qr")]
     fn prog_scan_qr(&mut self) {
@@ -28488,7 +28676,7 @@ fn sanitize_title(s: &str) -> String {
         .collect()
 }
 
-/// One labelled editor row in the Molto2 form: fixed-width label + a field.
+/// One labeled editor row in the Molto2 form: fixed-width label + a field.
 fn editor_row(ui: &mut egui::Ui, p: &Palette, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         ui.add_sized(
@@ -29230,6 +29418,72 @@ mod tests {
             busy_refusal_text(Some("Scanning")),
             "Still working on: Scanning\u{2026} Try again when it finishes."
         );
+    }
+
+    /// The app says what a factory reset leaves on a Feitian key, in the
+    /// CLI's words, and where to remove it here.
+    #[test]
+    fn factory_reset_says_feitian_otp_accounts_stay() {
+        use keyroost_resolve::Caps;
+        let mut caps = Caps::default();
+        caps.insert(Caps::PIV);
+        assert_eq!(factory_reset_keeps_note(caps), None);
+        caps.insert(Caps::FEITIAN_OTP);
+        assert_eq!(
+            factory_reset_keeps_note(caps).as_deref(),
+            Some("Feitian OTP accounts are not reset; remove them in the Feitian OTP tab.")
+        );
+    }
+
+    /// Capability pills that don't fit the card's width start a second row
+    /// (and the card grows to hold it) instead of running past its edge;
+    /// pills that fit keep the one row, spacing and card height they had.
+    #[test]
+    fn capability_pills_wrap_instead_of_running_past_the_card() {
+        assert_eq!(
+            pill_rows(&[47.0, 37.0, 34.0], 180.0),
+            vec![(0, 0.0), (0, 52.0), (0, 94.0)]
+        );
+        assert_eq!(
+            pill_rows(&[47.0, 37.0, 34.0, 86.0], 180.0),
+            vec![(0, 0.0), (0, 52.0), (0, 94.0), (1, 0.0)]
+        );
+        // A pill wider than the card still goes on its own row's start.
+        assert_eq!(pill_rows(&[300.0, 20.0], 180.0), vec![(0, 0.0), (1, 0.0)]);
+        assert!(pill_rows(&[], 180.0).is_empty());
+
+        // With the app's own fonts, in the sidebar's card width.
+        let key = |caps: &[Caps]| {
+            let mut d = sel_key("k", "1", None);
+            d.caps = Caps::default();
+            for c in caps {
+                d.caps.insert(*c);
+            }
+            d
+        };
+        let yubikey = key(&[Caps::FIDO2, Caps::OATH, Caps::PGP, Caps::PIV]);
+        let feitian = key(&[Caps::FIDO2, Caps::PGP, Caps::PIV, Caps::FEITIAN_OTP]);
+        let card_w = SIDEBAR_FULL_W - 28.0;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut got = None;
+        // Fonts load on the first frame.
+        for _ in 0..2 {
+            let _ = ctx.test_frame(egui::RawInput::default(), |ui| {
+                got = Some((
+                    card_pill_rows(ui, &yubikey, card_w),
+                    device_card_height(ui, &yubikey, card_w),
+                    card_pill_rows(ui, &feitian, card_w),
+                    device_card_height(ui, &feitian, card_w),
+                ));
+            });
+        }
+        let (yk_rows, yk_h, ft_rows, ft_h) = got.unwrap();
+        assert!(yk_rows.iter().all(|(row, _)| *row == 0), "{yk_rows:?}");
+        assert_eq!(yk_h, DEVICE_CARD_H);
+        assert_eq!(ft_rows.last().map(|(row, _)| *row), Some(1), "{ft_rows:?}");
+        assert_eq!(ft_rows[3], (1, 0.0), "FEITIAN-OTP starts the second row");
+        assert_eq!(ft_h, DEVICE_CARD_H + PILL_H + PILL_ROW_GAP);
     }
 
     #[test]
@@ -34737,6 +34991,35 @@ mod tests {
             .info
             .as_deref()
             .is_some_and(|m| m.starts_with(&idle_hidden_msg())));
+        assert!(!app.holds_unlocked_secrets());
+    }
+
+    /// A Feitian OTP code, each read with a touch, is held the same way; the
+    /// list it sits in stays, and a seed left in that pane's add form goes
+    /// with the other typed secrets.
+    #[test]
+    fn idle_lock_wipes_feitian_otp_codes_and_a_typed_seed() {
+        let mut app = App::default();
+        app.ftotp.rows = vec![ftotp_pane::FtotpRow {
+            slot: keyroost_feitianotp::Slot::Default,
+            stored: "30:Example_#_alice".into(),
+            issuer: Some("Example".into()),
+            account: "alice".into(),
+            hotp: false,
+            sha256: false,
+            period: 30,
+            code: Some("112233".into()),
+            code_window: Some(1),
+        }];
+        app.ftotp.add.secret = "JBSWY3DP".into();
+        assert!(app.holds_unlocked_secrets());
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+        assert!(!app.ftotp.has_codes());
+        assert_eq!(app.ftotp.rows.len(), 1, "only the code goes");
+        assert!(app.ftotp.add.secret.is_empty());
+        assert_eq!(app.ftotp.info, Some(idle_hidden_msg()));
         assert!(!app.holds_unlocked_secrets());
     }
 

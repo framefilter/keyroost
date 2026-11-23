@@ -39,6 +39,9 @@ impl Caps {
     /// whose FIDO SELECT didn't name CTAP2 is only marked unverified, not
     /// this: it keeps its FIDO2 reset step.
     pub const FIDO_PROTOCOL_UNKNOWN: Caps = Caps(1 << 8);
+    /// The OTP applet on Feitian FIDO keys (the `feitian` group): its own
+    /// protocol, neither the OATH applet nor Token2's.
+    pub const FEITIAN_OTP: Caps = Caps(1 << 9);
 
     pub fn has(self, c: Caps) -> bool {
         self.0 & c.0 != 0
@@ -193,6 +196,7 @@ impl Device {
             (Caps::PGP, "PGP"),
             (Caps::PIV, "PIV"),
             (Caps::OTP, "OTP"),
+            (Caps::FEITIAN_OTP, "FEITIAN-OTP"),
         ] {
             if self.caps.has(c) {
                 v.push((label, self.cap_state(c)));
@@ -768,6 +772,9 @@ pub fn correlate_with(
         }
         if p.has_otp {
             caps.insert(Caps::OTP);
+        }
+        if p.has_feitian_otp {
+            caps.insert(Caps::FEITIAN_OTP);
         }
         if caps.is_empty() {
             continue;
@@ -1854,6 +1861,17 @@ pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     steps
 }
 
+/// What a factory reset leaves on a key with these capabilities, in the words
+/// both front ends use, or `None` when it leaves nothing. The Feitian OTP
+/// applet has no step: its RESET is known only from Feitian's client and was
+/// never run by keyroost. Each front end follows the line with where to
+/// remove what stays (`feitian delete`, the Feitian OTP tab), in the
+/// confirmation and in the result.
+pub fn factory_reset_keeps(caps: Caps) -> Option<&'static str> {
+    caps.has(Caps::FEITIAN_OTP)
+        .then_some("Feitian OTP accounts are not reset")
+}
+
 /// Remove [`ResetStep::Piv`] from an already-built [`factory_reset_plan`]
 /// result — call once a live fingerprint
 /// (`keyroost_transport::PivSession::preview_factory_reset` resolving
@@ -2108,6 +2126,7 @@ mod tests {
             has_fido: false,
             fido_ctap2_confirmed: false,
             has_otp: false,
+            has_feitian_otp: false,
             is_prog: false,
             prog_serial: None,
             yubikey_serial: yk_serial.map(str::to_owned),
@@ -2602,7 +2621,7 @@ mod tests {
     fn merged_card_row_offers_otp_as_unverified_when_the_probe_declined() {
         // The probe SELECTed the OTP applet and got a decline, but the vendor
         // hint still offers the surface (#95: the applet may live on a channel
-        // the probe cannot see). Offered — and labelled unverified, because
+        // the probe cannot see). Offered — and labeled unverified, because
         // neither answer was proven.
         let probes = [probe(
             "Token2 PIN+ 00 00",
@@ -2992,6 +3011,35 @@ mod tests {
         )];
         let yk = &correlate(&yk_hid, &yk_probe, &Keyring::default())[0];
         assert_eq!(yk.cap_badges(), vec!["FIDO2", "OATH", "PGP", "PIV"]);
+
+        // The Feitian OTP applet badges in the app's words, after the rest.
+        let mut ft_probe = probe(
+            "FS CCID 0",
+            false,
+            false,
+            true,
+            true,
+            None,
+            Some(9),
+            Some(5),
+        );
+        ft_probe.has_feitian_otp = true;
+        let ft = &correlate(&[], &[ft_probe], &Keyring::default())[0];
+        assert_eq!(ft.cap_badges(), vec!["PGP", "PIV", "FEITIAN-OTP"]);
+    }
+
+    /// A factory reset has no Feitian OTP step, so it says what it leaves.
+    #[test]
+    fn factory_reset_names_the_feitian_otp_accounts_it_leaves() {
+        let mut caps = Caps::default();
+        caps.insert(Caps::PGP);
+        assert_eq!(factory_reset_keeps(caps), None);
+        caps.insert(Caps::FEITIAN_OTP);
+        assert_eq!(factory_reset_plan(caps), vec![ResetStep::OpenPgp]);
+        assert_eq!(
+            factory_reset_keeps(caps),
+            Some("Feitian OTP accounts are not reset")
+        );
     }
 
     #[test]

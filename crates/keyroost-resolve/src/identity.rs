@@ -705,6 +705,7 @@ mod tests {
             has_fido: false,
             fido_ctap2_confirmed: false,
             has_otp: false,
+            has_feitian_otp: false,
             is_prog: false,
             prog_serial: None,
             yubikey_serial: yk.map(str::to_owned),

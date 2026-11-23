@@ -486,7 +486,7 @@ mod token2_pid_tests {
     #[test]
     fn default_configuration_pids_are_the_full_function_set() {
         // The vendor's default shipping configuration for each family is the
-        // OTP + PGP + FIDO id. 0x0026 in particular was previously mislabelled
+        // OTP + PGP + FIDO id. 0x0026 in particular was previously mislabeled
         // as a generic "FIDO2 Security Key".
         assert_eq!(
             token2_pid_label(0x0016),

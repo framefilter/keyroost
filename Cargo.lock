@@ -1994,6 +1994,7 @@ dependencies = [
  "eframe",
  "egui",
  "keyroost-ctap",
+ "keyroost-feitianotp",
  "keyroost-hid",
  "keyroost-import",
  "keyroost-keyring",
@@ -2038,6 +2039,14 @@ dependencies = [
  "miniz_oxide 0.9.1",
  "p256",
  "sha2 0.11.1",
+ "zeroize",
+]
+
+[[package]]
+name = "keyroost-feitianotp"
+version = "0.16.0"
+dependencies = [
+ "keyroost-proto",
  "zeroize",
 ]
 
@@ -2232,6 +2241,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hidapi",
  "keyroost-ctap",
+ "keyroost-feitianotp",
  "keyroost-hid",
  "keyroost-import",
  "keyroost-oath",
@@ -2270,6 +2280,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "keyroost-ctap",
+ "keyroost-feitianotp",
  "keyroost-hid",
  "keyroost-import",
  "keyroost-keyring",

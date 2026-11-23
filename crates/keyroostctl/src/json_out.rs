@@ -435,6 +435,48 @@ pub(crate) struct OathCodeJson {
     pub code: String,
 }
 
+/// `keyroostctl feitian --json list` — one account of the Feitian OTP applet.
+/// Mirrors the human line `<app:account>  [<type>/<algorithm>]  <period>s`,
+/// with `  (slot N)` after it for an account in a keyboard slot.
+#[derive(Serialize)]
+pub(crate) struct FtotpAccountJson {
+    /// The name as stored on the key, period prefix included.
+    pub name: String,
+    /// "default", "1" or "2".
+    pub slot: &'static str,
+    /// The app part of the stored name (empty when it has none): what
+    /// `feitian code --app` and `feitian delete --app` take, as `otp list`'s
+    /// `app` is.
+    pub app: String,
+    /// The account part of the stored name: what `--account` takes.
+    pub account: String,
+    /// "TOTP" or "HOTP".
+    #[serde(rename = "type")]
+    pub oath_type: &'static str,
+    /// "sha1" / "sha256" (lowercase, like `oath list`).
+    pub algorithm: &'static str,
+    /// The TOTP period in seconds, from the stored name's prefix (30 when it
+    /// has none); `null` for HOTP.
+    pub period: Option<u32>,
+}
+
+/// `keyroostctl feitian --json info` — what the applet says when selected.
+#[derive(Serialize)]
+pub(crate) struct FtotpInfoJson {
+    /// The applet version, e.g. "1.0.2"; `null` when the key didn't say.
+    pub version: Option<String>,
+    pub slots: Vec<FtotpSlotJson>,
+}
+
+/// One slot in `feitian --json info`.
+#[derive(Serialize)]
+pub(crate) struct FtotpSlotJson {
+    /// "default", "1" or "2".
+    pub slot: &'static str,
+    /// Whether the slot has an access code; `null` when the key didn't say.
+    pub access_code_set: Option<bool>,
+}
+
 /// `keyroostctl otp --json list` — one Token2 OTP entry. Mirrors the human
 /// line `<app:account>  [<type>/<algo>]  <code|—>  (touch)?`.
 #[derive(Serialize)]

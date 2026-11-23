@@ -103,9 +103,10 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 - **Importing authenticator codes** — import an authenticator export (Aegis,
   plain or encrypted; 2FAS; a list of `otpauth://` URIs; a QR screenshot,
   including a Google Authenticator export) into a YubiKey, Solo 2 or
-  Nitrokey 3 (OATH), a Token2 key's OTP storage, or a Molto2. keyroost shows
-  what each code becomes before it writes anything (`oath import`,
-  `otp import`, `molto import --in`, or drop the file on the GUI); see
+  Nitrokey 3 (OATH), a Token2 key's OTP storage, a Feitian key's OTP applet,
+  or a Molto2. keyroost shows what each code becomes before it writes
+  anything (`oath import`, `otp import`, `feitian import`,
+  `molto import --in`, or drop the file on the GUI); see
   [Importing codes](#importing-codes).
 - **Token2 single-profile programmable TOTP token** — program the seed and TOTP
   configuration onto Token2's single-account card/fob tokens (OTPC-P1-i / P2-i,
@@ -130,9 +131,18 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   `otp list --unlock auto`, which tries the fingerprint and falls back to
   the PIN); fingerprint
   enrollment itself is done through the key's FIDO2 fingerprint setup.
+- **Feitian OTP (Feitian FIDO keys)** — list, read, add, import and delete
+  the TOTP/HOTP accounts in the OTP applet Feitian keys carry, over the
+  smart-card interface (`feitian info` / `list` / `code` / `add` /
+  `import` / `delete`, or the GUI's Feitian OTP tab). The key computes a
+  code, and saves or deletes an account, once it is touched. Its own
+  protocol, documented in
+  [`docs/PROTOCOL-feitianotp.md`](docs/PROTOCOL-feitianotp.md).
 - **One-shot factory reset** — `keyroostctl factory-reset` (and a card on
-  the GUI device Overview tab) resets every resettable applet on a key in turn:
-  OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. In a terminal you confirm by
+  the GUI device Overview tab) resets every applet keyroost can reset on a key
+  in turn: OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. Feitian OTP accounts
+  are not reset (it says so before asking and with the result); remove them
+  with `keyroostctl feitian delete` or the app's Feitian OTP tab. In a terminal you confirm by
   typing `reset`; a script passes `--yes`. On a USB key the FIDO2 step ends
   with an unplug/replug (detected automatically) and a touch; a card in a smart-card reader is instead
   reset in place (no replug, no touch — the card is power-cycled in the
@@ -173,7 +183,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 | **SoloKeys Solo 2** | FIDO2, OATH (incl. import) | Trussed firmware; no OpenPGP applet. **HOTP caveat:** the last-shipped Solo 2 firmware (2.964) computes HOTP over a 4-byte counter where RFC 4226 specifies 8, so its HOTP codes won't verify against standards-compliant servers (hardware-verified; fixed in the current upstream Trussed secrets app, but Solo 2 no longer receives firmware updates). TOTP is unaffected — its 8-byte time challenge comes from the host. |
 | **Nitrokey 3** | FIDO2, OATH (incl. import), OpenPGP, PIV | Built around the same Trussed firmware core as Solo 2, but the final firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2 does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3), contributed by [@episource](https://github.com/episource); keyroost reads the serial and firmware version from the Nitrokey admin application. Importing an RSA-2048 key and certificate from a `.p12` / `.pfx` file into slot 9A verified on firmware 1.9.1. OATH verified on firmware 1.9.0: adding, listing, TOTP and HOTP codes, and touch-required accounts, which also need a touch to save; deleting any account, or resetting the Authenticator, also needs a touch. This firmware has no CALCULATE ALL, so the Authenticator tab reads codes one at a time. Importing codes into its OATH storage follows Nitrokey's published secrets-app source (see [Importing codes](#importing-codes)). OpenPGP key generation, signing and reset exercised on firmware 1.9.1. |
 | **Swissbit iShield Key 2 Pro** (and iShield Key 1) | PIV (partial) | Key generation and certificate handling verified by [@episource](https://github.com/episource) on their own iShield Key 2 Pro. keyroost doesn't use the slot key type and PIN/touch policy this card reports in GET METADATA ([#113](https://github.com/framefilter/keyroost/issues/113)), so a slot without a certificate reads "no certificate (a key may be present)". Answers the Yubico version extension with four bytes instead of three; keyroost keeps the reply as sent. On the iShield Key 1 and 2, keyroost reads the serial and device name from Swissbit's own management applications (and, on the Key 1, the firmware version) for `piv info` and the GUI, contributed by [@episource](https://github.com/episource) ([#163](https://github.com/framefilter/keyroost/pull/163)). Other applets not yet exercised by this project. |
-| **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior, so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, largeBlob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys show as U2F in `list` and the app and don't support the CTAP2 management commands. |
+| **Feitian FIDO keys with the OTP applet** (e.g. ePass FIDO NFC Plus, BioPass FIDO Pro) | FIDO2, Feitian OTP (incl. import); OpenPGP / PIV only if the key carries those applets | Feitian keys' OTP applet, reached over PC/SC with Feitian's own protocol ([docs/PROTOCOL-feitianotp.md](docs/PROTOCOL-feitianotp.md)). Verified by [@Snrat](https://github.com/Snrat) on an ePass FIDO NFC Plus (OTP applet 1.0.2) on Windows: listing accounts, reading TOTP and HOTP codes, and adding, importing and deleting accounts ([#268](https://github.com/framefilter/keyroost/pull/268)). The applet's reset and slot access codes aren't supported, so `factory-reset` leaves Feitian OTP accounts on the key and says so. On Windows, when the system reports a Feitian key's card as not responding, keyroost warm-resets it once and connects again. The FIDO2 side follows the generic row below. |
+| **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior (apart from the Feitian OTP applet in the row above), so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, largeBlob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys show as U2F in `list` and the app and don't support the CTAP2 management commands. |
 
 Each listed row notes what's actually been verified on that device; the final,
 generic row describes the standards-based behavior expected on untested but
@@ -285,7 +296,10 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   for every hardware key in the FIDO Alliance's list
   ([#246](https://github.com/framefilter/keyroost/pull/246)); and logos
   stored as palette PNGs in the FIDO metadata card
-  ([#257](https://github.com/framefilter/keyroost/pull/257)).
+  ([#257](https://github.com/framefilter/keyroost/pull/257)); and the
+  Feitian OTP applet, the `feitian` group and the app's Feitian OTP tab,
+  hardware-verified on an ePass FIDO NFC Plus
+  ([#268](https://github.com/framefilter/keyroost/pull/268)).
 - **[@dlacko](https://github.com/dlacko)** — `openpgp info` cardholder name
   and public-key URL: the CLI prints the `005B` name and `5F50` URL
   (`cardholder_name` and `url` in `--json`), and the app's Card details
@@ -774,6 +788,12 @@ keyroostctl otp add --app GitHub --account me@x.com   # asks for the seed (hidde
 keyroostctl otp code --app GitHub --account me@x.com
 keyroostctl otp import -i export.json                  # add every code in an export (asks first)
 
+# --- Feitian OTP (Feitian FIDO keys; the key acts once it is touched) ---
+keyroostctl feitian list
+keyroostctl feitian add --app GitHub --account me@x.com    # asks for the seed (hidden)
+keyroostctl feitian code --app GitHub --account me@x.com
+keyroostctl feitian import -i export.json                  # add every code in an export (asks first)
+
 # --- Destructive operations (ask y/N, or type "reset", in a terminal) ---
 keyroostctl factory-reset --device my-yubikey          # asks you to type "reset"
 keyroostctl factory-reset --device my-yubikey --yes    # in a script
@@ -791,7 +811,8 @@ keyroostctl --json piv info --device my-yubikey
 keyroostctl manpage ./man && man -l ./man/keyroostctl-piv.1
 
 # launch the GUI (per-device tabs: Overview, FIDO2, Authenticator, OpenPGP, PIV,
-# On-device OTP, plus the distinct Molto2 and single-profile programmable-token views)
+# On-device OTP, Feitian OTP, plus the distinct Molto2 and single-profile
+# programmable-token views)
 keyroost
 ```
 
@@ -915,12 +936,13 @@ Google Authenticator export.
 keyroostctl oath import -i export.json --dry-run    # show what would happen; writes nothing
 keyroostctl oath import -i export.json              # YubiKey, Solo 2, Nitrokey 3: asks once, then adds
 keyroostctl otp import -i export.json               # a Token2 key's OTP storage
+keyroostctl feitian import -i export.json           # a Feitian key's OTP applet
 keyroostctl molto import -i export.json --slot 90   # a Molto2, from slot #90 on
 keyroostctl oath import -i export.json --file-password env:EXPORT_PW   # an encrypted Aegis export
 ```
 
 In the GUI, drop the file on the window, or click **Import file…** in a
-key's Authenticator, On-device OTP or Molto2 view. The **Import
+key's Authenticator, On-device OTP, Feitian OTP or Molto2 view. The **Import
 authenticator codes** dialog lists the entries, lets you pick the key under
 **Add to**, and shows what each entry will become before anything is
 written. An encrypted export asks for its password in the dialog. A
@@ -940,11 +962,18 @@ entry:
   "Solo 2 doesn't take SHA-512 codes"). keyroost never changes an entry to
   make it fit. Steam codes are skipped on every key.
 
+On a Feitian key, one app and account is one code, whatever its type or
+period: an entry whose app and account the key already holds is **exists**
+(or **replace**), and replacing removes the old code under its own stored
+name. `feitian add` refuses such an account in the same way.
+
 Imported codes can require a touch, as `add --touch` does: `--touch` for
 every code the import writes, or `--touch-for NAME` (repeat it) for the
 codes named as the preview shows them (in the GUI, "Require touch for every
 code" or the box on each code's row). The preview marks them "(touch)". A
-Nitrokey 3 asks for a touch to save each one. A Molto2 has no touch setting.
+Nitrokey 3 asks for a touch to save each one. A Molto2 has no touch setting,
+and a Feitian key has none either: it asks for a touch to save every code,
+and for each code it gives.
 
 On a Molto2, entries fill consecutive slots from `--slot`. A slot already in
 use is replaced (**replace**), an entry with no issuer or account is
@@ -953,9 +982,9 @@ skipped without using up a slot, and entries past slot #99 are skipped.
 keyroost asks once before writing (a script adds `-y`). It writes one code
 at a time and stops at the first error, saying what was added and what was
 not. Running the same import again is safe: codes it already added now
-show as **exists**. `--dry-run` writes nothing; for `oath import` and `otp
-import` the key must be connected, because the preview depends on what is
-on it. `molto import --dry-run` reads slot use from a connected Molto2, and
+show as **exists**. `--dry-run` writes nothing; for `oath import`, `otp
+import` and `feitian import` the key must be connected, because the preview
+depends on what is on it. `molto import --dry-run` reads slot use from a connected Molto2, and
 works without one too. `--json` prints the plan and, after writing, what
 happened to each entry.
 
@@ -973,6 +1002,7 @@ What each key can store:
 | Solo 2 | not reported (writing stops if it fills up) | names up to 127 bytes; no SHA-512; secrets up to 64 bytes |
 | Nitrokey 3 | 50 codes | names up to 128 bytes; 30-second codes only (the key doesn't store the period); no SHA-512 |
 | Token2 OTP storage | 50 codes | app and account up to 64 bytes each, plain ASCII only; no SHA-512; HOTP only with a counter of 0 (the key always starts at 0) |
+| Feitian OTP | not known | names up to 64 bytes, counting the `30:` or `60:` period in front and the `_#_` between app and account; SHA-1 or SHA-256; 6 or 8 digits; TOTP 30 or 60 seconds; HOTP only with a counter of 0; secrets up to 64 bytes |
 | Molto2 | 100 slots (#00 to #99) | TOTP only, 30 or 60 seconds; SHA-1 or SHA-256; 4, 6, 8 or 10 digits; titles shortened to 12 bytes |
 
 On a YubiKey or Solo 2, a TOTP code with a period other than 30 seconds is
@@ -1054,7 +1084,7 @@ old script.
 | Crate | Purpose | External deps |
 |---|---|---|
 | `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
-| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session, import writers for OATH / Token2 OTP / Molto2 (in-tree `keyroost-import`), PIV key import from `.p12` / `.pfx` (in-tree `keyroost-p12`) and the slot self-test (in-tree `keyroost-pivtest`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
+| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP and Feitian OTP sessions, import writers for OATH / Token2 OTP / Feitian OTP / Molto2 (in-tree `keyroost-import`), PIV key import from `.p12` / `.pfx` (in-tree `keyroost-p12`) and the slot self-test (in-tree `keyroost-pivtest`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
 | `keyroost-hid` | USB HID enumeration of FIDO devices, and the "same physical USB device" evidence used to pair a key's FIDO and smart-card sides | none on Linux (`sysfs`); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
 | `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management, large-blob storage (including the name a key carries) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`) and `getrandom` for client-PIN, `aes-gcm` + `miniz_oxide` for largeBlob entries, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
@@ -1063,6 +1093,7 @@ old script.
 | `keyroost-p12` | Host-side PKCS#12 (`.p12` / `.pfx`) reader for `piv key import`: legacy and modern encryption, MAC check, keys paired with their certificates | `rc2`, `des`, `cbc`, `aes`, `hmac`, `sha2`, `pbkdf2`, `p256`/`p384`, `ed25519-dalek`, `x25519-dalek`, `rsa`, `zeroize`; in-tree `keyroost-proto`, `keyroost-piv`, `keyroost-oath` |
 | `keyroost-pivtest` | Host-side round-trip self-test for a PIV slot key (decrypt / key-agree / sign), checked against a public key: the slot certificate's, or one given (an imported key's) | `rsa`, `p256`, `p384`, `p521`, `ed25519-dalek`, `x25519-dalek`, `zeroize` |
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`) and `getrandom` for ECDH seed encryption and the OTP-PIN session, `zeroize` |
+| `keyroost-feitianotp` | Pure-Rust Feitian OTP applet byte layer (APDU builders and TLV parsers; [docs/PROTOCOL-feitianotp.md](docs/PROTOCOL-feitianotp.md)) | `zeroize`; in-tree `keyroost-proto` |
 | `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints) | `serde`, `serde_json`, `getrandom` (the per-computer salt); in-tree SHA-256 from `keyroost-proto` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match), naming (names on the key and on this computer), and the model table and bundled FIDO metadata the CLI and the app both show | `serde`/`serde_json` (the bundled FIDO metadata); in-tree, including `keyroost-ctap` |
