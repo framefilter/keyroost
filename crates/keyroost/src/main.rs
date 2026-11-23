@@ -764,8 +764,10 @@ struct ResetArm {
     /// fires the reset.
     saw_removal: bool,
     /// Successful scans in a row that did not show the armed key, while the
-    /// unplug is not yet confirmed. See [`removal_scans_needed`].
+    /// unplug is not yet confirmed. See [`RemovalRule`].
     absent_scans: u8,
+    /// When the first of those scans was taken; `None` while the key is seen.
+    absent_since: Option<std::time::Instant>,
     /// The key has no serial of either kind, so it was armed only because
     /// nothing else was connected, and a re-insert fires only while that
     /// still holds ([`keyroost_resolve::serial_less_reinsert`]).
@@ -857,24 +859,54 @@ fn forget_departed_node(prev: &mut Vec<HidIdentity>, departed: &std::path::Path)
 /// returning key is a fresh connection without any help.
 const SAME_PORT_REPLUG_KEEPS_PATH: bool = cfg!(windows);
 
-/// How many successful scans in a row must miss the armed key before the
-/// armed-reset poll takes it as unplugged.
+/// What it takes for the armed-reset poll to take the armed key as unplugged:
+/// missing from at least `scans` successful scans in a row, and for at least
+/// `floor` from the first of them. A scan that shows the key starts it over.
 ///
 /// A scan can come back without a key that is still connected: Windows
 /// leaves out a HID interface it could not open, Linux one whose sysfs
 /// entry could not be read, and on some platforms a failed scan is reported
-/// as an empty list rather than an error. Where a same-port replug keeps
-/// the path, the unplug also drops the key from the snapshot, so one such
-/// scan would let the still-connected key pass for the re-insert on the
-/// next poll and be sent a reset with no replug behind it. Two scans in a
-/// row are asked for there. Elsewhere the snapshot keeps the key's entry
-/// and a key that never left is never fresh, so one scan is enough, as
-/// before.
-fn removal_scans_needed(same_port_keeps_path: bool) -> u8 {
-    if same_port_keeps_path {
-        2
-    } else {
-        1
+/// as an empty list rather than an error. Where the key coming back would
+/// then count as the re-insert, one such scan would get the still-connected
+/// key sent a reset with no replug behind it. That is the case in HID-serial
+/// mode on every platform (the serial seen again is the re-insert), and in
+/// path mode where a same-port replug keeps the path (the unplug drops the
+/// key from the snapshot). Those take [`RemovalRule::CONFIRMED`]. Path mode
+/// elsewhere keeps the key's entry in the snapshot, so a key that never left
+/// is never fresh, and one scan is enough, as before.
+///
+/// The floor only decides "left". Once that is settled, the key coming back
+/// is acted on at the first scan that shows it, so none of this eats into
+/// the window after power-up in which a key accepts the reset.
+#[derive(Clone, Copy)]
+struct RemovalRule {
+    scans: u8,
+    floor: std::time::Duration,
+}
+
+impl RemovalRule {
+    /// One scan without the key is the unplug.
+    const ONE_SCAN: Self = RemovalRule {
+        scans: 1,
+        floor: std::time::Duration::ZERO,
+    };
+    /// Missing from two scans in a row, over at least half a second. Half a
+    /// second is well above the time a scan glitch lasts (one poll, a few
+    /// milliseconds; the poll can run on every repaint, so two scans alone
+    /// can be milliseconds apart) and far below what a person takes to pull
+    /// a key out and push it back in.
+    const CONFIRMED: Self = RemovalRule {
+        scans: 2,
+        floor: std::time::Duration::from_millis(500),
+    };
+
+    /// The rule for path mode (no HID serial).
+    fn path_mode(same_port_keeps_path: bool) -> Self {
+        if same_port_keeps_path {
+            Self::CONFIRMED
+        } else {
+            Self::ONE_SCAN
+        }
     }
 }
 
@@ -890,6 +922,20 @@ enum ResetPoll {
 }
 
 impl ResetArm {
+    /// A successful scan at `now` did not show the armed key; whether it has
+    /// now been missing long enough under `rule` to count as unplugged.
+    fn missing_long_enough(&mut self, now: std::time::Instant, rule: RemovalRule) -> bool {
+        let since = *self.absent_since.get_or_insert(now);
+        self.absent_scans = self.absent_scans.saturating_add(1);
+        self.absent_scans >= rule.scans && now.saturating_duration_since(since) >= rule.floor
+    }
+
+    /// A scan showed the armed key: whatever absence was being timed is over.
+    fn seen(&mut self) {
+        self.absent_scans = 0;
+        self.absent_since = None;
+    }
+
     /// One poll of the armed reset against a HID scan: track the armed key's
     /// unplug and decide whether a device now connected is its re-insert.
     /// [`App::poll_reset_arm`] feeds it the live scan and acts on the answer;
@@ -902,18 +948,19 @@ impl ResetArm {
     /// YubiKey's), and `resolve` the full device list the serial-less rule
     /// needs; both reach PC/SC live, so they run only for a fresh connection
     /// after the unplug. `same_port_keeps_path` is
-    /// [`SAME_PORT_REPLUG_KEEPS_PATH`] outside tests.
+    /// [`SAME_PORT_REPLUG_KEEPS_PATH`] outside tests, and `now` the time of
+    /// the scan, for [`RemovalRule`]'s floor.
     fn poll(
         &mut self,
         scan: Option<&[FidoHid]>,
         mut effective_serial: impl FnMut(&std::path::Path) -> Option<String>,
         mut resolve: impl FnMut() -> Vec<keyroost_resolve::Device>,
         same_port_keeps_path: bool,
+        now: std::time::Instant,
     ) -> ResetPoll {
         let Some(current) = scan else {
             return ResetPoll::Wait;
         };
-        let needed = removal_scans_needed(same_port_keeps_path);
         let mut fire: Option<std::path::PathBuf> = None;
         if let Some(target_serial) = self.target_serial.clone() {
             // HID-serial mode: identity is port-independent.
@@ -922,14 +969,13 @@ impl ResetArm {
                 .find(|d| d.serial.as_deref() == Some(target_serial.as_str()));
             match here {
                 None if !self.saw_removal => {
-                    self.absent_scans = self.absent_scans.saturating_add(1);
-                    if self.absent_scans >= needed {
+                    if self.missing_long_enough(now, RemovalRule::CONFIRMED) {
                         self.saw_removal = true; // unplugged
                     }
                 }
                 None => {}
                 Some(d) if self.saw_removal => fire = Some(d.path.clone()),
-                Some(_) => self.absent_scans = 0,
+                Some(_) => self.seen(),
             }
         } else {
             // Effective-serial mode (no HID serial, e.g. most YubiKeys):
@@ -941,20 +987,19 @@ impl ResetArm {
             // runs only for a model-matching fresh connection, and only
             // after removal.
             let present = |p: &std::path::PathBuf| current.iter().any(|d| &d.path == p);
-            match &self.target_path {
-                Some(t) if !self.saw_removal && !present(t) => {
-                    self.absent_scans = self.absent_scans.saturating_add(1);
-                    if self.absent_scans >= needed {
+            match self.target_path.clone() {
+                Some(t) if !self.saw_removal && !present(&t) => {
+                    if self.missing_long_enough(now, RemovalRule::path_mode(same_port_keeps_path)) {
                         self.saw_removal = true;
                         if same_port_keeps_path {
                             // Gone, so the same path later is a new
                             // connection (a same-port replug on Windows
                             // keeps the path).
-                            forget_departed_node(&mut self.prev_devices, t);
+                            forget_departed_node(&mut self.prev_devices, &t);
                         }
                     }
                 }
-                Some(t) if !self.saw_removal && present(t) => self.absent_scans = 0,
+                Some(t) if !self.saw_removal && present(&t) => self.seen(),
                 _ => {}
             }
             if self.saw_removal && self.serial_less {
@@ -10025,6 +10070,7 @@ impl App {
                 prev_devices: devices.iter().map(HidIdentity::of).collect(),
                 saw_removal: false,
                 absent_scans: 0,
+                absent_since: None,
                 serial_less,
             });
         }
@@ -10273,9 +10319,9 @@ impl App {
     /// so the armed-reset poll skips it rather than read it as "the armed key
     /// is gone". Not every failure comes back as `None`, though: some
     /// platforms report a failed scan as an empty or partial list. That is
-    /// why, where an unplug also drops the key from the poll's snapshot, the
-    /// key has to be missing from two scans in a row
-    /// ([`removal_scans_needed`]).
+    /// why, wherever one such scan could pass for an unplug and replug, the
+    /// key has to be missing from two scans in a row and for half a second
+    /// ([`RemovalRule`]).
     fn scan_fido_devices() -> Option<Vec<FidoHid>> {
         keyroost_hid::enumerate().ok().map(|hids| {
             hids.into_iter()
@@ -10383,6 +10429,7 @@ impl App {
                 .unwrap_or_default()
             },
             SAME_PORT_REPLUG_KEEPS_PATH,
+            std::time::Instant::now(),
         );
         match verdict {
             ResetPoll::Wait => {}
@@ -30316,6 +30363,7 @@ mod tests {
             prev_devices: Vec::new(),
             saw_removal: true,
             absent_scans: 0,
+            absent_since: None,
             serial_less: false,
         });
 
@@ -30348,6 +30396,7 @@ mod tests {
             prev_devices: Vec::new(),
             saw_removal: true,
             absent_scans: 0,
+            absent_since: None,
             serial_less: false,
         }
     }
@@ -35819,17 +35868,43 @@ mod tests {
             prev_devices: connected.iter().map(HidIdentity::of).collect(),
             saw_removal: false,
             absent_scans: 0,
+            absent_since: None,
             serial_less: false,
         }
     }
 
-    /// Feed `scans` (`None` = a failed scan) to `arm` in order; the verdicts.
-    /// `serial_at` is the resolver's identity of the device at a path.
+    /// A scripted clock for the poll: each scan is taken `step` after the one
+    /// before it. Nothing sleeps.
+    struct Clock {
+        at: std::time::Instant,
+        step: std::time::Duration,
+    }
+
+    impl Clock {
+        fn every_ms(ms: u64) -> Self {
+            Clock {
+                at: std::time::Instant::now(),
+                step: std::time::Duration::from_millis(ms),
+            }
+        }
+
+        /// The time of the next scan.
+        fn tick(&mut self) -> std::time::Instant {
+            let now = self.at;
+            self.at += self.step;
+            now
+        }
+    }
+
+    /// Feed `scans` (`None` = a failed scan) to `arm` in order, one per
+    /// `clock` tick; the verdicts. `serial_at` is the resolver's identity of
+    /// the device at a path.
     fn drive(
         arm: &mut ResetArm,
         scans: &[Option<Vec<FidoHid>>],
         serial_at: impl Fn(&std::path::Path) -> Option<String>,
         same_port_keeps_path: bool,
+        clock: &mut Clock,
     ) -> Vec<ResetPoll> {
         scans
             .iter()
@@ -35839,6 +35914,7 @@ mod tests {
                     &serial_at,
                     || panic!("the serial-less rule is not part of these runs"),
                     same_port_keeps_path,
+                    clock.tick(),
                 )
             })
             .collect()
@@ -35860,7 +35936,13 @@ mod tests {
         for keeps_path in [true, false] {
             let mut arm = effective_serial_arm(&armed, &[armed.clone(), other.clone()]);
             assert_eq!(
-                arm.poll(None, armed_on_win_path, Vec::new, keeps_path),
+                arm.poll(
+                    None,
+                    armed_on_win_path,
+                    Vec::new,
+                    keeps_path,
+                    std::time::Instant::now()
+                ),
                 ResetPoll::Wait
             );
             assert!(!arm.saw_removal);
@@ -35896,6 +35978,7 @@ mod tests {
             ],
             armed_on_win_path,
             true,
+            &mut Clock::every_ms(500),
         );
         assert!(never_fires(&verdicts), "{verdicts:?}");
         assert!(!arm.saw_removal);
@@ -35917,7 +36000,13 @@ mod tests {
                 Some(vec![other.clone(), armed.clone()]),
                 Some(vec![armed.clone()]),
             ];
-            let verdicts = drive(&mut arm, &scans, armed_on_win_path, keeps_path);
+            let verdicts = drive(
+                &mut arm,
+                &scans,
+                armed_on_win_path,
+                keeps_path,
+                &mut Clock::every_ms(500),
+            );
             assert!(never_fires(&verdicts), "{verdicts:?}");
             assert!(!arm.saw_removal);
         }
@@ -35942,6 +36031,7 @@ mod tests {
             ],
             armed_on_win_path,
             true,
+            &mut Clock::every_ms(500),
         );
         assert_eq!(
             verdicts.last(),
@@ -35973,6 +36063,7 @@ mod tests {
             ],
             |path| (path == std::path::Path::new(WIN_ARMED)).then(|| "BBB".to_string()),
             true,
+            &mut Clock::every_ms(500),
         );
         assert!(never_fires(&verdicts), "{verdicts:?}");
         assert!(arm.saw_removal);
@@ -35989,6 +36080,8 @@ mod tests {
             (path == std::path::Path::new("/dev/hidraw0")).then(|| "AAA".to_string())
         };
         let mut arm = effective_serial_arm(&armed, std::slice::from_ref(&armed));
+        // Scans milliseconds apart: path mode on Linux takes no floor.
+        let mut clock = Clock::every_ms(10);
         let verdicts = drive(
             &mut arm,
             &[
@@ -35999,48 +36092,198 @@ mod tests {
             ],
             serial_at,
             false,
+            &mut clock,
         );
         assert!(never_fires(&verdicts), "{verdicts:?}");
         assert!(arm.saw_removal, "one scan without the key, as before");
 
         let replugged = linux_hid("/dev/hidraw0", 9);
         assert_eq!(
-            arm.poll(Some(&[replugged]), serial_at, Vec::new, false),
+            arm.poll(Some(&[replugged]), serial_at, Vec::new, false, clock.tick()),
             ResetPoll::Fire("/dev/hidraw0".into())
         );
     }
 
-    /// The HID-serial mode takes the same two scans on Windows: one scan that
-    /// leaves the key out, then the key again, sends nothing.
-    #[test]
-    fn hid_serial_mode_on_windows_needs_two_scans_without_the_key() {
-        let mut with_serial = win_hid(WIN_ARMED, 2);
-        with_serial.serial = Some("S1".into());
-        let mut arm = effective_serial_arm(&with_serial, &[with_serial.clone()]);
+    /// An arm in HID-serial mode for a key whose USB serial is "S1".
+    fn hid_serial_arm() -> (ResetArm, FidoHid) {
+        let mut key = win_hid(WIN_ARMED, 2);
+        key.serial = Some("S1".into());
+        let mut arm = effective_serial_arm(&key, std::slice::from_ref(&key));
         arm.target_serial = Some("S1".into());
-        let blip = drive(
-            &mut arm,
-            &[
-                Some(vec![with_serial.clone()]),
-                Some(Vec::new()),
-                Some(vec![with_serial.clone()]),
-            ],
-            |_| None,
-            true,
-        );
-        assert!(never_fires(&blip), "{blip:?}");
-        assert!(!arm.saw_removal);
-        let replug = drive(
-            &mut arm,
-            &[
-                Some(Vec::new()),
-                Some(Vec::new()),
-                Some(vec![with_serial.clone()]),
-            ],
-            |_| None,
-            true,
-        );
-        assert_eq!(replug.last(), Some(&ResetPoll::Fire(with_serial.path)));
+        (arm, key)
+    }
+
+    /// An arm in path mode for the Windows-shaped key on `WIN_ARMED`.
+    fn path_arm() -> (ResetArm, FidoHid) {
+        let key = win_hid(WIN_ARMED, 2);
+        let arm = effective_serial_arm(&key, std::slice::from_ref(&key));
+        (arm, key)
+    }
+
+    /// Every mode that waits for "the key left" to be confirmed: path mode
+    /// where a same-port replug keeps the path, and HID-serial mode on every
+    /// platform. Each entry is (what it is, a fresh arm and its key, the
+    /// `same_port_keeps_path` it runs under).
+    fn confirmed_modes() -> Vec<(&'static str, ResetArm, FidoHid, bool)> {
+        let (p, pk) = path_arm();
+        let (h1, hk1) = hid_serial_arm();
+        let (h2, hk2) = hid_serial_arm();
+        vec![
+            ("path mode, Windows", p, pk, true),
+            ("HID-serial mode, Windows", h1, hk1, true),
+            ("HID-serial mode, Linux/macOS", h2, hk2, false),
+        ]
+    }
+
+    /// Two scans without the key, milliseconds apart (the poll can run on
+    /// every repaint), are not the unplug, and the key seen again is not
+    /// the replug.
+    #[test]
+    fn two_scans_without_the_key_milliseconds_apart_are_not_the_unplug() {
+        for (mode, mut arm, key, keeps_path) in confirmed_modes() {
+            let verdicts = drive(
+                &mut arm,
+                &[
+                    Some(vec![key.clone()]),
+                    Some(Vec::new()),
+                    Some(Vec::new()),
+                    Some(Vec::new()),
+                    Some(vec![key.clone()]),
+                    Some(vec![key.clone()]),
+                ],
+                armed_on_win_path,
+                keeps_path,
+                &mut Clock::every_ms(10),
+            );
+            assert!(never_fires(&verdicts), "{mode}: {verdicts:?}");
+            assert!(!arm.saw_removal, "{mode}");
+        }
+    }
+
+    /// Missing from at least two scans over at least half a second is the
+    /// unplug, and the key back is acted on at the very next scan, however
+    /// soon: the floor is on "left", never on "returned".
+    #[test]
+    fn missing_for_half_a_second_over_two_scans_is_the_unplug() {
+        for (mode, mut arm, key, keeps_path) in confirmed_modes() {
+            let mut clock = Clock::every_ms(250);
+            let verdicts = drive(
+                &mut arm,
+                &[
+                    Some(vec![key.clone()]),
+                    Some(Vec::new()), // missing since here
+                    Some(Vec::new()), // 250 ms: not yet
+                ],
+                armed_on_win_path,
+                keeps_path,
+                &mut clock,
+            );
+            assert!(never_fires(&verdicts), "{mode}: {verdicts:?}");
+            assert!(!arm.saw_removal, "{mode}: 250 ms is under the floor");
+            let verdicts = drive(
+                &mut arm,
+                &[Some(Vec::new())], // 500 ms
+                armed_on_win_path,
+                keeps_path,
+                &mut clock,
+            );
+            assert!(never_fires(&verdicts), "{mode}: {verdicts:?}");
+            assert!(arm.saw_removal, "{mode}: three scans over 500 ms");
+            clock.step = std::time::Duration::from_millis(10);
+            let back = drive(
+                &mut arm,
+                &[Some(vec![key.clone()])],
+                armed_on_win_path,
+                keeps_path,
+                &mut clock,
+            );
+            assert_eq!(back, [ResetPoll::Fire(key.path.clone())], "{mode}");
+        }
+    }
+
+    /// One long gap between two scans also counts: the floor is time, and a
+    /// failed scan in between neither adds to nor breaks the run.
+    #[test]
+    fn two_scans_without_the_key_half_a_second_apart_are_the_unplug() {
+        for (mode, mut arm, key, keeps_path) in confirmed_modes() {
+            let verdicts = drive(
+                &mut arm,
+                &[
+                    Some(vec![key.clone()]),
+                    Some(Vec::new()),
+                    None,
+                    Some(Vec::new()),
+                    Some(vec![key.clone()]),
+                ],
+                armed_on_win_path,
+                keeps_path,
+                &mut Clock::every_ms(250),
+            );
+            assert_eq!(
+                verdicts.last(),
+                Some(&ResetPoll::Fire(key.path.clone())),
+                "{mode}: {verdicts:?}"
+            );
+        }
+    }
+
+    /// A scan that shows the key starts the timing over: misses on either
+    /// side of it don't add up, however long the whole stretch is.
+    #[test]
+    fn a_sighting_in_between_restarts_the_unplug_timing() {
+        for (mode, mut arm, key, keeps_path) in confirmed_modes() {
+            let missing = Some(Vec::new());
+            let seen = Some(vec![key.clone()]);
+            let verdicts = drive(
+                &mut arm,
+                &[
+                    seen.clone(),
+                    missing.clone(), // t=200
+                    missing.clone(), // t=400: 200 ms
+                    seen.clone(),    // t=600: starts over
+                    missing.clone(), // t=800
+                    missing.clone(), // t=1000: 200 ms since 800
+                    seen.clone(),
+                    seen,
+                ],
+                armed_on_win_path,
+                keeps_path,
+                &mut Clock::every_ms(200),
+            );
+            assert!(never_fires(&verdicts), "{mode}: {verdicts:?}");
+            assert!(!arm.saw_removal, "{mode}");
+        }
+    }
+
+    /// HID-serial mode, on every platform: one scan that leaves the key out,
+    /// then the key again, sends nothing; a real unplug and replug does.
+    #[test]
+    fn hid_serial_mode_needs_the_unplug_confirmed_on_every_platform() {
+        for keeps_path in [true, false] {
+            let (mut arm, key) = hid_serial_arm();
+            let mut clock = Clock::every_ms(500);
+            let blip = drive(
+                &mut arm,
+                &[
+                    Some(vec![key.clone()]),
+                    Some(Vec::new()),
+                    Some(vec![key.clone()]),
+                ],
+                |_| None,
+                keeps_path,
+                &mut clock,
+            );
+            assert!(never_fires(&blip), "{blip:?}");
+            assert!(!arm.saw_removal);
+            let replug = drive(
+                &mut arm,
+                &[Some(Vec::new()), Some(Vec::new()), Some(vec![key.clone()])],
+                |_| None,
+                keeps_path,
+                &mut clock,
+            );
+            assert_eq!(replug.last(), Some(&ResetPoll::Fire(key.path)));
+        }
     }
 }
 
