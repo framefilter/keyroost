@@ -451,6 +451,21 @@ pub enum TransportError {
     /// A Feitian OTP TOTP code came back for a time window that had ended
     /// while the key waited for its touch. The code was wiped, not returned.
     FeitianOtpWindowEnded,
+    /// A Feitian OTP RESET was accepted, but listing the slots afterwards
+    /// did not show all three empty. `left` says, per slot, how many
+    /// entries it still holds or why it couldn't be checked.
+    FeitianOtpResetUnconfirmed { left: Vec<String> },
+    /// The key's FIDO HID interface, which can carry the Feitian OTP
+    /// applet's commands in place of a smart-card reader, could not be
+    /// opened or did not complete an exchange.
+    FeitianOtpHid(String),
+    /// A key with both interfaces: its reader could not be opened for the
+    /// Feitian OTP applet (`reader`), and its FIDO HID interface, tried
+    /// next, failed too (`hid`).
+    FeitianOtpBothFailed {
+        reader: Box<TransportError>,
+        hid: Box<TransportError>,
+    },
     /// The RSA key's public exponent is wider than the OpenPGP card's declared
     /// exponent field (`e_bits`). Caught before building the import (the pure
     /// builder would otherwise panic); guards against a malformed card
@@ -816,6 +831,18 @@ impl fmt::Display for TransportError {
                 f,
                 "that code's time window ended while the key waited for the touch; \
                  read it again"
+            ),
+            TransportError::FeitianOtpResetUnconfirmed { left } => write!(
+                f,
+                "the key accepted the Feitian OTP reset, but not every slot reads empty: {}",
+                left.join("; ")
+            ),
+            TransportError::FeitianOtpHid(e) => {
+                write!(f, "Feitian OTP over the key's FIDO HID interface: {e}")
+            }
+            TransportError::FeitianOtpBothFailed { reader, hid } => write!(
+                f,
+                "{reader}; the key's FIDO HID interface also failed ({hid})"
             ),
             TransportError::OpenPgpExponentTooWide => write!(
                 f,
@@ -2004,6 +2031,37 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                     } else {
                         format!("token2 otp serial -> {shown:?}, not an R3.4 prefix: not used")
                     });
+                }
+            }
+            // A Feitian key's own serial, read with the command Feitian's
+            // client reads the serial it shows with; the key answers it
+            // whichever application is selected. Without it such a key is
+            // known by the serial field of its OpenPGP AID below, which is
+            // `00000001` on both keys measured and part of the AID Feitian's
+            // client selects that application by, so it does not tell one
+            // key from another; and a Feitian key with no OpenPGP
+            // application has no serial at all. Names saved under that AID
+            // serial are not carried over (`former_serial` stays unset): it
+            // would hand one key's name to the next.
+            if probe.has_feitian_otp && probe.serial.is_none() {
+                if let Ok((data, s1, s2)) =
+                    transmit_apdu(&card, &keyroost_feitianotp::device_serial())
+                {
+                    let serial = if sw_ok(s1, s2) {
+                        keyroost_feitianotp::parse_device_serial(&data)
+                    } else {
+                        None
+                    };
+                    if trace {
+                        probe_note(&match &serial {
+                            Some(sn) => format!("feitian serial -> {:?}", abbreviate(sn)),
+                            None => format!(
+                                "feitian serial -> {s1:02X}{s2:02X}, {} byte(s): not used",
+                                data.len()
+                            ),
+                        });
+                    }
+                    probe.serial = serial;
                 }
             }
             // OpenPGP present: read the AID once. Capture the manufacturer ID

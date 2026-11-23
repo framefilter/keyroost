@@ -38,6 +38,8 @@ pub const P1_SELECT_BY_NAME: u8 = 0x04;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Instruction {
+    /// Wipe the applet's credentials.
+    Reset = 0x07,
     /// Remove a credential by name.
     Delete = 0x08,
     /// Store a credential.
@@ -335,6 +337,97 @@ pub fn get_response() -> Vec<u8> {
     build_apdu_get(0x00, INS_GET_RESPONSE, 0x00, 0x00, 0x00)
 }
 
+/// Read the key's serial: `80 E3 03 00 00`.
+///
+/// Not a command of the OTP applet: the key answers it whichever
+/// application is selected (measured with nothing selected after a reset,
+/// and with this applet, PIV and OpenPGP selected). It is the command
+/// Feitian's own client reads the serial it shows with. The answer is read
+/// by [`parse_device_serial`].
+#[must_use]
+pub fn device_serial() -> Vec<u8> {
+    vec![0x80, 0xE3, 0x03, 0x00, 0x00]
+}
+
+/// The fewest characters an answer to [`device_serial`] is taken for a
+/// serial with. Feitian's client drops a shorter one.
+pub const DEVICE_SERIAL_MIN: usize = 6;
+
+/// The serial in an answer to [`device_serial`]: ASCII letters or digits,
+/// then only zero bytes to the end. The measured key answered twelve bytes,
+/// nine digits and three zeros.
+///
+/// `None` for any other shape: fewer than [`DEVICE_SERIAL_MIN`] characters,
+/// anything but zeros after them, or any other byte among them. Feitian's
+/// client also reads an answer of exactly eight bytes as a binary serial;
+/// no key was seen to answer that way, so it is not guessed at here.
+#[must_use]
+pub fn parse_device_serial(data: &[u8]) -> Option<String> {
+    let len = data.iter().position(|b| *b == 0).unwrap_or(data.len());
+    let (serial, padding) = data.split_at(len);
+    if serial.len() < DEVICE_SERIAL_MIN
+        || !serial.iter().all(u8::is_ascii_alphanumeric)
+        || padding.iter().any(|b| *b != 0)
+    {
+        return None;
+    }
+    String::from_utf8(serial.to_vec()).ok()
+}
+
+/// Read the key's device information: `80 E3 EE 80 00`.
+///
+/// Like [`device_serial`] this is the key's command, not the OTP applet's:
+/// one key answered it with nothing selected and with each of its
+/// applications selected. It is the command Feitian's own client names a
+/// key's model with. The COS version in the answer is read by
+/// [`parse_device_cos`].
+#[must_use]
+pub fn device_info() -> Vec<u8> {
+    vec![0x80, 0xE3, 0xEE, 0x80, 0x00]
+}
+
+/// The COS version in an answer to [`device_info`]: the three bytes under
+/// tag `92`.
+///
+/// The answer is `80`, a second byte, then TLVs with one-byte tags and
+/// lengths. The second byte is not a length to go by (it counts the TLVs on
+/// one measured key and the whole answer on another), so the TLVs are read
+/// to the end of the answer, as Feitian's client reads them.
+///
+/// The bytes are the version Feitian's product list gives for the product
+/// (<https://fido.ftsafe.com/products/>, under "COS/Applet version"), digit
+/// for digit: `01 08 26` on an ePass FIDO NFC Plus, listed as COS 1.826,
+/// and `47 17 00` on a BioPass FIDO Pro, listed as COS 4.7.17. Tag `84` of
+/// the same answer, which Feitian's older client shows as the COS version,
+/// is the USB release number instead (`07 04 00` on that ePass).
+///
+/// `None` when the answer does not start `80`, has no such tag, holds
+/// another number of bytes under it, or ends inside a TLV before it.
+#[must_use]
+pub fn parse_device_cos(data: &[u8]) -> Option<[u8; 3]> {
+    let mut rest = match data {
+        [0x80, _len, rest @ ..] => rest,
+        _ => return None,
+    };
+    while let [tag, len, tail @ ..] = rest {
+        let value = tail.get(..usize::from(*len))?;
+        if *tag == 0x92 {
+            return value.try_into().ok();
+        }
+        rest = &tail[value.len()..];
+    }
+    None
+}
+
+/// A COS version as keyroost shows it: the three bytes as read, two digits
+/// each, `01.08.26` and `47.17.00`. Feitian writes those two 1.826 and
+/// 4.7.17, grouping the same digits differently for the two products, so
+/// keyroost does not regroup them.
+#[must_use]
+pub fn cos_version_text(cos: [u8; 3]) -> String {
+    format!("{:02X}.{:02X}.{:02X}", cos[0], cos[1], cos[2])
+}
+
 /// Build a `LIST` APDU for one slot: `00 17 00 <slot> 00`. An empty slot
 /// answers a bare `9000`. The answer is read by [`parse_list`].
 #[must_use]
@@ -350,6 +443,22 @@ pub fn list(slot: Slot) -> Vec<u8> {
 #[must_use]
 pub fn list_legacy() -> Vec<u8> {
     vec![0x00, Instruction::List.code(), 0x00, 0x00]
+}
+
+/// Build the `RESET` APDU, `00 07 00 00 00`: no slot, no data.
+///
+/// Known from Feitian's client, where it wipes the applet's credentials.
+#[must_use]
+pub fn reset() -> Vec<u8> {
+    build_apdu_get(0x00, Instruction::Reset.code(), 0x00, 0x00, 0x00)
+}
+
+/// The four-byte `RESET`, `00 07 00 00`, with no `Le`: what Feitian's client
+/// sends when [`reset`] is answered [`SW_WRONG_LENGTH`], as for
+/// [`list_legacy`].
+#[must_use]
+pub fn reset_legacy() -> Vec<u8> {
+    vec![0x00, Instruction::Reset.code(), 0x00, 0x00]
 }
 
 /// Parameters for storing a credential via [`put`].
