@@ -2461,7 +2461,7 @@ enum FtotpCmd {
     /// Ask the key's FIDO HID interface whether it carries the OTP applet's
     /// commands, and print what it answers. Reads only, unless --write.
     #[command(hide = true)]
-    HidProbe {
+    Probe {
         /// Also store a test account over that interface, read its code and
         /// delete it again (three touches).
         #[arg(long)]
@@ -9401,28 +9401,28 @@ fn run_ftotp(cmd: &FtotpCmd, debug: bool) -> Result<(), Box<dyn std::error::Erro
             session.reset()?;
             outln!("Feitian OTP applet reset: all accounts wiped.");
         }
-        FtotpCmd::HidProbe { write, yes } => {
+        FtotpCmd::Probe { write, yes } => {
             // It stores and deletes a test account, so it changes the key:
             // confirmed up front, as `molto probe` is.
             if *write && !*yes {
                 return Err("refusing to write without --yes \
-                            (see `keyroostctl feitian hid-probe --help`)"
+                            (see `keyroostctl feitian probe --help`)"
                     .into());
             }
-            feitian_hid_probe(*write)?
+            feitian_probe(*write)?
         }
     }
     Ok(())
 }
 
-/// `feitian hid-probe`: does the key's FIDO HID interface carry the OTP
+/// `feitian probe`: does the key's FIDO HID interface carry the OTP
 /// applet's APDUs? Feitian's client falls back to that interface when there
 /// is no smart-card one, wrapping each APDU in a CTAPHID_MSG; whether the
 /// applet answers that way was never measured. This sends SELECT and the
 /// default slot's LIST and prints the raw outcome of each: the SELECT answer
 /// in full (version and flags, nothing private), and for LIST only its
 /// length and status word, since it holds account names.
-fn feitian_hid_probe(write: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn feitian_probe(write: bool) -> Result<(), Box<dyn std::error::Error>> {
     use keyroost_ctap::hid::{CtapHidDevice, CTAPHID_MSG};
     const FEITIAN_VID: u16 = 0x096E;
     let devices: Vec<_> = keyroost_hid::enumerate()?
@@ -9511,7 +9511,7 @@ fn feitian_hid_probe(write: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The write half of `feitian hid-probe --write`: over the FIDO HID interface,
+/// The write half of `feitian probe --write`: over the FIDO HID interface,
 /// through the same session the other commands use, store one test account
 /// (the published RFC 4226 seed), read its code, delete it. Each step waits
 /// for a touch; what the key answers and how long it took is printed.
