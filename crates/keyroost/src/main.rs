@@ -1010,14 +1010,14 @@ impl ResetArm {
                     .filter(|d| self.target_ids == Some(d.ids) && d.serial.is_none())
                     .find(|d| fresh_hid_connection(&self.prev_devices, &HidIdentity::of(d)));
                 if let Some(d) = cand {
-                    let now = resolve();
-                    match keyroost_resolve::serial_less_reinsert(&d.path, &now) {
+                    let connected = resolve();
+                    match keyroost_resolve::serial_less_reinsert(&d.path, &connected) {
                         keyroost_resolve::SerialLessReinsert::Fire => {
                             fire = Some(d.path.clone());
                         }
                         keyroost_resolve::SerialLessReinsert::Wait => {}
                         keyroost_resolve::SerialLessReinsert::Refuse => {
-                            let others: Vec<String> = now
+                            let others: Vec<String> = connected
                                 .iter()
                                 .filter(|r| r.hid_path.as_deref() != Some(d.path.as_path()))
                                 .map(|r| r.name.clone().unwrap_or_else(|| r.model_title()))
@@ -36073,6 +36073,46 @@ mod tests {
     /// what decides the re-insert is the USB bus/address. A key that only
     /// went missing from a scan and is back at the same address is the same
     /// attach, so it is not reset; a real replug (new address) is.
+    /// macOS keeps its old rule too: identity is the path alone (no USB
+    /// topology), one scan without the key is the unplug, and the key's
+    /// entry stays in the snapshot. A key that only went missing from a scan
+    /// (macOS reports a failed scan as an empty list, or one can leave a key
+    /// out) and is back on the same path is the same attach, so it is never
+    /// reset; a real replug comes back on a new path. This is what the
+    /// Windows-only forget protects.
+    #[test]
+    fn on_macos_a_key_back_on_the_same_path_after_one_missed_scan_never_fires() {
+        let mac = |path: &str| FidoHid {
+            path: path.into(),
+            serial: None,
+            ids: EPASS_IDS,
+            usb_device: None,
+        };
+        let armed = mac("DevSrvsID:4294968437");
+        let other = mac("DevSrvsID:4294968512");
+        let serial_at = |path: &std::path::Path| {
+            (path == std::path::Path::new("DevSrvsID:4294968437")).then(|| "AAA".to_string())
+        };
+        for missed in [Vec::new(), vec![other.clone()]] {
+            let mut arm = effective_serial_arm(&armed, &[armed.clone(), other.clone()]);
+            let verdicts = drive(
+                &mut arm,
+                &[
+                    Some(vec![armed.clone(), other.clone()]),
+                    Some(missed.clone()),
+                    Some(vec![armed.clone(), other.clone()]),
+                    Some(vec![armed.clone(), other.clone()]),
+                    Some(vec![armed.clone(), other.clone()]),
+                ],
+                serial_at,
+                false,
+                &mut Clock::every_ms(500),
+            );
+            assert!(never_fires(&verdicts), "{verdicts:?}");
+            assert!(arm.saw_removal, "one scan without the key, as before");
+        }
+    }
+
     #[test]
     fn on_linux_a_key_back_at_the_same_bus_address_is_not_fresh() {
         let armed = linux_hid("/dev/hidraw0", 8);
