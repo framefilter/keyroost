@@ -35910,7 +35910,7 @@ mod tests {
         let armed = win_hid(WIN_ARMED, 2);
         let other = win_hid(WIN_OTHER, 3);
         for keeps_path in [true, false] {
-            let mut arm = effective_serial_arm(&armed, &[armed.clone()]);
+            let mut arm = effective_serial_arm(&armed, std::slice::from_ref(&armed));
             let scans = vec![
                 Some(vec![armed.clone()]),
                 Some(vec![armed.clone(), other.clone()]),
@@ -35961,7 +35961,7 @@ mod tests {
     #[test]
     fn a_different_key_on_the_armed_path_after_removal_does_not_fire() {
         let armed = win_hid(WIN_ARMED, 2);
-        let mut arm = effective_serial_arm(&armed, &[armed.clone()]);
+        let mut arm = effective_serial_arm(&armed, std::slice::from_ref(&armed));
         let verdicts = drive(
             &mut arm,
             &[
@@ -35988,7 +35988,7 @@ mod tests {
         let serial_at = |path: &std::path::Path| {
             (path == std::path::Path::new("/dev/hidraw0")).then(|| "AAA".to_string())
         };
-        let mut arm = effective_serial_arm(&armed, &[armed.clone()]);
+        let mut arm = effective_serial_arm(&armed, std::slice::from_ref(&armed));
         let verdicts = drive(
             &mut arm,
             &[
