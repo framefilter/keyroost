@@ -1175,13 +1175,14 @@ pub fn generate_key(
 /// which tags, and which byte for each touch policy. The PIN policy bytes are
 /// the same in both ([`PinPolicy::id`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PolicyTags {
     /// Yubico's: PIN policy under `AA`, touch policy under `AB`, touch values
     /// [`TouchPolicy::id`].
     Yubico,
     /// Feitian's: PIN policy under `BA`, touch policy under `BC`, and the
     /// touch values 4 (never), 5 (always), 6 (cached). Measured on an ePass
-    /// FIDO-NFC: a GENERATE carrying `AA`/`AB` answers `6984`; with `BA`/`BC`
+    /// FIDO NFC Plus: a GENERATE carrying `AA`/`AB` answers `6984`; with `BA`/`BC`
     /// the key is made, [`get_slot_policy_feitian`] reads the two bytes back,
     /// and the card keeps to them (a second signature under "always" needs a
     /// new VERIFY; under touch "always" the signature waits for a touch).

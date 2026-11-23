@@ -461,6 +461,7 @@ impl PivExtension {
 /// The import's instruction and key layout are chosen by [`import_layout`],
 /// per fingerprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum PivDialect {
     /// Yubico's: the PIV reset is `INS 0xFB` ([`crate::reset`]), the retry
     /// counts `INS 0xFA` ([`crate::set_pin_retries`]), the management key
@@ -702,7 +703,7 @@ pub enum PivQuirk {
     /// token2-piv-gui/src-tauri/src/commands.rs) and PUK 86536286 (a PIN+ R3.4
     /// reset to it, checked on the key). Feitian: PIN 12345678 and PUK
     /// 12345678 (Feitian's SK Manager manual; both checked on an ePass
-    /// FIDO-NFC after a PIV reset).
+    /// FIDO NFC Plus after a PIV reset).
     DefaultPinPuk {
         /// The default PIN.
         pin: &'static str,

@@ -35,8 +35,10 @@ fn block_attempts_cap(reported: Option<u8>) -> u32 {
 fn reset_command(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> Vec<u8> {
     use keyroost_piv::compat::PivDialect;
     match PivDialect::of(quirks) {
-        PivDialect::YubiKey => piv::reset(),
         PivDialect::Feitian => piv::reset_feitian(),
+        // `PivDialect` is non-exhaustive: Yubico's bytes are the default, as
+        // they are for a quirk set that names no dialect (`PivDialect::of`).
+        _ => piv::reset(),
     }
 }
 
@@ -63,10 +65,9 @@ const RESET_TOUCH_TRIES: u32 = 3;
 
 /// What [`PivSession::force_reset`] reports when such a card was sent the
 /// reset [`RESET_TOUCH_TRIES`] times and answered "not allowed" each time.
-const RESET_UNTOUCHED: &str = "the key was not touched, so PIV was NOT reset: with the PIN and \
-     PUK blocked this key waits for a touch before it resets. Its keys and certificates \
-     are still there, and its PIN and PUK are blocked. Run the reset again and touch \
-     the key when it blinks.";
+const RESET_UNTOUCHED: &str = "PIV was NOT reset: the key refused the reset three times. If it \
+     blinked, it was waiting for a touch: run the reset again and touch it. Its keys and \
+     certificates are still there; its PIN and PUK are blocked.";
 
 /// The APDU that sets the PIN and PUK retry counts on a card with these
 /// quirks, in the dialect they name
@@ -79,8 +80,8 @@ fn set_pin_retries_command(
 ) -> Vec<u8> {
     use keyroost_piv::compat::PivDialect;
     match PivDialect::of(quirks) {
-        PivDialect::YubiKey => piv::set_pin_retries(pin_tries, puk_tries),
         PivDialect::Feitian => piv::set_pin_retries_feitian(pin_tries, puk_tries),
+        _ => piv::set_pin_retries(pin_tries, puk_tries),
     }
 }
 
@@ -90,8 +91,8 @@ fn set_pin_retries_command(
 fn generate_policy_tags(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> piv::PolicyTags {
     use keyroost_piv::compat::PivDialect;
     match PivDialect::of(quirks) {
-        PivDialect::YubiKey => piv::PolicyTags::Yubico,
         PivDialect::Feitian => piv::PolicyTags::Feitian,
+        _ => piv::PolicyTags::Yubico,
     }
 }
 
@@ -7592,8 +7593,8 @@ mod tests {
                 assert!(!reset_not_allowed(sw, &quirks), "{model:?} {sw:04X}");
             }
         }
-        // 6984 is read that way on such a card only: not on the ePass FIDO
-        // NFC Plus, which takes the same reset instruction, and not on a
+        // 6984 is read that way on such a card only: not on the ePass FIDO NFC
+        // Plus, which takes the same reset instruction, and not on a
         // YubiKey.
         let epass = resolve_quirks(
             AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
