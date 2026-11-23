@@ -8475,6 +8475,14 @@ fn reset_one_card_applet(
                         keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes())
                     }
                 });
+                // A card that may wait for a touch before it resets PIV, as
+                // `piv reset` says.
+                if s.reset_may_ask_touch() {
+                    crate::prompt::touch(&format!(
+                        "{}  touch the key if it blinks\u{2026}",
+                        step.label()
+                    ));
+                }
                 Ok(match s.factory_reset(current) {
                     Ok(keyroost_transport::FactoryResetOutcome::Wiped) => StepOutcome::Wiped,
                     // The device-wide mechanism ran cleanly -- more than just PIV
@@ -12308,6 +12316,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning)
                     {
                         output::warn(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT);
+                    }
+                    // A card that may wait for a touch before it resets
+                    // (`PivQuirk::ResetMayWaitForTouch`) is asked for one
+                    // only after its PIN and PUK are blocked; say so before
+                    // the wipe starts, as the other touch prompts do.
+                    if s.reset_may_ask_touch() {
+                        crate::prompt::touch(
+                            "Resetting PIV \u{2014} touch the key if it blinks\u{2026}",
+                        );
                     }
                     // `current` is also handed to `force_reset_if_known_supported`
                     // below — dead today (`PivSession::reset`'s doc explains why),
