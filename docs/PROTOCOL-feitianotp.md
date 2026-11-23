@@ -16,14 +16,14 @@ Every fact below is marked with where it comes from:
   - *Key A*: Feitian BioPass FIDO Pro, USB `096E:086A`, OTP applet 1.0.1.
     Read with Libre Key Companion (Android, USB CCID), and with `keyroostctl`
     over PC/SC on Windows (`feitian info`, `list`, `add`, `code` and
-    `delete`).
+    `delete`; not `reset`).
   - *Key B*: Feitian ePass FIDO NFC Plus, USB `096E:0853`, OTP applet 1.0.2.
     Read with Libre Key Companion (Android, USB CCID), over direct CCID, and
     with `keyroostctl` over PC/SC on Windows (every `feitian` command). Two
     keys of this model were read. Apart from the value under tag `51` they
-    answered alike in what both were asked: SELECT and LIST over PC/SC, and
-    the wait for a touch. Which of the two an exchange was made with was not
-    always noted.
+    answered alike in what both were asked: SELECT and LIST over PC/SC and
+    over FIDO HID, and the wait for a touch. Which of the two an exchange
+    was made with was not always noted.
 
   The product names are what the keys report. Feitian's client names a
   model with `80 E3 EE 80 00`; the second byte under tag `81` of the answer
@@ -43,8 +43,24 @@ purpose.
 - **Interface:** the key's smart-card interface: CCID over USB, or NFC. The
   applet is selected by AID. *(Measured.)*
 - **APDUs:** short ISO 7816. Both keys answer over T=1. *(Measured.)*
-- Feitian's desktop client can also carry the same APDUs over the FIDO HID
-  interface when no CCID reader is available. *(Client.)* `keyroost` does not.
+- **FIDO HID:** the same APDUs also go through the key's FIDO HID interface,
+  each one as it is in a `CTAPHID_MSG`. Feitian's client uses that when there
+  is no CCID reader, and so does `keyroost`, for a key with no reader on this
+  computer or one whose reader can't be opened. *(Measured, Key A and Key B:
+  SELECT, LIST, PUT, CALCULATE and DELETE, with the same answers as over
+  PC/SC.)*
+  - Short APDUs only: the SELECT in extended-length form is answered `6700`.
+    *(Measured.)*
+  - A `CTAPHID_MSG` reaches whichever applet was selected last. With this
+    applet selected, U2F's VERSION is answered `6D00`; after a SELECT of the
+    FIDO applet (`A0 00 00 06 47 2F 00 01`) it answers `U2F_V2` again. So
+    `keyroost` selects the FIDO applet again when it is done. *(Measured.)*
+  - A command that waits for a touch is answered `6984` only once the key
+    has waited for it (see CALCULATE), with nothing sent meanwhile. CTAP's
+    usual read timeout runs out first, so an exchange is given longer.
+    *(Measured.)* Feitian's client reads for up to 30 seconds per exchange
+    there. *(Client.)*
+  - Windows lets only an administrator open this interface.
 - **Windows:** Key B's card can stay unresponsive after plug-in. The reader's
   cold reset fails, and connecting answers `SCARD_W_UNRESPONSIVE_CARD`, or
   `SCARD_E_PROTO_MISMATCH` about ten seconds after a warm reset. This is the
@@ -78,11 +94,89 @@ answered the same value when it was first read and when it was read again on
 2026-11-19 and on 2026-11-22. The two keys of Key B's model answer different
 values from each other: one answered its value on 2026-11-18 and on
 2026-11-22, the other on 2026-11-19 and on 2026-11-22, across repeated
-SELECTs and card resets. *(Measured.)*
+SELECTs and card resets and, on that second key, a RESET of the applet.
+*(Measured.)*
 
 These keys do not host the Yubico OATH applet. A SELECT of its AID
 (`A0 00 00 05 27 21 01`) is answered `6700` by Key A and `6D00` by Key B, not
 `6A82`. *(Measured.)*
+
+## The key's serial
+
+```
+80 E3 03 00 00
+```
+
+This is not a command of the OTP applet. The key answers it whichever
+application is selected: nothing selected after a reset, and this applet, PIV
+and OpenPGP selected, all gave the same answer. *(Measured, one Key B,
+2026-11-22.)* It is the command Feitian's client reads the serial it shows
+with. *(Client.)*
+
+The answer is the serial in ASCII, padded with zero bytes: twelve bytes, nine
+digits and three zeros. *(Measured, one Key B.)* Each key answers a serial of
+its own: the two keys of Key B's model answer different serials, and Key A a
+third, nine digits as well. *(Measured, Key A and both keys of Key B's model.
+For Key A and the second Key B only the serial keyroost took from the answer
+was seen, not the bytes.)*
+
+keyroost takes an answer of that shape, six or more letters or digits and
+then only zeros, as the key's serial, and nothing else. Feitian's client also
+reads an answer of exactly eight bytes as a binary serial; no key was seen to
+answer that way. *(Client.)*
+
+The key's OpenPGP application has a serial field of its own, in its AID:
+`00 00 00 01` on both keys of Key B's model, whose AIDs are the same sixteen
+bytes. Feitian's client selects that application by an AID with those four
+bytes in it. So the field does not tell one key from another. *(AIDs
+measured, both keys of Key B's model; the AID the client selects by is
+Client.)* keyroost used to show that field as the serial of a Feitian key
+with OpenPGP, and showed none for one without. Key A is one without: it
+answers the OpenPGP SELECT `6700`. *(Measured.)*
+
+## The key's device information
+
+```
+80 E3 EE 80 00
+```
+
+Like the serial read, this is the key's command and not the OTP applet's. A
+Key B answered it with nothing selected and with each of its applications
+selected, Key A with PIV selected. *(Measured, Key A and one Key B,
+2026-11-22 and 23.)* It is the command Feitian's client names a key's model
+with. *(Client.)*
+
+The answer is `80`, a second byte, and then TLVs with one-byte tags and
+lengths. The second byte is not a length to go by: it counts the TLVs on Key
+A and the whole answer on Key B. keyroost reads the TLVs to the end of the
+answer, as Feitian's client does. *(Measured; the client's reading is
+Client.)*
+
+| Tag | Key A | Key B | What |
+|---|---|---|---|
+| `81` | `04 08` | `02 02` | The second byte is the product: Feitian's client names `08` "BioPass FIDO Pro" and `02` "ePass FIDO-NFC Plus". *(Client.)* |
+| `82` | nine ASCII digits | nine ASCII digits | The serial that the serial read above gives. |
+| `84` | `47 17 00` | `07 04 00` | Also each key's USB release number. Feitian's client shows the first two bytes as the COS version. *(Client.)* |
+| `92` | `47 17 00` | `01 08 26` | The COS version Feitian publishes for the product: 4.7.17 for the BioPass FIDO Pro, 1.826 for the ePass FIDO NFC Plus. |
+
+The other tags (`83`, `85`, `86`, and on Key A `87` to `90`) are not read.
+*(Measured.)*
+
+Feitian's product list (<https://fido.ftsafe.com/products/>) gives each
+product a COS version under "COS/Applet version", and for some a version for
+each application beside it: for the ePass FIDO NFC Plus (K9D, K40 Plus), COS
+1.826 with FIDO 9134, PIV 9166, openPGP 7386 and OTP 9126; for the BioPass
+FIDO Pro (K49 Pro, K50 Pro), COS 4.7.17. Those are the digits under `92` on
+the two keys. The list has a second row named ePass FIDO NFC Plus (K9, K40)
+with COS 3.3.01; no key with that version was read. *(Feitian's product
+list.)*
+
+keyroost shows the value under `92` as a Feitian key's firmware version, in
+the app's key header and in `fido info`, as the three bytes read, two digits
+each: `47.17.00` and `01.08.26`. Feitian groups those digits differently for
+the two products, so keyroost does not regroup them. It does not show a
+Feitian key's CTAPHID INIT version bytes (`1.0.1` on Key A), which are
+neither value. With no smart-card reader for the key, no firmware is shown.
 
 ## Slots
 
@@ -198,6 +292,13 @@ with no touch was seen on Key B. What the applet does
 with the true length in the `53` TLV has not been tried, nor what it does
 with a name it already holds: `keyroost` never sends one.)*
 
+Feitian's client can add a third TLV, `5C 01 01`, when it stores a credential
+that is to need a touch. *(Client.)* `keyroost` does not send it. On Key B a
+credential stored with `5C 01 00` and one stored with `5C 01 01` both needed
+a touch for a code, answering `6984` after about three seconds without one,
+the same as a credential stored with no `5C` at all: the TLV made no
+difference that could be seen there. *(Measured, Key B.)*
+
 ### DELETE (`08`)
 
 ```
@@ -208,12 +309,32 @@ The key removes the credential once it is touched. With no touch it answers
 `6984` and the credential stays. *(Measured, default slot: the removal on
 Key A and Key B, the answer with no touch on Key B.)*
 
+### RESET (`07`)
+
+```
+00 07 00 00 00
+```
+
+No slot and no data. The key wipes the applet's credentials once it is
+touched; with no touch it answers `6984`. *(Measured, Key B: two credentials
+in the default slot were gone afterwards, and the `51` value of the SELECT
+answer was the same before and after. A second RESET of the empty applet was
+answered `9000` as well. Whether it also clears the keyboard slots, and what
+it does on a slot with an access code, is not measured.)*
+
+Feitian's client answers a `6700` here with the four bytes `00 07 00 00`, as
+for LIST. *(Client. Key B did not answer `6700`.)* `keyroost` does the same.
+
+Since what RESET does to the keyboard slots is not measured, `keyroost`
+lists all three slots after the key accepts it, and reports the reset
+complete only when every slot reads empty.
+
 ## Status words
 
 | SW | Meaning | |
 |---|---|---|
 | `9000` | Success | *Measured* |
-| `6984` | CALCULATE, PUT, DELETE: no touch arrived | *Measured* |
+| `6984` | CALCULATE, PUT, DELETE, RESET: no touch arrived | *Measured* |
 | `6982` | The slot has an access code that must be presented first | *Client* |
 | `6700` | LIST: use the four-byte form | *Client* |
 | `6A84` | No space left | *Client* |
@@ -234,7 +355,7 @@ Key A and Key B, the answer with no touch on Key B.)*
 
 ## Not implemented
 
-Known from Feitian's client and left out until measured: the applet's RESET
-(`07`), the per-slot access codes (`A3`), the touch flag a PUT can carry
-(`5C`), and the commands that swap the keyboard slots or pick which credential
-a slot types. Static passwords and challenge-response secrets are not handled.
+Known from Feitian's client and left out until measured: the per-slot access
+codes (`A3`), and the commands that swap the keyboard slots or pick which
+credential a slot types. The touch TLV a PUT can carry (`5C`) is not sent:
+see PUT. Static passwords and challenge-response secrets are not handled.

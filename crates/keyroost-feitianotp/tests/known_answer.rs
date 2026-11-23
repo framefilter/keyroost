@@ -22,9 +22,10 @@
 //! None of the expected bytes were produced by this crate.
 
 use keyroost_feitianotp::{
-    calculate_hotp, calculate_totp, delete, list, list_legacy, parse_calculate, parse_list,
-    parse_name, parse_select, put, select, stored_name, totp_challenge, Algorithm, OathType,
-    PutParams, Slot,
+    calculate_hotp, calculate_totp, cos_version_text, delete, device_info, device_serial, list,
+    list_legacy, parse_calculate, parse_device_cos, parse_device_serial, parse_list, parse_name,
+    parse_select, put, reset, reset_legacy, select, stored_name, totp_challenge, Algorithm,
+    OathType, PutParams, Slot,
 };
 
 fn hex(s: &str) -> Vec<u8> {
@@ -100,6 +101,84 @@ fn select_answer_of_key_a() {
 // ---------------------------------------------------------------------------
 // LIST
 // ---------------------------------------------------------------------------
+
+#[test]
+fn serial_read_is_the_command_key_b_answered() {
+    // Captured 2026-11-22: one Key B answered this `9000` with nothing
+    // selected and with the OTP, PIV and OpenPGP applications selected.
+    assert_eq!(device_serial(), hex("80 E3 03 00 00"));
+}
+
+#[test]
+fn serial_answer_of_key_b() {
+    // Captured the same day: twelve bytes, nine ASCII digits and three zero
+    // bytes. The digits here are made up; the shape is the key's.
+    assert_eq!(
+        parse_device_serial(&hex("31 32 33 34 35 36 37 38 39 00 00 00")).as_deref(),
+        Some("123456789")
+    );
+}
+
+#[test]
+fn device_information_of_key_a_and_key_b() {
+    // Captured 2026-11-22 and 23, with made-up digits for the serial under
+    // tag 82: Key B (ePass FIDO NFC Plus), whose second byte is the whole
+    // answer's length, and Key A (BioPass FIDO Pro), whose second byte is
+    // the TLVs' length.
+    assert_eq!(device_info(), hex("80 E3 EE 80 00"));
+    let key_b = parse_device_cos(&hex(
+        "80 2C 81 02 02 02 82 09 31 32 33 34 35 36 37 38 39 83 02 00 00 \
+         84 03 07 04 00 85 08 20 26 03 16 15 18 50 00 86 01 70 92 03 01 08 26",
+    ));
+    assert_eq!(key_b, Some([0x01, 0x08, 0x26]));
+    let key_a = parse_device_cos(&hex(
+        "80 3D 81 02 04 08 82 09 31 32 33 34 35 36 37 38 39 83 02 00 00 \
+         84 03 47 17 00 85 08 20 25 03 05 11 16 53 00 86 01 60 \
+         87 07 00 00 00 00 00 3F 04 88 01 00 89 02 00 00 90 01 00 92 03 47 17 00",
+    ));
+    assert_eq!(key_a, Some([0x47, 0x17, 0x00]));
+    // Shown as read, two digits a byte. Feitian lists these two versions as
+    // 1.826 and 4.7.17.
+    assert_eq!(cos_version_text([0x01, 0x08, 0x26]), "01.08.26");
+    assert_eq!(cos_version_text([0x47, 0x17, 0x00]), "47.17.00");
+}
+
+#[test]
+fn a_device_information_answer_with_no_cos_version() {
+    // Constructed: the tag missing, not three bytes under it, a TLV cut
+    // short before it, no `80` in front, nothing at all.
+    for answer in [
+        "80 04 81 02 02 02",
+        "80 04 92 02 01 08",
+        "80 08 81 02 02 02 92 03 01 08",
+        "81 02 02 02 92 03 01 08 26",
+        "",
+    ] {
+        assert_eq!(parse_device_cos(&hex(answer)), None, "{answer}");
+    }
+}
+
+#[test]
+fn a_serial_answer_of_another_shape_is_not_guessed_at() {
+    // Constructed. Too short, something after the padding starts, a byte
+    // that is neither a letter nor a digit, nothing at all, and eight binary
+    // bytes (which Feitian's client would read as a serial).
+    for answer in [
+        "31 32 33 34 35 00 00 00",
+        "31 32 33 34 35 36 00 37",
+        "31 32 33 34 35 36 20 37 00",
+        "",
+        "00 00 00 00 00 00 00 00 00 00 00 00",
+        "A1 B2 C3 D4 E5 F6 07 18",
+    ] {
+        assert_eq!(parse_device_serial(&hex(answer)), None, "{answer}");
+    }
+    // Six characters are enough, and padding is not required.
+    assert_eq!(
+        parse_device_serial(&hex("41 42 43 31 32 33")).as_deref(),
+        Some("ABC123")
+    );
+}
 
 #[test]
 fn list_commands_are_the_ones_key_b_answered() {
@@ -325,6 +404,15 @@ fn put_of_an_hotp_credential_has_no_counter_and_no_prefix() {
             "51 0A 69 73 73 5F 23 5F 61 63 63 74",
         ))
     );
+}
+
+#[test]
+fn reset_has_no_slot_and_no_data() {
+    // Captured: Key B answered the five-byte form 9000 once touched, and its
+    // accounts were gone. Constructed: the four-byte form Feitian's client
+    // sends after a 6700, which Key B did not answer.
+    assert_eq!(reset(), hex("00 07 00 00 00"));
+    assert_eq!(reset_legacy(), hex("00 07 00 00"));
 }
 
 #[test]

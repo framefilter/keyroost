@@ -60,7 +60,9 @@ impl Need {
             Need::Otp => d.caps.has(Caps::OTP) && (hid || card),
             Need::OtpHid => d.caps.has(Caps::OTP) && hid,
             Need::OtpCcid => d.caps.has(Caps::OTP) && card,
-            Need::FeitianOtp => d.caps.has(Caps::FEITIAN_OTP) && card,
+            // Through a reader, or through the FIDO HID interface where the
+            // key has no reader here.
+            Need::FeitianOtp => d.caps.has(Caps::FEITIAN_OTP) && (card || hid),
             Need::Molto2 => d.kind == DeviceKind::Token && card,
             Need::Prog => d.kind == DeviceKind::ProgToken && card,
             Need::FactoryReset => {

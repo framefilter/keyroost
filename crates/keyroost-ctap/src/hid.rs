@@ -459,7 +459,27 @@ impl CtapHidDevice {
     /// The retry covers command traffic only; channel allocation in `do_init`
     /// is left to fail fast so opening a device can't stall.
     pub fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, HidTransportError> {
-        let sensitive = exchange_is_sensitive(cmd, payload);
+        self.transact_traced(cmd, payload, exchange_is_sensitive(cmd, payload))
+    }
+
+    /// [`Self::transact`] for an exchange the caller knows to be private
+    /// whatever its command byte says: a vendor applet's APDU carried in a
+    /// `CTAPHID_MSG`, say, that holds a seed or names an account. The trace
+    /// shows its length only, in both directions.
+    pub fn transact_private(
+        &mut self,
+        cmd: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, HidTransportError> {
+        self.transact_traced(cmd, payload, true)
+    }
+
+    fn transact_traced(
+        &mut self,
+        cmd: u8,
+        payload: &[u8],
+        sensitive: bool,
+    ) -> Result<Vec<u8>, HidTransportError> {
         let started = Instant::now();
         let mut attempt: u32 = 1;
         loop {

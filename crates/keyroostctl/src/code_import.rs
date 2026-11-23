@@ -606,8 +606,8 @@ pub(crate) fn run_feitian_import(
     };
     let dev = crate::target::select(Need::FeitianOtp, reader, None)?;
     crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
-    let reader = crate::target::reader_of(&dev)?;
-    let open = || keyroost_transport::FeitianOtpSession::open_traced(&reader, debug);
+    // Through the key's reader, or its FIDO HID interface where it has none.
+    let open = || crate::open_feitian_on(&dev, debug);
     let existing = read_feitian_existing(&mut open()?)?; // closed before the question
     let first = how.plan(&import, Store::FeitianOtp, existing);
     let Some(asked) = preview_and_ask(&dev, &shown, &first, KeyView::READ)? else {
