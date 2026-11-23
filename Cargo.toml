@@ -48,3 +48,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 # a tool that is I/O-bound on a smart card.
 [profile.release]
 overflow-checks = true
+
+# Temporary, until a hidapi release carries the fix: hidapi 2.6.7 plus the
+# one commit proposed in ruabmbua/hidapi-rs#189. With the `windows-native`
+# backend, `HidApi::new()` panics ("Slice is not null terminated") on an
+# affected Windows PC while it lists HID devices, which is the first thing
+# any keyroost command touching HID does. The commit changes two files of
+# that backend and nothing else. It applies to builds from this repository
+# only: a `cargo install` from crates.io resolves hidapi as published.
+# To drop it: delete this section and run `cargo update -p hidapi`.
+[patch.crates-io]
+hidapi = { git = "https://github.com/Snrat/hidapi-rs", rev = "625b3ec01ba57fde9103c33fa840718b03c0f0e8" }

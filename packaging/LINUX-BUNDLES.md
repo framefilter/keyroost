@@ -175,7 +175,9 @@ applets need a running **host `pcscd`** (every target talks to the host daemon).
 
 - **cargo-sources.json** is generated on the runner each build from `Cargo.lock`
   (never committed, never stale). Every entry comes from `static.crates.io`
-  (CI logs the count each build).
+  (CI logs the count each build), except a crate the root `Cargo.toml` patches
+  to a git commit: that one is fetched from its repository at the pinned
+  commit. Today that is hidapi, until a release carries its Windows fix.
 - **pcsc-lite sha256** is pinned (2.5.1) — see setup step 2. The upstream file
   server prunes old releases, so a pin that built fine last release can 404 on
   the next one; the packaging probe run is what catches it.
