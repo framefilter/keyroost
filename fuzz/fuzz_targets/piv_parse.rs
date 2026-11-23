@@ -43,4 +43,9 @@ fuzz_target!(|data: &[u8]| {
     // DEVICE INFO (nested TLV) and the Card Manager's text replies.
     let _ = keyroost_piv::fingerprint::parse_swissbit_device_name(data);
     let _ = keyroost_piv::fingerprint::parse_swissbit_text(data);
+    // Feitian replies (#274): the device-information reply that names the
+    // product, and the slot policy read back after a GENERATE or IMPORT.
+    let _ = keyroost_piv::fingerprint::feitian_product(data);
+    let _ = keyroost_piv::fingerprint::feitian_model(data);
+    let _ = keyroost_piv::parse_slot_policy_feitian(data);
 });

@@ -432,7 +432,7 @@ pub fn plan_import<'a>(
         return Err(ImportRefusal::SlotNotSupported(slot));
     }
     let layout = compat::import_layout(fp);
-    if layout == ImportLayout::Yubico {
+    if matches!(layout, ImportLayout::Yubico | ImportLayout::Feitian) {
         if let KeyParts::Rsa { e, .. } = &entry.key {
             if e.as_slice() != [1, 0, 1] {
                 return Err(ImportRefusal::RsaExponentNot65537);
@@ -510,7 +510,7 @@ pub fn import_parts(parts: &KeyParts, layout: ImportLayout) -> ImportParts<'_> {
             KeyParts::Rsa {
                 p, q, dp, dq, qinv, ..
             },
-            ImportLayout::Yubico,
+            ImportLayout::Yubico | ImportLayout::Feitian,
         ) => ImportParts::RsaCrt { p, q, dp, dq, qinv },
         (KeyParts::Ec { scalar, .. }, _) => ImportParts::Ec { scalar },
         (KeyParts::Ed25519 { seed, .. }, _) => ImportParts::Ed25519 { seed },
@@ -1550,7 +1550,14 @@ mod run_tests {
                 body: body.to_vec(),
             });
             if self.apdus.is_some() {
-                return send_import_key(LINK, slot, alg_id, body, &mut self.send());
+                return send_import_key(
+                    LINK,
+                    ImportLayout::Yubico,
+                    slot,
+                    alg_id,
+                    body,
+                    &mut self.send(),
+                );
             }
             if self.key_sw == 0x9000 {
                 Ok(())

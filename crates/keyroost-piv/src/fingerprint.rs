@@ -22,12 +22,72 @@
 /// registers under) — see
 /// <https://qccdata.qichacha.com/Disclosure/f31b9be6f9eb76113e9c078f7f375997.pdf>
 /// for the source associating this RID with Feitian.
-/// [`AppletFingerprint::Feitian`] is recognised solely by whether the card
-/// accepts a SELECT for this RID on its own (no PIX) — the transport layer
-/// SELECTs it (then re-SELECTs PIV) only when nothing else already
-/// fingerprinted the applet, since this is the lowest-priority, catch-all
-/// criterion and every other one is cheaper to check first.
+/// [`AppletFingerprint::Feitian`] is recognised by whether the card accepts
+/// a SELECT for this RID on its own (no PIX) or, when it refuses that, for
+/// [`FEITIAN_OTP_AID`] under it — the transport layer SELECTs them (then
+/// re-SELECTs PIV) only when nothing else already fingerprinted the applet,
+/// since this is the lowest-priority, catch-all criterion and every other
+/// one is cheaper to check first. Which Feitian product the card is, the
+/// key says itself afterwards — see [`FEITIAN_DEVICE_INFO`].
 pub const FEITIAN_RID: [u8; 5] = [0xD1, 0x56, 0x00, 0x01, 0x32];
+
+/// The AID of the OTP application Feitian's security keys carry, under
+/// [`FEITIAN_RID`]: the second thing [`AppletFingerprint::Feitian`] is
+/// recognised by. Not every Feitian key selects an application by the RID
+/// alone. A BioPass FIDO Pro (USB `096E:086A`) answers that `6A82` and
+/// selects this whole AID; with the RID as the only test it fell through to
+/// [`IDPRIME_SECONDARY_PIV_AID`], which its PIV application answers `9000`
+/// with the very answer it gives the PIV SELECT. (Hardware-observed,
+/// 2026-11-22.)
+pub const FEITIAN_OTP_AID: [u8; 9] = [0xD1, 0x56, 0x00, 0x01, 0x32, 0x83, 0x26, 0x01, 0x01];
+
+/// Feitian's device-information read, `80 E3 EE 80 00`: the command
+/// Feitian's own client names a key's model with. It is the key's, not the
+/// PIV application's: an ePass FIDO NFC Plus answered it with nothing
+/// selected and with each of its applications selected.
+///
+/// The answer is two bytes, `80` and a length, and then a run of TLVs with
+/// one-byte tags and lengths. The one under tag `81` holds two bytes, the
+/// second being the product ([`feitian_product`]). The length byte is not
+/// one to go by: it counted the TLVs on one key and the whole answer on the
+/// other, so the TLVs are read to the end of the answer, as Feitian's
+/// client reads them. (Hardware-observed on two keys, 2026-11-22 and 23.)
+pub const FEITIAN_DEVICE_INFO: [u8; 5] = [0x80, 0xE3, 0xEE, 0x80, 0x00];
+
+/// The product byte in an answer to [`FEITIAN_DEVICE_INFO`]: the second
+/// byte under tag `81`. `None` when the answer does not start `80`, has no
+/// such tag, or ends inside a TLV before it.
+#[must_use]
+pub fn feitian_product(device_info: &[u8]) -> Option<u8> {
+    let mut rest = match device_info {
+        [0x80, _len, rest @ ..] => rest,
+        _ => return None,
+    };
+    while let [tag, len, tail @ ..] = rest {
+        let value = tail.get(..usize::from(*len))?;
+        if *tag == 0x81 {
+            return value.get(1).copied();
+        }
+        rest = &tail[value.len()..];
+    }
+    None
+}
+
+/// The [`FeitianModel`] a key's answer to [`FEITIAN_DEVICE_INFO`] names:
+/// product `02` and `08` are the two with rows of their own. The names are
+/// the ones Feitian's client gives those numbers, and they are the products
+/// Feitian publishes the two keys' COS versions for (the version is under
+/// tag `92` of the same answer: `01 08 26` and `47 17 00`). Any other
+/// product, and an answer [`feitian_product`] reads none from, is
+/// [`FeitianModel::Generic`].
+#[must_use]
+pub fn feitian_model(device_info: &[u8]) -> FeitianModel {
+    match feitian_product(device_info) {
+        Some(0x02) => FeitianModel::EPassFidoNfcPlus,
+        Some(0x08) => FeitianModel::BioPassFidoPro,
+        _ => FeitianModel::Generic,
+    }
+}
 
 /// An obscure second PIV applet instance some Gemalto/Thales IDPrime cards
 /// register under, alongside the standard PIV AID — see
@@ -1146,10 +1206,12 @@ pub enum AppletFingerprint {
     /// Authentrend's ATkey PIV applets — <https://authentrend.com/atkey-card-nfc>.
     AuthentrendATKey,
     /// Feitian Technologies' security keys — recognised purely by whether
-    /// the card can select Feitian's registered RID ([`FEITIAN_RID`]): the
+    /// the card can select Feitian's registered RID ([`FEITIAN_RID`]) or,
+    /// failing that, the OTP application under it ([`FEITIAN_OTP_AID`]): the
     /// "does a specific applet exist" fingerprinting method, rather than an
-    /// ATR/select text hint.
-    Feitian,
+    /// ATR/select text hint. Which product it is, the key reports itself —
+    /// see [`FeitianModel`].
+    Feitian(FeitianModel),
     /// HID's Crescendo product line — <https://www.hidglobal.com/product-mix/crescendo>.
     HidCrescendo(HidCrescendoVariant),
     /// Gemalto/Thales IDPrime PIV cards — recognised purely by whether the
@@ -1225,6 +1287,29 @@ pub enum OpenFips201Variant {
     SwissbitIShield2,
 }
 
+/// Sub-fingerprint within [`AppletFingerprint::Feitian`]: the product, as the
+/// key reports it in its device information ([`FEITIAN_DEVICE_INFO`]).
+/// Feitian's keys take one set of PIV instructions, but they do not all hold
+/// the same key types or reset the same way, and the measured ones report no
+/// applet version to tell them apart by. The product does.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeitianModel {
+    /// The key reported no product, or one with no rows of its own: it gets
+    /// Feitian's instructions and nothing is claimed about what it holds.
+    /// The only variant [`classify`] produces; the transport layer puts the
+    /// product in afterwards.
+    Generic,
+    /// Product `02`: Feitian's ePass FIDO NFC Plus. Measured on one with USB
+    /// ID `096E:0853`, whose device information gives the version Feitian
+    /// publishes for the product, COS 1.826.
+    EPassFidoNfcPlus,
+    /// Product `08`: Feitian's BioPass FIDO Pro. Measured on one with USB ID
+    /// `096E:086A`, whose device information gives the version Feitian
+    /// publishes for the product, COS 4.7.17.
+    BioPassFidoPro,
+}
+
 /// Sub-fingerprint within [`AppletFingerprint::UTrust`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1258,7 +1343,7 @@ impl core::fmt::Display for AppletFingerprint {
             AppletFingerprint::Generic => write!(f, "Generic"),
             AppletFingerprint::ArekinathPivApplet(v) => write!(f, "ArekinathPivApplet::{v}"),
             AppletFingerprint::AuthentrendATKey => write!(f, "AuthentrendATKey"),
-            AppletFingerprint::Feitian => write!(f, "Feitian"),
+            AppletFingerprint::Feitian(v) => write!(f, "Feitian::{v}"),
             AppletFingerprint::HidCrescendo(v) => write!(f, "HidCrescendo::{v}"),
             AppletFingerprint::IdPrime => write!(f, "IdPrime"),
             AppletFingerprint::Trussed(v) => write!(f, "Trussed::{v}"),
@@ -1307,6 +1392,16 @@ impl core::fmt::Display for OpenFips201Variant {
     }
 }
 
+impl core::fmt::Display for FeitianModel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            FeitianModel::Generic => "Generic",
+            FeitianModel::EPassFidoNfcPlus => "EPassFidoNfcPlus",
+            FeitianModel::BioPassFidoPro => "BioPassFidoPro",
+        })
+    }
+}
+
 impl core::fmt::Display for UTrustVariant {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
@@ -1335,7 +1430,11 @@ impl AppletFingerprint {
                 "Swissbit iShield 1 Series"
             }
             AppletFingerprint::AuthentrendATKey => "Authentrend ATKey Series",
-            AppletFingerprint::Feitian => "Feitian Security Key",
+            AppletFingerprint::Feitian(FeitianModel::Generic) => "Feitian Security Key",
+            AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus) => {
+                "Feitian ePass FIDO NFC Plus"
+            }
+            AppletFingerprint::Feitian(FeitianModel::BioPassFidoPro) => "Feitian BioPass FIDO Pro",
             AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic) => {
                 "HID Crescendo ActivId"
             }
@@ -1468,8 +1567,9 @@ pub fn wants_swissbit_probe(select_identity: Option<&str>) -> bool {
 /// Resolve an [`AppletFingerprint`] from the fingerprint text plus the three
 /// live-probe bits — all "can a specific applet be selected by AID at all"
 /// checks ([`wants_swissbit_probe`]'s [`SWISSBIT_RID`],
-/// `feitian_rid_selectable`'s [`FEITIAN_RID`], and `idprime_aid_selectable`'s
-/// [`IDPRIME_SECONDARY_PIV_AID`]) — the transport layer can supply. Comparisons are
+/// `feitian_rid_selectable`'s [`FEITIAN_RID`] or [`FEITIAN_OTP_AID`], and
+/// `idprime_aid_selectable`'s [`IDPRIME_SECONDARY_PIV_AID`]) — the transport
+/// layer can supply. Comparisons are
 /// case-insensitive throughout, per the fingerprinting scheme. When more
 /// than one fingerprint's criteria are satisfied, the one backed by the most
 /// criteria wins — realised here as a priority order from most-specific to
@@ -1481,7 +1581,9 @@ pub fn wants_swissbit_probe(select_identity: Option<&str>) -> bool {
 /// performed that probe (an extra SELECT round trip) when every other branch
 /// here — including the other one of the two — would otherwise fall through
 /// to `Generic`. Passing `false` for a probe that wasn't run is exactly as
-/// safe as any other unanswered criterion.
+/// safe as any other unanswered criterion. A Feitian match comes back as
+/// [`FeitianModel::Generic`]: the product is not a probe bit, and the
+/// transport layer fills it in from the key's device information.
 #[must_use]
 pub fn classify(
     atr_identity: Option<&str>,
@@ -1537,7 +1639,7 @@ pub fn classify(
     } else if sel.is_some_and(|s| s.starts_with("atpiv")) {
         AppletFingerprint::AuthentrendATKey
     } else if feitian_rid_selectable {
-        AppletFingerprint::Feitian
+        AppletFingerprint::Feitian(FeitianModel::Generic)
     } else if idprime_aid_selectable {
         AppletFingerprint::IdPrime
     } else {
@@ -1739,7 +1841,7 @@ mod tests {
         // The probe bit alone, no other fingerprinting text, is enough.
         assert_eq!(
             classify(None, None, false, true, false),
-            AppletFingerprint::Feitian
+            AppletFingerprint::Feitian(FeitianModel::Generic)
         );
         // It's the lowest-priority criterion: any other match wins over it.
         assert_eq!(
@@ -1755,6 +1857,53 @@ mod tests {
     }
 
     #[test]
+    fn feitian_model_is_the_product_the_key_reports() {
+        // Hardware-observed, 2026-11-22 and 23: the device information of an
+        // ePass FIDO NFC Plus (USB 096E:0853) and of a BioPass FIDO Pro (USB
+        // 096E:086A), with made-up digits for the serial under tag 82. The
+        // second byte is the whole answer's length on the first key and the
+        // TLVs' on the second.
+        let epass = hex(
+            "80 2C 81 02 02 02 82 09 31 32 33 34 35 36 37 38 39 83 02 00 00 \
+             84 03 07 04 00 85 08 20 26 03 16 15 18 50 00 86 01 70 92 03 01 08 26",
+        );
+        let biopass = hex(
+            "80 3D 81 02 04 08 82 09 31 32 33 34 35 36 37 38 39 83 02 00 00 \
+             84 03 47 17 00 85 08 20 25 03 05 11 16 53 00 86 01 60 \
+             87 07 00 00 00 00 00 3F 04 88 01 00 89 02 00 00 90 01 00 92 03 47 17 00",
+        );
+        assert_eq!(feitian_product(&epass), Some(0x02));
+        assert_eq!(feitian_model(&epass), FeitianModel::EPassFidoNfcPlus);
+        assert_eq!(feitian_product(&biopass), Some(0x08));
+        assert_eq!(feitian_model(&biopass), FeitianModel::BioPassFidoPro);
+        // Constructed: a product with no rows of its own, and answers that
+        // name none — no tag 81, one byte under it, a TLV cut short, no `80`
+        // in front, nothing at all.
+        assert_eq!(feitian_product(&hex("80 04 81 02 00 05")), Some(0x05));
+        assert_eq!(
+            feitian_model(&hex("80 04 81 02 00 05")),
+            FeitianModel::Generic
+        );
+        for answer in [
+            "80 03 86 01 70",
+            "80 03 81 01 02",
+            "80 04 81 02 02",
+            "81 02 02 02",
+            "80",
+            "",
+        ] {
+            assert_eq!(feitian_product(&hex(answer)), None, "{answer}");
+            assert_eq!(
+                feitian_model(&hex(answer)),
+                FeitianModel::Generic,
+                "{answer}"
+            );
+        }
+        assert_eq!(FEITIAN_OTP_AID[..5], FEITIAN_RID);
+        assert_eq!(FEITIAN_DEVICE_INFO, hex("80 E3 EE 80 00")[..]);
+    }
+
+    #[test]
     fn classify_idprime_only_via_the_aid_probe() {
         // The probe bit alone, no other fingerprinting text, is enough.
         assert_eq!(
@@ -1764,7 +1913,7 @@ mod tests {
         // It's lower priority than even Feitian's own catch-all probe.
         assert_eq!(
             classify(None, None, false, true, true),
-            AppletFingerprint::Feitian
+            AppletFingerprint::Feitian(FeitianModel::Generic)
         );
         // Without the probe (or a false result from it), an otherwise
         // unidentified card stays Generic.
@@ -1956,7 +2105,18 @@ mod tests {
                 AppletFingerprint::AuthentrendATKey,
                 "Authentrend ATKey Series",
             ),
-            (AppletFingerprint::Feitian, "Feitian Security Key"),
+            (
+                AppletFingerprint::Feitian(FeitianModel::Generic),
+                "Feitian Security Key",
+            ),
+            (
+                AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
+                "Feitian ePass FIDO NFC Plus",
+            ),
+            (
+                AppletFingerprint::Feitian(FeitianModel::BioPassFidoPro),
+                "Feitian BioPass FIDO Pro",
+            ),
             (
                 AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
                 "HID Crescendo ActivId",
@@ -2024,7 +2184,14 @@ mod tests {
             AppletFingerprint::UTrust(UTrustVariant::Gov).to_string(),
             "UTrust::Gov"
         );
-        assert_eq!(AppletFingerprint::Feitian.to_string(), "Feitian");
+        assert_eq!(
+            AppletFingerprint::Feitian(FeitianModel::Generic).to_string(),
+            "Feitian::Generic"
+        );
+        assert_eq!(
+            AppletFingerprint::Feitian(FeitianModel::BioPassFidoPro).to_string(),
+            "Feitian::BioPassFidoPro"
+        );
         assert_eq!(AppletFingerprint::IdPrime.to_string(), "IdPrime");
         assert_eq!(AppletFingerprint::Thetis.to_string(), "Thetis");
         assert_eq!(AppletFingerprint::YubiKey.to_string(), "YubiKey");
