@@ -145,7 +145,7 @@
   <section class="kr-section" id="whole-key">
     <h2>Resetting a whole key at once</h2>
     <p>One command wipes every resettable applet the key exposes, in order — OATH, OpenPGP,
-      Token2 on-device OTP, PIV, then FIDO2 last, because it ends with a ceremony:</p>
+      Token2 on-device OTP, Feitian OTP, PIV, then FIDO2 last, because it ends with a ceremony:</p>
 <pre><code>keyroostctl factory-reset                       # asks you to type "reset"
 keyroostctl factory-reset --device my-key --yes  # in a script</code></pre>
     <p>The card applets need nothing from you, except that some keys (a Nitrokey 3) ask

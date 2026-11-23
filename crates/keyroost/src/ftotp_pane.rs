@@ -720,7 +720,7 @@ impl App {
                             // reads the now-empty applet again on its own.
                             app.ftotp = FtotpState::default();
                             app.ftotp_tried = false;
-                            app.ftotp_done("Feitian OTP reset: all accounts wiped.".into());
+                            app.ftotp_done("Feitian OTP applet reset: all accounts wiped.".into());
                         }
                         Err(e) => app.ftotp_failed(e),
                     }

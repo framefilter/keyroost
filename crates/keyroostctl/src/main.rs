@@ -2466,6 +2466,9 @@ enum FtotpCmd {
         /// delete it again (three touches).
         #[arg(long)]
         write: bool,
+        /// Confirm the --write exercise, which changes the key.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -9393,12 +9396,21 @@ fn run_ftotp(cmd: &FtotpCmd, debug: bool) -> Result<(), Box<dyn std::error::Erro
             let dev = crate::target::select(Need::FeitianOtp, reader.as_deref(), None)?;
             crate::prompt::confirm_on(&dev, *yes, "wipe the Feitian OTP applet")?;
             let mut session = open_feitian_on(&dev, debug)?;
-            // Whether the key waits for a touch here is not measured yet.
+            // The key wipes the applet once it is touched.
             crate::prompt::touch("Resetting \u{2014} touch the key if it blinks\u{2026}");
             session.reset()?;
             outln!("Feitian OTP applet reset: all accounts wiped.");
         }
-        FtotpCmd::HidProbe { write } => feitian_hid_probe(*write)?,
+        FtotpCmd::HidProbe { write, yes } => {
+            // It stores and deletes a test account, so it changes the key:
+            // confirmed up front, as `molto probe` is.
+            if *write && !*yes {
+                return Err("refusing to write without --yes \
+                            (see `keyroostctl feitian hid-probe --help`)"
+                    .into());
+            }
+            feitian_hid_probe(*write)?
+        }
     }
     Ok(())
 }
