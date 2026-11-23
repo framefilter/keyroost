@@ -303,12 +303,14 @@ impl FeitianOtpSession {
     /// five-byte form, then the four-byte one if the key answers `6700`. Like
     /// the other commands that change the key, it is sent again while the
     /// key answers that no touch came.
+    ///
+    /// Once the key accepted it, every slot is listed (LIST needs no touch).
+    /// `Ok` means all three slots read empty; a slot that still holds
+    /// entries, or can't be listed, makes it
+    /// [`TransportError::FeitianOtpResetUnconfirmed`]. What RESET does to
+    /// the keyboard slots has not been measured, so it is checked each time.
     pub fn reset(&mut self) -> Result<(), TransportError> {
-        let (_, mut sw) = self.transmit_for_touch(&fotp::reset())?;
-        if sw == fotp::SW_WRONG_LENGTH {
-            (_, sw) = self.transmit_for_touch(&fotp::reset_legacy())?;
-        }
-        touch_answer("feitian reset", "reset the applet", fotp::Slot::Default, sw)
+        reset_and_check(|apdu| self.transmit_full(apdu))
     }
 
     /// DELETE and return the raw status word.
@@ -456,6 +458,49 @@ fn list_all(
     }
     out.credentials.extend(default.credentials);
     Ok(out)
+}
+
+/// [`FeitianOtpSession::reset`] through `exchange` (one APDU in,
+/// `(payload, sw)` out): RESET, then a LIST of every slot.
+fn reset_and_check(
+    mut exchange: impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+) -> Result<(), TransportError> {
+    let (_, mut sw) = asking_for_touch(|| exchange(&fotp::reset()))?;
+    if sw == fotp::SW_WRONG_LENGTH {
+        (_, sw) = asking_for_touch(|| exchange(&fotp::reset_legacy()))?;
+    }
+    if sw == fotp::SW_NO_TOUCH {
+        return Err(TransportError::FeitianOtpNoTouch {
+            action: "reset the applet",
+        });
+    }
+    // RESET names no slot, so a refusal (a `6982` too) is reported as the
+    // key's answer, not as one slot's access code.
+    ok_or_apdu("feitian reset", sw)?;
+
+    let mut left = Vec::new();
+    for slot in [
+        fotp::Slot::Default,
+        fotp::Slot::Keyboard1,
+        fotp::Slot::Keyboard2,
+    ] {
+        let held = exchange(&fotp::list(slot)).and_then(|(data, sw)| {
+            ok_or_apdu("feitian list", sw)?;
+            let listing = fotp::parse_list(&data, slot).map_err(TransportError::FeitianOtpParse)?;
+            Ok(listing.credentials.len() + listing.skipped)
+        });
+        match held {
+            Ok(0) => {}
+            Ok(1) => left.push(format!("slot {} still holds 1 account", slot.label())),
+            Ok(n) => left.push(format!("slot {} still holds {n} accounts", slot.label())),
+            Err(e) => left.push(format!("slot {} couldn't be checked ({e})", slot.label())),
+        }
+    }
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(TransportError::FeitianOtpResetUnconfirmed { left })
+    }
 }
 
 /// How many times a command that waits for a touch is sent before giving up.
@@ -701,6 +746,101 @@ mod tests {
         assert_eq!(run(&[0x6984, 0x6A82]), (0x6A82, 2));
         // Never touched: the last "no touch" comes back after every try.
         assert_eq!(run(&[0x6984; TOUCH_TRIES]), (0x6984, TOUCH_TRIES));
+    }
+
+    /// A RESET checked by listing every slot, from scripted answers.
+    fn reset_with(answers: &[(&[u8], u16)]) -> (Result<(), TransportError>, Vec<Vec<u8>>) {
+        let mut left = answers.iter().map(|(d, sw)| (d.to_vec(), *sw));
+        let mut sent = Vec::new();
+        let out = reset_and_check(|apdu| {
+            sent.push(apdu.to_vec());
+            Ok(left.next().expect("more commands than scripted answers"))
+        });
+        (out, sent)
+    }
+
+    #[test]
+    fn a_reset_is_wiped_only_when_every_slot_lists_empty() {
+        let (out, sent) = reset_with(&[(&[], 0x9000), (&[], 0x9000), (&[], 0x9000), (&[], 0x9000)]);
+        assert!(out.is_ok());
+        assert_eq!(
+            sent,
+            vec![
+                fotp::reset(),
+                fotp::list(fotp::Slot::Default),
+                fotp::list(fotp::Slot::Keyboard1),
+                fotp::list(fotp::Slot::Keyboard2),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_keyboard_slot_left_holding_accounts_is_named() {
+        let two: &[u8] = &[0x52, 0x02, 0x11, b'h', 0x52, 0x02, 0x11, b'k'];
+        let (out, _) = reset_with(&[(&[], 0x9000), (&[], 0x9000), (&[], 0x9000), (two, 0x9000)]);
+        let err = out.unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::FeitianOtpResetUnconfirmed { .. }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("slot 2 still holds 2 accounts"), "{msg}");
+        assert!(
+            !msg.contains("slot default") && !msg.contains("slot 1"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_slot_that_cant_be_listed_leaves_the_reset_unconfirmed() {
+        // A refused LIST.
+        let (out, _) = reset_with(&[(&[], 0x9000), (&[], 0x9000), (&[], 0x6A82), (&[], 0x9000)]);
+        let msg = out.unwrap_err().to_string();
+        assert!(msg.contains("slot 1 couldn't be checked"), "{msg}");
+        assert!(msg.contains("6A82"), "{msg}");
+
+        // A LIST whose exchange fails.
+        let mut answers = vec![
+            Ok((Vec::new(), 0x9000u16)),
+            Err(TransportError::FeitianOtpHid("gone".into())),
+            Ok((Vec::new(), 0x9000)),
+            Ok((Vec::new(), 0x9000)),
+        ]
+        .into_iter();
+        let msg = reset_and_check(|_| answers.next().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("slot default couldn't be checked"), "{msg}");
+    }
+
+    /// RESET names no slot: a refusal, `6982` included, is the key's answer,
+    /// and nothing is listed after it.
+    #[test]
+    fn a_refused_reset_names_no_slot() {
+        let (out, sent) = reset_with(&[(&[], 0x6982)]);
+        let err = out.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TransportError::Apdu {
+                    sw1: 0x69,
+                    sw2: 0x82,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("slot"), "{err}");
+        assert_eq!(sent.len(), 1);
+
+        let none: &[u8] = &[];
+        let (out, _) = reset_with(&[(none, 0x6984u16); TOUCH_TRIES]);
+        assert!(matches!(
+            out,
+            Err(TransportError::FeitianOtpNoTouch {
+                action: "reset the applet"
+            })
+        ));
     }
 
     #[test]

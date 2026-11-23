@@ -2449,8 +2449,13 @@ enum FtotpCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Wipe every account in the Feitian OTP applet. Irreversible: asks first
+    /// Reset the Feitian OTP applet, then list its three slots to check
+    /// they are empty. The key asks for a touch. Irreversible: asks first
     /// (`--yes` to skip).
+    ///
+    /// The accounts are reported wiped only when every slot reads empty; a
+    /// slot that still holds accounts, or can't be read, is named and the
+    /// command fails.
     Reset {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -8930,7 +8935,11 @@ fn open_feitian_on(
         (Some(reader), Some(path)) => match FeitianOtpSession::open_traced(reader, debug) {
             Ok(session) => Ok(session),
             Err(card_err) => FeitianOtpSession::open_hid(path).map_err(|hid_err| {
-                format!("{card_err}; the key's FIDO HID interface also failed ({hid_err})").into()
+                keyroost_transport::TransportError::FeitianOtpBothFailed {
+                    reader: Box::new(card_err),
+                    hid: Box::new(hid_err),
+                }
+                .into()
             }),
         },
         (None, Some(path)) => Ok(FeitianOtpSession::open_hid(path)?),
@@ -20988,6 +20997,47 @@ mod cli_tests {
 
     /// The Feitian OTP applet is one of the applets the reset names, and
     /// the help no longer says its accounts stay.
+    /// The hidden probe's --write changes the key, so it refuses without
+    /// --yes, before looking for any key.
+    #[test]
+    fn feitian_probe_write_refuses_without_yes() {
+        let cli = parse(&["keyroostctl", "feitian", "probe", "--write"]).unwrap();
+        let Some(Cmd::Feitian { cmd }) = cli.command.as_ref() else {
+            panic!("not the feitian group")
+        };
+        let err = run_ftotp(cmd, false).unwrap_err().to_string();
+        assert!(err.contains("refusing to write without --yes"), "{err}");
+        // The probe stays out of the help and the generated reference.
+        let help = feitian_help();
+        assert!(!help.contains("probe"), "{help}");
+    }
+
+    /// `feitian --help` as printed.
+    fn feitian_help() -> String {
+        use clap::CommandFactory;
+        Cli::command()
+            .find_subcommand_mut("feitian")
+            .unwrap()
+            .render_help()
+            .to_string()
+    }
+
+    /// `feitian reset` says it needs a touch and that it checks the slots.
+    #[test]
+    fn feitian_reset_help_says_touch_and_check() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("feitian")
+            .unwrap()
+            .find_subcommand_mut("reset")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("The key asks for a touch"), "{help}");
+        assert!(help.contains("list its three slots"), "{help}");
+    }
+
     #[test]
     fn factory_reset_help_names_the_feitian_otp_applet() {
         use clap::CommandFactory;

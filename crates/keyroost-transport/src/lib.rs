@@ -451,10 +451,21 @@ pub enum TransportError {
     /// A Feitian OTP TOTP code came back for a time window that had ended
     /// while the key waited for its touch. The code was wiped, not returned.
     FeitianOtpWindowEnded,
+    /// A Feitian OTP RESET was accepted, but listing the slots afterwards
+    /// did not show all three empty. `left` says, per slot, how many
+    /// entries it still holds or why it couldn't be checked.
+    FeitianOtpResetUnconfirmed { left: Vec<String> },
     /// The key's FIDO HID interface, which can carry the Feitian OTP
     /// applet's commands in place of a smart-card reader, could not be
     /// opened or did not complete an exchange.
     FeitianOtpHid(String),
+    /// A key with both interfaces: its reader could not be opened for the
+    /// Feitian OTP applet (`reader`), and its FIDO HID interface, tried
+    /// next, failed too (`hid`).
+    FeitianOtpBothFailed {
+        reader: Box<TransportError>,
+        hid: Box<TransportError>,
+    },
     /// The RSA key's public exponent is wider than the OpenPGP card's declared
     /// exponent field (`e_bits`). Caught before building the import (the pure
     /// builder would otherwise panic); guards against a malformed card
@@ -821,9 +832,18 @@ impl fmt::Display for TransportError {
                 "that code's time window ended while the key waited for the touch; \
                  read it again"
             ),
+            TransportError::FeitianOtpResetUnconfirmed { left } => write!(
+                f,
+                "the key accepted the Feitian OTP reset, but not every slot reads empty: {}",
+                left.join("; ")
+            ),
             TransportError::FeitianOtpHid(e) => {
                 write!(f, "Feitian OTP over the key's FIDO HID interface: {e}")
             }
+            TransportError::FeitianOtpBothFailed { reader, hid } => write!(
+                f,
+                "{reader}; the key's FIDO HID interface also failed ({hid})"
+            ),
             TransportError::OpenPgpExponentTooWide => write!(
                 f,
                 "the key's RSA public exponent is wider than this OpenPGP card's \

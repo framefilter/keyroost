@@ -325,6 +325,10 @@ it does on a slot with an access code, is not measured.)*
 Feitian's client answers a `6700` here with the four bytes `00 07 00 00`, as
 for LIST. *(Client. Key B did not answer `6700`.)* `keyroost` does the same.
 
+Since what RESET does to the keyboard slots is not measured, `keyroost`
+lists all three slots after the key accepts it, and reports the reset
+complete only when every slot reads empty.
+
 ## Status words
 
 | SW | Meaning | |

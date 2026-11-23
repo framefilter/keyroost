@@ -27,9 +27,10 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// What the pane says for a key with neither a reader nor a FIDO HID path.
+/// What the pane, and an import into this applet, say for a key with
+/// neither a reader nor a FIDO HID path.
 pub(crate) const NO_INTERFACE: &str =
-    "the selected key has no smart-card reader and no FIDO HID interface keyroost can open";
+    "This key has no smart-card reader and no FIDO HID interface keyroost can open.";
 
 /// Where the Feitian OTP applet of one key is reached. A session opens the
 /// endpoint of the key that was picked, never the first that answers.
@@ -58,13 +59,19 @@ impl FtotpTarget {
 
     /// Open a session on this endpoint. With both interfaces, a reader that
     /// can't be opened is followed by the HID interface; if that fails too,
-    /// the reader's error is the one returned.
+    /// both errors are reported, the reader's first, in the CLI's words.
     pub(crate) fn open(&self) -> Result<FeitianOtpSession, TransportError> {
         match self {
             FtotpTarget::Reader(r) => FeitianOtpSession::open(r),
             FtotpTarget::Hid(p) => FeitianOtpSession::open_hid(p),
-            FtotpTarget::ReaderThenHid(r, p) => FeitianOtpSession::open(r)
-                .or_else(|card_err| FeitianOtpSession::open_hid(p).map_err(|_| card_err)),
+            FtotpTarget::ReaderThenHid(r, p) => FeitianOtpSession::open(r).or_else(|card_err| {
+                FeitianOtpSession::open_hid(p).map_err(|hid_err| {
+                    TransportError::FeitianOtpBothFailed {
+                        reader: Box::new(card_err),
+                        hid: Box::new(hid_err),
+                    }
+                })
+            }),
         }
     }
 }
@@ -704,12 +711,18 @@ impl App {
         self.spawn_job(
             "Resetting Feitian OTP \u{2014} touch your key\u{2026}",
             move || {
+                // The error, and whether the key took the reset: then the
+                // rows shown are out of date whatever the check found.
                 let result = target
                     .open()
                     .and_then(|mut session| session.reset())
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| {
+                        let took = matches!(e, TransportError::FeitianOtpResetUnconfirmed { .. });
+                        (e.to_string(), took)
+                    });
                 Box::new(move |app: &mut App| {
                     if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                        let result = result.map_err(|(e, _)| e);
                         app.log_moved_on(for_device.as_ref(), "resetting Feitian OTP", &result);
                         return;
                     }
@@ -722,7 +735,17 @@ impl App {
                             app.ftotp_tried = false;
                             app.ftotp_done("Feitian OTP applet reset: all accounts wiped.".into());
                         }
-                        Err(e) => app.ftotp_failed(e),
+                        Err((e, true)) => {
+                            // The key took the reset but not every slot
+                            // reads empty: the old rows are gone, the error
+                            // says what is left, and Refresh lists it.
+                            app.ftotp = FtotpState {
+                                loaded: true,
+                                ..FtotpState::default()
+                            };
+                            app.ftotp_failed(e);
+                        }
+                        Err((e, false)) => app.ftotp_failed(e),
                     }
                 })
             },

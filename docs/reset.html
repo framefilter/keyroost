@@ -167,7 +167,9 @@ keyroostctl factory-reset --device my-key --yes  # in a script</code></pre>
       own result, the command ends with a line like <code>factory reset: 5 wiped, 0
       skipped, 0 failed</code>, and it exits nonzero if any step failed or was skipped.</p>
     <p>The OTP applet on Feitian keys has a step of its own, which waits for a touch on the
-      key. On its own it is <code>keyroostctl feitian reset</code>, or
+      key. Afterwards keyroost lists the applet's three slots: the step counts as wiped only
+      when every slot reads empty, and otherwise names the slot that still holds accounts or
+      couldn't be read. On its own it is <code>keyroostctl feitian reset</code>, or
       <strong>Reset…</strong> in the app's Feitian OTP tab.</p>
     <p>The desktop app offers the same sweep as a <strong>Factory reset</strong> card on a
       key's Overview tab, with a live per-step report — including a FIDO2 row — so you can

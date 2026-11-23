@@ -539,7 +539,7 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl feitian add</code></td><td>Add a TOTP or HOTP account to the key&#x27;s default slot</td></tr>
       <tr><td><code>keyroostctl feitian import</code></td><td>Add every code in an authenticator export to this key&#x27;s default slot</td></tr>
       <tr><td><code>keyroostctl feitian delete</code></td><td>Delete one account by app and account. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
-      <tr><td><code>keyroostctl feitian reset</code></td><td>Wipe every account in the Feitian OTP applet. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl feitian reset</code></td><td>Reset the Feitian OTP applet, then list its three slots to check they are empty. The key asks for a touch. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
     </table></div>
     <h3 id="ref-openpgp">openpgp</h3>
     <p class="kr-muted">Manage the OpenPGP card applet: info, keys, sign, decrypt, PINs, cardholder details, and reset</p>

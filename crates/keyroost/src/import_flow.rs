@@ -319,10 +319,6 @@ pub const MOLTO_SLOTS_FAILED: &str =
 /// Shown for an OATH destination with no smart-card reader.
 pub const NO_SMART_CARD: &str = "This key has no smart-card interface to reach its OATH codes.";
 
-/// Shown for a Feitian OTP destination with no smart-card reader.
-pub const NO_SMART_CARD_FEITIAN: &str =
-    "This key has no smart-card interface to reach its Feitian OTP codes.";
-
 /// Shown for a Token2 key supplied without the on-device OTP function.
 pub const NO_OTP_FUNCTION: &str = "This key was supplied without the on-device OTP \
      function, so it can't store codes.";
@@ -1049,7 +1045,7 @@ impl App {
                     self.import_set_preview(
                         id,
                         &dest,
-                        Preview::Failed(NO_SMART_CARD_FEITIAN.into()),
+                        Preview::Failed(crate::ftotp_pane::NO_INTERFACE.into()),
                     );
                     return;
                 };
@@ -1413,7 +1409,8 @@ impl App {
                     dev.reader.as_deref(),
                     dev.hid_path.as_deref(),
                 ) else {
-                    self.import_add_refused(NO_SMART_CARD_FEITIAN);
+                    // The Feitian OTP tab's words for the same case.
+                    self.import_add_refused(crate::ftotp_pane::NO_INTERFACE);
                     return;
                 };
                 self.spawn_job_on(Some(&on), label, move || {
