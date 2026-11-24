@@ -108,6 +108,15 @@ pub(crate) fn note(msg: &str) {
     errln!("note: {msg}");
 }
 
+/// After a write to the key's large-blob store (a vault, a note, the key's
+/// name): [`keyroost_resolve::store_note`] as a [`note`] when less than a
+/// quarter of the store is free. The write itself is never refused for it.
+pub(crate) fn store_note(cap: &keyroost_ctap::large_blobs::BlobCapacity) {
+    if let Some(n) = keyroost_resolve::store_note(cap) {
+        note(&n);
+    }
+}
+
 /// A status line on stderr, unprefixed: prompts, progress, "wrote", the
 /// target announcement.
 pub(crate) fn status(msg: &str) {

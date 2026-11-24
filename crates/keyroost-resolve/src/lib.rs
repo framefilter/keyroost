@@ -19,12 +19,14 @@ use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey};
 use keyroost_transport::YubiKeyCcid;
 
 pub mod aaguid;
+pub mod blob_space;
 pub mod device;
 pub mod firmware;
 pub mod identity;
 pub mod mds;
 pub mod names;
 pub mod select;
+pub use blob_space::store_note;
 pub use device::{
     add_fido_models, add_key_names, correlate, correlate_live, correlate_with, enumerate,
     enumerate_with, exclude_unresettable_piv, factory_reset_plan, forget_key_names,

@@ -2082,6 +2082,11 @@ enum NameCmd {
     ///
     /// A name stored on the key travels with it and is visible to anyone who
     /// has the key; changing or replacing it needs the FIDO PIN.
+    ///
+    /// A name stored on the key is kept in the key's shared large-blob store
+    /// without belonging to a passkey, so a browser may clear it when the
+    /// store is full and a website needs room; setting the name again
+    /// restores it.
     Set {
         /// Any text up to 64 characters; control, zero-width and bidi
         /// characters are rejected.
@@ -3297,6 +3302,10 @@ enum LargeBlobCmd {
     /// IMPORTANT: the large-blob store is world-readable WITHOUT a PIN — do not
     /// put secrets here. TEXT is passed on the command line, so it is visible to
     /// other local processes (e.g. via the process list) while this runs.
+    ///
+    /// A note is kept in the key's shared large-blob store without belonging
+    /// to a passkey, so a browser may clear it when the store is full and a
+    /// website needs room; adding the note again restores it.
     Add {
         /// The note text to store (plain UTF-8). Visible in argv to other
         /// local processes — never a secret.
@@ -3312,6 +3321,10 @@ enum LargeBlobCmd {
     /// Replace the text of an existing keyroost note by its index.
     ///
     /// Refuses to touch opaque RP-encrypted entries.
+    ///
+    /// A note is kept in the key's shared large-blob store without belonging
+    /// to a passkey, so a browser may clear it when the store is full and a
+    /// website needs room; adding the note again restores it.
     Edit {
         /// Zero-based entry index as printed by `fido blob list`.
         index: usize,
@@ -14148,7 +14161,7 @@ fn plan_key_label(
 /// Write `plan` to `dev`: ask first when `question` is given (a name on the
 /// key is replaced or removed), read the FIDO PIN, re-find the key if the
 /// person was kept waiting, then write only over the array the plan was
-/// made from.
+/// made from. Returns how full the large-blob store is after the write.
 fn apply_key_label(
     sec: &mut Secrets,
     src: Source<'_>,
@@ -14157,7 +14170,7 @@ fn apply_key_label(
     plan: &keyroost_ctap::device_label::LabelPlan,
     question: Option<&str>,
     v: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<keyroost_ctap::large_blobs::BlobCapacity, Box<dyn std::error::Error>> {
     sec.check(&FIDO_PIN, src)?;
     let pin = confirm_then_read_pin(
         &mut crate::prompt::RealTerm,
@@ -14180,7 +14193,8 @@ fn apply_key_label(
     keyroost_resolve::with_key_names_forgotten(|| {
         keyroost_ctap::device_label::apply_label_plan(&mut h, &info, &token, plan)
     })
-    .map_err(|e| label_refusal(e, v, 0).into())
+    .map_err(|e| label_refusal(e, v, 0))?;
+    Ok(plan.after.capacity(&info))
 }
 
 /// `name set`: name the selected key, or rename it, where
@@ -14233,7 +14247,7 @@ fn name_set(
                     sanitize_terminal(old)
                 )
             });
-            apply_key_label(&mut sec, src, yes, &dev, &plan, question.as_deref(), &v)?;
+            let cap = apply_key_label(&mut sec, src, yes, &dev, &plan, question.as_deref(), &v)?;
             // Re-read keys.json: another keyroost run (or the app) may have
             // saved to it while the PIN prompt and the write ran.
             let saved = Keyring::load_default().and_then(|mut k| {
@@ -14254,6 +14268,7 @@ fn name_set(
             }
             outln!("Name set on the key: {shown}");
             errln!("The name is stored on the key and is visible to anyone who has the key.");
+            output::store_note(&cap);
             Ok(())
         }
     }
@@ -14323,7 +14338,7 @@ fn clear_key_label(
         "remove the name '{}' stored on the key",
         sanitize_terminal(label)
     );
-    apply_key_label(sec, src, yes, dev, &plan, Some(&question), &v)
+    apply_key_label(sec, src, yes, dev, &plan, Some(&question), &v).map(|_| ())
 }
 
 /// The note for a key whose own name couldn't be read just now: its local
@@ -15708,6 +15723,7 @@ fn run_fido_large_blob_add(
         keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
     })?;
     outln!("Note added; {} entries now.", updated.len());
+    output::store_note(&updated.capacity(&info));
     Ok(())
 }
 
@@ -15736,6 +15752,7 @@ fn run_fido_large_blob_edit(
         keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
     })?;
     outln!("Note {} updated.", index);
+    output::store_note(&updated.capacity(&info));
     Ok(())
 }
 
@@ -26556,6 +26573,76 @@ mod cli_tests {
             writer: Some("keyroost".into()),
         };
         base.with_label(Some(&l), [7; 12]).unwrap()
+    }
+
+    /// A getInfo with large blobs and a PIN, and a store of `max` bytes.
+    fn blob_info(max: u64) -> keyroost_ctap::AuthenticatorInfo {
+        keyroost_ctap::AuthenticatorInfo {
+            options: vec![("largeBlobs".into(), true), ("clientPin".into(), true)],
+            max_serialized_large_blob_array: Some(max),
+            ..Default::default()
+        }
+    }
+
+    /// For an array of `used` bytes, the store sizes that leave exactly a
+    /// quarter free and one byte less than a quarter free.
+    fn quarter_free_sizes(used: u64) -> (u64, u64) {
+        (used + used / 3, used + (used - 4) / 3)
+    }
+
+    /// The store note after a write that left `after`, checked on both sides
+    /// of the quarter-free line: none at a quarter free, the vault's note
+    /// with these numbers one byte below it.
+    fn assert_store_note_threshold(after: &LargeBlobArray) {
+        let used = after.capacity(&blob_info(4096)).used_bytes;
+        let (quarter, below) = quarter_free_sizes(used);
+
+        let cap = after.capacity(&blob_info(quarter));
+        assert_eq!(cap.free_bytes, cap.max_bytes / 4);
+        assert_eq!(keyroost_resolve::store_note(&cap), None);
+
+        let cap = after.capacity(&blob_info(below));
+        assert_eq!(cap.free_bytes, cap.max_bytes / 4 - 1);
+        assert_eq!(
+            keyroost_resolve::store_note(&cap),
+            Some(format!(
+                "the key's large-blob store is {}% full ({used} of {below} bytes). \
+                 Websites that store data with their passkeys may have no room left.",
+                used * 100 / below
+            ))
+        );
+    }
+
+    #[test]
+    fn a_note_write_leaving_under_a_quarter_free_gets_the_store_note() {
+        let before = with_key_name(&large_blob_array_of(&[&opaque_entry_map()]), "Work");
+        // `fido blob add`: the note is appended after the name.
+        let added = before.with_text_note("spare key in the desk drawer");
+        assert_store_note_threshold(&added);
+        // `fido blob edit`: entry 2 is that note.
+        let edited = added
+            .with_replaced_note(2, "moved to the safe, top shelf, left side")
+            .unwrap();
+        assert_store_note_threshold(&edited);
+    }
+
+    #[test]
+    fn a_name_write_leaving_under_a_quarter_free_gets_the_store_note() {
+        let current =
+            large_blob_array_of(&[&opaque_entry_map()]).with_text_note("spare key in the desk");
+        let name = keyroost_ctap::device_label::DeviceLabel {
+            label: "Work YubiKey".into(),
+            writer: Some(keyroost_ctap::device_label::WRITER_KEYROOST.into()),
+        };
+        // `name set --store key` reports on the array its plan writes.
+        let plan = keyroost_ctap::device_label::plan_label_change(
+            &current,
+            &blob_info(4096),
+            Some(&name),
+            [7; 12],
+        )
+        .unwrap();
+        assert_store_note_threshold(&plan.after);
     }
 
     #[test]
