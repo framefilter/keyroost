@@ -17728,6 +17728,7 @@ mod cli_tests {
             ("fido blob delete", IRREVERSIBLE),
             ("fido blob clear", IRREVERSIBLE),
             ("fido vault delete", IRREVERSIBLE),
+            ("fido vault entry delete", IRREVERSIBLE),
             ("molto delete", IRREVERSIBLE),
             ("molto reset", IRREVERSIBLE),
             ("oath delete", IRREVERSIBLE),

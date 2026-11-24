@@ -8,24 +8,27 @@
 //! carried in `--json`.
 
 use std::error::Error;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use keyroost_ctap::large_blobs::BlobCapacity;
 use keyroost_ctap::CtapHidDevice;
 use keyroost_proto::codec::hex_encode;
-use keyroost_resolve::{Choice, Picker};
+use keyroost_resolve::{Choice, Device, Picker};
 use keyroost_transport::vault::{
-    self, CtapVaultKey, LeftOver, OldVault, StoredData, Unlocked, VaultAuth, VaultCredential,
-    VaultKeyError, VaultPick, VaultProblem, VaultRef, VaultStep,
+    self, Change, CtapVaultKey, LeftOver, OldVault, StoredData, Unlocked, VaultAuth,
+    VaultCredential, VaultKeyError, VaultPick, VaultProblem, VaultRef, VaultStep,
 };
+use keyroost_vault::{Entry, Vault};
+use zeroize::Zeroizing;
 
 use crate::code_import::entries;
 use crate::json_out;
 use crate::output::{emit_json, json_output};
 use crate::prompt::{confirm, confirm_statement, key_label, RealTerm, TermPicker};
-use crate::secrets::SecretSource;
-use crate::{sanitize_terminal, PATH_HELP};
+use crate::secrets::{SecretIo, SecretSource, Secrets, Source, Spec};
+use crate::{sanitize_multiline, sanitize_terminal, PATH_HELP};
 
 /// `fido vault` subcommands.
 #[derive(Subcommand)]
@@ -91,6 +94,172 @@ pub(crate) enum FidoVaultCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
     },
+    /// Read and change the entries in a vault.
+    Entry {
+        #[command(subcommand)]
+        cmd: FidoVaultEntryCmd,
+    },
+}
+
+/// The help every vault entry command gives `--vault` (no final period,
+/// like the doc-comment help clap shows next to it).
+const VAULT_HELP: &str = "The vault to use when the key has several";
+
+/// `fido vault entry` subcommands.
+#[derive(Subcommand)]
+pub(crate) enum FidoVaultEntryCmd {
+    /// List a vault's entries with their usernames and web addresses (PIN and a touch).
+    List {
+        #[arg(long, value_name = "NAME", help = VAULT_HELP)]
+        vault: Option<String>,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<PathBuf>,
+    },
+    /// Show one entry; its password only with --reveal (PIN and a touch).
+    ///
+    /// Entries that share a title are told apart by username: name one with
+    /// --username, or pick it from a list at a terminal.
+    Show {
+        /// The entry's title, as `fido vault entry list` shows it.
+        title: String,
+        /// Pick the entry with this username when several share the title.
+        #[arg(long, value_name = "USERNAME")]
+        username: Option<String>,
+        #[arg(long, value_name = "NAME", help = VAULT_HELP)]
+        vault: Option<String>,
+        /// Also show the password until you press Enter. Anyone watching, or
+        /// anything recording, your terminal will capture it.
+        #[arg(long)]
+        reveal: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<PathBuf>,
+    },
+    /// Add an entry to a vault (PIN and a touch).
+    ///
+    /// Titles need not be unique: entries that share one are told apart by
+    /// username.
+    Add {
+        /// The new entry's title.
+        title: String,
+        #[arg(long, value_name = "NAME", help = VAULT_HELP)]
+        vault: Option<String>,
+        /// The entry's username.
+        #[arg(long, value_name = "USERNAME")]
+        username: Option<String>,
+        /// The entry's web address.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// The notes: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --password stdin is also given; hidden
+        /// when typed at a terminal).
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        notes: Option<SecretSource>,
+        /// The password: env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal,
+        /// twice). With neither (and no --generate-password), a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        password: Option<SecretSource>,
+        /// Make up a random password instead of reading one.
+        #[arg(long, conflicts_with = "password")]
+        generate_password: bool,
+        /// Length of the generated password (default 20).
+        #[arg(long, value_name = "N", requires = "generate_password", value_parser = length_parser())]
+        length: Option<usize>,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (the line after the password and notes when they come from
+        /// stdin too: second line after one of them, third after both; hidden
+        /// when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<PathBuf>,
+    },
+    /// Change an entry's title, username, web address, notes or password (PIN and a touch).
+    ///
+    /// Only what the flags name changes; an empty value clears a field
+    /// (`--url ""`). Entries that share a title are picked from a list at a
+    /// terminal.
+    #[command(group(
+        clap::ArgGroup::new("change")
+            .args(["new_title", "username", "url", "notes", "password", "generate_password"])
+            .required(true)
+            .multiple(true)
+    ))]
+    Edit {
+        /// The entry's title, as `fido vault entry list` shows it.
+        title: String,
+        #[arg(long, value_name = "NAME", help = VAULT_HELP)]
+        vault: Option<String>,
+        /// The new title.
+        #[arg(long = "title", value_name = "TITLE")]
+        new_title: Option<String>,
+        /// The new username.
+        #[arg(long, value_name = "USERNAME")]
+        username: Option<String>,
+        /// The new web address.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// The notes: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --password stdin is also given; hidden
+        /// when typed at a terminal).
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        notes: Option<SecretSource>,
+        /// The password: env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal,
+        /// twice).
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        password: Option<SecretSource>,
+        /// Replace the password with a random one.
+        #[arg(long, conflicts_with = "password")]
+        generate_password: bool,
+        /// Length of the generated password (default 20).
+        #[arg(long, value_name = "N", requires = "generate_password", value_parser = length_parser())]
+        length: Option<usize>,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (the line after the password and notes when they come from
+        /// stdin too: second line after one of them, third after both; hidden
+        /// when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<PathBuf>,
+    },
+    /// Delete an entry from a vault (PIN and a touch). Irreversible: asks first (`--yes` to skip).
+    Delete {
+        /// The entry's title, as `fido vault entry list` shows it.
+        title: String,
+        /// Pick the entry with this username when several share the title.
+        #[arg(long, value_name = "USERNAME")]
+        username: Option<String>,
+        #[arg(long, value_name = "NAME", help = VAULT_HELP)]
+        vault: Option<String>,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<PathBuf>,
+    },
+}
+
+/// `--length`: what the generator makes, 4 to 128 characters.
+fn length_parser() -> clap::builder::RangedU64ValueParser<usize> {
+    clap::builder::RangedU64ValueParser::new().range(4..=128)
 }
 
 pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
@@ -187,6 +356,7 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
             outln!("{}", rotated_line(name, new.contents.entries.len()));
             Ok(())
         }
+        FidoVaultCmd::Entry { cmd } => run_vault_entry(cmd),
     }
 }
 
@@ -334,13 +504,6 @@ pub(crate) fn open_vault_key(
 }
 
 /// How `--vault` names the vault: by name, or (not given) the only one.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the vault entry, export and import commands use it"
-    )
-)]
 pub(crate) fn vault_pick(arg: Option<&str>) -> VaultPick<'_> {
     match arg {
         None => VaultPick::Only,
@@ -673,6 +836,786 @@ pub(crate) fn list_json(rows: &[VaultRow], cap: &BlobCapacity) -> json_out::Fido
             used_bytes: cap.used_bytes,
             free_bytes: cap.free_bytes,
         },
+    }
+}
+
+/// An entry's password, read like any secret: asked twice at a terminal,
+/// and an empty one is a real answer (an entry with no password).
+const ENTRY_PASSWORD: Spec = Spec::new_secret("password", "password")
+    .allow_empty()
+    .hint("--password env:NAME, --password stdin or --generate-password");
+
+/// An entry's notes (where people keep recovery codes), read like a secret;
+/// read only when `--notes` is given. Empty clears them.
+const ENTRY_NOTES: Spec = Spec::value("notes", "notes").allow_empty();
+
+/// Refuse early, before any key is looked for, a password or notes source
+/// that can't be read. `password_needed`: no `--password` doesn't excuse it
+/// (`entry add` without `--generate-password`).
+fn check_content<I: SecretIo>(
+    sec: &Secrets<I>,
+    password: Option<&SecretSource>,
+    password_needed: bool,
+    notes: Option<&SecretSource>,
+) -> Result<(), String> {
+    if password.is_some() || password_needed {
+        sec.check(&ENTRY_PASSWORD, Source::from_flag(password))?;
+    }
+    if notes.is_some() {
+        sec.check(&ENTRY_NOTES, Source::from_flag(notes))?;
+    }
+    Ok(())
+}
+
+/// The password and notes, in stdin order (password first); the PIN comes
+/// after them ([`crate::fido_pin_with`]).
+type Content = (Option<Zeroizing<String>>, Option<Zeroizing<String>>);
+
+fn read_content<I: SecretIo>(
+    sec: &mut Secrets<I>,
+    password: Option<&SecretSource>,
+    password_needed: bool,
+    notes: Option<&SecretSource>,
+) -> Result<Content, String> {
+    let password = if password.is_some() || password_needed {
+        Some(sec.read(&ENTRY_PASSWORD, Source::from_flag(password))?)
+    } else {
+        None
+    };
+    let notes = sec.read_given(&ENTRY_NOTES, Source::from_flag(notes))?;
+    Ok((password, notes))
+}
+
+/// What an entry command reads in, in order, before it opens the key.
+#[derive(Default)]
+struct ContentFlags<'a> {
+    password: Option<&'a SecretSource>,
+    password_needed: bool,
+    notes: Option<&'a SecretSource>,
+}
+
+/// An entry command's key, opened after every secret was read.
+struct EntryKey {
+    dev: Device,
+    key: CtapVaultKey<CtapHidDevice>,
+    auth: VaultAuth,
+    password: Option<Zeroizing<String>>,
+    notes: Option<Zeroizing<String>>,
+}
+
+/// One `Secrets` for the command: check every source, select the key, read
+/// the password and notes, then the PIN, then open the key.
+fn open_entry_key(
+    path: Option<&Path>,
+    pin: Option<&SecretSource>,
+    c: ContentFlags<'_>,
+) -> Result<EntryKey, Box<dyn Error>> {
+    let mut sec = Secrets::real();
+    check_content(&sec, c.password, c.password_needed, c.notes)?;
+    sec.check(&crate::FIDO_PIN, Source::from_flag(pin))?;
+    let dev = crate::target::select_fido(path)?;
+    let (password, notes) = read_content(&mut sec, c.password, c.password_needed, c.notes)?;
+    let pin = crate::fido_pin_with(&mut sec, &dev, pin)?;
+    let key = open_vault_key(path)?;
+    Ok(EntryKey {
+        dev,
+        key,
+        auth: VaultAuth::pin(pin),
+        password,
+        notes,
+    })
+}
+
+/// Unlock (one touch) and choose the vault `--vault` names, or the only one.
+fn unlock_one(k: &mut EntryKey, name: Option<&str>) -> Result<(Unlocked, usize), Box<dyn Error>> {
+    let mut touches = Touches::new(1);
+    let unlocked =
+        vault::unlock(&mut k.key, &mut k.auth, &mut |s| touches.step(s)).map_err(vault_error)?;
+    let matches = vault::matching(&unlocked.vaults, &vault_pick(name)).map_err(vault_error)?;
+    let i = choose_vault(
+        &unlocked_choices(&unlocked),
+        &matches,
+        name,
+        &mut TermPicker::new(&mut RealTerm),
+    )?;
+    Ok((unlocked, i))
+}
+
+/// The indices of the entries titled exactly `title` (and, when given,
+/// with exactly this username), in vault order.
+pub(crate) fn entry_matches(v: &Vault, title: &str, username: Option<&str>) -> Vec<usize> {
+    v.entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.title == title && username.is_none_or(|u| e.username == u))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// `  TITLE  USERNAME  URL` lines with the columns aligned (no username
+/// column when no entry has one).
+fn entry_rows<'a>(rows: impl Iterator<Item = &'a Entry>, indent: &str) -> Vec<String> {
+    let rows: Vec<[String; 3]> = rows
+        .map(|e| {
+            [
+                sanitize_terminal(&e.title),
+                sanitize_terminal(&e.username),
+                sanitize_terminal(&e.url),
+            ]
+        })
+        .collect();
+    let width = |k: usize| rows.iter().map(|r| r[k].chars().count()).max().unwrap_or(0);
+    let (wt, wu) = (width(0), width(1));
+    rows.iter()
+        .map(|[t, u, url]| {
+            let line = if wu == 0 {
+                format!("{indent}{t:<wt$}  {url}")
+            } else {
+                format!("{indent}{t:<wt$}  {u:<wu$}  {url}")
+            };
+            line.trim_end().to_owned()
+        })
+        .collect()
+}
+
+/// Which of `matches` (indices into `v`, all titled `title`) the command
+/// means. One is it; several are asked about at a terminal and refused,
+/// listed by username and URL, without one. `username_selects`: the
+/// command's `--username` picks among them (`show`, `delete`; on `edit` it
+/// is the new value), so the refusal suggests it when the usernames differ.
+pub(crate) fn choose_entry(
+    v: &Vault,
+    title: &str,
+    matches: &[usize],
+    username_selects: bool,
+    picker: &mut dyn Picker,
+) -> Result<usize, String> {
+    let shown = sanitize_terminal(title);
+    match matches {
+        [] => Err(format!("no entry titled \"{shown}\" in this vault")),
+        [one] => Ok(*one),
+        many => {
+            let heading = format!("{} entries are titled \"{shown}\":", many.len());
+            if picker.interactive() {
+                let list: Vec<Choice> = many
+                    .iter()
+                    .enumerate()
+                    .map(|(n, &i)| {
+                        let e = &v.entries[i];
+                        Choice {
+                            number: n + 1,
+                            label: if e.username.is_empty() {
+                                e.title.clone()
+                            } else {
+                                format!("{}  {}", e.title, e.username)
+                            },
+                            endpoint: e.url.clone(),
+                        }
+                    })
+                    .collect();
+                let k = picker.pick(&heading, &list)?;
+                return many
+                    .get(k)
+                    .copied()
+                    .ok_or_else(|| format!("choice {k} is out of range"));
+            }
+            let names: Vec<&str> = many
+                .iter()
+                .map(|&i| v.entries[i].username.as_str())
+                .collect();
+            let distinct = names
+                .iter()
+                .enumerate()
+                .all(|(a, n)| !names[..a].contains(n));
+            let next = if username_selects && distinct {
+                "add --username to pick one"
+            } else {
+                "run this in a terminal to pick one"
+            };
+            let mut lines = vec![heading];
+            lines.extend(entry_rows(many.iter().map(|&i| &v.entries[i]), "  "));
+            lines.push(next.to_owned());
+            Err(lines.join("\n"))
+        }
+    }
+}
+
+/// [`entry_matches`] + [`choose_entry`] at the real terminal, saying so
+/// when `--username` is what left nothing.
+fn pick_entry(
+    v: &Vault,
+    title: &str,
+    username: Option<&str>,
+    username_selects: bool,
+) -> Result<usize, String> {
+    let matches = entry_matches(v, title, username);
+    if let (true, Some(u)) = (matches.is_empty(), username) {
+        if !entry_matches(v, title, None).is_empty() {
+            return Err(format!(
+                "no entry titled \"{}\" with username \"{}\" in this vault",
+                sanitize_terminal(title),
+                sanitize_terminal(u)
+            ));
+        }
+    }
+    choose_entry(
+        v,
+        title,
+        &matches,
+        username_selects,
+        &mut TermPicker::new(&mut RealTerm),
+    )
+}
+
+/// An entry's `modified_minutes` as a date, `YYYY-MM-DD` (UTC).
+pub(crate) fn changed_date(minutes: i64) -> String {
+    let (y, m, d) = keyroost_pgpkey::cert::civil_from_days(minutes.div_euclid(24 * 60));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// What starts the password line, revealed or not; as wide as the widest
+/// label, so the value lines up with the others.
+const REVEAL_LABEL: &str = "Password: ";
+
+/// `Label:` padded to the value column.
+fn label(name: &str) -> String {
+    format!("{:<w$}", format!("{name}:"), w = REVEAL_LABEL.len())
+}
+
+/// `entry show` as text: Title, Username, URL, Notes, Changed, then
+/// `Password: (hidden)` or `(none)`. Never the password, never the ID.
+/// Notes over several lines stay under their column.
+pub(crate) fn entry_lines(e: &Entry) -> Vec<String> {
+    let value = |s: &str| {
+        if s.is_empty() {
+            "(none)".to_owned()
+        } else {
+            sanitize_terminal(s)
+        }
+    };
+    let mut lines = vec![
+        format!("{}{}", label("Title"), value(&e.title)),
+        format!("{}{}", label("Username"), value(&e.username)),
+        format!("{}{}", label("URL"), value(&e.url)),
+    ];
+    if e.notes.is_empty() {
+        lines.push(format!("{}(none)", label("Notes")));
+    } else {
+        let notes = Zeroizing::new(sanitize_multiline(&e.notes));
+        for (n, l) in notes.split('\n').enumerate() {
+            let head = if n == 0 {
+                label("Notes")
+            } else {
+                " ".repeat(REVEAL_LABEL.len())
+            };
+            lines.push(format!("{head}{l}").trim_end().to_owned());
+        }
+    }
+    lines.push(format!(
+        "{}{}",
+        label("Changed"),
+        changed_date(e.modified_minutes)
+    ));
+    let password = if e.password.is_empty() {
+        "(none)"
+    } else {
+        "(hidden)"
+    };
+    lines.push(format!("{REVEAL_LABEL}{password}"));
+    lines
+}
+
+/// How `entry show --reveal` gives the password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevealPlan {
+    /// A terminal: the entry, the password on its own line until Enter,
+    /// then that line erased.
+    ShowUntilEnter,
+    /// A pipe or a file: the password bytes alone, no newline.
+    PasswordOnly,
+    /// `--json`: the entry with its password.
+    Json,
+}
+
+pub(crate) fn reveal_plan(stdout_is_tty: bool, json: bool) -> RevealPlan {
+    match (json, stdout_is_tty) {
+        (true, _) => RevealPlan::Json,
+        (false, true) => RevealPlan::ShowUntilEnter,
+        (false, false) => RevealPlan::PasswordOnly,
+    }
+}
+
+/// Exactly the password's bytes: no newline, so `| xclip` or `> file` gets
+/// the password and nothing else.
+pub(crate) fn write_password_only(out: &mut impl Write, p: &str) -> io::Result<()> {
+    out.write_all(p.as_bytes())
+}
+
+/// Erases the shown password once the Enter wait is over. The reader
+/// (rpassword) writes a newline to the terminal when it returns, which
+/// leaves the cursor at the start of the line below the password: up one
+/// line, then clear that whole line.
+pub(crate) fn erase_shown_line() -> &'static str {
+    "\x1b[1A\x1b[2K"
+}
+
+/// Erases the password when the Enter wait failed: no newline was written,
+/// so the password is still on the cursor's own line.
+pub(crate) fn erase_current_line() -> &'static str {
+    "\r\x1b[2K"
+}
+
+/// Whether the terminal the Enter wait reads (and the reader writes its
+/// newline to) can be opened: checked before the password is shown, so a
+/// failure never leaves it on screen.
+fn terminal_opens() -> io::Result<()> {
+    let open = |p: &str, read: bool| {
+        std::fs::OpenOptions::new()
+            .read(read)
+            .write(true)
+            .open(p)
+            .map(drop)
+    };
+    if cfg!(windows) {
+        open("CONIN$", true)?;
+        open("CONOUT$", false)
+    } else {
+        open("/dev/tty", true)
+    }
+}
+
+/// [`RevealPlan::ShowUntilEnter`]: the entry, `Password: p` with no
+/// newline, a wait for Enter at the terminal (never stdin, which may carry
+/// the PIN), then the password line erased.
+fn show_until_enter(e: &Entry) -> Result<(), Box<dyn Error>> {
+    let lines = entry_lines(e);
+    if e.password.is_empty() {
+        for l in &lines {
+            outln!("{l}");
+        }
+        return Ok(());
+    }
+    terminal_opens().map_err(|err| {
+        format!("could not open the terminal to wait for Enter ({err}); the password was not shown")
+    })?;
+    for l in &lines[..lines.len() - 1] {
+        outln!("{l}");
+    }
+    // Shown on a terminal: no control characters reach it.
+    let shown = Zeroizing::new(sanitize_terminal(&e.password));
+    let mut out = io::stdout();
+    out.write_all(REVEAL_LABEL.as_bytes())?;
+    out.write_all(shown.as_bytes())?;
+    out.flush()?;
+    let waited = rpassword::prompt_password("").map(Zeroizing::new);
+    let erase = if waited.is_ok() {
+        erase_shown_line()
+    } else {
+        erase_current_line()
+    };
+    out.write_all(erase.as_bytes())?;
+    out.flush()?;
+    waited.map(drop).map_err(|err| match err.kind() {
+        io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof => {
+            "canceled while the password was shown; it is erased".into()
+        }
+        _ => format!("could not wait for Enter ({err}); the password is erased").into(),
+    })
+}
+
+/// `value` as pretty JSON and a newline, built in a wiped buffer sized up
+/// front (so no growth leaves an unwiped copy): for a document that holds
+/// a password or notes.
+fn write_json_wiped<T: serde::Serialize>(
+    out: &mut impl Write,
+    value: &T,
+) -> Result<(), Box<dyn Error>> {
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut size = Count(0);
+    serde_json::to_writer_pretty(&mut size, value)?;
+    let mut buf = Zeroizing::new(Vec::with_capacity(size.0 + 1));
+    serde_json::to_writer_pretty(&mut *buf, value)?;
+    buf.push(b'\n');
+    out.write_all(&buf)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// `entry list --json`: ids and every field but the password and notes.
+pub(crate) fn entry_list_json(vault: Option<&str>, v: &Vault) -> json_out::FidoVaultEntryListJson {
+    json_out::FidoVaultEntryListJson {
+        vault: vault.map(str::to_owned),
+        entries: v
+            .entries
+            .iter()
+            .map(|e| json_out::FidoVaultEntryJson {
+                id: e.id.clone(),
+                title: e.title.clone(),
+                username: e.username.clone(),
+                url: e.url.clone(),
+                changed: changed_date(e.modified_minutes),
+            })
+            .collect(),
+    }
+}
+
+/// `entry show --json`; the password only when `reveal`.
+pub(crate) fn entry_show_json(
+    vault: Option<&str>,
+    e: &Entry,
+    reveal: bool,
+) -> json_out::FidoVaultEntryShowJson {
+    json_out::FidoVaultEntryShowJson {
+        vault: vault.map(str::to_owned),
+        id: e.id.clone(),
+        title: e.title.clone(),
+        username: e.username.clone(),
+        url: e.url.clone(),
+        notes: e.notes.clone(),
+        changed: changed_date(e.modified_minutes),
+        password: reveal.then(|| e.password.to_string()),
+    }
+}
+
+/// `entry list` as text: one aligned line per entry, `(none)` without any.
+fn entry_list_lines(v: &Vault) -> Vec<String> {
+    if v.entries.is_empty() {
+        return vec!["(none)".to_owned()];
+    }
+    entry_rows(v.entries.iter(), "")
+}
+
+/// `entry delete`'s question, in `confirm`'s form.
+fn entry_delete_question(
+    term: &mut dyn crate::prompt::Term,
+    yes: bool,
+    title: &str,
+    vault: Option<&str>,
+    key: &str,
+) -> Result<bool, String> {
+    confirm(
+        term,
+        yes,
+        &format!(
+            "delete entry \"{}\" from vault \"{}\"",
+            sanitize_terminal(title),
+            shown_name(vault)
+        ),
+        key,
+    )
+}
+
+/// The progress line a save prints when it writes.
+pub(crate) const SAVE_LINE: &str = "Saving to the key\u{2026}";
+
+/// A save's progress: [`SAVE_LINE`] once, even when a fresh-token retry
+/// repeats the write step.
+#[derive(Default)]
+pub(crate) struct SaveProgress {
+    shown: bool,
+}
+
+impl SaveProgress {
+    pub(crate) fn line(&mut self, step: VaultStep) -> Option<&'static str> {
+        if step == VaultStep::Write && !self.shown {
+            self.shown = true;
+            return Some(SAVE_LINE);
+        }
+        None
+    }
+
+    /// An `on_step` callback.
+    pub(crate) fn step(&mut self, step: VaultStep) {
+        if let Some(line) = self.line(step) {
+            crate::output::status(line);
+        }
+    }
+}
+
+/// A failed entry save as `main` prints it: a conflict says to run the
+/// command again; everything else as [`vault_error`].
+fn entry_save_error(e: VaultKeyError) -> Box<dyn Error> {
+    match e {
+        VaultKeyError::Conflict => "this entry changed on the key while the command ran; \
+                                    nothing was written. Run it again."
+            .into(),
+        e => vault_error(e),
+    }
+}
+
+/// Save one change to the chosen vault, with its progress line.
+fn save_change(
+    k: &mut EntryKey,
+    open: &mut vault::OpenVault,
+    change: &Change,
+) -> Result<(), Box<dyn Error>> {
+    let mut progress = SaveProgress::default();
+    vault::save(&mut k.key, &mut k.auth, open, change, &mut |s| {
+        progress.step(s)
+    })
+    .map_err(entry_save_error)?;
+    Ok(())
+}
+
+/// What `entry add` prints when done.
+fn added_line(title: &str, vault: Option<&str>) -> String {
+    format!(
+        "Entry \"{}\" added to vault \"{}\".",
+        sanitize_terminal(title),
+        shown_name(vault)
+    )
+}
+
+/// The command that shows a generated password: `--vault` when the key has
+/// several vaults, `--username` when the title is shared.
+fn reveal_hint(title: &str, vault: Option<&str>, username: Option<&str>) -> String {
+    let mut cmd = format!(
+        "See the new password with keyroostctl fido vault entry show {}",
+        export_hint_arg(title)
+    );
+    if let Some(v) = vault {
+        cmd.push_str(&format!(" --vault {}", export_hint_arg(v)));
+    }
+    if let Some(u) = username {
+        cmd.push_str(&format!(" --username {}", export_hint_arg(u)));
+    }
+    cmd.push_str(" --reveal");
+    cmd
+}
+
+/// [`reveal_hint`] for the entry just saved as `title` / `username` in the
+/// vault `name`, out of `vaults` on the key.
+fn reveal_hint_for(open: &vault::OpenVault, vaults: usize, title: &str, username: &str) -> String {
+    let name = open.vault_ref.name.as_deref();
+    let shared = entry_matches(&open.contents, title, None).len() > 1;
+    reveal_hint(
+        title,
+        name.filter(|_| vaults > 1),
+        Some(username).filter(|u| shared && !u.is_empty()),
+    )
+}
+
+/// A generated password, `--length` long (20 by default).
+fn generated(length: Option<usize>) -> Result<Zeroizing<String>, Box<dyn Error>> {
+    Ok(keyroost_vault::generate_password(
+        &keyroost_vault::GenOptions {
+            length: length.unwrap_or(20),
+            ..Default::default()
+        },
+    )?)
+}
+
+/// A title an entry may have: not empty, since entries are found by it.
+fn check_title(title: &str) -> Result<(), String> {
+    if title.is_empty() {
+        return Err("an entry needs a title".to_owned());
+    }
+    Ok(())
+}
+
+/// The text of a secret read as an entry field, moved out of its wiped
+/// buffer into the entry (which wipes it in turn).
+fn moved_text(mut s: Zeroizing<String>) -> String {
+    std::mem::take(&mut *s)
+}
+
+fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
+    match cmd {
+        FidoVaultEntryCmd::List { vault, pin, path } => {
+            let mut k = open_entry_key(path.as_deref(), pin.as_ref(), ContentFlags::default())?;
+            let (mut unlocked, i) = unlock_one(&mut k, vault.as_deref())?;
+            let open = unlocked.vaults[i].open_mut().map_err(vault_error)?;
+            if json_output() {
+                return emit_json(&entry_list_json(
+                    open.vault_ref.name.as_deref(),
+                    &open.contents,
+                ));
+            }
+            for line in entry_list_lines(&open.contents) {
+                outln!("{line}");
+            }
+            Ok(())
+        }
+        FidoVaultEntryCmd::Show {
+            title,
+            username,
+            vault,
+            reveal,
+            pin,
+            path,
+        } => {
+            let mut k = open_entry_key(path.as_deref(), pin.as_ref(), ContentFlags::default())?;
+            let (mut unlocked, i) = unlock_one(&mut k, vault.as_deref())?;
+            let open = unlocked.vaults[i].open_mut().map_err(vault_error)?;
+            let n = pick_entry(&open.contents, title, username.as_deref(), true)?;
+            let e = &open.contents.entries[n];
+            let name = open.vault_ref.name.as_deref();
+            let plan = reveal_plan(io::stdout().is_terminal(), json_output());
+            match (*reveal, plan) {
+                (_, RevealPlan::Json) => {
+                    write_json_wiped(&mut io::stdout().lock(), &entry_show_json(name, e, *reveal))
+                }
+                (false, _) => {
+                    for line in entry_lines(e) {
+                        outln!("{line}");
+                    }
+                    Ok(())
+                }
+                (true, RevealPlan::ShowUntilEnter) => show_until_enter(e),
+                (true, RevealPlan::PasswordOnly) => {
+                    let mut out = io::stdout().lock();
+                    write_password_only(&mut out, &e.password)?;
+                    out.flush()?;
+                    Ok(())
+                }
+            }
+        }
+        FidoVaultEntryCmd::Add {
+            title,
+            vault,
+            username,
+            url,
+            notes,
+            password,
+            generate_password,
+            length,
+            pin,
+            path,
+        } => {
+            check_title(title)?;
+            let mut k = open_entry_key(
+                path.as_deref(),
+                pin.as_ref(),
+                ContentFlags {
+                    password: password.as_ref(),
+                    password_needed: !generate_password,
+                    notes: notes.as_ref(),
+                },
+            )?;
+            let password = match k.password.take() {
+                Some(p) => p,
+                None => generated(*length)?,
+            };
+            let notes = k.notes.take().map(moved_text).unwrap_or_default();
+            let (mut unlocked, i) = unlock_one(&mut k, vault.as_deref())?;
+            let vaults = unlocked.vaults.len();
+            let open = unlocked.vaults[i].open_mut().map_err(vault_error)?;
+            let entry = Entry {
+                id: keyroost_vault::new_id(),
+                title: title.clone(),
+                username: username.clone().unwrap_or_default(),
+                password,
+                url: url.clone().unwrap_or_default(),
+                notes,
+                modified_minutes: vault::now_minutes(),
+            };
+            let username = entry.username.clone();
+            save_change(&mut k, open, &Change::Add(entry))?;
+            outln!("{}", added_line(title, open.vault_ref.name.as_deref()));
+            if *generate_password {
+                outln!("{}", reveal_hint_for(open, vaults, title, &username));
+            }
+            Ok(())
+        }
+        FidoVaultEntryCmd::Edit {
+            title,
+            vault,
+            new_title,
+            username,
+            url,
+            notes,
+            password,
+            generate_password,
+            length,
+            pin,
+            path,
+        } => {
+            if let Some(t) = new_title {
+                check_title(t)?;
+            }
+            let mut k = open_entry_key(
+                path.as_deref(),
+                pin.as_ref(),
+                ContentFlags {
+                    password: password.as_ref(),
+                    password_needed: false,
+                    notes: notes.as_ref(),
+                },
+            )?;
+            let new_password = match k.password.take() {
+                Some(p) => Some(p),
+                None if *generate_password => Some(generated(*length)?),
+                None => None,
+            };
+            let new_notes = k.notes.take().map(moved_text);
+            let (mut unlocked, i) = unlock_one(&mut k, vault.as_deref())?;
+            let vaults = unlocked.vaults.len();
+            let open = unlocked.vaults[i].open_mut().map_err(vault_error)?;
+            // `--username` is the new value here, never a selector.
+            let n = pick_entry(&open.contents, title, None, false)?;
+            let before = open.contents.entries[n].clone();
+            let mut after = before.clone();
+            if let Some(t) = new_title {
+                after.title.clone_from(t);
+            }
+            if let Some(u) = username {
+                after.username.clone_from(u);
+            }
+            if let Some(u) = url {
+                after.url.clone_from(u);
+            }
+            if let Some(n) = new_notes {
+                after.notes = n;
+            }
+            if let Some(p) = new_password {
+                after.password = p;
+            }
+            after.modified_minutes = vault::now_minutes();
+            let (now_title, now_username) = (after.title.clone(), after.username.clone());
+            save_change(&mut k, open, &Change::Edit { before, after })?;
+            outln!("Entry \"{}\" updated.", sanitize_terminal(title));
+            if *generate_password {
+                outln!(
+                    "{}",
+                    reveal_hint_for(open, vaults, &now_title, &now_username)
+                );
+            }
+            Ok(())
+        }
+        FidoVaultEntryCmd::Delete {
+            title,
+            username,
+            vault,
+            yes,
+            pin,
+            path,
+        } => {
+            let mut k = open_entry_key(path.as_deref(), pin.as_ref(), ContentFlags::default())?;
+            let (mut unlocked, i) = unlock_one(&mut k, vault.as_deref())?;
+            let open = unlocked.vaults[i].open_mut().map_err(vault_error)?;
+            let n = pick_entry(&open.contents, title, username.as_deref(), true)?;
+            let before = open.contents.entries[n].clone();
+            // The open handle ties the question to the key (`confirm_on_held`).
+            entry_delete_question(
+                &mut RealTerm,
+                *yes,
+                title,
+                open.vault_ref.name.as_deref(),
+                &key_label(&k.dev),
+            )?;
+            save_change(&mut k, open, &Change::Delete { before })?;
+            outln!("Entry \"{}\" deleted.", sanitize_terminal(title));
+            Ok(())
+        }
     }
 }
 
@@ -1251,6 +2194,479 @@ mod tests {
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].name.as_deref(), Some("Personal"));
         assert_eq!(choices[0].detail, "(unavailable)");
+    }
+
+    fn ent(id: &str, title: &str, username: &str, url: &str) -> Entry {
+        Entry {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            username: username.to_owned(),
+            password: Zeroizing::new("hunter2-secret".to_owned()),
+            url: url.to_owned(),
+            notes: String::new(),
+            modified_minutes: 28_333_343,
+        }
+    }
+
+    fn gmail_vault() -> Vault {
+        Vault {
+            entries: vec![
+                ent(
+                    "id-aaaa",
+                    "Gmail",
+                    "alice@example.com",
+                    "https://mail.google.com",
+                ),
+                ent("id-bbbb", "GitHub", "alice", "https://github.com"),
+                ent(
+                    "id-cccc",
+                    "Gmail",
+                    "bob@example.com",
+                    "https://accounts.google.com",
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn entry_matches_by_title_and_username() {
+        let v = gmail_vault();
+        assert_eq!(entry_matches(&v, "Gmail", None), [0, 2]);
+        assert_eq!(entry_matches(&v, "Gmail", Some("bob@example.com")), [2]);
+        assert_eq!(entry_matches(&v, "GitHub", None), [1]);
+        // Exact: no case folding, no prefix match.
+        assert!(entry_matches(&v, "gmail", None).is_empty());
+        assert!(entry_matches(&v, "Gm", None).is_empty());
+        assert!(entry_matches(&v, "Gmail", Some("bob")).is_empty());
+    }
+
+    #[test]
+    fn duplicate_titles_in_a_terminal_use_the_picker() {
+        let v = gmail_vault();
+        let mut t = ScriptTerm::new(true, &["1\n"]);
+        let picked = {
+            let mut p = crate::prompt::TermPicker::new(&mut t);
+            choose_entry(&v, "Gmail", &[0, 2], true, &mut p)
+        };
+        assert_eq!(picked, Ok(0));
+        assert_eq!(t.said[0], "2 entries are titled \"Gmail\":");
+        assert!(
+            t.said[1].contains("1) Gmail  alice@example.com")
+                && t.said[1].contains("https://mail.google.com"),
+            "{}",
+            t.said[1]
+        );
+        assert!(t.said[2].contains("2) Gmail  bob@example.com"));
+        assert_eq!(t.asked, ["Select [1/2]: "]);
+    }
+
+    #[test]
+    fn duplicate_titles_without_terminal_are_refused_with_usernames() {
+        let v = gmail_vault();
+        let mut t = ScriptTerm::new(false, &["1\n"]);
+        let e = {
+            let mut p = crate::prompt::TermPicker::new(&mut t);
+            choose_entry(&v, "Gmail", &[0, 2], true, &mut p).unwrap_err()
+        };
+        assert!(t.asked.is_empty(), "never reads stdin without a terminal");
+        assert_eq!(
+            e,
+            "2 entries are titled \"Gmail\":\n  \
+             Gmail  alice@example.com  https://mail.google.com\n  \
+             Gmail  bob@example.com    https://accounts.google.com\n\
+             add --username to pick one"
+        );
+        assert!(!e.contains("id-"), "never an ID: {e}");
+    }
+
+    #[test]
+    fn edit_duplicates_without_terminal_say_use_a_terminal() {
+        let v = gmail_vault();
+        let mut t = ScriptTerm::new(false, &[]);
+        let e = {
+            let mut p = crate::prompt::TermPicker::new(&mut t);
+            choose_entry(&v, "Gmail", &[0, 2], false, &mut p).unwrap_err()
+        };
+        assert!(e.ends_with("\nrun this in a terminal to pick one"), "{e}");
+        assert!(!e.contains("--username"), "{e}");
+    }
+
+    #[test]
+    fn same_title_and_username_without_terminal_says_use_a_terminal() {
+        let v = Vault {
+            entries: vec![
+                ent("id-1", "Bank", "alice", "https://a.example"),
+                ent("id-2", "Bank", "alice", "https://b.example"),
+            ],
+        };
+        let mut t = ScriptTerm::new(false, &[]);
+        let e = {
+            let mut p = crate::prompt::TermPicker::new(&mut t);
+            choose_entry(&v, "Bank", &[0, 1], true, &mut p).unwrap_err()
+        };
+        assert!(e.ends_with("\nrun this in a terminal to pick one"), "{e}");
+    }
+
+    #[test]
+    fn no_matching_entry_is_said_plainly() {
+        let v = gmail_vault();
+        let mut t = ScriptTerm::new(true, &[]);
+        let mut p = crate::prompt::TermPicker::new(&mut t);
+        assert_eq!(
+            choose_entry(&v, "Bank", &[], true, &mut p),
+            Err("no entry titled \"Bank\" in this vault".to_owned())
+        );
+        assert_eq!(choose_entry(&v, "GitHub", &[1], true, &mut p), Ok(1));
+    }
+
+    #[test]
+    fn key_supplied_entry_text_is_neutralized() {
+        let v = Vault {
+            entries: vec![
+                ent("1", "a\u{1b}[2Jb", "u\u{7}", "x\u{1b}]0;t\u{7}"),
+                ent("2", "a\u{1b}[2Jb", "v", ""),
+            ],
+        };
+        let mut t = ScriptTerm::new(false, &[]);
+        let e = {
+            let mut p = crate::prompt::TermPicker::new(&mut t);
+            choose_entry(&v, "a\u{1b}[2Jb", &[0, 1], true, &mut p).unwrap_err()
+        };
+        assert!(!e.contains('\u{1b}') && !e.contains('\u{7}'), "{e:?}");
+        let mut e = ent("1", "t\u{1b}", "u\u{1b}", "x\u{1b}");
+        e.notes = "line1\u{1b}[2J\nline2".to_owned();
+        for l in entry_lines(&e) {
+            assert!(!l.contains('\u{1b}'), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn entry_lines_hide_the_password() {
+        let mut e = ent(
+            "id-aaaa",
+            "Gmail",
+            "alice@example.com",
+            "https://mail.google.com",
+        );
+        e.notes = "recovery codes in the safe".to_owned();
+        let lines = entry_lines(&e);
+        assert_eq!(
+            lines,
+            [
+                "Title:    Gmail",
+                "Username: alice@example.com",
+                "URL:      https://mail.google.com",
+                "Notes:    recovery codes in the safe",
+                "Changed:  2023-11-14",
+                "Password: (hidden)",
+            ]
+        );
+        for l in &lines {
+            assert!(!l.contains("hunter2"), "{l}");
+            assert!(!l.contains("id-aaaa"), "no ID in text: {l}");
+        }
+
+        // Nothing there: (none), the password too.
+        let mut empty = ent("id", "Bare", "", "");
+        empty.password = Zeroizing::new(String::new());
+        assert_eq!(
+            entry_lines(&empty),
+            [
+                "Title:    Bare",
+                "Username: (none)",
+                "URL:      (none)",
+                "Notes:    (none)",
+                "Changed:  2023-11-14",
+                "Password: (none)",
+            ]
+        );
+
+        // Notes over several lines stay under their column.
+        let mut multi = ent("id", "X", "u", "");
+        multi.notes = "one\ntwo".to_owned();
+        let lines = entry_lines(&multi);
+        assert_eq!(lines[3], "Notes:    one");
+        assert_eq!(lines[4], "          two");
+    }
+
+    #[test]
+    fn changed_date() {
+        assert_eq!(super::changed_date(28_333_343), "2023-11-14");
+        assert_eq!(super::changed_date(0), "1970-01-01");
+        // The last minute of a day is still that day (UTC).
+        assert_eq!(super::changed_date(1439), "1970-01-01");
+        assert_eq!(super::changed_date(1440), "1970-01-02");
+        assert_eq!(super::changed_date(-1), "1969-12-31");
+    }
+
+    #[test]
+    fn reveal_plan_by_output() {
+        assert_eq!(reveal_plan(true, false), RevealPlan::ShowUntilEnter);
+        assert_eq!(reveal_plan(false, false), RevealPlan::PasswordOnly);
+        assert_eq!(reveal_plan(true, true), RevealPlan::Json);
+        assert_eq!(reveal_plan(false, true), RevealPlan::Json);
+    }
+
+    #[test]
+    fn write_password_only_writes_no_newline() {
+        let mut out = Vec::new();
+        write_password_only(&mut out, "pw").unwrap();
+        assert_eq!(out, b"pw");
+        let mut out = Vec::new();
+        write_password_only(&mut out, "").unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// The reader for Enter (rpassword) writes a newline when it returns, so
+    /// the cursor is one line below the shown password: up one line, then
+    /// clear that whole line.
+    #[test]
+    fn erase_sequence_after_the_readers_newline() {
+        assert_eq!(erase_shown_line(), "\x1b[1A\x1b[2K");
+        // A reader that failed wrote no newline: the password is on the
+        // cursor's own line.
+        assert_eq!(erase_current_line(), "\r\x1b[2K");
+    }
+
+    #[test]
+    fn reveal_line_is_the_hidden_lines_label() {
+        let e = ent("id", "Gmail", "alice", "");
+        let lines = entry_lines(&e);
+        assert_eq!(lines.last().unwrap(), &format!("{REVEAL_LABEL}(hidden)"));
+    }
+
+    #[test]
+    fn entry_json_has_ids_and_no_password_without_reveal() {
+        let mut v = gmail_vault();
+        v.entries[0].notes = "n".to_owned();
+        let list = serde_json::to_value(entry_list_json(Some("Personal"), &v)).unwrap();
+        assert_eq!(list["vault"], "Personal");
+        let entries = list["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        let mut keys: Vec<&str> = entries[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["changed", "id", "title", "url", "username"]);
+        assert_eq!(entries[0]["id"], "id-aaaa");
+        assert_eq!(entries[0]["changed"], "2023-11-14");
+        assert!(!list.to_string().contains("hunter2"));
+
+        let shown =
+            serde_json::to_value(entry_show_json(Some("Personal"), &v.entries[0], false)).unwrap();
+        let mut keys: Vec<&str> = shown
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["changed", "id", "notes", "password", "title", "url", "username", "vault"]
+        );
+        // Never omitted (the JSON rule): `null` until --reveal.
+        assert!(shown["password"].is_null());
+        assert!(!shown.to_string().contains("hunter2"));
+
+        let revealed =
+            serde_json::to_value(entry_show_json(Some("Personal"), &v.entries[0], true)).unwrap();
+        assert_eq!(revealed["password"], "hunter2-secret");
+        assert_eq!(revealed["id"], "id-aaaa");
+
+        // The bytes written for --json: the same document, one newline.
+        let mut out = Vec::new();
+        write_json_wiped(&mut out, &entry_show_json(None, &v.entries[0], true)).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.ends_with("}\n"), "{text}");
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["password"], "hunter2-secret");
+        assert!(back["vault"].is_null());
+    }
+
+    #[test]
+    fn entry_delete_question_uses_the_confirm_form() {
+        let mut t = ScriptTerm::new(true, &["y\n"]);
+        assert_eq!(
+            entry_delete_question(&mut t, false, "Gmail", Some("Personal"), "yubi-test"),
+            Ok(true)
+        );
+        assert_eq!(
+            t.asked,
+            ["delete entry \"Gmail\" from vault \"Personal\" on yubi-test? [y/N] "]
+        );
+        let mut t = ScriptTerm::new(false, &[]);
+        assert_eq!(
+            entry_delete_question(&mut t, false, "Gmail", Some("Personal"), "yubi-test"),
+            Err(
+                "refusing to delete entry \"Gmail\" from vault \"Personal\" on yubi-test \
+                 without confirmation; add --yes"
+                    .to_owned()
+            )
+        );
+        let mut t = ScriptTerm::new(true, &[]);
+        assert_eq!(
+            entry_delete_question(&mut t, true, "Gmail", None, "yubi-test"),
+            Ok(false)
+        );
+        assert!(t.asked.is_empty());
+    }
+
+    fn parse(args: &[&str]) -> Result<crate::Cli, clap::Error> {
+        use clap::Parser;
+        crate::Cli::try_parse_from(
+            ["keyroostctl", "fido", "vault", "entry"]
+                .iter()
+                .chain(args)
+                .copied(),
+        )
+    }
+
+    #[test]
+    fn edit_needs_a_change() {
+        let e = parse(&["edit", "Gmail"]).err().expect("refused");
+        assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        for change in [
+            &["--title", "Mail"][..],
+            &["--username", ""],
+            &["--url", "u"],
+            &["--notes", "stdin"],
+            &["--password", "stdin"],
+            &["--generate-password"],
+        ] {
+            let mut args = vec!["edit", "Gmail"];
+            args.extend_from_slice(change);
+            assert!(parse(&args).is_ok(), "{change:?}");
+        }
+    }
+
+    #[test]
+    fn password_and_generate_conflict() {
+        for cmd in ["add", "edit"] {
+            let e = parse(&[cmd, "x", "--password", "stdin", "--generate-password"])
+                .err()
+                .expect("refused");
+            assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn length_requires_generate() {
+        for cmd in ["add", "edit"] {
+            let e = parse(&[cmd, "x", "--length", "30", "--url", "u"])
+                .err()
+                .expect("refused");
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{cmd}"
+            );
+            assert!(parse(&[cmd, "x", "--generate-password", "--length", "30"]).is_ok());
+        }
+    }
+
+    #[test]
+    fn length_out_of_range_is_refused() {
+        for n in ["3", "129", "0"] {
+            let e = parse(&["add", "x", "--generate-password", "--length", n])
+                .err()
+                .expect("refused");
+            assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{n}");
+        }
+        for n in ["4", "128"] {
+            assert!(parse(&["add", "x", "--generate-password", "--length", n]).is_ok());
+        }
+    }
+
+    #[test]
+    fn content_secrets_come_before_the_pin_on_stdin() {
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
+        let mut sec = Secrets::new(FakeIo::piped(&["pw\n", "my notes\n", "1234\n"]));
+        let stdin = SecretSource::Stdin;
+        check_content(&sec, Some(&stdin), true, Some(&stdin)).unwrap();
+        let (password, notes) = read_content(&mut sec, Some(&stdin), true, Some(&stdin)).unwrap();
+        let pin = sec.read(&crate::FIDO_PIN, Source::new(None, true)).unwrap();
+        assert_eq!(password.as_deref().map(|s| s.as_str()), Some("pw"));
+        assert_eq!(notes.as_deref().map(|s| s.as_str()), Some("my notes"));
+        assert_eq!(pin.as_str(), "1234");
+
+        // Notes alone take the first line; an empty one clears.
+        let mut sec = Secrets::new(FakeIo::piped(&["\n", "1234\n"]));
+        let (password, notes) = read_content(&mut sec, None, false, Some(&stdin)).unwrap();
+        assert!(password.is_none());
+        assert_eq!(notes.as_deref().map(|s| s.as_str()), Some(""));
+    }
+
+    #[test]
+    fn a_password_with_no_source_and_no_terminal_names_generate() {
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::Secrets;
+        let sec = Secrets::new(FakeIo::piped(&[]));
+        let e = check_content(&sec, None, true, None).unwrap_err();
+        assert_eq!(
+            e,
+            "no password given: pass --password env:NAME, --password stdin or \
+             --generate-password"
+        );
+        // Not needed (edit, or --generate-password): nothing to refuse.
+        assert!(check_content(&sec, None, false, None).is_ok());
+    }
+
+    #[test]
+    fn a_typed_password_is_asked_twice() {
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::Secrets;
+        let mut sec = Secrets::new(FakeIo::terminal().typing(&["pw", "pw"]));
+        let (password, _) = read_content(&mut sec, None, true, None).unwrap();
+        assert_eq!(password.as_deref().map(|s| s.as_str()), Some("pw"));
+        assert_eq!(sec.io.prompts, ["Password: ", "Repeat password: "]);
+    }
+
+    #[test]
+    fn the_save_line_shows_once() {
+        let mut s = SaveProgress::default();
+        assert_eq!(s.line(VaultStep::UnlockTouch), None);
+        assert_eq!(s.line(VaultStep::Write), Some(SAVE_LINE));
+        // A fresh-token retry repeats the write step: no second line.
+        assert_eq!(s.line(VaultStep::Write), None);
+    }
+
+    #[test]
+    fn conflict_says_run_it_again() {
+        let t = crate::error_text(entry_save_error(VaultKeyError::Conflict).as_ref());
+        assert_eq!(
+            t,
+            "this entry changed on the key while the command ran; nothing was written. Run it \
+             again."
+        );
+        // Anything else goes through vault_error.
+        let t = crate::error_text(entry_save_error(VaultKeyError::NoVaults).as_ref());
+        assert!(t.contains("keyroostctl fido vault add NAME"), "{t}");
+    }
+
+    #[test]
+    fn result_lines() {
+        assert_eq!(
+            added_line("Gmail", Some("Personal")),
+            "Entry \"Gmail\" added to vault \"Personal\"."
+        );
+        assert_eq!(
+            added_line("Gmail", None),
+            "Entry \"Gmail\" added to vault \"(unnamed)\"."
+        );
+        assert_eq!(
+            reveal_hint("Gmail", None, None),
+            "See the new password with keyroostctl fido vault entry show Gmail --reveal"
+        );
+        assert_eq!(
+            reveal_hint("Work Mail", Some("My Vault"), Some("bob")),
+            "See the new password with keyroostctl fido vault entry show 'Work Mail' --vault \
+             'My Vault' --username bob --reveal"
+        );
     }
 
     #[test]

@@ -495,6 +495,16 @@ const LITERAL_CASES: &[&[&str]] = &[
     ],
     &["prog", "seed", "set", "--seed", "-S3CRETVALUE"],
     &["molto", "import", "--slot", "1", "--uri", "S3CRETVALUE"],
+    &[
+        "fido",
+        "vault",
+        "entry",
+        "add",
+        "x",
+        "--notes",
+        "S3CRETVALUE",
+    ],
+    &["fido", "vault", "entry", "edit", "x", "--notes=S3CRETVALUE"],
 ];
 
 /// A literal value given to a secret flag, in any spelling, is refused

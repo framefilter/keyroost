@@ -492,6 +492,12 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl fido vault add</code></td><td>Create an empty vault on the key (PIN and two touches)</td></tr>
       <tr><td><code>keyroostctl fido vault delete</code></td><td>Delete a vault and its entries (PIN, no touch). Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl fido vault rotate</code></td><td>Give a vault a new key: a new vault takes its entries and the old one is deleted after every entry is checked</td></tr>
+      <tr><td><code>keyroostctl fido vault entry</code></td><td>Read and change the entries in a vault</td></tr>
+      <tr><td><code>keyroostctl fido vault entry list</code></td><td>List a vault&#x27;s entries with their usernames and web addresses (PIN and a touch)</td></tr>
+      <tr><td><code>keyroostctl fido vault entry show</code></td><td>Show one entry; its password only with --reveal (PIN and a touch)</td></tr>
+      <tr><td><code>keyroostctl fido vault entry add</code></td><td>Add an entry to a vault (PIN and a touch)</td></tr>
+      <tr><td><code>keyroostctl fido vault entry edit</code></td><td>Change an entry&#x27;s title, username, web address, notes or password (PIN and a touch)</td></tr>
+      <tr><td><code>keyroostctl fido vault entry delete</code></td><td>Delete an entry from a vault (PIN and a touch). Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
     </table></div>
     <h3 id="ref-oath">oath</h3>
     <p class="kr-muted">Show codes and manage OATH (TOTP/HOTP) accounts on a security key</p>

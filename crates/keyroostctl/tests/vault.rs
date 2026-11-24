@@ -62,3 +62,44 @@ fn vault_add_refuses_a_name_over_32_bytes_before_the_key() {
 fn vault_add_refuses_an_empty_name() {
     assert_name_refused_before_the_key("");
 }
+
+/// `entry add` with no password source, no `--generate-password` and no
+/// terminal is refused before any key is looked for, naming both ways out.
+#[test]
+fn entry_add_without_password_or_terminal_is_refused() {
+    let (code, out, err) = run(&[
+        "fido",
+        "vault",
+        "entry",
+        "add",
+        "Gmail",
+        "--pin",
+        "env:KR_TEST_PIN",
+    ]);
+    assert_eq!(code, 1, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(
+        err,
+        "error: no password given: pass --password env:NAME, --password stdin or \
+         --generate-password\n",
+        "no key message, only the refusal"
+    );
+}
+
+/// `entry add --generate-password` needs no password source and goes on to
+/// look for the key.
+#[test]
+fn entry_add_with_generate_reaches_the_key() {
+    let (code, out, err) = run(&[
+        "fido",
+        "vault",
+        "entry",
+        "add",
+        "Gmail",
+        "--generate-password",
+        "--pin",
+        "env:KR_TEST_PIN",
+    ]);
+    let ssh = run(&["fido", "ssh", "list", "--pin", "env:KR_TEST_PIN"]);
+    assert_eq!((code, out, err), ssh);
+}

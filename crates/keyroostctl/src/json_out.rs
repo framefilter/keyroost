@@ -602,6 +602,54 @@ pub(crate) struct FidoVaultJson {
     pub detail: Option<String>,
 }
 
+/// `keyroostctl --json fido vault entry list` — the entries of one vault,
+/// without their passwords or notes.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultEntryListJson {
+    /// The vault's name; `null` when the credential carries none.
+    pub vault: Option<String>,
+    pub entries: Vec<FidoVaultEntryJson>,
+}
+
+/// One entry in `fido vault entry list`.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultEntryJson {
+    /// The entry's id in the vault, as FidoParole stores it.
+    pub id: String,
+    pub title: String,
+    pub username: String,
+    pub url: String,
+    /// Last changed, `YYYY-MM-DD` (UTC).
+    pub changed: String,
+}
+
+/// `keyroostctl --json fido vault entry show` — one entry; the password
+/// only with `--reveal`. Every field is wiped when it is dropped.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultEntryShowJson {
+    pub vault: Option<String>,
+    pub id: String,
+    pub title: String,
+    pub username: String,
+    pub url: String,
+    pub notes: String,
+    /// Last changed, `YYYY-MM-DD` (UTC).
+    pub changed: String,
+    /// The password with `--reveal`; `null` without it (an entry with no
+    /// password is `""`).
+    pub password: Option<String>,
+}
+
+impl Drop for FidoVaultEntryShowJson {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.username.zeroize();
+        self.url.zeroize();
+        self.notes.zeroize();
+        self.password.zeroize();
+    }
+}
+
 /// `keyroostctl fido blob --json list` — one entry per stored blob.
 #[derive(Serialize)]
 pub(crate) struct FidoLargeBlobListJson {
