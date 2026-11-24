@@ -394,7 +394,10 @@ pub(crate) fn fill_random(buf: &mut [u8]) -> Result<()> {
 }
 
 fn rsa_generate(bits: usize) -> Result<Material> {
-    // `rsa` 0.9 takes the RNG of its own `rand_core` generation.
+    // `rsa` 0.9 takes the RNG of its own `rand_core` generation, whose
+    // `OsRng` panics if the OS source fails mid-search. Probe the source
+    // first so a source that is already down is an error, not a panic.
+    fill_random(&mut [0u8; 1])?;
     let mut key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, bits)
         .map_err(|e| Error::Crypto(e.to_string()))?;
     key.precompute().map_err(|e| Error::Crypto(e.to_string()))?;
