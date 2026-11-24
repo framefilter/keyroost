@@ -553,7 +553,8 @@ pub(crate) struct FidoRelyingPartyJson {
 pub(crate) struct FidoCredentialJson {
     /// Full hex credentialId (the value `fido credential delete ID` expects).
     pub credential_id: String,
-    /// The user handle, rendered as UTF-8 (lossy), as the human prints it.
+    /// Full hex user handle, like `credential_id`: the handle is bytes, often
+    /// not text.
     pub user_id: String,
     pub user_name: Option<String>,
     pub user_display_name: Option<String>,

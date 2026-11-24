@@ -16372,6 +16372,20 @@ fn run_fido_creds_metadata(
     })
 }
 
+/// One credential in `fido credential list --json`. The user handle is
+/// bytes (often not UTF-8), so it is hex like the credential ID: every byte
+/// is kept.
+fn credential_json(c: &keyroost_ctap::cred_mgmt::Credential) -> json_out::FidoCredentialJson {
+    json_out::FidoCredentialJson {
+        credential_id: hex_encode(&c.credential_id),
+        user_id: hex_encode(&c.user.id),
+        user_name: c.user.name.clone(),
+        user_display_name: c.user.display_name.clone(),
+        algorithm: c.algorithm,
+        algorithm_name: c.algorithm.map(cose_algorithm_name),
+    }
+}
+
 fn run_fido_creds_list(
     path: Option<&std::path::Path>,
     pin: &str,
@@ -16385,17 +16399,7 @@ fn run_fido_creds_list(
                     Some(hash) => mgr.list_credentials(&hash)?,
                     None => Vec::new(),
                 };
-                let credentials = creds
-                    .iter()
-                    .map(|c| json_out::FidoCredentialJson {
-                        credential_id: hex_encode(&c.credential_id),
-                        user_id: String::from_utf8_lossy(&c.user.id).into_owned(),
-                        user_name: c.user.name.clone(),
-                        user_display_name: c.user.display_name.clone(),
-                        algorithm: c.algorithm,
-                        algorithm_name: c.algorithm.map(cose_algorithm_name),
-                    })
-                    .collect();
+                let credentials = creds.iter().map(credential_json).collect();
                 relying_parties.push(json_out::FidoRelyingPartyJson {
                     rp_id: rp.id.clone(),
                     rp_name: rp.name.clone().filter(|n| !n.is_empty()),
@@ -26358,6 +26362,27 @@ mod cli_tests {
         let v = serde_json::to_value(&no_name).unwrap();
         assert!(v["rp_name"].is_null(), "rp_name should be null: {v}");
         assert!(v.as_object().unwrap().contains_key("rp_name"));
+    }
+
+    #[test]
+    fn creds_list_json_user_id_is_hex_like_the_credential_id() {
+        // A user handle is bytes, often not UTF-8: hex keeps every byte.
+        let c = keyroost_ctap::cred_mgmt::Credential {
+            credential_id: vec![0xAB, 0x01],
+            user: keyroost_ctap::cred_mgmt::CredentialUser {
+                id: vec![0xFF, 0x00, 0x80, 0x41],
+                name: Some("alice".into()),
+                display_name: None,
+            },
+            algorithm: Some(-7),
+            large_blob_key: None,
+        };
+        let v = serde_json::to_value(credential_json(&c)).unwrap();
+        assert_eq!(v["user_id"], "ff008041");
+        assert_eq!(v["credential_id"], "ab01");
+        assert!(!v.to_string().contains('\u{FFFD}'), "{v}");
+        assert_eq!(v["user_name"], "alice");
+        assert!(v["user_display_name"].is_null());
     }
 
     // ---- large-blob shaping (pure logic; no hardware) ----
