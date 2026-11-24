@@ -17766,9 +17766,10 @@ mod cli_tests {
         // Commands that ask before a change that destroys no key, seed or
         // certificate: a token setting, `piv cert request`, which replaces a
         // key only with the optional `--generate-key`, a key's name, and the
-        // code imports, which replace a code only with `--replace`, and a
-        // vault rotate, whose old vault goes only after its entries are
-        // checked in the new one.
+        // code imports, which replace a code only with `--replace`, a vault
+        // rotate, whose old vault goes only after its entries are checked
+        // in the new one, and a vault import, which replaces an entry only
+        // with a newer copy unless asked.
         let confirms_only = [
             "prog config set",
             "piv cert request",
@@ -17778,6 +17779,7 @@ mod cli_tests {
             "otp import",
             "feitian import",
             "fido vault rotate",
+            "fido vault import",
         ];
         let tree = all_commands();
         for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {
@@ -25270,6 +25272,9 @@ mod cli_tests {
             Cmd::Fido {
                 cmd: FidoCmd::Pin { cmd },
             } => fido_pin_secret_pair(cmd),
+            Cmd::Fido {
+                cmd: FidoCmd::Vault { cmd },
+            } => vault_cmd::vault_secret_pair(cmd),
             _ => None,
         }
     }
@@ -25378,6 +25383,8 @@ mod cli_tests {
                 "molto customer-key change",
                 "molto import",
                 "fido pin change",
+                "fido vault export",
+                "fido vault import",
                 "oath add",
                 "oath import",
                 "oath password set",

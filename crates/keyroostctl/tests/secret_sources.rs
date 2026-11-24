@@ -241,6 +241,8 @@ fn fixture_dir() -> common::TempDir {
             "fixture.p12",
             include_bytes!("fixtures/rsa2048-modern.p12"),
         ),
+        // A vault backup (`fido vault import`).
+        ("vault.t2vault", include_bytes!("fixtures/vault.t2vault")),
     ] {
         std::fs::write(dir.join(name), body).unwrap();
     }

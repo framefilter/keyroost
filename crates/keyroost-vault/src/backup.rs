@@ -89,6 +89,16 @@ pub fn import_backup(bytes: &[u8], passphrase: &str) -> Result<Vault, VaultError
     from_json(&inflate(&plain)?)
 }
 
+/// The rule a new backup's passphrase must meet: at least 10 characters
+/// (Unicode scalar values, not bytes). [`export_backup`] applies it; a front
+/// end can check it before the key is used.
+pub fn check_passphrase(pass: &str) -> Result<(), VaultError> {
+    if pass.chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(VaultError::ShortPassphrase);
+    }
+    Ok(())
+}
+
 pub(crate) fn export_backup_with(
     v: &Vault,
     pass: &str,
@@ -96,9 +106,7 @@ pub(crate) fn export_backup_with(
     salt: [u8; 16],
     nonce: [u8; 12],
 ) -> Result<Vec<u8>, VaultError> {
-    if pass.chars().count() < MIN_PASSPHRASE_CHARS {
-        return Err(VaultError::ShortPassphrase);
-    }
+    check_passphrase(pass)?;
     let mut header = Vec::with_capacity(HEADER_LEN);
     header.extend_from_slice(MAGIC);
     header.push(VERSION);
@@ -151,6 +159,18 @@ mod tests {
     fn wrong_passphrase_is_decrypt_error() {
         let r = import_backup(&unhex(BACKUP_HEX), "wrong horse battery");
         assert_eq!(r.unwrap_err(), VaultError::Decrypt);
+    }
+
+    #[test]
+    fn check_passphrase_matches_export_rule() {
+        assert_eq!(
+            check_passphrase("123456789").unwrap_err(),
+            VaultError::ShortPassphrase
+        );
+        assert_eq!(check_passphrase("1234567890"), Ok(()));
+        // Characters, not bytes, as the export counts them.
+        assert_eq!(check_passphrase("ééééé"), Err(VaultError::ShortPassphrase));
+        assert_eq!(check_passphrase("ééééééééél"), Ok(()));
     }
 
     #[test]

@@ -492,6 +492,8 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl fido vault add</code></td><td>Create an empty vault on the key (PIN and two touches)</td></tr>
       <tr><td><code>keyroostctl fido vault delete</code></td><td>Delete a vault and its entries (PIN, no touch). Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl fido vault rotate</code></td><td>Give a vault a new key: a new vault takes its entries and the old one is deleted after every entry is checked</td></tr>
+      <tr><td><code>keyroostctl fido vault export</code></td><td>Write a vault&#x27;s entries to a backup file protected by a passphrase (PIN and a touch)</td></tr>
+      <tr><td><code>keyroostctl fido vault import</code></td><td>Bring entries back from a vault backup file: shows what each becomes, then asks once (PIN and a touch; two to make a new vault)</td></tr>
       <tr><td><code>keyroostctl fido vault entry</code></td><td>Read and change the entries in a vault</td></tr>
       <tr><td><code>keyroostctl fido vault entry list</code></td><td>List a vault&#x27;s entries with their usernames and web addresses (PIN and a touch)</td></tr>
       <tr><td><code>keyroostctl fido vault entry show</code></td><td>Show one entry; its password only with --reveal (PIN and a touch)</td></tr>

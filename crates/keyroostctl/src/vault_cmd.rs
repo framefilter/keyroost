@@ -94,6 +94,78 @@ pub(crate) enum FidoVaultCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
     },
+    /// Write a vault's entries to a backup file protected by a passphrase (PIN and a touch).
+    ///
+    /// The file opens with its passphrase alone, without the key: keep the
+    /// two apart. The passphrase needs at least 10 characters. Restore the
+    /// entries with `fido vault import`, on this key or another.
+    Export {
+        /// The vault's name, as `fido vault list` shows it.
+        name: String,
+        /// The backup file to write.
+        #[arg(long, short = 'o', value_name = "FILE")]
+        out: PathBuf,
+        #[arg(long, help = crate::OVERWRITE_HELP)]
+        overwrite: bool,
+        /// The backup's passphrase: env:NAME reads that environment
+        /// variable, stdin reads one line (first line when --pin stdin is
+        /// also given; hidden when typed at a terminal, twice). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        passphrase: Option<SecretSource>,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (second line when --passphrase stdin is also given; hidden
+        /// when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<PathBuf>,
+    },
+    /// Bring entries back from a vault backup file: shows what each becomes, then asks once (PIN and a touch; two to make a new vault).
+    ///
+    /// An entry the vault lacks is added; one whose backup copy is newer
+    /// replaces the vault's; one that is the same is left as is; one whose
+    /// copy on the key is newer is skipped unless --replace. --entry imports
+    /// only the entries with the titles it names. With --vault NAME and no
+    /// vault of that name on the key, asks to create it and imports into
+    /// it. Asks once before writing (`--yes` to skip); with --dry-run
+    /// nothing is written.
+    Import {
+        /// The backup file to read.
+        #[arg(long = "in", short = 'i', value_name = "FILE")]
+        input: PathBuf,
+        /// The vault to import into; created (after asking) when the key has
+        /// none of that name.
+        #[arg(long, value_name = "NAME")]
+        vault: Option<String>,
+        /// The backup's passphrase: env:NAME reads that environment
+        /// variable, stdin reads one line (first line when --pin stdin is
+        /// also given; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        passphrase: Option<SecretSource>,
+        /// Import only the entries with this title, as the preview shows it.
+        /// Repeat for more.
+        #[arg(long, value_name = "TITLE")]
+        entry: Vec<String>,
+        /// Also import entries whose copy on the key is newer than the
+        /// backup's.
+        #[arg(long)]
+        replace: bool,
+        /// Show what would be added, replaced or skipped; nothing is written.
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (second line when --passphrase stdin is also given; hidden
+        /// when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<PathBuf>,
+    },
     /// Read and change the entries in a vault.
     Entry {
         #[command(subcommand)]
@@ -356,7 +428,527 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
             outln!("{}", rotated_line(name, new.contents.entries.len()));
             Ok(())
         }
+        FidoVaultCmd::Export {
+            name,
+            out,
+            overwrite,
+            path,
+            ..
+        } => run_export(
+            name,
+            out,
+            *overwrite,
+            crate::pair_of(vault_secret_pair(cmd))?,
+            path.as_deref(),
+        ),
+        FidoVaultCmd::Import {
+            input,
+            vault,
+            entry,
+            replace,
+            dry_run,
+            yes,
+            path,
+            ..
+        } => run_import(&ImportArgs {
+            input,
+            vault: vault.as_deref(),
+            pair: crate::pair_of(vault_secret_pair(cmd))?,
+            entries: entry,
+            replace: *replace,
+            dry_run: *dry_run,
+            yes: *yes,
+            path: path.as_deref(),
+        }),
         FidoVaultCmd::Entry { cmd } => run_vault_entry(cmd),
+    }
+}
+
+/// The two secrets of `vault export` and `vault import`, in stdin order:
+/// the backup's passphrase (asked twice at a terminal for a new backup),
+/// then the PIN.
+pub(crate) fn vault_secret_pair(cmd: &FidoVaultCmd) -> Option<crate::SecretPair<'_>> {
+    Some(match cmd {
+        FidoVaultCmd::Export {
+            passphrase, pin, ..
+        } => crate::secret_pair(
+            (&crate::PGP_NEW_PASSPHRASE, passphrase),
+            (&crate::FIDO_PIN, pin),
+        ),
+        FidoVaultCmd::Import {
+            passphrase, pin, ..
+        } => crate::secret_pair(
+            (&crate::PGP_PASSPHRASE, passphrase),
+            (&crate::FIDO_PIN, pin),
+        ),
+        _ => return None,
+    })
+}
+
+/// `vault export`. Order: check the passphrase and PIN sources, check the
+/// output file, read the passphrase and check its length (it belongs to the
+/// file, so a short one is refused before the key is used), select the
+/// key, read the PIN, unlock (a touch), choose the vault, encrypt, write.
+fn run_export(
+    name: &str,
+    out: &Path,
+    overwrite: bool,
+    pair: crate::SecretPair<'_>,
+    path: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let mut sec = Secrets::real();
+    pair.check(&sec)?;
+    let mode = crate::prompt::check_secret_overwrite(Some(out), overwrite)?;
+    let (pass, pin) = pair.read_first(&mut sec)?;
+    let pass = pass.text()?;
+    keyroost_vault::check_passphrase(&pass)?;
+    let dev = crate::target::select_fido(path)?;
+    let pin = crate::fido_pin_with(&mut sec, &dev, pin.flag)?;
+    let mut key = open_vault_key(path)?;
+    let mut auth = VaultAuth::pin(pin);
+    let mut touches = Touches::new(1);
+    let mut unlocked =
+        vault::unlock(&mut key, &mut auth, &mut |s| touches.step(s)).map_err(vault_error)?;
+    let matches = vault::matching(&unlocked.vaults, &VaultPick::Name(name)).map_err(vault_error)?;
+    let i = choose_vault(
+        &unlocked_choices(&unlocked),
+        &matches,
+        Some(name),
+        &mut TermPicker::new(&mut RealTerm),
+    )?;
+    let open = unlocked.vaults[i].open_mut().map_err(vault_error)?;
+    let bytes = keyroost_vault::export_backup(&open.contents, &pass)?;
+    crate::write_private_file(out, &bytes, mode)
+        .map_err(|e| format!("cannot write {}: {}", out.display(), e))?;
+    outln!("{}", exported_line(name, open.contents.entries.len(), out));
+    Ok(())
+}
+
+/// What `vault export` prints when the file is written.
+fn exported_line(name: &str, n: usize, out: &Path) -> String {
+    format!(
+        "Backup of vault \"{}\" ({}) written to {}.",
+        sanitize_terminal(name),
+        entries(n),
+        sanitize_terminal(&out.display().to_string())
+    )
+}
+
+/// `vault import`'s flags.
+struct ImportArgs<'a> {
+    input: &'a Path,
+    vault: Option<&'a str>,
+    /// The passphrase, then the PIN.
+    pair: crate::SecretPair<'a>,
+    entries: &'a [String],
+    replace: bool,
+    dry_run: bool,
+    yes: bool,
+    path: Option<&'a Path>,
+}
+
+/// The largest backup file read: as large as an authenticator export may
+/// be for the code imports. A vault fits a key's largeBlob store, so a real
+/// backup is a few kilobytes.
+const MAX_BACKUP_BYTES: usize = keyroost_qr::file::MAX_FILE_BYTES;
+
+/// A backup file's bytes, refused past [`MAX_BACKUP_BYTES`].
+fn read_backup_file(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let read_err = |e: io::Error| format!("cannot read {}: {}", path.display(), e);
+    let f = std::fs::File::open(path).map_err(read_err)?;
+    let mut bytes = Vec::new();
+    f.take(MAX_BACKUP_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read_err)?;
+    if bytes.len() > MAX_BACKUP_BYTES {
+        return Err(format!(
+            "{}: larger than 16 MiB, too large for a vault backup. Nothing was read.",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// `vault import`. Order: check the passphrase and PIN sources, read and
+/// decrypt the file (a wrong passphrase fails before any key is looked
+/// for), check the `--entry` titles, select the key, read the PIN, list the
+/// vaults (no touch), then either unlock (a touch) and compare with the
+/// vault, or plan a new vault; preview, ask once, write.
+fn run_import(a: &ImportArgs<'_>) -> Result<(), Box<dyn Error>> {
+    if let Some(name) = a.vault {
+        // The format's name rule, before anything is read.
+        keyroost_vault::user_handle(name)?;
+    }
+    let mut sec = Secrets::real();
+    a.pair.check(&sec)?;
+    let bytes = read_backup_file(a.input)?;
+    let (pass, pin) = a.pair.read_first(&mut sec)?;
+    let incoming = keyroost_vault::import_backup(&bytes, &pass.text()?)
+        .map_err(|e| format!("{}: {e}", a.input.display()))?;
+    check_entry_titles(&incoming, a.entries)?;
+    let dev = crate::target::select_fido(a.path)?;
+    let pin = crate::fido_pin_with(&mut sec, &dev, pin.flag)?;
+    let mut key = open_vault_key(a.path)?;
+    let mut auth = VaultAuth::pin(pin);
+    let key_name = key_label(&dev);
+    let file = a
+        .input
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| a.input.display().to_string());
+    // Credential management: no touch.
+    let creds = vault::list_credentials(&mut key, &mut auth).map_err(vault_error)?;
+    let pick = vault_pick(a.vault);
+    match vault::matching(&creds, &pick) {
+        Ok(_) => {}
+        Err(VaultKeyError::NotFound(_)) => {
+            let Some(name) = a.vault else {
+                return Err(vault_error(VaultKeyError::NoVaults));
+            };
+            return import_into_new(a, &mut key, &mut auth, name, &incoming, &file, &key_name);
+        }
+        Err(VaultKeyError::NoVaults) => {
+            return Err(format!(
+                "{}; pass --vault NAME to make a vault from this backup",
+                VaultKeyError::NoVaults
+            )
+            .into())
+        }
+        Err(e) => return Err(vault_error(e)),
+    }
+    let mut touches = Touches::new(1);
+    let mut unlocked =
+        vault::unlock(&mut key, &mut auth, &mut |s| touches.step(s)).map_err(vault_error)?;
+    let matches = vault::matching(&unlocked.vaults, &pick).map_err(vault_error)?;
+    let i = choose_vault(
+        &unlocked_choices(&unlocked),
+        &matches,
+        a.vault,
+        &mut TermPicker::new(&mut RealTerm),
+    )?;
+    let open = unlocked.vaults[i].open_mut().map_err(vault_error)?;
+    let statuses = keyroost_vault::classify(&open.contents, &incoming);
+    let rows = import_rows(&statuses, &incoming, a.entries, a.replace)?;
+    let name = open.vault_ref.name.clone();
+    let lines = import_lines(
+        &rows,
+        &file,
+        &shown_name(name.as_deref()),
+        &key_name,
+        open.contents.entries.len(),
+    );
+    if preview_stops(&lines, &rows, name.as_deref(), false, a.dry_run)? {
+        return Ok(());
+    }
+    let chosen = chosen(&rows);
+    // The open handle ties the question to the key (`confirm_on_held`).
+    import_question(
+        &mut RealTerm,
+        a.yes,
+        chosen.len(),
+        name.as_deref(),
+        &key_name,
+    )?;
+    let mut progress = SaveProgress::default();
+    let saved = vault::save(
+        &mut key,
+        &mut auth,
+        open,
+        &Change::Import { incoming, chosen },
+        &mut |s| progress.step(s),
+    )
+    .map_err(import_save_error)?;
+    import_done(&rows, name.as_deref(), false, saved.added, saved.replaced)
+}
+
+/// `vault import` into a vault the key doesn't have: every entry (or every
+/// one `--entry` names) is added, after the `create vault` question; the
+/// create takes two touches.
+fn import_into_new(
+    a: &ImportArgs<'_>,
+    key: &mut CtapVaultKey<CtapHidDevice>,
+    auth: &mut VaultAuth,
+    name: &str,
+    incoming: &Vault,
+    file: &str,
+    key_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let statuses: Vec<_> = (0..incoming.entries.len())
+        .map(|i| (i, keyroost_vault::ImportStatus::New))
+        .collect();
+    let rows = import_rows(&statuses, incoming, a.entries, a.replace)?;
+    let lines = import_lines(&rows, file, name, key_name, 0);
+    if preview_stops(&lines, &rows, Some(name), true, a.dry_run)? {
+        return Ok(());
+    }
+    create_question(&mut RealTerm, a.yes, name, key_name)?;
+    let initial = Vault {
+        entries: chosen(&rows)
+            .into_iter()
+            .map(|i| incoming.entries[i].clone())
+            .collect(),
+    };
+    let mut touches = Touches::new(2);
+    let made =
+        vault::create(key, auth, name, &initial, &mut |s| touches.step(s)).map_err(vault_error)?;
+    import_done(&rows, Some(name), true, made.contents.entries.len(), 0)
+}
+
+/// Show the preview. A dry run prints it on stdout (or its JSON) and
+/// stops; otherwise it goes to stderr, and a plan with nothing to add or
+/// replace stops with `Nothing to add.` `Ok(true)`: stop here.
+fn preview_stops(
+    lines: &[String],
+    rows: &[ImportRow],
+    vault: Option<&str>,
+    creates: bool,
+    dry_run: bool,
+) -> Result<bool, Box<dyn Error>> {
+    if dry_run {
+        if json_output() {
+            emit_json(&import_json(rows, vault, creates, true))?;
+        } else {
+            for l in lines {
+                outln!("{l}");
+            }
+        }
+        return Ok(true);
+    }
+    for l in lines {
+        errln!("{l}");
+    }
+    if chosen(rows).is_empty() {
+        if json_output() {
+            emit_json(&import_json(rows, vault, creates, false))?;
+        } else {
+            outln!("Nothing to add.");
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The result of an import that wrote: its JSON, or the summary line.
+fn import_done(
+    rows: &[ImportRow],
+    vault: Option<&str>,
+    creates: bool,
+    added: usize,
+    replaced: usize,
+) -> Result<(), Box<dyn Error>> {
+    if json_output() {
+        return emit_json(&import_json(rows, vault, creates, false));
+    }
+    outln!("{}", imported_line(vault, added, replaced));
+    Ok(())
+}
+
+/// A failed import save as `main` prints it: a conflict says to run the
+/// command again; everything else as [`vault_error`].
+fn import_save_error(e: VaultKeyError) -> Box<dyn Error> {
+    match e {
+        VaultKeyError::Conflict => "an entry in this vault changed on the key while the command \
+                                    ran; nothing was written. Run it again."
+            .into(),
+        e => vault_error(e),
+    }
+}
+
+/// What `vault import` prints when done.
+fn imported_line(vault: Option<&str>, added: usize, replaced: usize) -> String {
+    format!(
+        "Imported into vault \"{}\": {added} added, {replaced} replaced.",
+        shown_name(vault)
+    )
+}
+
+/// One backup entry in the import preview: what the import does with it.
+#[derive(Debug, Clone)]
+pub(crate) struct ImportRow {
+    /// Its place in the backup, from 0.
+    pub(crate) index: usize,
+    /// Carried for `--json` only, never printed in text.
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) username: String,
+    /// `add`, `replace`, `exists` or `skip`.
+    pub(crate) plan: &'static str,
+    pub(crate) reason: Option<&'static str>,
+}
+
+const NEWER: &str = "the backup's copy is newer";
+const OLDER: &str = "the key's copy is newer (--replace takes it)";
+const OLDER_TAKEN: &str = "replaces the key's newer copy";
+const SAME: &str = "already in the vault; left as is";
+const NOT_NAMED: &str = "not named with --entry";
+
+/// Every `--entry` title is some backup entry's title; the first that
+/// isn't is refused.
+fn check_entry_titles(incoming: &Vault, titles: &[String]) -> Result<(), String> {
+    match titles
+        .iter()
+        .find(|t| !incoming.entries.iter().any(|e| e.title == **t))
+    {
+        Some(t) => Err(format!(
+            "no entry in the backup is titled \"{}\"",
+            sanitize_terminal(t)
+        )),
+        None => Ok(()),
+    }
+}
+
+/// What the import does with each backup entry, from how it compares with
+/// the vault (`statuses`, from [`keyroost_vault::classify`]). By default it
+/// takes the new ones and those whose backup copy is newer; `replace` also
+/// takes those whose key copy is newer. With `--entry` titles (`entries`),
+/// it takes every entry with one of them (an older one too) and skips the
+/// rest; a title no backup entry has is refused.
+pub(crate) fn import_rows(
+    statuses: &[(usize, keyroost_vault::ImportStatus)],
+    incoming: &Vault,
+    entries: &[String],
+    replace: bool,
+) -> Result<Vec<ImportRow>, String> {
+    use keyroost_vault::ImportStatus;
+    check_entry_titles(incoming, entries)?;
+    statuses
+        .iter()
+        .map(|&(index, status)| {
+            let e = incoming
+                .entries
+                .get(index)
+                .ok_or_else(|| format!("internal error: the backup has no entry {index}"))?;
+            let named = entries.is_empty() || entries.contains(&e.title);
+            let (plan, reason) = match status {
+                _ if !named => ("skip", Some(NOT_NAMED)),
+                ImportStatus::New => ("add", None),
+                ImportStatus::Newer => ("replace", Some(NEWER)),
+                ImportStatus::Same => ("exists", Some(SAME)),
+                ImportStatus::Older if replace || !entries.is_empty() => {
+                    ("replace", Some(OLDER_TAKEN))
+                }
+                ImportStatus::Older => ("skip", Some(OLDER)),
+                _ => ("skip", Some("this build can't tell how it compares")),
+            };
+            Ok(ImportRow {
+                index,
+                id: e.id.clone(),
+                title: e.title.clone(),
+                username: e.username.clone(),
+                plan,
+                reason,
+            })
+        })
+        .collect()
+}
+
+/// The backup indices the import writes: its `add` and `replace` rows.
+fn chosen(rows: &[ImportRow]) -> Vec<usize> {
+    rows.iter()
+        .filter(|r| matches!(r.plan, "add" | "replace"))
+        .map(|r| r.index)
+        .collect()
+}
+
+/// The import preview: a header, one row per backup entry (as the code
+/// imports lay them out, named `title (username)`), then the counts. Never
+/// a password or an ID.
+pub(crate) fn import_lines(
+    rows: &[ImportRow],
+    file: &str,
+    vault: &str,
+    key: &str,
+    on_key: usize,
+) -> Vec<String> {
+    let mut out = vec![format!(
+        "{} in {} for vault \"{}\" on {}:",
+        entries(rows.len()),
+        sanitize_terminal(file),
+        sanitize_terminal(vault),
+        key
+    )];
+    let table: Vec<(&str, String, Option<String>)> = rows
+        .iter()
+        .map(|r| {
+            let name = if r.username.is_empty() {
+                sanitize_terminal(&r.title)
+            } else {
+                format!(
+                    "{} ({})",
+                    sanitize_terminal(&r.title),
+                    sanitize_terminal(&r.username)
+                )
+            };
+            (r.plan, name, r.reason.map(str::to_owned))
+        })
+        .collect();
+    out.extend(crate::code_import::plan_row_lines(&table));
+    let count = |w: &str| rows.iter().filter(|r| r.plan == w).count();
+    out.push(format!(
+        "{} in the vault; {} will be added, {} replaced, {} left as is, {} skipped.",
+        entries(on_key),
+        count("add"),
+        count("replace"),
+        count("exists"),
+        count("skip")
+    ));
+    out
+}
+
+/// `vault import`'s question, in the code imports' `confirm` form.
+fn import_question(
+    term: &mut dyn crate::prompt::Term,
+    yes: bool,
+    n: usize,
+    vault: Option<&str>,
+    key: &str,
+) -> Result<bool, String> {
+    confirm(
+        term,
+        yes,
+        &format!("import {} into vault \"{}\"", entries(n), shown_name(vault)),
+        key,
+    )
+}
+
+/// The question before an import makes the vault it writes to.
+fn create_question(
+    term: &mut dyn crate::prompt::Term,
+    yes: bool,
+    name: &str,
+    key: &str,
+) -> Result<bool, String> {
+    confirm(
+        term,
+        yes,
+        &format!("create vault \"{}\"", sanitize_terminal(name)),
+        key,
+    )
+}
+
+/// `vault import --json`: the plan, as the preview shows it, with ids.
+pub(crate) fn import_json(
+    rows: &[ImportRow],
+    vault: Option<&str>,
+    creates: bool,
+    dry_run: bool,
+) -> json_out::FidoVaultImportJson {
+    json_out::FidoVaultImportJson {
+        vault: vault.map(str::to_owned),
+        creates,
+        dry_run,
+        entries: rows
+            .iter()
+            .map(|r| json_out::FidoVaultImportRowJson {
+                index: r.index,
+                id: r.id.clone(),
+                title: r.title.clone(),
+                username: r.username.clone(),
+                plan: r.plan,
+                reason: r.reason,
+            })
+            .collect(),
     }
 }
 
@@ -2772,5 +3364,275 @@ mod tests {
         };
         let t = crate::error_text(vault_error(e).as_ref());
         assert!(!t.contains('\u{1b}'), "{t:?}");
+    }
+
+    /// A backup of four entries, one per status, and the statuses
+    /// `classify` gives them against a vault of five.
+    fn backup() -> (Vault, Vec<(usize, keyroost_vault::ImportStatus)>) {
+        use keyroost_vault::ImportStatus::*;
+        let v = Vault {
+            entries: vec![
+                ent("id-new", "Mail", "alice", ""),
+                ent("id-newer", "GitHub", "alice", ""),
+                ent("id-older", "Bank", "", ""),
+                ent("id-same", "Forum", "bob", ""),
+            ],
+        };
+        (v, vec![(0, New), (1, Newer), (2, Older), (3, Same)])
+    }
+
+    fn plans(rows: &[ImportRow]) -> Vec<(&str, Option<&str>)> {
+        rows.iter().map(|r| (r.plan, r.reason)).collect()
+    }
+
+    #[test]
+    fn import_rows_default_takes_add_and_replace() {
+        let (v, st) = backup();
+        let rows = import_rows(&st, &v, &[], false).unwrap();
+        assert_eq!(
+            plans(&rows),
+            [
+                ("add", None),
+                ("replace", Some("the backup's copy is newer")),
+                ("skip", Some("the key's copy is newer (--replace takes it)")),
+                ("exists", Some("already in the vault; left as is")),
+            ]
+        );
+        let r = &rows[1];
+        assert_eq!(
+            (
+                r.index,
+                r.id.as_str(),
+                r.title.as_str(),
+                r.username.as_str()
+            ),
+            (1, "id-newer", "GitHub", "alice")
+        );
+        assert_eq!(chosen(&rows), [0, 1]);
+    }
+
+    #[test]
+    fn import_rows_replace_takes_the_older() {
+        let (v, st) = backup();
+        let rows = import_rows(&st, &v, &[], true).unwrap();
+        assert_eq!(
+            plans(&rows),
+            [
+                ("add", None),
+                ("replace", Some("the backup's copy is newer")),
+                ("replace", Some("replaces the key's newer copy")),
+                ("exists", Some("already in the vault; left as is")),
+            ]
+        );
+        assert_eq!(chosen(&rows), [0, 1, 2]);
+    }
+
+    #[test]
+    fn import_rows_entry_names_exactly_those() {
+        let (v, st) = backup();
+        let named = ["Bank".to_owned(), "Forum".to_owned()];
+        let rows = import_rows(&st, &v, &named, false).unwrap();
+        assert_eq!(
+            plans(&rows),
+            [
+                ("skip", Some("not named with --entry")),
+                ("skip", Some("not named with --entry")),
+                ("replace", Some("replaces the key's newer copy")),
+                ("exists", Some("already in the vault; left as is")),
+            ]
+        );
+        assert_eq!(chosen(&rows), [2]);
+    }
+
+    #[test]
+    fn import_rows_entry_takes_every_entry_with_that_title() {
+        use keyroost_vault::ImportStatus::*;
+        let v = Vault {
+            entries: vec![
+                ent("id-1", "GitHub", "alice", ""),
+                ent("id-2", "Mail", "alice", ""),
+                ent("id-3", "GitHub", "work", ""),
+            ],
+        };
+        let st = [(0, New), (1, New), (2, Newer)];
+        let rows = import_rows(&st, &v, &["GitHub".to_owned()], false).unwrap();
+        assert_eq!(
+            plans(&rows),
+            [
+                ("add", None),
+                ("skip", Some("not named with --entry")),
+                ("replace", Some("the backup's copy is newer")),
+            ]
+        );
+        assert_eq!(chosen(&rows), [0, 2]);
+    }
+
+    #[test]
+    fn import_rows_unknown_entry_is_refused() {
+        let (v, st) = backup();
+        let err =
+            import_rows(&st, &v, &["Mail".to_owned(), "Gmial".to_owned()], false).unwrap_err();
+        assert_eq!(err, "no entry in the backup is titled \"Gmial\"");
+        assert_eq!(
+            check_entry_titles(&v, &["Gmial".to_owned()]).unwrap_err(),
+            err
+        );
+        assert!(check_entry_titles(&v, &["Mail".to_owned()]).is_ok());
+        // Key-supplied text never reaches the terminal raw.
+        let err = check_entry_titles(&v, &["a\u{1b}[2Jb".to_owned()]).unwrap_err();
+        assert!(!err.contains('\u{1b}'), "{err:?}");
+    }
+
+    #[test]
+    fn import_lines_layout() {
+        let (v, st) = backup();
+        let rows = import_rows(&st, &v, &[], false).unwrap();
+        let lines = import_lines(&rows, "vault.t2vault", "Personal", "yubi-test", 5);
+        let mut want =
+            vec!["4 entries in vault.t2vault for vault \"Personal\" on yubi-test:".to_owned()];
+        want.extend(crate::code_import::plan_row_lines(&[
+            ("add", "Mail (alice)".to_owned(), None),
+            (
+                "replace",
+                "GitHub (alice)".to_owned(),
+                Some("the backup's copy is newer".to_owned()),
+            ),
+            (
+                "skip",
+                "Bank".to_owned(),
+                Some("the key's copy is newer (--replace takes it)".to_owned()),
+            ),
+            (
+                "exists",
+                "Forum (bob)".to_owned(),
+                Some("already in the vault; left as is".to_owned()),
+            ),
+        ]));
+        want.push(
+            "5 entries in the vault; 1 will be added, 1 replaced, 1 left as is, 1 skipped."
+                .to_owned(),
+        );
+        assert_eq!(lines, want);
+        assert_eq!(lines[1], "  add       Mail (alice)");
+        assert_eq!(
+            lines[2],
+            "  replace   GitHub (alice)  the backup's copy is newer"
+        );
+
+        let one = import_lines(&rows[..1], "f", "V", "k", 1);
+        assert_eq!(one[0], "1 entry in f for vault \"V\" on k:");
+        assert_eq!(
+            one[2],
+            "1 entry in the vault; 1 will be added, 0 replaced, 0 left as is, 0 skipped."
+        );
+
+        // Key- and file-supplied text is neutralized.
+        let mut bad = rows[..1].to_vec();
+        bad[0].title = "x\u{1b}[2Jy".to_owned();
+        for l in import_lines(&bad, "a\u{7}b", "c\u{1b}d", "k", 0) {
+            assert!(!l.contains('\u{1b}') && !l.contains('\u{7}'), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn import_question_uses_code_imports_form() {
+        let mut t = ScriptTerm::new(true, &["y"]);
+        assert_eq!(
+            import_question(&mut t, false, 2, Some("Personal"), "yubi-test"),
+            Ok(true)
+        );
+        assert_eq!(
+            t.asked,
+            ["import 2 entries into vault \"Personal\" on yubi-test? [y/N] "]
+        );
+        let mut t = ScriptTerm::new(false, &[]);
+        assert_eq!(
+            import_question(&mut t, false, 2, Some("Personal"), "yubi-test").unwrap_err(),
+            "refusing to import 2 entries into vault \"Personal\" on yubi-test without \
+             confirmation; add --yes"
+        );
+        let mut t = ScriptTerm::new(false, &[]);
+        assert_eq!(import_question(&mut t, true, 1, None, "k"), Ok(false));
+        assert!(t.asked.is_empty());
+    }
+
+    #[test]
+    fn import_into_a_new_vault_asks_to_create() {
+        let mut t = ScriptTerm::new(true, &["y"]);
+        assert_eq!(
+            create_question(&mut t, false, "Personal", "yubi-test"),
+            Ok(true)
+        );
+        assert_eq!(t.asked, ["create vault \"Personal\" on yubi-test? [y/N] "]);
+        let mut t = ScriptTerm::new(true, &["n"]);
+        assert!(create_question(&mut t, false, "Personal", "yubi-test").is_err());
+    }
+
+    #[test]
+    fn import_json_fields() {
+        let (v, st) = backup();
+        let rows = import_rows(&st, &v, &[], false).unwrap();
+        let json = serde_json::to_value(import_json(&rows, Some("Personal"), false, true)).unwrap();
+        assert_eq!(json["vault"], "Personal");
+        assert_eq!(json["creates"], false);
+        assert_eq!(json["dry_run"], true);
+        let e = &json["entries"][2];
+        let keys: Vec<&str> = e.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut want = ["index", "id", "title", "username", "plan", "reason"];
+        want.sort_unstable();
+        let mut keys = keys;
+        keys.sort_unstable();
+        assert_eq!(keys, want);
+        assert_eq!(e["index"], 2);
+        assert_eq!(e["id"], "id-older");
+        assert_eq!(e["title"], "Bank");
+        assert_eq!(e["username"], "");
+        assert_eq!(e["plan"], "skip");
+        assert_eq!(e["reason"], "the key's copy is newer (--replace takes it)");
+        assert_eq!(json["entries"][0]["reason"], serde_json::Value::Null);
+        // Never a password.
+        assert!(!json.to_string().contains("hunter2"), "{json}");
+    }
+
+    #[test]
+    fn export_and_import_result_lines() {
+        assert_eq!(
+            exported_line("Personal", 3, Path::new("personal.t2vault")),
+            "Backup of vault \"Personal\" (3 entries) written to personal.t2vault."
+        );
+        assert_eq!(
+            exported_line("Personal", 1, Path::new("p.t2vault")),
+            "Backup of vault \"Personal\" (1 entry) written to p.t2vault."
+        );
+        assert_eq!(
+            imported_line(Some("Personal"), 2, 1),
+            "Imported into vault \"Personal\": 2 added, 1 replaced."
+        );
+    }
+
+    #[test]
+    fn import_and_export_flags() {
+        use clap::Parser;
+        let p = |args: &[&str]| {
+            crate::Cli::try_parse_from(["keyroostctl", "fido", "vault"].iter().chain(args).copied())
+        };
+        assert!(p(&["export", "Personal", "-o", "p.t2vault", "--overwrite"]).is_ok());
+        assert!(p(&["export", "Personal"]).is_err(), "--out is required");
+        assert!(p(&[
+            "import",
+            "-i",
+            "p.t2vault",
+            "--vault",
+            "V",
+            "--entry",
+            "A",
+            "--entry",
+            "B",
+            "--replace",
+            "--dry-run",
+            "-y"
+        ])
+        .is_ok());
+        assert!(p(&["import"]).is_err(), "--in is required");
     }
 }

@@ -623,6 +623,33 @@ pub(crate) struct FidoVaultEntryJson {
     pub changed: String,
 }
 
+/// `keyroostctl --json fido vault import` — what the import does with each
+/// backup entry, as the preview shows it. Never a password.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultImportJson {
+    /// The vault imported into; `null` when the credential carries no name.
+    pub vault: Option<String>,
+    /// Whether the import makes the vault (the key had none of that name).
+    pub creates: bool,
+    pub dry_run: bool,
+    pub entries: Vec<FidoVaultImportRowJson>,
+}
+
+/// One backup entry in `fido vault import`.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultImportRowJson {
+    /// Its place in the backup, from 0.
+    pub index: usize,
+    /// The entry's id, as FidoParole stores it.
+    pub id: String,
+    pub title: String,
+    pub username: String,
+    /// `add`, `replace`, `exists` or `skip`.
+    pub plan: &'static str,
+    /// Why a row is not a plain add; `null` for one.
+    pub reason: Option<&'static str>,
+}
+
 /// `keyroostctl --json fido vault entry show` — one entry; the password
 /// only with `--reveal`. Every field is wiped when it is dropped.
 #[derive(Serialize)]

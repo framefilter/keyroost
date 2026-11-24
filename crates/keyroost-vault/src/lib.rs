@@ -23,7 +23,7 @@ mod model;
 #[cfg(test)]
 pub(crate) mod test_vectors;
 
-pub use backup::{export_backup, import_backup, KdfParams, BACKUP_KDF};
+pub use backup::{check_passphrase, export_backup, import_backup, KdfParams, BACKUP_KDF};
 pub use blob::{open, seal};
 pub use credential::{user_handle, MAX_NAME_BYTES, PRF_INPUT, RP_ID, RP_NAME};
 pub use error::VaultError;
