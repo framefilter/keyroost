@@ -93,6 +93,23 @@ fn refusal(action: &str, key: &str) -> String {
     format!("refusing to {action} on {key} without confirmation; add --yes")
 }
 
+/// For a command that can ask its question only after it has used the key
+/// (a PIN, a touch): the refusal [`confirm`] would give there, given now,
+/// when there is no terminal and no `--yes`, so a script is refused before
+/// the key is used rather than after. With a terminal or `--yes`, nothing.
+pub(crate) fn refuse_unaskable(
+    term: &dyn Term,
+    yes: bool,
+    action: &str,
+    key: &str,
+) -> Result<(), String> {
+    if yes || term.present() {
+        Ok(())
+    } else {
+        Err(refusal(action, key))
+    }
+}
+
 /// `[y/N]` before erasing or replacing something the host can't restore.
 /// `--yes` skips it; without a terminal it refuses with "add --yes".
 /// `Ok(true)` means the question was shown and answered yes.
@@ -582,6 +599,19 @@ mod tests {
             "refusing to delete OATH credential \"x\" on yubi-test (serial 1) without confirmation; add --yes"
         );
         assert!(t.asked.is_empty(), "never reads stdin without a terminal");
+    }
+
+    #[test]
+    fn unaskable_is_refused_up_front_as_confirm_would() {
+        let t = FakeTerm::new(false, &[]);
+        assert_eq!(
+            refuse_unaskable(&t, false, "delete vault \"x\"", "yk").unwrap_err(),
+            "refusing to delete vault \"x\" on yk without confirmation; add --yes"
+        );
+        assert_eq!(refuse_unaskable(&t, true, "x", "yk"), Ok(()));
+        let t = FakeTerm::new(true, &[]);
+        assert_eq!(refuse_unaskable(&t, false, "x", "yk"), Ok(()));
+        assert!(t.asked.is_empty(), "asks nothing");
     }
 
     #[test]

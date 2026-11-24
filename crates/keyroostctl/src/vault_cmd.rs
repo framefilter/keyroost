@@ -26,7 +26,9 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::code_import::entries;
 use crate::json_out;
 use crate::output::{emit_json, json_output};
-use crate::prompt::{confirm, confirm_statement, key_label, RealTerm, TermPicker};
+use crate::prompt::{
+    confirm, confirm_statement, key_label, refuse_unaskable, RealTerm, TermPicker,
+};
 use crate::secrets::{SecretIo, SecretSource, Secrets, Source, Spec};
 use crate::{sanitize_terminal, PATH_HELP};
 
@@ -376,8 +378,8 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
             pin,
             path,
         } => {
-            let pin = crate::fido_pin(path.as_deref(), pin.as_ref())?;
-            let dev = crate::target::select_fido(path.as_deref())?;
+            let (dev, pin) =
+                key_and_pin(path.as_deref(), pin.as_ref(), *yes, &delete_action(name))?;
             let mut key = open_vault_key(path.as_deref())?;
             let mut auth = VaultAuth::pin(pin);
             // Credential management: no touch.
@@ -405,8 +407,8 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
             pin,
             path,
         } => {
-            let pin = crate::fido_pin(path.as_deref(), pin.as_ref())?;
-            let dev = crate::target::select_fido(path.as_deref())?;
+            let (dev, pin) =
+                key_and_pin(path.as_deref(), pin.as_ref(), *yes, &rotate_action(name))?;
             let mut key = open_vault_key(path.as_deref())?;
             let mut auth = VaultAuth::pin(pin);
             // One touch to unlock, then the two of the new vault's create.
@@ -588,15 +590,20 @@ fn run_import(a: &ImportArgs<'_>) -> Result<(), Box<dyn Error>> {
         .map_err(|e| format!("{}: {e}", a.input.display()))?;
     check_entry_titles(&incoming, a.entries)?;
     let dev = crate::target::select_fido(a.path)?;
-    let pin = crate::fido_pin_with(&mut sec, &dev, pin.flag)?;
-    let mut key = open_vault_key(a.path)?;
-    let mut auth = VaultAuth::pin(pin);
     let key_name = key_label(&dev);
     let file = a
         .input
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| a.input.display().to_string());
+    if !a.dry_run {
+        // The question comes after the unlock; a run that could never
+        // answer it is refused before the PIN is read.
+        refuse_unaskable(&RealTerm, a.yes, &import_action(&file, a.vault), &key_name)?;
+    }
+    let pin = crate::fido_pin_with(&mut sec, &dev, pin.flag)?;
+    let mut key = open_vault_key(a.path)?;
+    let mut auth = VaultAuth::pin(pin);
     // Credential management: no touch.
     let creds = vault::list_credentials(&mut key, &mut auth).map_err(vault_error)?;
     let pick = vault_pick(a.vault);
@@ -1019,12 +1026,12 @@ fn delete_question(
     name: &str,
     key: &str,
 ) -> Result<bool, String> {
-    confirm(
-        term,
-        yes,
-        &format!("delete vault \"{}\"", sanitize_terminal(name)),
-        key,
-    )
+    confirm(term, yes, &delete_action(name), key)
+}
+
+/// `vault delete`'s action.
+fn delete_action(name: &str) -> String {
+    format!("delete vault \"{}\"", sanitize_terminal(name))
 }
 
 /// `vault rotate`'s question, as a statement.
@@ -1034,6 +1041,7 @@ fn rotate_question(
     name: &str,
     key: &str,
 ) -> Result<bool, String> {
+    let action = rotate_action(name);
     let name = sanitize_terminal(name);
     confirm_statement(
         term,
@@ -1042,9 +1050,41 @@ fn rotate_question(
             "Rotate the key of vault \"{name}\" on {key}? A new vault replaces it; the old one \
              is deleted after every entry is checked."
         ),
-        &format!("rotate the key of vault \"{name}\""),
+        &action,
         key,
     )
+}
+
+/// `vault rotate`'s action.
+fn rotate_action(name: &str) -> String {
+    format!("rotate the key of vault \"{}\"", sanitize_terminal(name))
+}
+
+/// `vault import`'s action as it is known before the unlock: the backup
+/// file, and the vault when `--vault` names it.
+fn import_action(file: &str, vault: Option<&str>) -> String {
+    let file = sanitize_terminal(file);
+    match vault {
+        Some(v) => format!("import {file} into vault \"{}\"", sanitize_terminal(v)),
+        None => format!("import {file}"),
+    }
+}
+
+/// The key and its PIN for a command that asks only after the unlock: the
+/// PIN source is checked, the key selected, a run that could never answer
+/// the question refused ([`refuse_unaskable`]), then the PIN read.
+fn key_and_pin(
+    path: Option<&Path>,
+    pin: Option<&SecretSource>,
+    yes: bool,
+    action: &str,
+) -> Result<(Device, Zeroizing<String>), Box<dyn Error>> {
+    let mut sec = Secrets::real();
+    sec.check(&crate::FIDO_PIN, Source::from_flag(pin))?;
+    let dev = crate::target::select_fido(path)?;
+    refuse_unaskable(&RealTerm, yes, action, &key_label(&dev))?;
+    let pin = crate::fido_pin_with(&mut sec, &dev, pin)?;
+    Ok((dev, pin))
 }
 
 /// What `vault delete` prints when done.
@@ -1493,12 +1533,16 @@ fn read_content<I: SecretIo>(
     Ok((password, notes))
 }
 
-/// What an entry command reads in, in order, before it opens the key.
+/// What an entry command reads in, in order, before it opens the key, and
+/// the question it asks after the unlock.
 #[derive(Default)]
 struct ContentFlags<'a> {
     password: Option<&'a SecretSource>,
     password_needed: bool,
     notes: Option<&'a SecretSource>,
+    /// `--yes` and the action of the question asked after the unlock: a run
+    /// that could never answer it is refused before the PIN is read.
+    asks: Option<(bool, &'a str)>,
 }
 
 /// An entry command's key, opened after every secret was read.
@@ -1510,8 +1554,9 @@ struct EntryKey {
     notes: Option<Zeroizing<String>>,
 }
 
-/// One `Secrets` for the command: check every source, select the key, read
-/// the password and notes, then the PIN, then open the key.
+/// One `Secrets` for the command: check every source, select the key,
+/// refuse a run that could never answer the question asked after the unlock
+/// (`asks`), read the password and notes, then the PIN, then open the key.
 fn open_entry_key(
     path: Option<&Path>,
     pin: Option<&SecretSource>,
@@ -1521,6 +1566,9 @@ fn open_entry_key(
     check_content(&sec, c.password, c.password_needed, c.notes)?;
     sec.check(&crate::FIDO_PIN, Source::from_flag(pin))?;
     let dev = crate::target::select_fido(path)?;
+    if let Some((yes, action)) = c.asks {
+        refuse_unaskable(&RealTerm, yes, action, &key_label(&dev))?;
+    }
     let (password, notes) = read_content(&mut sec, c.password, c.password_needed, c.notes)?;
     let pin = crate::fido_pin_with(&mut sec, &dev, pin)?;
     let key = open_vault_key(path)?;
@@ -1935,13 +1983,22 @@ fn entry_delete_question(
     confirm(
         term,
         yes,
-        &format!(
-            "delete entry \"{}\" from vault \"{}\"",
-            sanitize_terminal(title),
-            shown_name(vault)
-        ),
+        &entry_delete_action(title, Some(&shown_name(vault))),
         key,
     )
+}
+
+/// `entry delete`'s action: the entry, and the vault when it is known
+/// (`--vault` before the unlock; the chosen one's shown name after).
+fn entry_delete_action(title: &str, vault: Option<&str>) -> String {
+    let title = sanitize_terminal(title);
+    match vault {
+        Some(v) => format!(
+            "delete entry \"{title}\" from vault \"{}\"",
+            sanitize_terminal(v)
+        ),
+        None => format!("delete entry \"{title}\""),
+    }
 }
 
 /// The progress line a save prints when it writes.
@@ -2139,6 +2196,7 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
                     password: password.as_ref(),
                     password_needed: !generate_password,
                     notes: notes.as_ref(),
+                    asks: None,
                 },
             )?;
             let password = match k.password.take() {
@@ -2198,6 +2256,7 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
                     password: password.as_ref(),
                     password_needed: false,
                     notes: notes.as_ref(),
+                    asks: None,
                 },
             )?;
             let new_password = match k.password.take() {
@@ -2259,7 +2318,15 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             pin,
             path,
         } => {
-            let mut k = open_entry_key(path.as_deref(), pin.as_ref(), ContentFlags::default())?;
+            let action = entry_delete_action(title, vault.as_deref());
+            let mut k = open_entry_key(
+                path.as_deref(),
+                pin.as_ref(),
+                ContentFlags {
+                    asks: Some((*yes, &action)),
+                    ..ContentFlags::default()
+                },
+            )?;
             let (mut unlocked, i) = unlock_one(&mut k, vault.as_deref())?;
             let open = unlocked.vaults[i].open_mut().map_err(vault_error)?;
             let n = pick_entry(&open.contents, title, username.as_deref(), true)?;
@@ -3396,6 +3463,33 @@ mod tests {
         // Anything else goes through vault_error.
         let t = crate::error_text(entry_save_error(VaultKeyError::NoVaults).as_ref());
         assert!(t.contains("keyroostctl fido vault add NAME"), "{t}");
+    }
+
+    #[test]
+    fn early_refusal_actions() {
+        assert_eq!(delete_action("Personal"), "delete vault \"Personal\"");
+        assert_eq!(
+            rotate_action("Personal"),
+            "rotate the key of vault \"Personal\""
+        );
+        assert_eq!(entry_delete_action("Gmail", None), "delete entry \"Gmail\"");
+        assert_eq!(
+            entry_delete_action("Gmail", Some("Work")),
+            "delete entry \"Gmail\" from vault \"Work\""
+        );
+        assert_eq!(import_action("b.t2vault", None), "import b.t2vault");
+        assert_eq!(
+            import_action("b.t2vault", Some("Work")),
+            "import b.t2vault into vault \"Work\""
+        );
+        for a in [
+            delete_action("a\u{1b}[2J"),
+            rotate_action("a\u{1b}[2J"),
+            entry_delete_action("a\u{1b}[2J", Some("b\u{1b}[2J")),
+            import_action("a\u{1b}[2J", Some("b\u{1b}[2J")),
+        ] {
+            assert!(!a.contains('\u{1b}'), "{a}");
+        }
     }
 
     #[test]

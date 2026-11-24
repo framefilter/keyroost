@@ -229,3 +229,97 @@ fn export_refuses_a_short_passphrase_before_the_key() {
     );
     assert!(!out.exists());
 }
+
+/// A `--path` no key answers at: selection takes it as typed (no key
+/// needed), so a run gets as far as its first use of the key.
+const NO_KEY_PATH: &str = "/nonexistent/kr-vault-test-hidraw";
+
+/// Without a terminal and without `--yes`, a command whose question comes
+/// after the unlock is refused once the key is selected, before the PIN is
+/// used or the key touched: the refusal `confirm` would give, and nothing
+/// on stdout. With `--yes` the same run goes on to open the key.
+fn assert_refused_before_the_pin(args: &[&str], vars: &[(&str, &str)], action: &str) {
+    let mut all = args.to_vec();
+    all.extend(["--path", NO_KEY_PATH, "--pin", "env:KR_TEST_PIN"]);
+    let (code, out, err) = run_with(&all, vars);
+    assert_eq!(code, 1, "{err}");
+    assert!(out.is_empty(), "{out}");
+    let last = err.lines().last().unwrap_or_default();
+    assert!(
+        last.starts_with(&format!("error: refusing to {action} on ")),
+        "{err}"
+    );
+    assert!(last.ends_with(" without confirmation; add --yes"), "{err}");
+    all.push("--yes");
+    let (code, _, err) = run_with(&all, vars);
+    assert_eq!(code, 1, "{err}");
+    assert!(!err.contains("refusing to"), "with --yes: {err}");
+}
+
+#[test]
+fn rotate_without_terminal_or_yes_is_refused_before_the_pin() {
+    assert_refused_before_the_pin(
+        &["fido", "vault", "rotate", "Personal"],
+        &[],
+        "rotate the key of vault \"Personal\"",
+    );
+}
+
+#[test]
+fn vault_delete_without_terminal_or_yes_is_refused_before_the_pin() {
+    assert_refused_before_the_pin(
+        &["fido", "vault", "delete", "Personal"],
+        &[],
+        "delete vault \"Personal\"",
+    );
+}
+
+#[test]
+fn entry_delete_without_terminal_or_yes_is_refused_before_the_pin() {
+    assert_refused_before_the_pin(
+        &["fido", "vault", "entry", "delete", "Gmail"],
+        &[],
+        "delete entry \"Gmail\"",
+    );
+    assert_refused_before_the_pin(
+        &[
+            "fido", "vault", "entry", "delete", "Gmail", "--vault", "Work",
+        ],
+        &[],
+        "delete entry \"Gmail\" from vault \"Work\"",
+    );
+}
+
+#[test]
+fn import_without_terminal_or_yes_is_refused_before_the_pin() {
+    let pass = [("KR_PASS", BACKUP_PASS)];
+    let args = [
+        "fido",
+        "vault",
+        "import",
+        "-i",
+        BACKUP,
+        "--passphrase",
+        "env:KR_PASS",
+    ];
+    assert_refused_before_the_pin(&args, &pass, "import vault.t2vault");
+    let mut named = args.to_vec();
+    named.extend(["--vault", "Personal"]);
+    assert_refused_before_the_pin(
+        &named,
+        &pass,
+        "import vault.t2vault into vault \"Personal\"",
+    );
+    // A dry run asks nothing, so it is not refused.
+    let mut dry = args.to_vec();
+    dry.extend([
+        "--dry-run",
+        "--path",
+        NO_KEY_PATH,
+        "--pin",
+        "env:KR_TEST_PIN",
+    ]);
+    let (code, _, err) = run_with(&dry, &pass);
+    assert_eq!(code, 1, "{err}");
+    assert!(!err.contains("refusing to"), "{err}");
+}
