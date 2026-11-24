@@ -32,6 +32,7 @@ keyroost-piv = { path = "../crates/keyroost-piv" }
 # cargo-fuzz's `--cfg fuzzing` lowers the backup-chosen Argon2 bounds.
 keyroost-vault = { path = "../crates/keyroost-vault" }
 keyroost-token2otp = { path = "../crates/keyroost-token2otp" }
+keyroost-feitianotp = { path = "../crates/keyroost-feitianotp" }
 # winwebauthn is Windows-only for its FFI, but parse_detail_path is pure and
 # compiles/runs on Linux — the audit's KEY-020 surface, fuzzed here.
 keyroost-winwebauthn = { path = "../crates/keyroost-winwebauthn" }
@@ -108,6 +109,13 @@ bench = false
 [[bin]]
 name = "token2otp_parse"
 path = "fuzz_targets/token2otp_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "feitianotp_parse"
+path = "fuzz_targets/feitianotp_parse.rs"
 test = false
 doc = false
 bench = false

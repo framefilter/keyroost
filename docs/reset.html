@@ -145,7 +145,7 @@
   <section class="kr-section" id="whole-key">
     <h2>Resetting a whole key at once</h2>
     <p>One command wipes every resettable applet the key exposes, in order — OATH, OpenPGP,
-      Token2 on-device OTP, PIV, then FIDO2 last, because it ends with a ceremony:</p>
+      Token2 on-device OTP, Feitian OTP, PIV, then FIDO2 last, because it ends with a ceremony:</p>
 <pre><code>keyroostctl factory-reset                       # asks you to type "reset"
 keyroostctl factory-reset --device my-key --yes  # in a script</code></pre>
     <p>The card applets need nothing from you, except that some keys (a Nitrokey 3) ask
@@ -166,6 +166,11 @@ keyroostctl factory-reset --device my-key --yes  # in a script</code></pre>
       <code>keyroostctl fido reset --reader &lt;name&gt;</code>. Each step prints its
       own result, the command ends with a line like <code>factory reset: 5 wiped, 0
       skipped, 0 failed</code>, and it exits nonzero if any step failed or was skipped.</p>
+    <p>The OTP applet on Feitian keys has a step of its own, which waits for a touch on the
+      key. Afterwards keyroost lists the applet's three slots: the step counts as wiped only
+      when every slot reads empty, and otherwise names the slot that still holds accounts or
+      couldn't be read. On its own it is <code>keyroostctl feitian reset</code>, or
+      <strong>Reset…</strong> in the app's Feitian OTP tab.</p>
     <p>The desktop app offers the same sweep as a <strong>Factory reset</strong> card on a
       key's Overview tab, with a live per-step report — including a FIDO2 row — so you can
       see exactly which applets came back clean and which need another pass.</p>

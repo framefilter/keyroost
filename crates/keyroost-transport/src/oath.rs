@@ -16,7 +16,7 @@
 use crate::recover::{self, FirstContact};
 use crate::TransportError;
 use keyroost_oath as oath;
-use pcsc::{Card, Protocols, ShareMode};
+use pcsc::Card;
 use zeroize::Zeroizing;
 
 /// "Security status not satisfied": no VALIDATE yet, or (Nitrokey) no touch.
@@ -60,7 +60,7 @@ impl OathSession {
         let mut contact = FirstContact::new(reader_name, debug, "oath");
         loop {
             let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
-            let mut card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
+            let mut card = match crate::connect_shared(&ctx, &cstr) {
                 Ok(card) => card,
                 Err(e) => {
                     contact.retry_or_fail(e.into())?;
@@ -245,7 +245,7 @@ impl OathSession {
             .collect();
         let mut out = Vec::new();
         for name in names {
-            if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+            if let Ok(card) = crate::connect_shared(&ctx, name.as_c_str()) {
                 let mut session = OathSession {
                     card,
                     debug: false,
@@ -405,7 +405,7 @@ impl OathSession {
             self.debug,
             &io,
             apdu,
-            cmd_sensitive,
+            cmd_sensitive.into(),
             resp_sensitive,
         )
     }
@@ -429,7 +429,7 @@ fn version_of(v: &[u8]) -> Option<(u8, u8, u8)> {
     }
 }
 
-/// Map an OATH status word to success or a labelled APDU error.
+/// Map an OATH status word to success or a labeled APDU error.
 fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     if sw == oath::SW_OK {
         Ok(())

@@ -39,6 +39,9 @@ impl Caps {
     /// whose FIDO SELECT didn't name CTAP2 is only marked unverified, not
     /// this: it keeps its FIDO2 reset step.
     pub const FIDO_PROTOCOL_UNKNOWN: Caps = Caps(1 << 8);
+    /// The OTP applet on Feitian FIDO keys (the `feitian` group): its own
+    /// protocol, neither the OATH applet nor Token2's.
+    pub const FEITIAN_OTP: Caps = Caps(1 << 9);
 
     pub fn has(self, c: Caps) -> bool {
         self.0 & c.0 != 0
@@ -193,6 +196,7 @@ impl Device {
             (Caps::PGP, "PGP"),
             (Caps::PIV, "PIV"),
             (Caps::OTP, "OTP"),
+            (Caps::FEITIAN_OTP, "FEITIAN-OTP"),
         ] {
             if self.caps.has(c) {
                 v.push((label, self.cap_state(c)));
@@ -769,6 +773,9 @@ pub fn correlate_with(
         if p.has_otp {
             caps.insert(Caps::OTP);
         }
+        if p.has_feitian_otp {
+            caps.insert(Caps::FEITIAN_OTP);
+        }
         if caps.is_empty() {
             continue;
         }
@@ -941,6 +948,14 @@ pub fn correlate_with(
                 // not evidence — record it as unverified, never as presence.
                 caps.insert(Caps::OTP);
                 unverified.insert(Caps::OTP);
+            }
+            if hid.vendor_id == FEITIAN_VID {
+                // The same for a Feitian key with no reader bound: its OTP
+                // applet answers through the FIDO HID interface too, so the
+                // surface is offered, unverified. A key with a reader is left
+                // to what its probe found.
+                caps.insert(Caps::FEITIAN_OTP);
+                unverified.insert(Caps::FEITIAN_OTP);
             }
             let vendor = vendor_name(hid.vendor_id).to_string();
             let model = if is_token2 {
@@ -1777,12 +1792,19 @@ pub fn enumerate() -> Result<Vec<Device>, String> {
     enumerate_with(&EnumerateOptions::default())
 }
 
+/// Feitian's USB vendor id.
+const FEITIAN_VID: u16 = 0x096e;
+
 /// One applet-reset step in a whole-device factory reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetStep {
     Oath,
     OpenPgp,
     Token2Otp,
+    /// The Feitian OTP applet's own RESET
+    /// (`keyroost_transport::FeitianOtpSession::reset`): it wipes the
+    /// applet's accounts once the key is touched.
+    FeitianOtp,
     /// Resetting the PIV applet — `keyroost_transport::PivSession::
     /// factory_reset` decides on its own, from a live fingerprint, exactly
     /// which mechanism this ends up running: a PIV-only reset (several
@@ -1809,6 +1831,7 @@ impl ResetStep {
             ResetStep::OpenPgp => "OpenPGP",
             ResetStep::Piv => "PIV",
             ResetStep::Token2Otp => "OTP",
+            ResetStep::FeitianOtp => "FEITIAN-OTP",
             ResetStep::Fido => "FIDO2",
         }
     }
@@ -1841,6 +1864,9 @@ pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     }
     if caps.has(Caps::OTP) {
         steps.push(ResetStep::Token2Otp);
+    }
+    if caps.has(Caps::FEITIAN_OTP) {
+        steps.push(ResetStep::FeitianOtp);
     }
     if caps.has(Caps::PIV) {
         steps.push(ResetStep::Piv);
@@ -2108,6 +2134,7 @@ mod tests {
             has_fido: false,
             fido_ctap2_confirmed: false,
             has_otp: false,
+            has_feitian_otp: false,
             is_prog: false,
             prog_serial: None,
             yubikey_serial: yk_serial.map(str::to_owned),
@@ -2602,7 +2629,7 @@ mod tests {
     fn merged_card_row_offers_otp_as_unverified_when_the_probe_declined() {
         // The probe SELECTed the OTP applet and got a decline, but the vendor
         // hint still offers the surface (#95: the applet may live on a channel
-        // the probe cannot see). Offered — and labelled unverified, because
+        // the probe cannot see). Offered — and labeled unverified, because
         // neither answer was proven.
         let probes = [probe(
             "Token2 PIN+ 00 00",
@@ -2992,6 +3019,74 @@ mod tests {
         )];
         let yk = &correlate(&yk_hid, &yk_probe, &Keyring::default())[0];
         assert_eq!(yk.cap_badges(), vec!["FIDO2", "OATH", "PGP", "PIV"]);
+
+        // The Feitian OTP applet badges in the app's words, after the rest.
+        let mut ft_probe = probe(
+            "FS CCID 0",
+            false,
+            false,
+            true,
+            true,
+            None,
+            Some(9),
+            Some(5),
+        );
+        ft_probe.has_feitian_otp = true;
+        let ft = &correlate(&[], &[ft_probe], &Keyring::default())[0];
+        assert_eq!(ft.cap_badges(), vec!["PGP", "PIV", "FEITIAN-OTP"]);
+    }
+
+    /// A Feitian key seen only as a FIDO HID device is offered the OTP
+    /// surface, unverified: its applet answers through that interface too.
+    /// Another vendor's HID-only key is not.
+    #[test]
+    fn a_hid_only_feitian_key_is_offered_feitian_otp_unverified() {
+        let hids = [hid(
+            0x096e,
+            0x0853,
+            "/dev/hidraw4",
+            Some("S9"),
+            Some(1),
+            Some(4),
+        )];
+        let d = &correlate(&hids, &[], &Keyring::default())[0];
+        assert_eq!(d.cap_state(Caps::FEITIAN_OTP), CapState::Unverified);
+        assert!(
+            crate::select::Need::FeitianOtp.admits(d),
+            "over its HID path"
+        );
+        let hids = [hid(
+            0x1050,
+            0x0407,
+            "/dev/hidraw5",
+            Some("S8"),
+            Some(1),
+            Some(5),
+        )];
+        let d = &correlate(&hids, &[], &Keyring::default())[0];
+        assert!(!d.caps.has(Caps::FEITIAN_OTP));
+    }
+
+    /// A Feitian key's OTP applet has a reset step of its own, with the
+    /// other card applets and before PIV and FIDO2.
+    #[test]
+    fn factory_reset_has_a_feitian_otp_step() {
+        let mut caps = Caps::default();
+        caps.insert(Caps::PGP);
+        assert_eq!(factory_reset_plan(caps), vec![ResetStep::OpenPgp]);
+        for c in [Caps::FEITIAN_OTP, Caps::PIV, Caps::FIDO2] {
+            caps.insert(c);
+        }
+        assert_eq!(
+            factory_reset_plan(caps),
+            vec![
+                ResetStep::OpenPgp,
+                ResetStep::FeitianOtp,
+                ResetStep::Piv,
+                ResetStep::Fido
+            ]
+        );
+        assert_eq!(ResetStep::FeitianOtp.label(), "FEITIAN-OTP");
     }
 
     #[test]

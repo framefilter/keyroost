@@ -65,6 +65,19 @@ Being worked on right now — check with whoever holds it before starting.
   bug can refuse a keyroost backup restored into GnuPG on Ubuntu 26.04
   ("Bad passphrase" on first decrypt); keyroost's export is not at fault.
 
+- **Drop the carried hidapi fix once a hidapi release has it — waits on
+  hidapi.** The root `Cargo.toml` patches hidapi to the commit of
+  [ruabmbua/hidapi-rs#189](https://github.com/ruabmbua/hidapi-rs/pull/189),
+  carried on the `keyroost-windows-serial-fallback-fix` branch of
+  framefilter/hidapi-rs, because hidapi 2.6.7 can panic while listing HID
+  devices on some Windows PCs ([#281](https://github.com/framefilter/keyroost/pull/281)).
+  Check upstream at the end of every dev cycle, with the Windows test round:
+  is #189 merged, and is there a hidapi release on crates.io with it? When
+  there is, delete the `[patch.crates-io]` section and the `outputHashes`
+  entry in `flake.nix`, run `cargo update -p hidapi`, re-run the Windows
+  round, and then delete the fork's branch. Until then, leave that branch as
+  it is: the builds and the Flatpak fetch from it.
+
 - **OnlyKey recognition
   ([#37](https://github.com/framefilter/keyroost/issues/37), filed as "serial
   number detection on hardware keys") — needs testing on an OnlyKey.**
@@ -207,6 +220,20 @@ plan's two-key manual steps were never executed):
   Fixes the glibc-version portability caveat; the wrinkle is `libpcsclite`
   linking for the PC/SC path (and the dlopen item above changes that calculus).
   Think it through before committing.
+
+- **Turning an OpenPGP card's KDF setting on or off** from keyroost, in the
+  CLI and the app together. Since [#276](https://github.com/framefilter/keyroost/issues/276)
+  keyroost honors the setting (`gpg --card-edit` → `kdf-setup`) but doesn't
+  change it. Changing it resets the PINs, and how differs by card: GnuPG
+  leaves that to YubiKey and Gnuk cards, which reset their PINs themselves
+  when the setting is written; on other cards it runs its own sequence from
+  the host first (CHANGE REFERENCE DATA 83 → VERIFY 83 → RESET RETRY COUNTER
+  81 → clear the resetting code D3 → PUT DATA F9). An interruption partway
+  leaves the PINs and the setting out of step, so the order and the way back
+  need hardware evidence per vendor before anything is built. A YubiKey
+  refuses the change while keys are on the card. Needs "off" as well as "on",
+  and wording that says plainly the PINs go back to their defaults (user
+  123456, admin 12345678).
 
 - **Require green CI on `main`** — deliberately deferred; the remaining piece
   of full branch protection. Require-PR, linear history and squash-only merges

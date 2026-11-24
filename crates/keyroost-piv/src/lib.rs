@@ -124,6 +124,19 @@ pub enum Instruction {
     SetPinRetries = 0xFA,
     /// Yubico extension: RESET the PIV application (only when PIN and PUK blocked).
     Reset = 0xFB,
+    /// Feitian's RESET of the PIV application (only when PIN and PUK blocked):
+    /// its own instruction byte, on cards where `0xFB` is not the reset. See
+    /// [`reset_feitian`].
+    ResetFeitian = 0xFC,
+    /// Feitian's SET MANAGEMENT KEY (9B), on cards that do not know `0xFF`.
+    /// See [`set_management_key_feitian`].
+    SetManagementKeyFeitian = 0xCF,
+    /// Feitian's IMPORT ASYMMETRIC KEY, on cards where `0xFE` sets the PIN
+    /// and PUK retry counts instead. See [`ImportLayout::Feitian`].
+    ImportKeyFeitian = 0xE3,
+    /// Feitian's read of a slot's PIN and touch policy. See
+    /// [`get_slot_policy_feitian`].
+    GetSlotPolicyFeitian = 0xEC,
     /// Yubico extension: ATTEST — a self-signed certificate for a slot's key,
     /// proving on-card generation (fw 4.3+). On firmware older than 5.3 (GET
     /// METADATA's policy support), this certificate's key-policy extension is
@@ -162,6 +175,10 @@ impl Instruction {
             0xFF => Self::SetManagementKey,
             0xFA => Self::SetPinRetries,
             0xFB => Self::Reset,
+            0xFC => Self::ResetFeitian,
+            0xCF => Self::SetManagementKeyFeitian,
+            0xE3 => Self::ImportKeyFeitian,
+            0xEC => Self::GetSlotPolicyFeitian,
             0xF9 => Self::Attest,
             0xFE => Self::ImportKey,
             _ => return None,
@@ -189,6 +206,10 @@ impl Instruction {
             Self::SetManagementKey => "SET MANAGEMENT KEY (yubico extension)",
             Self::SetPinRetries => "SET PIN RETRIES (yubico extension)",
             Self::Reset => "RESET (yubico extension)",
+            Self::ResetFeitian => "RESET (feitian)",
+            Self::SetManagementKeyFeitian => "SET MANAGEMENT KEY (feitian)",
+            Self::ImportKeyFeitian => "IMPORT ASYMMETRIC KEY (feitian)",
+            Self::GetSlotPolicyFeitian => "GET SLOT POLICY (feitian)",
             Self::Attest => "ATTEST (yubico extension)",
             Self::ImportKey => "IMPORT ASYMMETRIC KEY (yubico extension)",
         }
@@ -816,6 +837,20 @@ pub fn verify_pin_status() -> Vec<u8> {
     vec![0x00, Instruction::Verify.code(), 0x00, PIN_REF_APPLICATION]
 }
 
+/// [`verify_pin_status`] with an `Lc` of zero: `00 20 00 80 00`. Some cards
+/// answer the four-byte form `6700` and take this one
+/// ([`compat::PivQuirk::RetryQueryTakesLc`]).
+#[must_use]
+pub fn verify_pin_status_lc() -> Vec<u8> {
+    vec![
+        0x00,
+        Instruction::Verify.code(),
+        0x00,
+        PIN_REF_APPLICATION,
+        0x00,
+    ]
+}
+
 /// Yubico GET VERSION (case 2): 3-byte `major.minor.patch`.
 #[must_use]
 pub fn get_version() -> Vec<u8> {
@@ -1133,13 +1168,92 @@ pub fn generate_key(
     pin_policy: PinPolicy,
     touch_policy: TouchPolicy,
 ) -> Vec<u8> {
+    generate_key_with(slot, alg_id, pin_policy, touch_policy, PolicyTags::Yubico)
+}
+
+/// How a card's GENERATE and IMPORT carry a slot's PIN and touch policy:
+/// which tags, and which byte for each touch policy. The PIN policy bytes are
+/// the same in both ([`PinPolicy::id`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PolicyTags {
+    /// Yubico's: PIN policy under `AA`, touch policy under `AB`, touch values
+    /// [`TouchPolicy::id`].
+    Yubico,
+    /// Feitian's: PIN policy under `BA`, touch policy under `BC`, and the
+    /// touch values 4 (never), 5 (always), 6 (cached). Measured on an ePass
+    /// FIDO NFC Plus: a GENERATE carrying `AA`/`AB` answers `6984`; with `BA`/`BC`
+    /// the key is made, [`get_slot_policy_feitian`] reads the two bytes back,
+    /// and the card keeps to them (a second signature under "always" needs a
+    /// new VERIFY; under touch "always" the signature waits for a touch).
+    Feitian,
+}
+
+impl PolicyTags {
+    /// The tag a PIN policy goes under.
+    #[must_use]
+    pub const fn pin_tag(self) -> u8 {
+        match self {
+            PolicyTags::Yubico => 0xAA,
+            PolicyTags::Feitian => 0xBA,
+        }
+    }
+
+    /// The tag a touch policy goes under.
+    #[must_use]
+    pub const fn touch_tag(self) -> u8 {
+        match self {
+            PolicyTags::Yubico => 0xAB,
+            PolicyTags::Feitian => 0xBC,
+        }
+    }
+
+    /// The byte that names `policy`. [`TouchPolicy::Default`] is never sent
+    /// (the builders leave the TLV out), so its value here is unused.
+    #[must_use]
+    pub const fn touch_id(self, policy: TouchPolicy) -> u8 {
+        match (self, policy) {
+            (PolicyTags::Yubico, p) => p.id(),
+            (PolicyTags::Feitian, TouchPolicy::Default) => 0x00,
+            (PolicyTags::Feitian, TouchPolicy::Never) => 0x04,
+            (PolicyTags::Feitian, TouchPolicy::Always) => 0x05,
+            (PolicyTags::Feitian, TouchPolicy::Cached) => 0x06,
+        }
+    }
+
+    /// The touch policy `id` names, the inverse of [`Self::touch_id`].
+    #[must_use]
+    pub const fn touch_from_id(self, id: u8) -> Option<TouchPolicy> {
+        match (self, id) {
+            (PolicyTags::Yubico, id) => TouchPolicy::from_id(id),
+            (PolicyTags::Feitian, 0x04) => Some(TouchPolicy::Never),
+            (PolicyTags::Feitian, 0x05) => Some(TouchPolicy::Always),
+            (PolicyTags::Feitian, 0x06) => Some(TouchPolicy::Cached),
+            (PolicyTags::Feitian, _) => None,
+        }
+    }
+}
+
+/// [`generate_key`] with the policy tags the card uses.
+#[must_use]
+pub fn generate_key_with(
+    slot: Slot,
+    alg_id: u8,
+    pin_policy: PinPolicy,
+    touch_policy: TouchPolicy,
+    tags: PolicyTags,
+) -> Vec<u8> {
     let mut control = Vec::with_capacity(9);
     push_tlv(&mut control, &[0x80], &[alg_id]); // algorithm
     if pin_policy != PinPolicy::Default {
-        push_tlv(&mut control, &[0xAA], &[pin_policy.id()]);
+        push_tlv(&mut control, &[tags.pin_tag()], &[pin_policy.id()]);
     }
     if touch_policy != TouchPolicy::Default {
-        push_tlv(&mut control, &[0xAB], &[touch_policy.id()]);
+        push_tlv(
+            &mut control,
+            &[tags.touch_tag()],
+            &[tags.touch_id(touch_policy)],
+        );
     }
     let mut data = Vec::with_capacity(control.len() + 3);
     push_tlv(&mut data, &[0xAC], &control); // control reference template
@@ -1164,6 +1278,34 @@ pub enum ImportLayout {
     /// exponent `e` (tags `01`..`03`); it derives the rest itself. Source-verified
     /// (piv-authenticator's `import_asymmetric_key`), not yet hardware-verified.
     NitrokeyRsa,
+    /// Feitian's import: the same values under the same tags as
+    /// [`Self::Yubico`], sent with instruction `E3` and with the policies
+    /// under Feitian's tags ([`PolicyTags::Feitian`]). On these cards `FE`,
+    /// Yubico's import instruction, sets the PIN and PUK retry counts.
+    /// Measured on an ePass FIDO NFC Plus: an RSA-2048 key (chained) and a P-256
+    /// key went in this way, and each then signed with a signature that
+    /// verified against its public half.
+    Feitian,
+}
+
+impl ImportLayout {
+    /// The instruction byte the import is sent with.
+    #[must_use]
+    pub const fn instruction(self) -> Instruction {
+        match self {
+            ImportLayout::Yubico | ImportLayout::NitrokeyRsa => Instruction::ImportKey,
+            ImportLayout::Feitian => Instruction::ImportKeyFeitian,
+        }
+    }
+
+    /// The tags the import's PIN and touch policy go under.
+    #[must_use]
+    pub const fn policy_tags(self) -> PolicyTags {
+        match self {
+            ImportLayout::Yubico | ImportLayout::NitrokeyRsa => PolicyTags::Yubico,
+            ImportLayout::Feitian => PolicyTags::Feitian,
+        }
+    }
 }
 
 /// The private-key values of one import, borrowed from the caller (typically
@@ -1279,6 +1421,20 @@ pub fn import_key_body(
     pin_policy: PinPolicy,
     touch_policy: TouchPolicy,
 ) -> Result<Zeroizing<Vec<u8>>, ImportBodyError> {
+    import_key_body_with(key, pin_policy, touch_policy, PolicyTags::Yubico)
+}
+
+/// [`import_key_body`] with the policies under the tags the card uses
+/// ([`ImportLayout::policy_tags`]).
+///
+/// # Errors
+/// [`ImportBodyError`], as [`import_key_body`].
+pub fn import_key_body_with(
+    key: &ImportKey<'_>,
+    pin_policy: PinPolicy,
+    touch_policy: TouchPolicy,
+    tags: PolicyTags,
+) -> Result<Zeroizing<Vec<u8>>, ImportBodyError> {
     let rsa_bits = match key.alg {
         KeyAlg::Rsa1024 => Some(1024),
         KeyAlg::Rsa2048 => Some(2048),
@@ -1318,10 +1474,14 @@ pub fn import_key_body(
         _ => return Err(ImportBodyError::PartsMismatch),
     }
     if pin_policy != PinPolicy::Default {
-        push_tlv(&mut out, &[0xAA], &[pin_policy.id()]);
+        push_tlv(&mut out, &[tags.pin_tag()], &[pin_policy.id()]);
     }
     if touch_policy != TouchPolicy::Default {
-        push_tlv(&mut out, &[0xAB], &[touch_policy.id()]);
+        push_tlv(
+            &mut out,
+            &[tags.touch_tag()],
+            &[tags.touch_id(touch_policy)],
+        );
     }
     Ok(out)
 }
@@ -1332,9 +1492,21 @@ pub fn import_key_body(
 /// material, so it zeroizes on drop.
 #[must_use]
 pub fn import_key(slot: Slot, alg_id: u8, body: &[u8]) -> Zeroizing<Vec<u8>> {
+    import_key_for(ImportLayout::Yubico, slot, alg_id, body)
+}
+
+/// [`import_key`] with the instruction `layout` is sent with
+/// ([`ImportLayout::instruction`]).
+#[must_use]
+pub fn import_key_for(
+    layout: ImportLayout,
+    slot: Slot,
+    alg_id: u8,
+    body: &[u8],
+) -> Zeroizing<Vec<u8>> {
     Zeroizing::new(build_apdu_ext(
         0x00,
-        Instruction::ImportKey.code(),
+        layout.instruction().code(),
         alg_id,
         slot.key_ref(),
         body,
@@ -1353,9 +1525,21 @@ pub fn import_key_chained(
     body: &[u8],
     max_chunk: usize,
 ) -> Vec<Zeroizing<Vec<u8>>> {
+    import_key_chained_for(ImportLayout::Yubico, slot, alg_id, body, max_chunk)
+}
+
+/// [`import_key_chained`] with the instruction `layout` is sent with.
+#[must_use]
+pub fn import_key_chained_for(
+    layout: ImportLayout,
+    slot: Slot,
+    alg_id: u8,
+    body: &[u8],
+    max_chunk: usize,
+) -> Vec<Zeroizing<Vec<u8>>> {
     chain_apdu(
         0x00,
-        Instruction::ImportKey.code(),
+        layout.instruction().code(),
         alg_id,
         slot.key_ref(),
         body,
@@ -1948,6 +2132,83 @@ pub fn set_pin_retries(pin_tries: u8, puk_tries: u8) -> Vec<u8> {
     ]
 }
 
+/// Feitian's SET PIN RETRIES: `00 FE <pin_tries> <puk_tries>`, the instruction
+/// byte that is Yubico's key import ([`Instruction::ImportKey`]). Needs
+/// management-key authentication and a verified PIN, like Yubico's.
+///
+/// Measured on an ePass FIDO NFC Plus: with counts 5 and 5 both counters read 5
+/// afterwards, and 3 and 3 put them back; a PIN changed beforehand no longer
+/// verified afterwards and the default PIN did. Yubico's `FA` answers `6D00`
+/// there.
+#[must_use]
+pub fn set_pin_retries_feitian(pin_tries: u8, puk_tries: u8) -> Vec<u8> {
+    vec![0x00, Instruction::ImportKey.code(), pin_tries, puk_tries]
+}
+
+/// Feitian's SET MANAGEMENT KEY: `00 CF FF FF <Lc> <alg> 9B <len> <key>`,
+/// the body Yubico's has. Needs management-key authentication. There is no
+/// touch-required form.
+///
+/// Measured on an ePass FIDO NFC Plus with a 3DES key: the new key then
+/// authenticated and the old one answered `6A80`. With an AES algorithm byte
+/// the card answered `6A80` and changed nothing, so on that card only 3DES
+/// is of use. Yubico's `FF` answers `6D00` there.
+///
+/// # Panics
+/// If `key` is longer than 255 bytes.
+#[must_use]
+pub fn set_management_key_feitian(alg: MgmtAlg, key: &[u8]) -> Vec<u8> {
+    assert!(key.len() <= 255, "management key too long");
+    // Holds the new management key; wipe on drop.
+    let mut body = Zeroizing::new(Vec::with_capacity(3 + key.len()));
+    body.push(alg.id());
+    body.push(KEY_REF_MANAGEMENT);
+    body.push(key.len() as u8);
+    body.extend_from_slice(key);
+    build_apdu(
+        0x00,
+        Instruction::SetManagementKeyFeitian.code(),
+        0xFF,
+        0xFF,
+        &body,
+    )
+}
+
+/// Feitian's read of a slot's PIN and touch policy: `00 EC 00 <key_ref> 00`.
+/// No authentication needed. Parse the answer with
+/// [`parse_slot_policy_feitian`].
+#[must_use]
+pub fn get_slot_policy_feitian(key_ref: u8) -> Vec<u8> {
+    build_apdu_get(
+        0x00,
+        Instruction::GetSlotPolicyFeitian.code(),
+        0x00,
+        key_ref,
+        0x00,
+    )
+}
+
+/// The PIN and touch policy in the answer to [`get_slot_policy_feitian`]:
+/// three bytes, the second the PIN policy ([`PinPolicy::from_id`]) and the
+/// third the touch policy in Feitian's values ([`PolicyTags::Feitian`]). The
+/// first byte is not understood and is ignored. `None` for any other shape or
+/// value, and for a PIN policy of 0.
+///
+/// The card answers for a slot with no key too, with what a key generated
+/// there without policy tags would get (measured: once and never for 9A, 9D
+/// and the retired slots, always for 9C, never for 9E).
+#[must_use]
+pub fn parse_slot_policy_feitian(data: &[u8]) -> Option<(PinPolicy, TouchPolicy)> {
+    let [_, pin, touch] = data else {
+        return None;
+    };
+    let pin = match PinPolicy::from_id(*pin)? {
+        PinPolicy::Default => return None,
+        p => p,
+    };
+    Some((pin, PolicyTags::Feitian.touch_from_id(*touch)?))
+}
+
 /// Yubico GET METADATA for a key/PIN reference (`0x9B`, `0x80`, `0x81`, or a
 /// slot key ref). Requires firmware 5.3+.
 #[must_use]
@@ -1960,6 +2221,19 @@ pub fn get_metadata(key_ref: u8) -> Vec<u8> {
 #[must_use]
 pub fn reset() -> Vec<u8> {
     vec![0x00, Instruction::Reset.code(), 0x00, 0x00]
+}
+
+/// Feitian's RESET: wipe the PIV application back to factory defaults, on a
+/// card whose reset is `INS 0xFC` rather than Yubico's `0xFB` (see
+/// [`compat::PivDialect::Feitian`]). Five bytes, as Feitian's own client
+/// software sends it.
+///
+/// Measured on a Feitian ePass FIDO NFC Plus (USB `096E:0853`): with neither the
+/// PIN nor the PUK blocked the card answers `6982`; with both blocked it
+/// answers `9000`, and both try counters are back at 3 afterwards.
+#[must_use]
+pub fn reset_feitian() -> Vec<u8> {
+    vec![0x00, Instruction::ResetFeitian.code(), 0x00, 0x00, 0x00]
 }
 
 /// Yubico ATTEST (case 2): request the self-signed attestation certificate for
@@ -2495,6 +2769,10 @@ mod tests {
             Instruction::SetManagementKey,
             Instruction::SetPinRetries,
             Instruction::Reset,
+            Instruction::ResetFeitian,
+            Instruction::SetManagementKeyFeitian,
+            Instruction::ImportKeyFeitian,
+            Instruction::GetSlotPolicyFeitian,
             Instruction::Attest,
             Instruction::ImportKey,
         ] {
@@ -2634,6 +2912,13 @@ mod tests {
     #[test]
     fn verify_status_is_case1() {
         assert_eq!(verify_pin_status(), vec![0x00, 0x20, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn verify_status_with_lc_is_the_form_the_086a_key_answered() {
+        // Hardware-observed on a Feitian BioPass FIDO Pro (USB 096E:086A), 2026-11-22:
+        // answered 63C3; the four-byte form above was answered 6700.
+        assert_eq!(verify_pin_status_lc(), vec![0x00, 0x20, 0x00, 0x80, 0x00]);
     }
 
     #[test]
@@ -2997,6 +3282,157 @@ mod tests {
         assert_eq!(set_pin_retries(5, 3), vec![0x00, 0xFA, 0x05, 0x03]);
         assert_eq!(reset(), vec![0x00, 0xFB, 0x00, 0x00]);
         assert_eq!(get_metadata(0x9B), vec![0x00, 0xF7, 0x00, 0x9B]);
+    }
+
+    #[test]
+    fn feitian_reset_is_the_command_the_key_answered() {
+        // Captured, 2026-11-22, Feitian ePass FIDO NFC Plus (USB 096E:0853): this
+        // command was answered 6982 with the PIN and PUK not blocked, and
+        // 9000 once both were. The expected bytes are the ones sent then, not
+        // produced by this crate.
+        assert_eq!(reset_feitian(), vec![0x00, 0xFC, 0x00, 0x00, 0x00]);
+        assert_eq!(Instruction::ResetFeitian.name(), "RESET (feitian)");
+    }
+
+    #[test]
+    fn feitian_commands_are_the_ones_the_key_answered() {
+        // Captured, 2026-11-22, Feitian ePass FIDO NFC Plus (USB 096E:0853). The
+        // expected bytes are the ones sent then, not produced by this crate.
+        // Retry counts 5 and 4: `9000`, and the PIN counter then read 5.
+        assert_eq!(set_pin_retries_feitian(5, 4), vec![0x00, 0xFE, 0x05, 0x04]);
+        // A new 3DES management key: `9000`, and the key then authenticated.
+        let key: Vec<u8> = (1..=24).collect();
+        let mut want = vec![0x00, 0xCF, 0xFF, 0xFF, 0x1B, 0x03, 0x9B, 0x18];
+        want.extend_from_slice(&key);
+        assert_eq!(set_management_key_feitian(MgmtAlg::TripleDes, &key), want);
+        // The policy of slot 9D.
+        assert_eq!(
+            get_slot_policy_feitian(0x9D),
+            vec![0x00, 0xEC, 0x00, 0x9D, 0x00]
+        );
+        // P-256 in 9D, PIN always, touch never: the key was generated and
+        // the policy read back `00 03 04`.
+        assert_eq!(
+            generate_key_with(
+                Slot::KeyManagement,
+                0x11,
+                PinPolicy::Always,
+                TouchPolicy::Never,
+                PolicyTags::Feitian
+            ),
+            vec![
+                0x00, 0x47, 0x00, 0x9D, 0x0B, 0xAC, 0x09, 0x80, 0x01, 0x11, 0xBA, 0x01, 0x03, 0xBC,
+                0x01, 0x04, 0x00
+            ]
+        );
+        // The same request with Yubico's tags is what `generate_key` builds.
+        assert_eq!(
+            generate_key_with(
+                Slot::KeyManagement,
+                0x11,
+                PinPolicy::Always,
+                TouchPolicy::Never,
+                PolicyTags::Yubico
+            ),
+            generate_key(
+                Slot::KeyManagement,
+                0x11,
+                PinPolicy::Always,
+                TouchPolicy::Never
+            )
+        );
+        assert_eq!(
+            Instruction::SetManagementKeyFeitian.name(),
+            "SET MANAGEMENT KEY (feitian)"
+        );
+    }
+
+    #[test]
+    fn feitian_slot_policy_answers_parse_as_measured() {
+        // The answers the key gave, with what had been asked for.
+        use PinPolicy as P;
+        use TouchPolicy as T;
+        for (answer, want) in [
+            ([0x00, 0x03, 0x04], (P::Always, T::Never)),
+            ([0x00, 0x02, 0x04], (P::Once, T::Never)),
+            ([0x00, 0x01, 0x04], (P::Never, T::Never)),
+            ([0x04, 0x03, 0x05], (P::Always, T::Always)),
+            ([0x03, 0x01, 0x05], (P::Never, T::Always)),
+            ([0x03, 0x01, 0x06], (P::Never, T::Cached)),
+        ] {
+            assert_eq!(
+                parse_slot_policy_feitian(&answer),
+                Some(want),
+                "{answer:02X?}"
+            );
+        }
+        // Another shape, a PIN policy of 0 and a touch value outside 4..=6
+        // (Yubico's 1..=3 among them) are not guessed at.
+        for bad in [
+            &[][..],
+            &[0x00, 0x02][..],
+            &[0x00, 0x02, 0x04, 0x00][..],
+            &[0x00, 0x00, 0x04][..],
+            &[0x00, 0x02, 0x01][..],
+            &[0x00, 0x02, 0x07][..],
+        ] {
+            assert_eq!(parse_slot_policy_feitian(bad), None, "{bad:02X?}");
+        }
+        // The touch values both ways.
+        for policy in [T::Never, T::Always, T::Cached] {
+            let id = PolicyTags::Feitian.touch_id(policy);
+            assert_eq!(PolicyTags::Feitian.touch_from_id(id), Some(policy));
+            assert_eq!(PolicyTags::Yubico.touch_id(policy), policy.id());
+        }
+    }
+
+    #[test]
+    fn feitian_import_uses_its_instruction_and_its_policy_tags() {
+        let scalar = [0x5A; 32];
+        let key = ImportKey {
+            alg: KeyAlg::EccP256,
+            alg_id: 0x11,
+            parts: ImportParts::Ec { scalar: &scalar },
+        };
+        let layout = ImportLayout::Feitian;
+        let body = import_key_body_with(
+            &key,
+            PinPolicy::Always,
+            TouchPolicy::Never,
+            layout.policy_tags(),
+        )
+        .unwrap();
+        // 06 20 <scalar>, then BA 01 03 and BC 01 04.
+        assert_eq!(&body[..2], &[0x06, 0x20]);
+        assert_eq!(&body[34..], &[0xBA, 0x01, 0x03, 0xBC, 0x01, 0x04]);
+        // With no policy the body is the one Yubico's import carries: this is
+        // what the key took for a P-256 key (`00 E3 11 87 22 06 20 ...`).
+        let plain = import_key_body_with(
+            &key,
+            PinPolicy::Default,
+            TouchPolicy::Default,
+            layout.policy_tags(),
+        )
+        .unwrap();
+        assert_eq!(
+            *plain,
+            *import_key_body(&key, PinPolicy::Default, TouchPolicy::Default).unwrap()
+        );
+        let apdu = import_key_for(layout, Slot::Retired(6), 0x11, &plain);
+        assert_eq!(&apdu[..7], &[0x00, 0xE3, 0x11, 0x87, 0x22, 0x06, 0x20]);
+        // Chained, every part carries the same instruction.
+        let parts = import_key_chained_for(layout, Slot::Signature, 0x07, &[0x5A; 600], 255);
+        assert!(parts.len() > 1);
+        for (i, part) in parts.iter().enumerate() {
+            let last = i + 1 == parts.len();
+            assert_eq!(part[0], if last { 0x00 } else { 0x10 });
+            assert_eq!(&part[1..4], &[0xE3, 0x07, 0x9C]);
+        }
+        // The other layouts keep Yubico's instruction and tags.
+        for other in [ImportLayout::Yubico, ImportLayout::NitrokeyRsa] {
+            assert_eq!(other.instruction(), Instruction::ImportKey);
+            assert_eq!(other.policy_tags(), PolicyTags::Yubico);
+        }
     }
 
     #[test]

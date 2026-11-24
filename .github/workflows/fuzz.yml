@@ -32,6 +32,7 @@ jobs:
           - ctap_typed
           - aegis_encrypted
           - token2otp_parse
+          - feitianotp_parse
           - molto_parse
           - winhid_detail
           - otp_apdu_retry

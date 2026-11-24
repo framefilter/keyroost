@@ -1,0 +1,16 @@
+[package]
+name = "keyroost-feitianotp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust byte layer for the Feitian OTP (TOTP/HOTP) applet on Feitian security keys: APDU builders and response parsers."
+
+[lints]
+workspace = true
+
+[dependencies]
+keyroost-proto = { path = "../keyroost-proto", version = "0.16.0" }
+# Scrub the secret-bearing PUT intermediates on drop.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }

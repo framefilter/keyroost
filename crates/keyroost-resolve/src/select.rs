@@ -19,6 +19,7 @@ pub enum Need {
     Otp,
     OtpHid,
     OtpCcid,
+    FeitianOtp,
     Molto2,
     Prog,
     FactoryReset,
@@ -38,6 +39,7 @@ impl Need {
             Need::Otp => "key with Token2 OTP",
             Need::OtpHid => "key with Token2 OTP over USB-HID",
             Need::OtpCcid => "key with Token2 OTP over a smart-card reader",
+            Need::FeitianOtp => "key with Feitian OTP",
             Need::Molto2 => "Molto2 token",
             Need::Prog => "programmable token",
             Need::FactoryReset => "key with something to factory-reset",
@@ -58,6 +60,9 @@ impl Need {
             Need::Otp => d.caps.has(Caps::OTP) && (hid || card),
             Need::OtpHid => d.caps.has(Caps::OTP) && hid,
             Need::OtpCcid => d.caps.has(Caps::OTP) && card,
+            // Through a reader, or through the FIDO HID interface where the
+            // key has no reader here.
+            Need::FeitianOtp => d.caps.has(Caps::FEITIAN_OTP) && (card || hid),
             Need::Molto2 => d.kind == DeviceKind::Token && card,
             Need::Prog => d.kind == DeviceKind::ProgToken && card,
             Need::FactoryReset => {
@@ -73,7 +78,13 @@ impl Need {
     fn prefers_reader(self) -> bool {
         matches!(
             self,
-            Need::Oath | Need::OpenPgp | Need::Piv | Need::OtpCcid | Need::Molto2 | Need::Prog
+            Need::Oath
+                | Need::OpenPgp
+                | Need::Piv
+                | Need::OtpCcid
+                | Need::FeitianOtp
+                | Need::Molto2
+                | Need::Prog
         )
     }
 }

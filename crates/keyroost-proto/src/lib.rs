@@ -12,6 +12,23 @@ pub mod sha512;
 pub mod sm4;
 pub mod trace;
 
+/// Overwrite `xs` with zeros, for buffers that held secret bytes (the
+/// in-tree hashers' block buffers and state, which see PINs when an OpenPGP
+/// card's KDF setting derives them).
+///
+/// The workspace forbids `unsafe`, so this can't use the volatile writes
+/// the `zeroize` crate does, and this crate takes no dependencies. Instead
+/// the zeroed slice is handed to [`core::hint::black_box`], which the
+/// optimizer must treat as reading it, so the stores are not removed as
+/// dead. That is best-effort (the standard library documents `black_box`
+/// as a hint, not a guarantee), which is as far as safe Rust goes.
+pub(crate) fn wipe<T: Copy + Default>(xs: &mut [T]) {
+    for x in xs.iter_mut() {
+        *x = T::default();
+    }
+    core::hint::black_box(xs);
+}
+
 pub use commands::{
     answer_challenge, delete_seed, derive_sm4_key, factory_reset, get_challenge, get_info,
     parse_public_data, read_public_data, set_config, set_customer_key, set_seed, set_title,
@@ -486,7 +503,7 @@ mod token2_pid_tests {
     #[test]
     fn default_configuration_pids_are_the_full_function_set() {
         // The vendor's default shipping configuration for each family is the
-        // OTP + PGP + FIDO id. 0x0026 in particular was previously mislabelled
+        // OTP + PGP + FIDO id. 0x0026 in particular was previously mislabeled
         // as a generic "FIDO2 Security Key".
         assert_eq!(
             token2_pid_label(0x0016),
@@ -618,5 +635,33 @@ mod device_test_switch_tests {
             assert_eq!(crate::devices_hidden(), hidden, "value {value:?}");
         }
         std::env::remove_var("KEYROOST_DEVICE_TEST");
+    }
+}
+
+#[cfg(test)]
+mod wipe_tests {
+    #[test]
+    fn wipe_zeroes_every_element() {
+        let mut bytes = [0xA5u8; 130];
+        super::wipe(&mut bytes);
+        assert!(bytes.iter().all(|&b| b == 0));
+        let mut words = [u64::MAX; 8];
+        super::wipe(&mut words);
+        assert_eq!(words, [0; 8]);
+    }
+
+    #[test]
+    fn a_dropped_clone_leaves_the_original_hasher_intact() {
+        // Drop wipes the clone's own buffers, never the original's.
+        let mut h = crate::sha256::Sha256::new();
+        h.update(b"ab");
+        drop(h.clone());
+        h.update(b"c");
+        assert_eq!(h.finalize(), crate::sha256::sha256(b"abc"));
+        let mut h = crate::sha512::Sha512::new();
+        h.update(b"ab");
+        drop(h.clone());
+        h.update(b"c");
+        assert_eq!(h.finalize(), crate::sha512::sha512(b"abc"));
     }
 }

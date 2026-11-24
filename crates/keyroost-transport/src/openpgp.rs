@@ -14,11 +14,66 @@ use crate::recover::{self, FirstContact};
 use crate::{trace, TransportError};
 use keyroost_openpgp as pgp;
 use keyroost_proto::trace::{format_line, Dir};
-use pcsc::{Card, Protocols, ShareMode};
+use pcsc::Card;
 use zeroize::Zeroizing;
 
 /// `SW 6A82`: selected file/application not found — i.e. no OpenPGP applet.
 const SW_FILE_NOT_FOUND: u16 = 0x6A82;
+
+/// `SW 6A88`: referenced data (the data object) not found.
+const SW_DATA_NOT_FOUND: u16 = 0x6A88;
+
+/// A card exchange: send one APDU, get the reassembled reply and status
+/// word. The session's is `transmit_full`; tests script one.
+type Tx<'a> = dyn FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError> + 'a;
+
+/// The card's KDF setting as `openpgp info` shows it: whether PINs reach
+/// the card hashed (see [`pgp::Kdf`]).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenPgpKdf {
+    /// The card doesn't announce the setting (Extended Capabilities).
+    NotSupported,
+    /// Supported, and off: PINs go to the card as typed.
+    Off,
+    /// On: PINs are hashed with this hash before they reach the card.
+    On(pgp::KdfHash),
+    /// A setting keyroost doesn't recognize; PIN commands are refused.
+    Unrecognized(pgp::KdfError),
+}
+
+impl OpenPgpKdf {
+    /// The value after the "KDF" label: `on (SHA-256)`, `off`,
+    /// `not supported`, `unrecognized setting (hash 0x09)`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            OpenPgpKdf::NotSupported => "not supported".to_string(),
+            OpenPgpKdf::Off => "off".to_string(),
+            OpenPgpKdf::On(hash) => format!("on ({})", hash.label()),
+            OpenPgpKdf::Unrecognized(e) => format!("unrecognized setting ({e})"),
+        }
+    }
+
+    /// The `--json` state word: `on`, `off`, `not-supported`,
+    /// `unrecognized` (the label without its detail).
+    #[must_use]
+    pub fn state_word(&self) -> &'static str {
+        match self {
+            OpenPgpKdf::NotSupported => "not-supported",
+            OpenPgpKdf::Off => "off",
+            OpenPgpKdf::On(_) => "on",
+            OpenPgpKdf::Unrecognized(_) => "unrecognized",
+        }
+    }
+
+    fn from_read(read: Result<pgp::Kdf, pgp::KdfError>) -> Self {
+        match read {
+            Ok(kdf) => kdf.hash().map_or(OpenPgpKdf::Off, OpenPgpKdf::On),
+            Err(e) => OpenPgpKdf::Unrecognized(e),
+        }
+    }
+}
 
 /// A read-only snapshot of an OpenPGP card's state, assembled from the
 /// Application Related Data (`6E`), the signature counter (`7A`/`93`), and
@@ -63,6 +118,9 @@ pub struct OpenPgpStatus {
     /// [`Self::cardholder_name`]: outer `None` is unreadable, `Some(None)` is
     /// unset.
     pub url: Option<Option<String>>,
+    /// The KDF setting (`F9`), read without a PIN. `None` when the card
+    /// announces it but the read failed.
+    pub kdf: Option<OpenPgpKdf>,
 }
 
 impl OpenPgpStatus {
@@ -136,6 +194,9 @@ impl OpenPgpStatus {
 pub struct OpenPgpSession {
     card: Card,
     debug: bool,
+    /// The card's KDF setting, read before the first PIN command of the
+    /// session (see [`cached_kdf`]).
+    kdf: Option<pgp::Kdf>,
 }
 
 /// Map a public-key read to "known to hold a key": success is `Some(true)`,
@@ -192,14 +253,18 @@ impl OpenPgpSession {
         let mut contact = FirstContact::new(reader_name, debug, "openpgp");
         loop {
             let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
-            let card = match ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY) {
+            let card = match crate::connect_shared(&ctx, &cstr) {
                 Ok(card) => card,
                 Err(e) => {
                     contact.retry_or_fail(e.into())?;
                     continue;
                 }
             };
-            let mut session = Self { card, debug };
+            let mut session = Self {
+                card,
+                debug,
+                kdf: None,
+            };
             match session.select() {
                 Ok(()) => {
                     contact.opened();
@@ -231,8 +296,12 @@ impl OpenPgpSession {
             .collect();
         let mut out = Vec::new();
         for name in names {
-            if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
-                let mut session = OpenPgpSession { card, debug: false };
+            if let Ok(card) = crate::connect_shared(&ctx, name.as_c_str()) {
+                let mut session = OpenPgpSession {
+                    card,
+                    debug: false,
+                    kdf: None,
+                };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
                 }
@@ -298,6 +367,17 @@ impl OpenPgpSession {
         });
         let url: Option<Option<String>> = self.read_optional_text(&pgp::get_url(), pgp::parse_url);
 
+        // The KDF setting is public too (access "Always"). A failed read is
+        // unreadable, not a failed status.
+        let kdf = if ard.kdf_supported {
+            self.transmit_full(&pgp::get_kdf())
+                .and_then(|(bytes, sw)| decode_kdf_reply(&bytes, sw))
+                .ok()
+                .map(OpenPgpKdf::from_read)
+        } else {
+            Some(OpenPgpKdf::NotSupported)
+        };
+
         Ok(OpenPgpStatus {
             sig_algo_id: ard.sig_algo_id(),
             dec_algo_id: ard.dec_algo_id(),
@@ -316,6 +396,7 @@ impl OpenPgpSession {
             otp_applet_serial,
             cardholder_name,
             url,
+            kdf,
         })
     }
 
@@ -335,90 +416,43 @@ impl OpenPgpSession {
         decode_optional_text(self.transmit_full(apdu).ok(), parse)
     }
 
-    /// Present a PIN against the password reference `pw_ref` (one of
-    /// [`keyroost_openpgp::PW1_SIGN`], [`keyroost_openpgp::PW1_OTHER`],
-    /// [`keyroost_openpgp::PW3_ADMIN`]). A wrong PIN is reported as
-    /// [`TransportError::OpenPgpPinRejected`] carrying the remaining-tries count.
-    /// The PIN bytes come from the caller and are never logged or stored.
+    /// The card's KDF setting, read once per session before the first PIN
+    /// command (see [`cached_kdf`]).
+    fn kdf(&mut self) -> Result<pgp::Kdf, TransportError> {
+        let mut cache = self.kdf.take();
+        let kdf = cached_kdf(&mut cache, &mut |apdu| self.transmit_full(apdu));
+        self.kdf = cache;
+        kdf
+    }
+
     /// Convenience: verify the admin PIN (PW3). Lets front-ends gate write
     /// operations without naming the `keyroost-openpgp` PW reference constants.
     pub fn verify_admin_pin(&mut self, pin: &[u8]) -> Result<(), TransportError> {
         self.verify_pin(pgp::PW3_ADMIN, pin)
     }
 
+    /// Present a PIN against the password reference `pw_ref` (one of
+    /// [`keyroost_openpgp::PW1_SIGN`], [`keyroost_openpgp::PW1_OTHER`],
+    /// [`keyroost_openpgp::PW3_ADMIN`]). A wrong PIN is reported as
+    /// [`TransportError::OpenPgpPinRejected`] carrying the remaining-tries count.
+    /// The PIN bytes come from the caller and are never logged or stored.
+    ///
+    /// On a card with the KDF setting on, the PIN is sent hashed as the
+    /// setting says; a setting keyroost doesn't recognize is refused before
+    /// anything is sent ([`TransportError::OpenPgpKdfUnrecognized`]).
     pub fn verify_pin(&mut self, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
-        let apdu = Zeroizing::new(pgp::verify(pw_ref, pin));
-        let (_, sw) = self.transmit_full(&apdu)?;
-        if sw == pgp::SW_OK {
-            return Ok(());
-        }
-        // Spec form: 63Cx = verification failed, x tries remaining.
-        if let Some(n) = crate::sw_tries_remaining(sw) {
-            return Err(TransportError::OpenPgpPinRejected {
-                tries_remaining: Some(n),
-            });
-        }
-        // YubiKey form: a failed VERIFY returns 6982/6983 without an embedded
-        // count. Read the PW status to report the actual remaining tries.
-        if sw == 0x6982 || sw == 0x6983 {
-            let tries_remaining = self.pin_tries_for(pw_ref);
-            return Err(TransportError::OpenPgpPinRejected { tries_remaining });
-        }
-        Err(TransportError::Apdu {
-            label: "openpgp verify",
-            sw1: (sw >> 8) as u8,
-            sw2: sw as u8,
-        })
-    }
-
-    /// Remaining tries for the counter behind `pw_ref`, read from the PW status
-    /// bytes (`C4`). `None` if the status can't be read/parsed.
-    fn pin_tries_for(&mut self, pw_ref: u8) -> Option<u8> {
-        let (bytes, sw) = self.transmit_full(&pgp::get_pw_status()).ok()?;
-        if sw != pgp::SW_OK {
-            return None;
-        }
-        let status = pgp::parse_pw_status(&bytes).ok()?;
-        match pw_ref {
-            pgp::PW3_ADMIN => Some(status.tries_pw3),
-            _ => Some(status.tries_pw1), // PW1_SIGN / PW1_OTHER
-        }
-    }
-
-    /// Map a non-OK status word from a PIN-presenting command to a
-    /// tries-remaining [`TransportError::OpenPgpPinRejected`] when it signals a
-    /// wrong PIN (`63Cx`, or `6982`/`6983` followed by a PW-status read), else a
-    /// generic APDU error labelled `label`.
-    fn pin_rejected(&mut self, sw: u16, pw_ref: u8, label: &'static str) -> TransportError {
-        if let Some(n) = crate::sw_tries_remaining(sw) {
-            return TransportError::OpenPgpPinRejected {
-                tries_remaining: Some(n),
-            };
-        }
-        if sw == 0x6982 || sw == 0x6983 {
-            return TransportError::OpenPgpPinRejected {
-                tries_remaining: self.pin_tries_for(pw_ref),
-            };
-        }
-        TransportError::Apdu {
-            label,
-            sw1: (sw >> 8) as u8,
-            sw2: sw as u8,
-        }
+        let kdf = self.kdf()?;
+        verify_with(&mut |apdu| self.transmit_full(apdu), &kdf, pw_ref, pin)
     }
 
     /// Change the PIN behind `pw_ref` (PW1 `0x81` for the user PIN, PW3 `0x83`
     /// for the admin PIN) from `old` to `new`. A wrong `old` is reported as a
     /// tries-remaining error. No prior VERIFY is required — CHANGE REFERENCE
     /// DATA carries the old PIN itself. PINs come from the caller and are never
-    /// stored or logged.
+    /// stored or logged. With the KDF setting on, both are sent hashed.
     pub fn change_pin(&mut self, pw_ref: u8, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
-        let apdu = Zeroizing::new(pgp::change_reference_data(pw_ref, old, new));
-        let (_, sw) = self.transmit_full(&apdu)?;
-        if sw == pgp::SW_OK {
-            return Ok(());
-        }
-        Err(self.pin_rejected(sw, pw_ref, "openpgp change pin"))
+        let kdf = self.kdf()?;
+        change_with(&mut |apdu| self.transmit_full(apdu), &kdf, pw_ref, old, new)
     }
 
     /// Change the user PIN (PW1) from `old` to `new`.
@@ -435,16 +469,20 @@ impl OpenPgpSession {
     /// admin PIN (PW3). Verifies PW3 first (a wrong admin PIN is reported as a
     /// tries-remaining error), then issues RESET RETRY COUNTER. Recovers a card
     /// whose user PIN is blocked without a factory reset. PINs come from the
-    /// caller and are never stored or logged.
+    /// caller and are never stored or logged. With the KDF setting on, both
+    /// are sent hashed.
     pub fn reset_retry_counter(
         &mut self,
         admin_pin: &[u8],
         new_user_pin: &[u8],
     ) -> Result<(), TransportError> {
-        self.verify_pin(pgp::PW3_ADMIN, admin_pin)?;
-        let apdu = Zeroizing::new(pgp::reset_retry_counter(new_user_pin));
-        let (_, sw) = self.transmit_full(&apdu)?;
-        ok_or_apdu("openpgp reset retry counter", sw)
+        let kdf = self.kdf()?;
+        reset_retry_counter_with(
+            &mut |apdu| self.transmit_full(apdu),
+            &kdf,
+            admin_pin,
+            new_user_pin,
+        )
     }
 
     /// Generate a fresh asymmetric key pair in the given slot and return its
@@ -1063,55 +1101,38 @@ impl OpenPgpSession {
             },
             _ => (15, 15),
         };
+        // How long the wrong guesses are: a card with the KDF setting on
+        // stores hashes and may refuse a guess of another length without
+        // counting it. Reading the setting needs no PIN, and its outcome
+        // never stops the reset (it is the way out).
+        let guess_len = {
+            let mut cache = self.kdf.take();
+            let len = reset_guess_len(&mut cache, &mut |apdu| self.transmit_full(apdu));
+            self.kdf = cache;
+            len
+        };
         // Looping until the card reports blocked (6983) guards against the count
         // being stale; the trailing guesses past zero just keep returning 6983.
-        self.block_pin(pgp::PW1_OTHER, pw1_tries)?;
-        self.block_pin(pgp::PW3_ADMIN, pw3_tries)?;
+        let mut tx = |apdu: &[u8]| self.transmit_full(apdu);
+        block_pin(&mut tx, pgp::PW1_OTHER, pw1_tries, guess_len)?;
+        block_pin(&mut tx, pgp::PW3_ADMIN, pw3_tries, guess_len)?;
 
         let (_, sw) = self.transmit_full(&pgp::terminate_df())?;
         ok_or_apdu("openpgp terminate df", sw)?;
+        // The reset restores the card's defaults, the KDF setting among
+        // them: read it again before the next PIN command.
+        self.kdf = None;
         let (_, sw) = self.transmit_full(&pgp::activate_file())?;
         ok_or_apdu("openpgp activate file", sw)
-    }
-
-    /// Exhaust a PIN's retry counter with wrong guesses so it becomes blocked.
-    /// Sends up to `max_tries + 1` attempts, stopping early once the card reports
-    /// the PIN blocked (`6983`). Best-effort: transmit errors abort the loop.
-    ///
-    /// The guesses come fresh from the host RNG rather than a compiled-in
-    /// constant: a card whose password happened to equal that constant answered
-    /// `9000` every iteration, so the counter never moved and PW1 stayed
-    /// unblocked while PW3 blocked — leaving the applet unadministrable. A guess
-    /// that *is* accepted is now a hard error instead of a silent no-op.
-    fn block_pin(&mut self, pw_ref: u8, max_tries: u8) -> Result<(), TransportError> {
-        let mut previous: Option<Zeroizing<Vec<u8>>> = None;
-        for _ in 0..max_tries.saturating_add(1) {
-            let guess =
-                crate::piv::random_credential_guess(previous.as_ref().map(|g| g.as_slice()))?;
-            let apdu = Zeroizing::new(pgp::verify(pw_ref, &guess));
-            match self.transmit_full(&apdu) {
-                Ok((_, pgp::SW_OK)) => return Err(TransportError::OpenPgpPinGuessAccepted),
-                Ok((_, 0x6983)) => break, // blocked
-                Ok(_) => {}
-                Err(_) => break,
-            }
-            previous = Some(guess);
-        }
-        Ok(())
     }
 
     /// Transmit one APDU and reassemble a response the card splits across `61xx`
     /// continuations (`GET RESPONSE`), returning `(payload, sw)`.
     fn transmit_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
-        // VERIFY (20), CHANGE REFERENCE DATA (24), RESET RETRY COUNTER (2C)
-        // carry plaintext PINs; PUT DATA odd (DB) carries imported private
-        // keys. PSO:DECIPHER (2A 80 86) *responses* are the recovered
+        // PSO:DECIPHER (2A 80 86) *responses* are the recovered
         // plaintext — and so are the GET RESPONSE chunks that follow, hence
         // the sticky flag for the whole reassembly loop.
-        let cmd_sensitive = matches!(
-            apdu.get(1),
-            Some(0x20) | Some(0x24) | Some(0x2C) | Some(0xDB)
-        );
+        let cmd_redact = cmd_redact(apdu);
         // The Token2 serial read (status's `otp_applet_serial`) answers with
         // the printed serial, hidden on every path that reads it.
         let resp_sensitive =
@@ -1127,7 +1148,7 @@ impl OpenPgpSession {
             self.debug,
             &IO,
             apdu,
-            cmd_sensitive,
+            cmd_redact,
             resp_sensitive,
         )
     }
@@ -1353,7 +1374,238 @@ fn crt_flag_name(crt: pgp::KeyCrt) -> &'static str {
     }
 }
 
-/// Map an OpenPGP status word to success or a labelled APDU error.
+/// How much of `apdu` a `--debug` trace hides. VERIFY (20), CHANGE
+/// REFERENCE DATA (24), RESET RETRY COUNTER (2C) and PUT DATA of the
+/// resetting code (DA 00 D3) carry PINs: their body and also their length
+/// byte, which is the PIN's length (both PINs' for a change), so a shared
+/// trace doesn't narrow a PIN down. PUT DATA odd (DB) carries imported
+/// private keys: its body.
+fn cmd_redact(apdu: &[u8]) -> crate::CmdRedact {
+    match apdu.get(1..4) {
+        Some([0x20 | 0x24 | 0x2C, ..]) | Some([0xDA, 0x00, 0xD3]) => {
+            crate::CmdRedact::LengthAndBody
+        }
+        Some([0xDB, ..]) => crate::CmdRedact::Body,
+        _ => crate::CmdRedact::Nothing,
+    }
+}
+
+/// Length of the factory reset's wrong guesses when the card's KDF setting
+/// can't be read or isn't recognized: 32 bytes, the length GnuPG's own
+/// factory reset sends to every card ("the length of dummy wrong PIN is
+/// 32-byte, also supporting authentication with KDF DO"), a SHA-256 hash's.
+const KDF_UNKNOWN_GUESS_LEN: usize = 32;
+
+/// How long the factory reset's wrong guesses are: `None` for the 8 random
+/// digits keyroost has always sent (the setting is off or not announced);
+/// a hash's length with the setting on, since such a card stores hashes
+/// and may refuse a guess of another length without counting it; and
+/// [`KDF_UNKNOWN_GUESS_LEN`] when the setting can't be read or isn't
+/// recognized, so the reset still goes ahead.
+fn reset_guess_len(cache: &mut Option<pgp::Kdf>, tx: &mut Tx) -> Option<usize> {
+    match cached_kdf(cache, tx) {
+        Ok(kdf) => kdf.hash().map(pgp::KdfHash::digest_len),
+        Err(_) => Some(KDF_UNKNOWN_GUESS_LEN),
+    }
+}
+
+/// A random wrong guess for [`block_pin`]: `len` random bytes (any bytes
+/// do, the card compares them with a stored hash), or 8 random digits when
+/// `len` is `None`. Never equal to `previous`.
+fn reset_guess(
+    len: Option<usize>,
+    previous: Option<&[u8]>,
+) -> Result<Zeroizing<Vec<u8>>, TransportError> {
+    let Some(len) = len else {
+        return crate::piv::random_credential_guess(previous);
+    };
+    let mut guess = Zeroizing::new(vec![0u8; len]);
+    getrandom::fill(&mut guess[..]).map_err(|_| TransportError::HostRngFailed)?;
+    if previous == Some(guess.as_slice()) {
+        guess[0] ^= 0x01;
+    }
+    Ok(guess)
+}
+
+/// Exhaust a PIN's retry counter with wrong guesses so it becomes blocked.
+/// Sends up to `max_tries + 1` attempts, stopping early once the card reports
+/// the PIN blocked (`6983`). Best-effort: transmit errors abort the loop.
+/// `guess_len` is from [`reset_guess_len`].
+///
+/// The guesses come fresh from the host RNG rather than a compiled-in
+/// constant: a card whose password happened to equal that constant answered
+/// `9000` every iteration, so the counter never moved and PW1 stayed
+/// unblocked while PW3 blocked — leaving the applet unadministrable. A guess
+/// that *is* accepted is now a hard error instead of a silent no-op.
+fn block_pin(
+    tx: &mut Tx,
+    pw_ref: u8,
+    max_tries: u8,
+    guess_len: Option<usize>,
+) -> Result<(), TransportError> {
+    let mut previous: Option<Zeroizing<Vec<u8>>> = None;
+    for _ in 0..max_tries.saturating_add(1) {
+        let guess = reset_guess(guess_len, previous.as_ref().map(|g| g.as_slice()))?;
+        let apdu = Zeroizing::new(pgp::verify(pw_ref, &guess));
+        match tx(&apdu) {
+            Ok((_, pgp::SW_OK)) => return Err(TransportError::OpenPgpPinGuessAccepted),
+            Ok((_, 0x6983)) => break, // blocked
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        previous = Some(guess);
+    }
+    Ok(())
+}
+
+/// The card's KDF setting for PIN commands: `cache` when this session
+/// already read it, else read now (see [`read_kdf`]) and kept in `cache`.
+/// An unrecognized setting or a failed read is not kept, and is the error.
+fn cached_kdf(cache: &mut Option<pgp::Kdf>, tx: &mut Tx) -> Result<pgp::Kdf, TransportError> {
+    if let Some(kdf) = cache {
+        return Ok(kdf.clone());
+    }
+    let kdf = read_kdf(tx)?;
+    *cache = Some(kdf.clone());
+    Ok(kdf)
+}
+
+/// Read the KDF setting the card's PINs need: the Extended Capabilities
+/// (in `6E`) say whether the card has one; if so, `GET DATA F9`. Neither
+/// read needs a PIN or touches a retry counter. A setting keyroost doesn't
+/// recognize is [`TransportError::OpenPgpKdfUnrecognized`], so the caller
+/// sends no PIN at all rather than one the card may count as wrong.
+fn read_kdf(tx: &mut Tx) -> Result<pgp::Kdf, TransportError> {
+    let (ard, sw) = tx(&pgp::get_application_related_data())?;
+    ok_or_apdu("get application related data", sw)?;
+    // Only C0 matters here; the rest of 6E needn't parse.
+    if !pgp::kdf_supported_in(&ard) {
+        return Ok(pgp::Kdf::Off);
+    }
+    let (bytes, sw) = tx(&pgp::get_kdf())?;
+    decode_kdf_reply(&bytes, sw)?.map_err(TransportError::OpenPgpKdfUnrecognized)
+}
+
+/// Decode a `GET DATA F9` reply: the setting, or why it wasn't recognized
+/// (inner `Err`). A card answering "not found" (`6A88`) has no setting
+/// stored, so PINs go as typed; any other status word is a failed read.
+fn decode_kdf_reply(
+    bytes: &[u8],
+    sw: u16,
+) -> Result<Result<pgp::Kdf, pgp::KdfError>, TransportError> {
+    match sw {
+        pgp::SW_OK => Ok(pgp::parse_kdf(bytes)),
+        SW_DATA_NOT_FOUND => Ok(Ok(pgp::Kdf::Off)),
+        _ => Err(TransportError::Apdu {
+            label: "openpgp get kdf setting",
+            sw1: (sw >> 8) as u8,
+            sw2: sw as u8,
+        }),
+    }
+}
+
+/// With the KDF setting on, the card sees only a hash and can no longer
+/// refuse a PIN that's too short, so check it here first (as GnuPG does).
+/// With it off, the card checks.
+fn check_pin_len(kdf: &pgp::Kdf, role: pgp::PinRole, pin: &[u8]) -> Result<(), TransportError> {
+    if kdf.is_on() && pin.len() < role.min_len() {
+        return Err(TransportError::OpenPgpPinTooShort {
+            pin: role.label(),
+            min: role.min_len(),
+        });
+    }
+    Ok(())
+}
+
+/// VERIFY `pin` against `pw_ref`, derived as `kdf` says.
+fn verify_with(tx: &mut Tx, kdf: &pgp::Kdf, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
+    let role = pgp::PinRole::for_pw_ref(pw_ref);
+    check_pin_len(kdf, role, pin)?;
+    let value = kdf.derive(role, pin);
+    let apdu = Zeroizing::new(pgp::verify(pw_ref, &value));
+    let (_, sw) = tx(&apdu)?;
+    if sw == pgp::SW_OK {
+        return Ok(());
+    }
+    Err(pin_rejected(tx, sw, pw_ref, "openpgp verify"))
+}
+
+/// CHANGE REFERENCE DATA from `old` to `new`, both derived as `kdf` says:
+/// one hashed and the other not would store a PIN the card can't match.
+fn change_with(
+    tx: &mut Tx,
+    kdf: &pgp::Kdf,
+    pw_ref: u8,
+    old: &[u8],
+    new: &[u8],
+) -> Result<(), TransportError> {
+    let role = pgp::PinRole::for_pw_ref(pw_ref);
+    check_pin_len(kdf, role, old)?;
+    check_pin_len(kdf, role, new)?;
+    let old = kdf.derive(role, old);
+    let new = kdf.derive(role, new);
+    let apdu = Zeroizing::new(pgp::change_reference_data(pw_ref, &old, &new));
+    let (_, sw) = tx(&apdu)?;
+    if sw == pgp::SW_OK {
+        return Ok(());
+    }
+    Err(pin_rejected(tx, sw, pw_ref, "openpgp change pin"))
+}
+
+/// VERIFY the admin PIN, then RESET RETRY COUNTER to `new_user`, both
+/// derived as `kdf` says. Both lengths are checked before anything is sent.
+fn reset_retry_counter_with(
+    tx: &mut Tx,
+    kdf: &pgp::Kdf,
+    admin: &[u8],
+    new_user: &[u8],
+) -> Result<(), TransportError> {
+    check_pin_len(kdf, pgp::PinRole::Admin, admin)?;
+    check_pin_len(kdf, pgp::PinRole::User, new_user)?;
+    verify_with(tx, kdf, pgp::PW3_ADMIN, admin)?;
+    let new_user = kdf.derive(pgp::PinRole::User, new_user);
+    let apdu = Zeroizing::new(pgp::reset_retry_counter(&new_user));
+    let (_, sw) = tx(&apdu)?;
+    ok_or_apdu("openpgp reset retry counter", sw)
+}
+
+/// Remaining tries for the counter behind `pw_ref`, read from the PW status
+/// bytes (`C4`). `None` if the status can't be read/parsed.
+fn pin_tries_for(tx: &mut Tx, pw_ref: u8) -> Option<u8> {
+    let (bytes, sw) = tx(&pgp::get_pw_status()).ok()?;
+    if sw != pgp::SW_OK {
+        return None;
+    }
+    let status = pgp::parse_pw_status(&bytes).ok()?;
+    match pw_ref {
+        pgp::PW3_ADMIN => Some(status.tries_pw3),
+        _ => Some(status.tries_pw1), // PW1_SIGN / PW1_OTHER
+    }
+}
+
+/// Map a non-OK status word from a PIN-presenting command to a
+/// tries-remaining [`TransportError::OpenPgpPinRejected`] when it signals a
+/// wrong PIN (spec form `63Cx`; YubiKey form `6982`/`6983` without a count,
+/// followed by a PW-status read), else a generic APDU error labeled `label`.
+fn pin_rejected(tx: &mut Tx, sw: u16, pw_ref: u8, label: &'static str) -> TransportError {
+    if let Some(n) = crate::sw_tries_remaining(sw) {
+        return TransportError::OpenPgpPinRejected {
+            tries_remaining: Some(n),
+        };
+    }
+    if sw == 0x6982 || sw == 0x6983 {
+        return TransportError::OpenPgpPinRejected {
+            tries_remaining: pin_tries_for(tx, pw_ref),
+        };
+    }
+    TransportError::Apdu {
+        label,
+        sw1: (sw >> 8) as u8,
+        sw2: sw as u8,
+    }
+}
+
+/// Map an OpenPGP status word to success or a labeled APDU error.
 fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     if sw == pgp::SW_OK {
         Ok(())
@@ -1724,6 +1976,7 @@ mod tests {
             otp_applet_serial: None,
             cardholder_name: None,
             url: None,
+            kdf: None,
         };
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Sign), "EdDSA Ed25519");
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Decrypt), "ECDH X25519");
@@ -1761,6 +2014,7 @@ mod tests {
             otp_applet_serial: None,
             cardholder_name: None,
             url: None,
+            kdf: None,
         }
     }
 
@@ -1876,5 +2130,500 @@ mod tests {
         );
         assert_eq!(resolve_cardholder_name(None, || Some(None)), Some(None));
         assert_eq!(resolve_cardholder_name(None, || None), None);
+    }
+
+    // --- KDF setting: scripted card -------------------------------------
+
+    /// A scripted card: answers each APDU with the next reply, in order, and
+    /// records what was sent. An APDU past the script fails the test.
+    struct ScriptedCard {
+        replies: std::collections::VecDeque<(Vec<u8>, u16)>,
+        sent: Vec<Vec<u8>>,
+    }
+
+    impl ScriptedCard {
+        fn new(replies: Vec<(Vec<u8>, u16)>) -> Self {
+            ScriptedCard {
+                replies: replies.into(),
+                sent: Vec::new(),
+            }
+        }
+
+        fn tx(&mut self) -> impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError> + '_ {
+            move |apdu| {
+                self.sent.push(apdu.to_vec());
+                Ok(self
+                    .replies
+                    .pop_front()
+                    .unwrap_or_else(|| panic!("unscripted APDU {apdu:02X?}")))
+            }
+        }
+
+        /// Sent APDUs that carry a PIN: VERIFY, CHANGE REFERENCE DATA,
+        /// RESET RETRY COUNTER.
+        fn pin_commands(&self) -> Vec<&Vec<u8>> {
+            self.sent
+                .iter()
+                .filter(|a| matches!(a[1], 0x20 | 0x24 | 0x2C))
+                .collect()
+        }
+    }
+
+    fn hexbytes(s: &str) -> Vec<u8> {
+        let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        (0..clean.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag, value.len() as u8];
+        v.extend_from_slice(value);
+        v
+    }
+
+    /// The spec's example derived defaults (§4.3.2): "123456" under the
+    /// user salt, "12345678" under the admin salt.
+    const SPEC_87: &str = "773784A602B6C81E3F092F4D7D00E17CC822D88F7360FCF2D2EF2D9D901F44B6";
+    const SPEC_88: &str = "2675D6164A0D4827D1D00C7EEA620D015C00030A1CAB38B4D0DD600B27DC9630";
+
+    /// A minimal `6E` reply; `kdf` sets the Extended Capabilities KDF bit.
+    fn ard(kdf: bool) -> (Vec<u8>, u16) {
+        let c0 = [
+            if kdf { 0x7D } else { 0x7C },
+            0,
+            0x0B,
+            0xFE,
+            8,
+            0,
+            0,
+            0xFF,
+            0,
+            0,
+        ];
+        let disc = [
+            tlv(0xC0, &c0),
+            tlv(0xC1, &[0x01, 0x08, 0x00, 0x00, 0x11, 0x00]),
+            tlv(0xC2, &[0x01, 0x08, 0x00, 0x00, 0x11, 0x00]),
+            tlv(0xC3, &[0x01, 0x08, 0x00, 0x00, 0x11, 0x00]),
+            tlv(0xC4, &[0x01, 0x7F, 0x7F, 0x7F, 0x03, 0x00, 0x03]),
+            tlv(0xC5, &[0u8; 60]),
+        ]
+        .concat();
+        let mut body = tlv(
+            0x4F,
+            &[0xD2, 0x76, 0, 1, 0x24, 1, 3, 4, 0, 6, 0, 0, 0, 1, 0, 0],
+        );
+        body.push(0x73);
+        body.push(0x81);
+        body.push(disc.len() as u8);
+        body.extend_from_slice(&disc);
+        (body, pgp::SW_OK)
+    }
+
+    /// The spec's example KDF-DO (three salts, SHA-256, count 100000).
+    fn spec_kdf() -> (Vec<u8>, u16) {
+        let v = [
+            tlv(0x81, &[0x03]),
+            tlv(0x82, &[0x08]),
+            tlv(0x83, &[0x00, 0x01, 0x86, 0xA0]),
+            tlv(0x84, b"01234567"),
+            tlv(0x85, &[0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]),
+            tlv(0x86, b"ABCDEFGH"),
+        ]
+        .concat();
+        (v, pgp::SW_OK)
+    }
+
+    fn ok() -> (Vec<u8>, u16) {
+        (vec![], pgp::SW_OK)
+    }
+
+    /// What the session methods do: the setting (once), then the command.
+    fn verify_on(card: &mut ScriptedCard, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
+        let mut tx = card.tx();
+        let kdf = cached_kdf(&mut None, &mut tx)?;
+        verify_with(&mut tx, &kdf, pw_ref, pin)
+    }
+
+    fn change_on(
+        card: &mut ScriptedCard,
+        pw_ref: u8,
+        old: &[u8],
+        new: &[u8],
+    ) -> Result<(), TransportError> {
+        let mut tx = card.tx();
+        let kdf = cached_kdf(&mut None, &mut tx)?;
+        change_with(&mut tx, &kdf, pw_ref, old, new)
+    }
+
+    fn unblock_on(card: &mut ScriptedCard, admin: &[u8], new: &[u8]) -> Result<(), TransportError> {
+        let mut tx = card.tx();
+        let kdf = cached_kdf(&mut None, &mut tx)?;
+        reset_retry_counter_with(&mut tx, &kdf, admin, new)
+    }
+
+    fn apdu(header: [u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut v = header.to_vec();
+        v.push(body.len() as u8);
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn kdf_off_cards_get_the_pin_as_typed() {
+        // No KDF bit: one 6E read, no F9 read, the PIN as typed.
+        let mut card = ScriptedCard::new(vec![ard(false), ok()]);
+        verify_on(&mut card, pgp::PW1_SIGN, b"123456").unwrap();
+        assert_eq!(card.sent.len(), 2);
+        assert_eq!(card.sent[1], apdu([0x00, 0x20, 0x00, 0x81], b"123456"));
+        // Announced, but set to none, or not stored (6A88): as typed too.
+        for f9 in [(vec![0x81, 0x01, 0x00], pgp::SW_OK), (vec![], 0x6A88)] {
+            let mut card = ScriptedCard::new(vec![ard(true), f9, ok()]);
+            verify_on(&mut card, pgp::PW3_ADMIN, b"12345678").unwrap();
+            assert_eq!(card.sent[1], pgp::get_kdf());
+            assert_eq!(card.sent[2], apdu([0x00, 0x20, 0x00, 0x83], b"12345678"));
+        }
+        // With the setting off, the card checks lengths, not keyroost.
+        let mut card = ScriptedCard::new(vec![ard(false), (vec![], 0x6700)]);
+        assert!(verify_on(&mut card, pgp::PW1_SIGN, b"12345").is_err());
+        assert_eq!(card.pin_commands().len(), 1);
+    }
+
+    #[test]
+    fn kdf_on_verify_sends_the_derived_pin() {
+        let mut card = ScriptedCard::new(vec![ard(true), spec_kdf(), ok()]);
+        verify_on(&mut card, pgp::PW3_ADMIN, b"12345678").unwrap();
+        assert_eq!(
+            card.sent[2],
+            apdu([0x00, 0x20, 0x00, 0x83], &hexbytes(SPEC_88))
+        );
+        // Both PW1 references take the user salt.
+        for pw_ref in [pgp::PW1_SIGN, pgp::PW1_OTHER] {
+            let mut card = ScriptedCard::new(vec![ard(true), spec_kdf(), ok()]);
+            verify_on(&mut card, pw_ref, b"123456").unwrap();
+            assert_eq!(
+                card.sent[2],
+                apdu([0x00, 0x20, 0x00, pw_ref], &hexbytes(SPEC_87))
+            );
+        }
+        // A wrong PIN still reports the tries left.
+        let mut card = ScriptedCard::new(vec![ard(true), spec_kdf(), (vec![], 0x63C2)]);
+        assert!(matches!(
+            verify_on(&mut card, pgp::PW3_ADMIN, b"87654321"),
+            Err(TransportError::OpenPgpPinRejected {
+                tries_remaining: Some(2)
+            })
+        ));
+    }
+
+    #[test]
+    fn change_hashes_both_pins() {
+        let kdf = pgp::parse_kdf(&spec_kdf().0).unwrap();
+        let mut card = ScriptedCard::new(vec![ard(true), spec_kdf(), ok()]);
+        change_on(&mut card, pgp::PW1_SIGN, b"123456", b"87654321").unwrap();
+        let body = [
+            hexbytes(SPEC_87),
+            kdf.derive(pgp::PinRole::User, b"87654321").to_vec(),
+        ]
+        .concat();
+        assert_eq!(body.len(), 64);
+        assert_eq!(card.sent[2], apdu([0x00, 0x24, 0x00, 0x81], &body));
+        // The admin PIN: both halves under the admin salt.
+        let mut card = ScriptedCard::new(vec![ard(true), spec_kdf(), ok()]);
+        change_on(&mut card, pgp::PW3_ADMIN, b"12345678", b"abcdefgh").unwrap();
+        let body = [
+            hexbytes(SPEC_88),
+            kdf.derive(pgp::PinRole::Admin, b"abcdefgh").to_vec(),
+        ]
+        .concat();
+        assert_eq!(card.sent[2], apdu([0x00, 0x24, 0x00, 0x83], &body));
+    }
+
+    #[test]
+    fn unblock_hashes_the_admin_pin_and_the_new_user_pin() {
+        let kdf = pgp::parse_kdf(&spec_kdf().0).unwrap();
+        let mut card = ScriptedCard::new(vec![ard(true), spec_kdf(), ok(), ok()]);
+        unblock_on(&mut card, b"12345678", b"87654321").unwrap();
+        assert_eq!(
+            card.sent[2],
+            apdu([0x00, 0x20, 0x00, 0x83], &hexbytes(SPEC_88))
+        );
+        assert_eq!(
+            card.sent[3],
+            apdu(
+                [0x00, 0x2C, 0x02, 0x81],
+                &kdf.derive(pgp::PinRole::User, b"87654321")
+            )
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_setting_sends_no_pin() {
+        let unknown = (
+            [tlv(0x81, &[0x03]), tlv(0x82, &[0x09]), tlv(0x84, b"salt")].concat(),
+            pgp::SW_OK,
+        );
+        let refused = |r: Result<(), TransportError>| {
+            matches!(
+                r,
+                Err(TransportError::OpenPgpKdfUnrecognized(
+                    pgp::KdfError::UnknownHash(0x09)
+                ))
+            )
+        };
+        let mut card = ScriptedCard::new(vec![ard(true), unknown.clone()]);
+        assert!(refused(verify_on(&mut card, pgp::PW3_ADMIN, b"12345678")));
+        assert_eq!(card.sent.len(), 2);
+        assert!(card.pin_commands().is_empty());
+        let mut card = ScriptedCard::new(vec![ard(true), unknown.clone()]);
+        assert!(refused(change_on(
+            &mut card,
+            pgp::PW1_SIGN,
+            b"123456",
+            b"654321"
+        )));
+        assert!(card.pin_commands().is_empty());
+        let mut card = ScriptedCard::new(vec![ard(true), unknown]);
+        assert!(refused(unblock_on(&mut card, b"12345678", b"654321")));
+        assert!(card.pin_commands().is_empty());
+        // A malformed object and a failed read refuse the same way.
+        let mut card = ScriptedCard::new(vec![ard(true), (vec![0x81, 0x05, 0x03], pgp::SW_OK)]);
+        assert!(matches!(
+            verify_on(&mut card, pgp::PW1_SIGN, b"123456"),
+            Err(TransportError::OpenPgpKdfUnrecognized(pgp::KdfError::Tlv(
+                _
+            )))
+        ));
+        assert!(card.pin_commands().is_empty());
+        let mut card = ScriptedCard::new(vec![ard(true), (vec![], 0x6F00)]);
+        assert!(matches!(
+            verify_on(&mut card, pgp::PW1_SIGN, b"123456"),
+            Err(TransportError::Apdu {
+                label: "openpgp get kdf setting",
+                ..
+            })
+        ));
+        assert!(card.pin_commands().is_empty());
+    }
+
+    #[test]
+    fn short_pins_are_refused_on_the_host_with_kdf_on() {
+        let too_short = |r: Result<(), TransportError>, pin: &str, min: usize| matches!(r, Err(TransportError::OpenPgpPinTooShort { pin: p, min: m }) if p == pin && m == min);
+        let mut card = ScriptedCard::new(vec![ard(true), spec_kdf()]);
+        assert!(too_short(
+            verify_on(&mut card, pgp::PW1_OTHER, b"12345"),
+            "user PIN",
+            6
+        ));
+        let mut card = ScriptedCard::new(vec![ard(true), spec_kdf()]);
+        assert!(too_short(
+            change_on(&mut card, pgp::PW3_ADMIN, b"12345678", b"1234567"),
+            "admin PIN",
+            8
+        ));
+        // Unblock checks the new user PIN before it verifies the admin PIN.
+        let mut card = ScriptedCard::new(vec![ard(true), spec_kdf()]);
+        assert!(too_short(
+            unblock_on(&mut card, b"12345678", b"12345"),
+            "user PIN",
+            6
+        ));
+        assert!(card.pin_commands().is_empty());
+        assert_eq!(
+            TransportError::OpenPgpPinTooShort {
+                pin: "admin PIN",
+                min: 8
+            }
+            .to_string(),
+            "OpenPGP admin PIN must be at least 8 characters"
+        );
+    }
+
+    #[test]
+    fn the_setting_is_read_once_per_session() {
+        let mut card = ScriptedCard::new(vec![ard(true), spec_kdf()]);
+        let mut cache = None;
+        {
+            let mut tx = card.tx();
+            let first = cached_kdf(&mut cache, &mut tx).unwrap();
+            let second = cached_kdf(&mut cache, &mut tx).unwrap();
+            assert_eq!(first, second);
+            assert!(first.is_on());
+        }
+        assert_eq!(card.sent.len(), 2);
+        // An unrecognized setting isn't kept: the next PIN command reads again.
+        let unknown = (vec![0x81, 0x01, 0x07], pgp::SW_OK);
+        let mut card = ScriptedCard::new(vec![ard(true), unknown.clone(), ard(true), unknown]);
+        let mut cache = None;
+        let mut tx = card.tx();
+        assert!(cached_kdf(&mut cache, &mut tx).is_err());
+        assert!(cached_kdf(&mut cache, &mut tx).is_err());
+        assert!(cache.is_none());
+    }
+
+    #[test]
+    fn pin_commands_hide_their_length_in_traces() {
+        use crate::CmdRedact::{Body, LengthAndBody, Nothing};
+        assert_eq!(
+            cmd_redact(&pgp::verify(pgp::PW1_SIGN, b"123456")),
+            LengthAndBody
+        );
+        assert_eq!(
+            cmd_redact(&pgp::change_reference_data(pgp::PW3_ADMIN, b"a", b"b")),
+            LengthAndBody
+        );
+        assert_eq!(
+            cmd_redact(&pgp::reset_retry_counter(b"123456")),
+            LengthAndBody
+        );
+        assert_eq!(
+            cmd_redact(&pgp::put_data(0x00D3, b"12345678")),
+            LengthAndBody
+        );
+        // Key import keeps its header; everything else is shown whole.
+        assert_eq!(
+            cmd_redact(&[0x00, 0xDB, 0x3F, 0xFF, 0x02, 0x4D, 0x00]),
+            Body
+        );
+        assert_eq!(cmd_redact(&pgp::put_url(b"https://example.org")), Nothing);
+        assert_eq!(cmd_redact(&pgp::get_kdf()), Nothing);
+        assert_eq!(cmd_redact(&pgp::select()), Nothing);
+        assert_eq!(cmd_redact(&[]), Nothing);
+    }
+
+    /// The VERIFY bodies a factory reset's blocking loop sends for PW1,
+    /// after reading the setting with `setting` (replies to 6E, F9).
+    fn reset_guesses(setting: Vec<(Vec<u8>, u16)>) -> Vec<Vec<u8>> {
+        let mut replies = setting;
+        replies.extend([(vec![], 0x63C2), (vec![], 0x63C1), (vec![], 0x6983)]);
+        let mut card = ScriptedCard::new(replies);
+        {
+            let mut tx = card.tx();
+            let len = reset_guess_len(&mut None, &mut tx);
+            block_pin(&mut tx, pgp::PW1_OTHER, 3, len).unwrap();
+        }
+        let verifies: Vec<Vec<u8>> = card
+            .pin_commands()
+            .into_iter()
+            .map(|a| {
+                assert_eq!(&a[..4], &[0x00, 0x20, 0x00, 0x82]);
+                assert_eq!(usize::from(a[4]), a.len() - 5);
+                a[5..].to_vec()
+            })
+            .collect();
+        assert_eq!(verifies.len(), 3);
+        verifies
+    }
+
+    #[test]
+    fn factory_reset_guesses_fit_the_kdf_setting() {
+        // On: the hash's length (SHA-256 32, SHA-512 64), random bytes.
+        for g in reset_guesses(vec![ard(true), spec_kdf()]) {
+            assert_eq!(g.len(), 32);
+        }
+        let sha512 = (
+            [
+                tlv(0x81, &[0x03]),
+                tlv(0x82, &[0x0A]),
+                tlv(0x83, &[0x00, 0x01, 0x86, 0xA0]),
+                tlv(0x84, b"01234567"),
+            ]
+            .concat(),
+            pgp::SW_OK,
+        );
+        for g in reset_guesses(vec![ard(true), sha512]) {
+            assert_eq!(g.len(), 64);
+        }
+        // Unrecognized or unreadable: 32 bytes, as GnuPG's reset sends; the
+        // reset still goes ahead.
+        for g in reset_guesses(vec![ard(true), (vec![0x81, 0x01, 0x07], pgp::SW_OK)]) {
+            assert_eq!(g.len(), 32);
+        }
+        for g in reset_guesses(vec![ard(true), (vec![], 0x6F00)]) {
+            assert_eq!(g.len(), 32);
+        }
+        for g in reset_guesses(vec![(vec![], 0x6F00)]) {
+            assert_eq!(g.len(), 32);
+        }
+        // Off or not announced: the 8 random digits as before.
+        for setting in [
+            vec![ard(false)],
+            vec![ard(true), (vec![0x81, 0x01, 0x00], pgp::SW_OK)],
+        ] {
+            let guesses = reset_guesses(setting);
+            for g in &guesses {
+                assert_eq!(g.len(), 8);
+                assert!(g.iter().all(u8::is_ascii_digit));
+            }
+        }
+    }
+
+    #[test]
+    fn the_kdf_decision_needs_only_c0() {
+        // A 6E with an AID and C0 but none of C1-C5 (which `status` needs).
+        let bare_ard = |kdf: bool| {
+            let c0 = [
+                if kdf { 0x7D } else { 0x7C },
+                0,
+                0x0B,
+                0xFE,
+                8,
+                0,
+                0,
+                0xFF,
+                0,
+                0,
+            ];
+            let mut body = tlv(
+                0x4F,
+                &[0xD2, 0x76, 0, 1, 0x24, 1, 3, 4, 0, 6, 0, 0, 0, 1, 0, 0],
+            );
+            body.extend(tlv(0x73, &tlv(0xC0, &c0)));
+            (body, pgp::SW_OK)
+        };
+        let mut card = ScriptedCard::new(vec![bare_ard(true), spec_kdf(), ok()]);
+        verify_on(&mut card, pgp::PW3_ADMIN, b"12345678").unwrap();
+        assert_eq!(card.sent[1], pgp::get_kdf());
+        assert_eq!(
+            card.sent[2],
+            apdu([0x00, 0x20, 0x00, 0x83], &hexbytes(SPEC_88))
+        );
+        let mut card = ScriptedCard::new(vec![bare_ard(false), ok()]);
+        verify_on(&mut card, pgp::PW3_ADMIN, b"12345678").unwrap();
+        assert_eq!(card.sent[1], apdu([0x00, 0x20, 0x00, 0x83], b"12345678"));
+    }
+
+    #[test]
+    fn kdf_state_words_for_json() {
+        assert_eq!(OpenPgpKdf::On(pgp::KdfHash::Sha256).state_word(), "on");
+        assert_eq!(OpenPgpKdf::Off.state_word(), "off");
+        assert_eq!(OpenPgpKdf::NotSupported.state_word(), "not-supported");
+        assert_eq!(
+            OpenPgpKdf::Unrecognized(pgp::KdfError::UnknownHash(9)).state_word(),
+            "unrecognized"
+        );
+    }
+
+    #[test]
+    fn kdf_labels_for_info() {
+        assert_eq!(OpenPgpKdf::NotSupported.label(), "not supported");
+        assert_eq!(OpenPgpKdf::Off.label(), "off");
+        assert_eq!(OpenPgpKdf::On(pgp::KdfHash::Sha256).label(), "on (SHA-256)");
+        assert_eq!(
+            OpenPgpKdf::Unrecognized(pgp::KdfError::UnknownAlgorithm(5)).label(),
+            "unrecognized setting (algorithm 0x05)"
+        );
+        assert_eq!(
+            OpenPgpKdf::from_read(pgp::parse_kdf(&spec_kdf().0)),
+            OpenPgpKdf::On(pgp::KdfHash::Sha256)
+        );
+        assert_eq!(OpenPgpKdf::from_read(Ok(pgp::Kdf::Off)), OpenPgpKdf::Off);
+        assert_eq!(
+            TransportError::OpenPgpKdfUnrecognized(pgp::KdfError::UnknownHash(9)).to_string(),
+            "this card's OpenPGP KDF setting is one keyroost doesn't recognize (hash 0x09); \
+             no PIN was sent to it"
+        );
     }
 }

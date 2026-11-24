@@ -41,8 +41,125 @@ pub(crate) fn establish_context() -> Result<Context, PcscError> {
     Context::establish(Scope::User)
 }
 
+/// Connect to `reader`, shared, on any protocol: what every session and
+/// probe here does first.
+///
+/// On Windows the card of a Feitian ePass FIDO NFC Plus (USB `096E:0853`,
+/// reader "FS CCID 0") can stay unresponsive after plug-in: the reader's cold
+/// reset fails, and `SCardConnect` answers `SCARD_W_UNRESPONSIVE_CARD`, or
+/// `SCARD_E_PROTO_MISMATCH` some ten seconds after an earlier warm reset.
+/// Nothing on the key is reachable then: OpenPGP, PIV and Feitian OTP all go
+/// undetected. A warm reset on a direct connection brings the card up. So
+/// on Windows, for a Feitian reader, either of those two errors gets one
+/// warm reset and one more try; every other reader, error and outcome is
+/// returned as it came.
+///
+/// Measured on one PC (Windows 11, the inbox CCID driver), where the same
+/// key went from no applet detected to all three with this retry; reported
+/// on other PCs. A Feitian BioPass FIDO Pro (USB `096E:086A`) connected
+/// without it there. Why the cold reset fails is not established.
+///
+/// The reset changes the card's state, so it is traced: a `connect` line
+/// when it is tried and one with its outcome, under `--debug` /
+/// `KEYROOST_PROBE_DEBUG` and in the app's activity log.
+pub(crate) fn connect_shared(
+    context: &Context,
+    reader: &std::ffi::CStr,
+) -> Result<Card, PcscError> {
+    let connect = || context.connect(reader, ShareMode::Shared, Protocols::ANY);
+    #[cfg(windows)]
+    {
+        retry_after_warm_reset(
+            &reader.to_string_lossy(),
+            connect(),
+            || warm_reset(context, reader),
+            connect,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        connect()
+    }
+}
+
+/// [`connect_shared`]'s retry, apart from PC/SC so it is tested on every
+/// system: `first` is the connect's outcome, `reset` warm-resets the card
+/// (`false` when it couldn't), and `again` connects once more. Only a
+/// Feitian reader's `UnresponsiveCard` or `ProtoMismatch` gets the reset;
+/// everything else is returned as it came, untraced. When the reset can't
+/// be done, the first error stands.
+#[cfg(any(windows, test))]
+fn retry_after_warm_reset<T>(
+    reader: &str,
+    first: Result<T, PcscError>,
+    reset: impl FnOnce() -> bool,
+    again: impl FnOnce() -> Result<T, PcscError>,
+) -> Result<T, PcscError> {
+    let error = match first {
+        Err(e @ (PcscError::UnresponsiveCard | PcscError::ProtoMismatch))
+            if is_feitian_reader(reader) =>
+        {
+            e
+        }
+        other => return other,
+    };
+    let shown = keyroost_proto::trace::reader_name(reader);
+    connect_note(&format!(
+        "{shown}: {error:?}; warm reset of the card, then connect again"
+    ));
+    if !reset() {
+        connect_note(&format!("{shown}: warm reset not done; {error:?} stands"));
+        return Err(error);
+    }
+    let result = again();
+    match &result {
+        Ok(_) => connect_note(&format!("{shown}: connected after the warm reset")),
+        Err(e) => connect_note(&format!("{shown}: {e:?} after the warm reset")),
+    }
+    result
+}
+
+/// One connect trace line in the shared grammar: on stderr under `--debug`
+/// or `KEYROOST_PROBE_DEBUG` (the probe trace switch, which `--debug` turns
+/// on), and into the activity log's capture when one is open.
+#[cfg(any(windows, test))]
+fn connect_note(body: &str) {
+    keyroost_proto::trace::emit(probe_trace_on(), || format_line(Dir::Note, "connect", body));
+}
+
+/// The reader of the key the warm reset was measured on: Windows names it
+/// "FS CCID 0". The other Feitian reader name seen ("FT CCID 0", a BioPass
+/// FIDO Pro) connects normally and never needed the reset, so it isn't
+/// matched.
+#[cfg(any(windows, test))]
+fn is_feitian_reader(name: &str) -> bool {
+    name.starts_with("FS CCID")
+}
+
+/// Warm-reset the card in `reader` over a direct connection, which needs no
+/// card protocol, and release it without a further reset. `false` when the
+/// reader can't be opened that way or refuses the reset.
+#[cfg(windows)]
+fn warm_reset(context: &Context, reader: &std::ffi::CStr) -> bool {
+    let Ok(card) = context.connect(reader, ShareMode::Direct, Protocols::UNDEFINED) else {
+        return false;
+    };
+    // IOCTL_SMARTCARD_POWER is control function 1; its argument 2 is
+    // SCARD_WARM_RESET.
+    let mut answer = [0u8; 64];
+    let ok = card
+        .control(pcsc::ctl_code(1), &2u32.to_le_bytes(), &mut answer)
+        .is_ok();
+    // pcsc's `Drop` would reset the card again.
+    let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+    ok
+}
+
 mod oath;
 pub use oath::OathSession;
+
+mod feitianotp;
+pub use feitianotp::{FeitianOtpListing, FeitianOtpSession};
 
 mod ctap_pcsc;
 pub use ctap_pcsc::{CtapPcscDevice, WINDOWS_NEEDS_ADMIN};
@@ -51,7 +168,7 @@ mod token2prog;
 pub use token2prog::Token2ProgSession;
 
 mod openpgp;
-pub use openpgp::{ImportKey, KeyImport, OpenPgpSession, OpenPgpStatus};
+pub use openpgp::{ImportKey, KeyImport, OpenPgpKdf, OpenPgpSession, OpenPgpStatus};
 
 mod gzip;
 
@@ -160,6 +277,13 @@ pub enum TransportError {
     /// *accepted*: it happened to be the card's live PW1/PW3. The counter never
     /// decrements for a correct PIN, so that password can't be blocked this way.
     OpenPgpPinGuessAccepted,
+    /// The card's KDF setting (`F9`) is one keyroost doesn't recognize, so
+    /// it can't tell how the card wants PINs hashed. No PIN was sent.
+    OpenPgpKdfUnrecognized(keyroost_openpgp::KdfError),
+    /// With the card's KDF setting on, a PIN shorter than the spec allows
+    /// (the card can't check a hashed one). `pin` is "user PIN", "admin
+    /// PIN" or "reset code". Nothing was sent.
+    OpenPgpPinTooShort { pin: &'static str, min: usize },
     /// A PIV applet response could not be parsed.
     PivParse(keyroost_piv::ParseError),
     /// No PIV applet is present on the selected card (`SW 6A82` on SELECT).
@@ -182,6 +306,10 @@ pub enum TransportError {
     /// `PivSession::fingerprint` already says so should never actually see
     /// this.
     PivManagementKeyDeleteUnsupported,
+    /// [`PivSession::set_management_key`] was asked for a key that needs a
+    /// touch on a card whose own management-key command has no such form (a
+    /// Feitian card). Nothing was sent.
+    PivManagementKeyTouchUnsupported,
     /// A PIV PIN/PUK verification failed; `tries_remaining` is the count the
     /// card reported (`63 Cx`), or `None` when blocked / unknown.
     PivPinRejected { tries_remaining: Option<u8> },
@@ -318,6 +446,37 @@ pub enum TransportError {
     /// or delete a touch-required account, and answers `6982` when none comes
     /// in time. `action` is what was asked ("save the account", ...).
     OathNoTouch { action: &'static str },
+    /// A Feitian OTP applet response could not be parsed.
+    FeitianOtpParse(keyroost_feitianotp::ParseError),
+    /// A Feitian OTP command could not be built: the name or secret does not
+    /// fit, or the applet does not take the digits or period asked for.
+    FeitianOtpBuild(keyroost_feitianotp::BuildError),
+    /// A Feitian OTP CALCULATE, PUT or DELETE answered `6984` on every try:
+    /// the key acts once it is touched and gives up after a few seconds
+    /// without one. `action` is what was asked ("save the account", ...).
+    FeitianOtpNoTouch { action: &'static str },
+    /// A Feitian OTP command answered `6982` for `slot`. Feitian's software
+    /// uses that answer for a slot that has an access code; keyroost has no
+    /// way to enter one.
+    FeitianOtpAccessCode { slot: &'static str },
+    /// A Feitian OTP TOTP code came back for a time window that had ended
+    /// while the key waited for its touch. The code was wiped, not returned.
+    FeitianOtpWindowEnded,
+    /// A Feitian OTP RESET was accepted, but listing the slots afterwards
+    /// did not show all three empty. `left` says, per slot, how many
+    /// entries it still holds or why it couldn't be checked.
+    FeitianOtpResetUnconfirmed { left: Vec<String> },
+    /// The key's FIDO HID interface, which can carry the Feitian OTP
+    /// applet's commands in place of a smart-card reader, could not be
+    /// opened or did not complete an exchange.
+    FeitianOtpHid(String),
+    /// A key with both interfaces: its reader could not be opened for the
+    /// Feitian OTP applet (`reader`), and its FIDO HID interface, tried
+    /// next, failed too (`hid`).
+    FeitianOtpBothFailed {
+        reader: Box<TransportError>,
+        hid: Box<TransportError>,
+    },
     /// The RSA key's public exponent is wider than the OpenPGP card's declared
     /// exponent field (`e_bits`). Caught before building the import (the pure
     /// builder would otherwise panic); guards against a malformed card
@@ -465,6 +624,14 @@ impl fmt::Display for TransportError {
                  password cannot be blocked this way. Change the card's PW1/PW3 \
                  and run the factory reset again."
             ),
+            TransportError::OpenPgpKdfUnrecognized(e) => write!(
+                f,
+                "this card's OpenPGP KDF setting is one keyroost doesn't recognize ({e}); \
+                 no PIN was sent to it"
+            ),
+            TransportError::OpenPgpPinTooShort { pin, min } => {
+                write!(f, "OpenPGP {pin} must be at least {min} characters")
+            }
             TransportError::PivParse(e) => write!(f, "PIV response parse error: {}", e),
             TransportError::NoPivApplet => write!(f, "no PIV applet on this card"),
             TransportError::PivManagementAuthFailed => {
@@ -479,6 +646,10 @@ impl fmt::Display for TransportError {
                 f,
                 "deleting the management key outright is only supported on HID Crescendo \
                  devices without a standard PIV management key"
+            ),
+            TransportError::PivManagementKeyTouchUnsupported => write!(
+                f,
+                "this key's management key cannot be set to need a touch; nothing was changed"
             ),
             TransportError::PivPinRejected {
                 tries_remaining: Some(n),
@@ -664,6 +835,38 @@ impl fmt::Display for TransportError {
                 "the key would not {action} (SW=6982); it may want a touch: \
                  try again and touch the key when it blinks"
             ),
+            TransportError::FeitianOtpParse(e) => {
+                write!(f, "Feitian OTP response parse error: {}", e)
+            }
+            TransportError::FeitianOtpBuild(e) => write!(f, "{}", e),
+            TransportError::FeitianOtpNoTouch { action } => write!(
+                f,
+                "the key did not {action} (SW=6984): it waits for a touch and none \
+                 came. Try again and touch the key when it blinks"
+            ),
+            TransportError::FeitianOtpAccessCode { slot } => write!(
+                f,
+                "the key refused (SW=6982) for slot {slot}. Feitian's software answers \
+                 this way for a slot protected by an access code, which keyroost \
+                 cannot enter"
+            ),
+            TransportError::FeitianOtpWindowEnded => write!(
+                f,
+                "that code's time window ended while the key waited for the touch; \
+                 read it again"
+            ),
+            TransportError::FeitianOtpResetUnconfirmed { left } => write!(
+                f,
+                "the key accepted the Feitian OTP reset, but not every slot reads empty: {}",
+                left.join("; ")
+            ),
+            TransportError::FeitianOtpHid(e) => {
+                write!(f, "Feitian OTP over the key's FIDO HID interface: {e}")
+            }
+            TransportError::FeitianOtpBothFailed { reader, hid } => write!(
+                f,
+                "{reader}; the key's FIDO HID interface also failed ({hid})"
+            ),
             TransportError::OpenPgpExponentTooWide => write!(
                 f,
                 "the key's RSA public exponent is wider than this OpenPGP card's \
@@ -752,6 +955,7 @@ impl std::error::Error for TransportError {
             TransportError::OathParse(e) => Some(e),
             TransportError::OpenPgpParse(e) => Some(e),
             TransportError::OpenPgpSlotMismatch(e) => Some(e),
+            TransportError::OpenPgpKdfUnrecognized(e) => Some(e),
             TransportError::OpenPgpKeySetPartial { cause, .. } => Some(cause.as_ref()),
             TransportError::PivParse(e) => Some(e),
             TransportError::PivResetUnverifiedFailed(e)
@@ -826,7 +1030,7 @@ impl Session {
         let name = readers
             .find(|r| keyroost_proto::is_molto2_reader(&r.to_string_lossy()))
             .ok_or(TransportError::NoMolto2Reader)?;
-        let card = ctx.connect(name, ShareMode::Shared, Protocols::ANY)?;
+        let card = crate::connect_shared(&ctx, name)?;
         Ok(Self {
             card,
             sm4_key: None,
@@ -840,7 +1044,7 @@ impl Session {
         let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let cstring = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let card = ctx.connect(&cstring, ShareMode::Shared, Protocols::ANY)?;
+        let card = crate::connect_shared(&ctx, &cstring)?;
         Ok(Self {
             card,
             sm4_key: None,
@@ -1114,7 +1318,7 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
     for (name, (tree_key, _)) in names.into_iter().zip(tree) {
         let reader_name = name.to_string_lossy().into_owned();
         let (mut usb_device, mut serial) = (tree_key, None);
-        if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+        if let Ok(card) = crate::connect_shared(&ctx, name.as_c_str()) {
             // Windows reports no bus/address here; its evidence is the device
             // tree read above, without a connection.
             if !cfg!(windows) {
@@ -1161,9 +1365,7 @@ pub fn reader_usb_devices() -> Result<Vec<Option<UsbDeviceKey>>, TransportError>
             if cfg!(windows) || keyroost_proto::is_molto2_reader(&name.to_string_lossy()) {
                 return tree_key;
             }
-            let card = ctx
-                .connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY)
-                .ok()?;
+            let card = crate::connect_shared(&ctx, name.as_c_str()).ok()?;
             let key = read_channel_id(&card);
             // Release without resetting (pcsc's `Drop` would reset the card).
             let _ = card.disconnect(pcsc::Disposition::LeaveCard);
@@ -1213,6 +1415,9 @@ pub struct ReaderProbe {
     /// than guessing from the reader name, so the OTP tab is offered only for
     /// keys that really have it.
     pub has_otp: bool,
+    /// True when the card answers a SELECT of the Feitian OTP applet
+    /// (`D15600013283260101`), detected the same way.
+    pub has_feitian_otp: bool,
     /// True when the card answers the single-profile programmable token's
     /// `get_info` with a serial whose prefix matches a known model. Set during
     /// the same probe connection. The matched serial is carried in
@@ -1542,7 +1747,7 @@ fn read_molto2_serial(
     ctx: &pcsc::Context,
     name: &std::ffi::CStr,
 ) -> Result<String, TransportError> {
-    let card = ctx.connect(name, ShareMode::Shared, Protocols::ANY)?;
+    let card = crate::connect_shared(ctx, name)?;
     let answer = transmit_apdu(&card, &commands::get_info().apdu);
     let _ = card.disconnect(pcsc::Disposition::LeaveCard);
     let (data, sw1, sw2) = answer?;
@@ -1644,6 +1849,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                 has_fido: false,
                 fido_ctap2_confirmed: false,
                 has_otp: false,
+                has_feitian_otp: false,
                 is_prog: false,
                 prog_serial: None,
                 yubikey_serial: None,
@@ -1665,6 +1871,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
             has_fido: false,
             fido_ctap2_confirmed: false,
             has_otp: false,
+            has_feitian_otp: false,
             is_prog: false,
             prog_serial: None,
             yubikey_serial: None,
@@ -1678,7 +1885,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                 keyroost_proto::trace::reader_name(&probe.reader_name)
             ));
         }
-        if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+        if let Ok(card) = crate::connect_shared(&ctx, name.as_c_str()) {
             // Windows reports no bus/address here; its evidence is the device
             // tree read above, without a connection.
             if !cfg!(windows) {
@@ -1735,10 +1942,14 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                 "otp",
                 keyroost_token2otp::build_select(&keyroost_token2otp::OTP_APPLET_AID),
             );
+            // Feitian OTP applet: selected by its own AID, like the others.
+            // A Feitian key answers the Yubico OATH AID above with 6700 or
+            // 6D00, so `has_oath` is already false for it.
+            probe.has_feitian_otp = answers("feitian", keyroost_feitianotp::select());
             // Single-profile programmable token: it has no distinctive reader
             // name and no applet to SELECT, so identify it by its info response.
             // Only flag it when the returned serial matches a known model prefix
-            // — a generic NFC card that happens to answer won't be mislabelled.
+            // — a generic NFC card that happens to answer won't be mislabeled.
             // Skip if an applet already matched (a FIDO/OATH key isn't a prog
             // token), keeping the get_info off cards that clearly aren't one.
             if !probe.has_fido && !probe.has_oath && !probe.has_piv && !probe.has_openpgp {
@@ -1844,6 +2055,37 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                     } else {
                         format!("token2 otp serial -> {shown:?}, not an R3.4 prefix: not used")
                     });
+                }
+            }
+            // A Feitian key's own serial, read with the command Feitian's
+            // client reads the serial it shows with; the key answers it
+            // whichever application is selected. Without it such a key is
+            // known by the serial field of its OpenPGP AID below, which is
+            // `00000001` on both keys measured and part of the AID Feitian's
+            // client selects that application by, so it does not tell one
+            // key from another; and a Feitian key with no OpenPGP
+            // application has no serial at all. Names saved under that AID
+            // serial are not carried over (`former_serial` stays unset): it
+            // would hand one key's name to the next.
+            if probe.has_feitian_otp && probe.serial.is_none() {
+                if let Ok((data, s1, s2)) =
+                    transmit_apdu(&card, &keyroost_feitianotp::device_serial())
+                {
+                    let serial = if sw_ok(s1, s2) {
+                        keyroost_feitianotp::parse_device_serial(&data)
+                    } else {
+                        None
+                    };
+                    if trace {
+                        probe_note(&match &serial {
+                            Some(sn) => format!("feitian serial -> {:?}", abbreviate(sn)),
+                            None => format!(
+                                "feitian serial -> {s1:02X}{s2:02X}, {} byte(s): not used",
+                                data.len()
+                            ),
+                        });
+                    }
+                    probe.serial = serial;
                 }
             }
             // OpenPGP present: read the AID once. Capture the manufacturer ID
@@ -2230,14 +2472,48 @@ pub(crate) fn hex_dump(bytes: &[u8]) -> String {
 /// does not. Debug traces are exactly what users paste into bug reports —
 /// they must never carry PINs or key material.
 pub(crate) fn dump_cmd(apdu: &[u8], sensitive: bool) -> String {
-    if !sensitive || apdu.len() <= 5 {
+    dump_cmd_redacted(apdu, sensitive.into())
+}
+
+/// How much of a command APDU a `--debug` trace hides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmdRedact {
+    /// Nothing: the whole APDU in hex.
+    Nothing,
+    /// The data field; the 5-byte header (with Lc) stays.
+    Body,
+    /// The data field and its length byte: for PIN commands, where Lc is
+    /// the PIN's length (old + new for a change). Only CLA INS P1 P2 stay.
+    LengthAndBody,
+}
+
+impl From<bool> for CmdRedact {
+    fn from(sensitive: bool) -> Self {
+        if sensitive {
+            CmdRedact::Body
+        } else {
+            CmdRedact::Nothing
+        }
+    }
+}
+
+/// [`dump_cmd`] with the redaction spelled out. An APDU without a data
+/// field (5 bytes or fewer) always dumps in full.
+pub(crate) fn dump_cmd_redacted(apdu: &[u8], redact: CmdRedact) -> String {
+    if apdu.len() <= 5 {
         return hex_dump(apdu);
     }
-    format!(
-        "{} [{} data bytes redacted]",
-        hex_dump(&apdu[..5]),
-        apdu.len() - 5
-    )
+    match redact {
+        CmdRedact::Nothing => hex_dump(apdu),
+        CmdRedact::Body => format!(
+            "{} [{} data bytes redacted]",
+            hex_dump(&apdu[..5]),
+            apdu.len() - 5
+        ),
+        CmdRedact::LengthAndBody => {
+            format!("{} [length and data redacted]", hex_dump(&apdu[..4]))
+        }
+    }
 }
 
 /// Caps on `61xx` / GET RESPONSE reassembly across the CCID sessions. A
@@ -2440,7 +2716,8 @@ pub(crate) fn advance_exchange(
 
 /// One applet APDU exchange with `61xx`-continuation reassembly, shared by the
 /// OATH, OpenPGP, and PIV sessions (each computes its own sensitivity
-/// predicates). `cmd_sensitive` redacts command bodies from `--debug` traces;
+/// predicates). `cmd_redact` says how much of each command a `--debug` trace
+/// hides;
 /// `resp_sensitive` redacts every response chunk of the reassembly loop
 /// (sticky, so GET RESPONSE chunks of a secret payload stay hidden). The
 /// transmitted copy is zeroized so PIN/key bodies don't linger on the heap.
@@ -2449,7 +2726,7 @@ pub(crate) fn transmit_applet(
     debug: bool,
     io: &AppletIo,
     apdu: &[u8],
-    cmd_sensitive: bool,
+    cmd_redact: CmdRedact,
     resp_sensitive: bool,
 ) -> Result<(Vec<u8>, u16), TransportError> {
     let mut acc = Vec::new();
@@ -2466,7 +2743,11 @@ pub(crate) fn transmit_applet(
             });
         }
         trace::line(debug, || {
-            format_line(Dir::Sent, io.label, &dump_cmd(&to_send, cmd_sensitive))
+            format_line(
+                Dir::Sent,
+                io.label,
+                &dump_cmd_redacted(&to_send, cmd_redact),
+            )
         });
         let mut buf = [0u8; 4096];
         let resp = card
@@ -2568,6 +2849,91 @@ mod reader_poll_tests {
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    /// The warm reset is traced when it is tried and with its outcome; any
+    /// other reader or error is returned untouched, with no reset and no
+    /// line.
+    #[test]
+    fn the_warm_reset_retry_is_traced() {
+        let run = |reader: &str,
+                   first: Result<u8, PcscError>,
+                   reset_ok: bool,
+                   again: Result<u8, PcscError>| {
+            let mut reset_called = false;
+            keyroost_proto::trace::begin();
+            let out = retry_after_warm_reset(
+                reader,
+                first,
+                || {
+                    reset_called = true;
+                    reset_ok
+                },
+                || again,
+            );
+            let lines = keyroost_proto::trace::take().unwrap_or_default();
+            (out, reset_called, lines)
+        };
+
+        let (out, reset, lines) = run("FS CCID 0", Err(PcscError::UnresponsiveCard), true, Ok(7));
+        assert_eq!((out, reset), (Ok(7), true));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("! connect"), "{lines:?}");
+        assert!(
+            lines[0].ends_with(
+                "FS CCID 0: UnresponsiveCard; warm reset of the card, then connect again"
+            ),
+            "{lines:?}"
+        );
+        assert!(lines[1].ends_with("FS CCID 0: connected after the warm reset"));
+
+        // The reset can't be done: the first error stands, and says so.
+        let (out, _, lines) = run("FS CCID 1", Err(PcscError::ProtoMismatch), false, Ok(7));
+        assert_eq!(out, Err(PcscError::ProtoMismatch));
+        assert!(lines[1].ends_with("FS CCID 1: warm reset not done; ProtoMismatch stands"));
+
+        // The second connect fails too: its error is returned and traced.
+        let (out, _, lines) = run(
+            "FS CCID 0",
+            Err(PcscError::UnresponsiveCard),
+            true,
+            Err(PcscError::RemovedCard),
+        );
+        assert_eq!(out, Err(PcscError::RemovedCard));
+        assert!(lines[1].ends_with("FS CCID 0: RemovedCard after the warm reset"));
+
+        // Another reader, or another error: nothing reset, nothing traced.
+        for (reader, first) in [
+            (
+                "Yubico YubiKey OTP+FIDO+CCID 0",
+                Err(PcscError::UnresponsiveCard),
+            ),
+            ("FS CCID 0", Err(PcscError::NoSmartcard)),
+            ("FS CCID 0", Ok(1)),
+        ] {
+            let (out, reset, lines) = run(reader, first, true, Ok(9));
+            assert_eq!(out, first, "{reader}");
+            assert!(!reset, "{reader}");
+            assert!(lines.is_empty(), "{reader}: {lines:?}");
+        }
+    }
+
+    /// The warm-reset retry is for a Feitian key's own reader only: no
+    /// other reader is reset because a connect failed.
+    #[test]
+    fn only_feitian_readers_get_the_warm_reset_retry() {
+        assert!(is_feitian_reader("FS CCID 0"));
+        assert!(is_feitian_reader("FS CCID 1"));
+        for other in [
+            "FT CCID 0",
+            "Yubico YubiKey OTP+FIDO+CCID 0",
+            "TOKEN2 Molto2 0",
+            "FSCCID 0",
+            "Generic FS CCID 0",
+            "",
+        ] {
+            assert!(!is_feitian_reader(other), "{other}");
+        }
+    }
 
     #[test]
     fn fido_select_names_ctap2_by_prefix() {
@@ -2844,6 +3210,35 @@ mod redaction_tests {
         assert_eq!(dump_cmd(&apdu, false), hex_dump(&apdu));
         let get_response = [0x00, 0xC0, 0x00, 0x00, 0x00];
         assert_eq!(dump_cmd(&get_response, true), hex_dump(&get_response));
+    }
+
+    #[test]
+    fn pin_commands_hide_the_length_byte_too() {
+        // The same VERIFY: with the length hidden, nothing tells a 6-digit
+        // PIN from an 8-digit one.
+        let six = [
+            0x00, 0x20, 0x00, 0x81, 0x06, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+        ];
+        let mut eight = six.to_vec();
+        eight[4] = 0x08;
+        eight.extend_from_slice(b"78");
+        for apdu in [&six[..], &eight] {
+            assert_eq!(
+                dump_cmd_redacted(apdu, CmdRedact::LengthAndBody),
+                "00 20 00 81 [length and data redacted]"
+            );
+        }
+        // A bodiless APDU (GET RESPONSE) still dumps whole.
+        let get_response = [0x00, 0xC0, 0x00, 0x00, 0x00];
+        assert_eq!(
+            dump_cmd_redacted(&get_response, CmdRedact::LengthAndBody),
+            hex_dump(&get_response)
+        );
+        assert_eq!(dump_cmd_redacted(&six, CmdRedact::Nothing), hex_dump(&six));
+        assert_eq!(
+            dump_cmd_redacted(&six, CmdRedact::Body),
+            dump_cmd(&six, true)
+        );
     }
 
     #[test]

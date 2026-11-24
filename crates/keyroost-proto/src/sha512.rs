@@ -6,6 +6,10 @@
 //! mirrors [`crate::sha256::Sha256`] with 64-bit words, a 128-byte block, and
 //! a 128-bit length field; SHA-384 is SHA-512 with a different IV and the
 //! output truncated to 48 bytes.
+//!
+//! Like [`crate::sha256`], it wipes its block buffer, chaining state and
+//! each block's message schedule once they are done with (OpenPGP card PIN
+//! derivation hashes PINs with it).
 
 const BLOCK_SIZE: usize = 128;
 
@@ -147,15 +151,14 @@ impl Core {
             self.buf_len += take;
             data = &data[take..];
             if self.buf_len == BLOCK_SIZE {
-                let block = self.buf;
-                self.process_block(&block);
+                compress(&mut self.h, &self.buf);
                 self.buf_len = 0;
             }
         }
 
         while data.len() >= BLOCK_SIZE {
             let (block, rest) = data.split_at(BLOCK_SIZE);
-            self.process_block(block.try_into().unwrap());
+            compress(&mut self.h, block.try_into().unwrap());
             data = rest;
         }
 
@@ -174,16 +177,14 @@ impl Core {
             for i in self.buf_len..BLOCK_SIZE {
                 self.buf[i] = 0;
             }
-            let block = self.buf;
-            self.process_block(&block);
+            compress(&mut self.h, &self.buf);
             self.buf_len = 0;
         }
         for i in self.buf_len..BLOCK_SIZE - 16 {
             self.buf[i] = 0;
         }
         self.buf[BLOCK_SIZE - 16..].copy_from_slice(&bit_len.to_be_bytes());
-        let block = self.buf;
-        self.process_block(&block);
+        compress(&mut self.h, &self.buf);
 
         let mut out = [0u8; 64];
         for (i, word) in self.h.iter().enumerate() {
@@ -191,57 +192,69 @@ impl Core {
         }
         out
     }
+}
 
-    #[allow(clippy::needless_range_loop)] // FIPS-180-4 style is clearer than enumerate() here
-    fn process_block(&mut self, block: &[u8; BLOCK_SIZE]) {
-        let mut w = [0u64; 80];
-        for i in 0..16 {
-            w[i] = u64::from_be_bytes(block[i * 8..i * 8 + 8].try_into().unwrap());
-        }
-        for i in 16..80 {
-            let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
-            let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (
-            self.h[0], self.h[1], self.h[2], self.h[3], self.h[4], self.h[5], self.h[6], self.h[7],
-        );
-
-        for i in 0..80 {
-            let big_s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = h
-                .wrapping_add(big_s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let big_s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = big_s0.wrapping_add(maj);
-
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-
-        self.h[0] = self.h[0].wrapping_add(a);
-        self.h[1] = self.h[1].wrapping_add(b);
-        self.h[2] = self.h[2].wrapping_add(c);
-        self.h[3] = self.h[3].wrapping_add(d);
-        self.h[4] = self.h[4].wrapping_add(e);
-        self.h[5] = self.h[5].wrapping_add(f);
-        self.h[6] = self.h[6].wrapping_add(g);
-        self.h[7] = self.h[7].wrapping_add(h);
+impl Drop for Core {
+    fn drop(&mut self) {
+        crate::wipe(&mut self.buf);
+        crate::wipe(&mut self.h);
+        self.buf_len = 0;
+        self.total_bits = 0;
     }
+}
+
+/// One SHA-512 compression of `block` into the chaining state `state`. The
+/// message schedule holds the block's words, so it is wiped before returning.
+#[allow(clippy::needless_range_loop)] // FIPS-180-4 style is clearer than enumerate() here
+fn compress(state: &mut [u64; 8], block: &[u8; BLOCK_SIZE]) {
+    let mut w = [0u64; 80];
+    for i in 0..16 {
+        w[i] = u64::from_be_bytes(block[i * 8..i * 8 + 8].try_into().unwrap());
+    }
+    for i in 16..80 {
+        let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
+        let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+
+    let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (
+        state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7],
+    );
+
+    for i in 0..80 {
+        let big_s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+        let ch = (e & f) ^ ((!e) & g);
+        let t1 = h
+            .wrapping_add(big_s1)
+            .wrapping_add(ch)
+            .wrapping_add(K[i])
+            .wrapping_add(w[i]);
+        let big_s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = big_s0.wrapping_add(maj);
+
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+    state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g);
+    state[7] = state[7].wrapping_add(h);
+    crate::wipe(&mut w);
 }
 
 /// Incremental SHA-384.

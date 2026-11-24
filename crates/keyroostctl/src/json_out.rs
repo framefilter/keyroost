@@ -374,6 +374,18 @@ pub(crate) struct OpenpgpStatusJson {
     pub cardholder_name: Option<String>,
     /// Public-key URL (`5F50`); `null` when unreadable, `""` when unset.
     pub url: Option<String>,
+    /// The KDF setting (whether PINs reach the card hashed): `"on"`,
+    /// `"off"`, `"not-supported"` or `"unrecognized"`; `null` when it
+    /// couldn't be read. See [`kdf_json`].
+    pub kdf: Option<&'static str>,
+}
+
+/// JSON word for [`OpenpgpStatusJson::kdf`]: the text `KDF:` line's state
+/// without its detail (the hash, or what wasn't recognized). The words come
+/// from `OpenPgpKdf::state_word`, an exhaustive match in its own crate, so
+/// a new state can't turn into `null` unnoticed.
+pub(crate) fn kdf_json(kdf: Option<&keyroost_transport::OpenPgpKdf>) -> Option<&'static str> {
+    kdf.map(keyroost_transport::OpenPgpKdf::state_word)
 }
 
 /// JSON form of a tri-state public text field (`cardholder_name`, `url`):
@@ -433,6 +445,48 @@ pub(crate) struct OathCredentialJson {
 pub(crate) struct OathCodeJson {
     pub name: String,
     pub code: String,
+}
+
+/// `keyroostctl feitian --json list` — one account of the Feitian OTP applet.
+/// Mirrors the human line `<app:account>  [<type>/<algorithm>]  <period>s`,
+/// with `  (slot N)` after it for an account in a keyboard slot.
+#[derive(Serialize)]
+pub(crate) struct FtotpAccountJson {
+    /// The name as stored on the key, period prefix included.
+    pub name: String,
+    /// "default", "1" or "2".
+    pub slot: &'static str,
+    /// The app part of the stored name (empty when it has none): what
+    /// `feitian code --app` and `feitian delete --app` take, as `otp list`'s
+    /// `app` is.
+    pub app: String,
+    /// The account part of the stored name: what `--account` takes.
+    pub account: String,
+    /// "TOTP" or "HOTP".
+    #[serde(rename = "type")]
+    pub oath_type: &'static str,
+    /// "sha1" / "sha256" (lowercase, like `oath list`).
+    pub algorithm: &'static str,
+    /// The TOTP period in seconds, from the stored name's prefix (30 when it
+    /// has none); `null` for HOTP.
+    pub period: Option<u32>,
+}
+
+/// `keyroostctl feitian --json info` — what the applet says when selected.
+#[derive(Serialize)]
+pub(crate) struct FtotpInfoJson {
+    /// The applet version, e.g. "1.0.2"; `null` when the key didn't say.
+    pub version: Option<String>,
+    pub slots: Vec<FtotpSlotJson>,
+}
+
+/// One slot in `feitian --json info`.
+#[derive(Serialize)]
+pub(crate) struct FtotpSlotJson {
+    /// "default", "1" or "2".
+    pub slot: &'static str,
+    /// Whether the slot has an access code; `null` when the key didn't say.
+    pub access_code_set: Option<bool>,
 }
 
 /// `keyroostctl otp --json list` — one Token2 OTP entry. Mirrors the human
@@ -1130,6 +1184,7 @@ mod tests {
             ("signature_count", "number|null"),
             ("cardholder_name", "string|null"),
             ("url", "string|null"),
+            ("kdf", "string|null"),
         ];
         let status = |serial: Option<u32>, fpr: Option<String>| OpenpgpStatusJson {
             aid: "D276".into(),
@@ -1149,6 +1204,7 @@ mod tests {
             signature_count: fpr.as_ref().map(|_| 9),
             cardholder_name: None,
             url: None,
+            kdf: Some("on"),
         };
         let v = to_v(&status(Some(0x0000_0001), Some("AB".into())));
         assert_shape(&v, &shape);
@@ -1159,6 +1215,23 @@ mod tests {
         let v = to_v(&status(None, None));
         assert_shape(&v, &shape);
         assert!(v["serial"].is_null());
+    }
+
+    #[test]
+    fn kdf_json_words() {
+        use keyroost_openpgp::{KdfError, KdfHash};
+        use keyroost_transport::OpenPgpKdf;
+        assert_eq!(kdf_json(Some(&OpenPgpKdf::On(KdfHash::Sha512))), Some("on"));
+        assert_eq!(kdf_json(Some(&OpenPgpKdf::Off)), Some("off"));
+        assert_eq!(
+            kdf_json(Some(&OpenPgpKdf::NotSupported)),
+            Some("not-supported")
+        );
+        assert_eq!(
+            kdf_json(Some(&OpenPgpKdf::Unrecognized(KdfError::UnknownHash(9)))),
+            Some("unrecognized")
+        );
+        assert_eq!(kdf_json(None), None);
     }
 
     #[test]
