@@ -157,7 +157,7 @@ plan's two-key manual steps were never executed):
   `exists` or `skip` with its reason, and explore letting the user pick, in
   the terminal, which rows to bring in or overwrite. Not decided whether it
   gets built, since vaults may grow large; the goal is a smoother CLI path
-  than `--entry`. Vault CLI PR: #NNN (fill in when the PR is opened).
+  than `--entry`. Vault CLI PR: [#285](https://github.com/framefilter/keyroost/pull/285).
 
 - **Keep copied codes out of clipboard history on native Wayland** (waits for
   GNOME). Copies are marked `x-kde-passwordManagerHint=secret` on X11 and
