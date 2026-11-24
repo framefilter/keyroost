@@ -59,6 +59,7 @@ mod overview;
 mod prompt;
 mod secrets;
 mod target;
+mod vault_cmd;
 
 use crate::output::{emit_json, json_output};
 use crate::secrets::{SecretSource, Secrets, Source, Spec};
@@ -2950,6 +2951,16 @@ enum FidoCmd {
     Ssh {
         #[command(subcommand)]
         cmd: SshCertCmd,
+    },
+    /// Keep passwords in vaults on the key, in FidoParole's vault format.
+    ///
+    /// Each vault is a FIDO2 credential on the key; its entries are sealed
+    /// with a secret only the key gives out (after the PIN and a touch) and
+    /// stored in the key's large-blob store. If the key is lost or reset,
+    /// its vaults go with it: keep a backup.
+    Vault {
+        #[command(subcommand)]
+        cmd: vault_cmd::FidoVaultCmd,
     },
 }
 
@@ -14582,11 +14593,23 @@ fn fido_pin(
     flag: Option<&SecretSource>,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
     let mut sec = Secrets::real();
-    let src = Source::from_flag(flag);
-    sec.check(&FIDO_PIN, src)?;
+    sec.check(&FIDO_PIN, Source::from_flag(flag))?;
     let dev = crate::target::select_fido(path)?;
-    let pin = sec.read(&FIDO_PIN, src)?;
-    fido_reverify_if_prompted(&sec, &dev)?;
+    fido_pin_with(&mut sec, &dev, flag)
+}
+
+/// The PIN for a FIDO command that reads other secrets first, from the
+/// command's one `Secrets` (so a PIN on stdin takes the line after them):
+/// read last, then `dev` (the key selected before any secret was read) is
+/// re-found if a secret was typed at the hidden prompt. The caller has
+/// already checked every source, the PIN's included.
+fn fido_pin_with<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    dev: &keyroost_resolve::Device,
+    flag: Option<&SecretSource>,
+) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
+    let pin = sec.read(&FIDO_PIN, Source::from_flag(flag))?;
+    fido_reverify_if_prompted(sec, dev)?;
     Ok(pin)
 }
 
@@ -14672,6 +14695,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
         FidoCmd::Config { cmd } => run_fido_config(cmd),
         FidoCmd::Blob { cmd } => run_fido_large_blob(cmd),
         FidoCmd::Ssh { cmd } => run_fido_ssh_cert(cmd),
+        FidoCmd::Vault { cmd } => vault_cmd::run_fido_vault(cmd),
     }
 }
 
@@ -20344,6 +20368,19 @@ mod cli_tests {
             naming: Default::default(),
             smart_card_unlisted: false,
         }
+    }
+
+    #[test]
+    fn fido_pin_with_reads_after_content_secrets() {
+        // One `Secrets` per command: the content secret takes stdin line 1,
+        // the PIN line 2.
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
+        let mut sec = Secrets::new(FakeIo::piped(&["pass\n", "1234\n"]));
+        let pass = sec.read(&PGP_PASSPHRASE, Source::new(None, true)).unwrap();
+        let pin = fido_pin_with(&mut sec, &test_fido_row(), Some(&SecretSource::Stdin)).unwrap();
+        assert_eq!((pass.as_str(), pin.as_str()), ("pass", "1234"));
+        assert_eq!(sec.io.lines_read, 2);
     }
 
     #[test]

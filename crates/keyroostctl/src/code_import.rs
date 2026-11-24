@@ -698,7 +698,7 @@ fn shown_name(row: &keyroost_import::plan::PlanRow) -> String {
 }
 
 /// "1 entry" / "3 entries".
-fn entries(n: usize) -> String {
+pub(crate) fn entries(n: usize) -> String {
     if n == 1 {
         "1 entry".to_owned()
     } else {

@@ -2335,6 +2335,7 @@ dependencies = [
  "keyroost-token2otp",
  "keyroost-token2prog",
  "keyroost-transport",
+ "keyroost-vault",
  "keyroost-winwebauthn",
  "proptest",
  "rpassword",

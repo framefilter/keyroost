@@ -579,6 +579,29 @@ pub(crate) struct FidoSshCredentialJson {
     pub cert_present: bool,
 }
 
+/// `keyroostctl fido vault --json list` — one entry per vault on the key,
+/// and how full the large-blob store that holds them is.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultListJson {
+    pub vaults: Vec<FidoVaultJson>,
+    pub capacity: FidoLargeBlobCapacityJson,
+}
+
+/// One vault in the `fido vault list` output.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultJson {
+    /// The vault's name; `null` when the credential carries none.
+    pub name: Option<String>,
+    /// Full hex credentialId, as `fido ssh list` gives it.
+    pub credential_id: String,
+    /// `ok`, `no-data` (opens empty: nothing stored yet) or `unavailable`.
+    pub state: &'static str,
+    /// How many entries it holds; `null` when it is `unavailable`.
+    pub entry_count: Option<usize>,
+    /// Why an `unavailable` vault does not open; `null` otherwise.
+    pub detail: Option<String>,
+}
+
 /// `keyroostctl fido blob --json list` — one entry per stored blob.
 #[derive(Serialize)]
 pub(crate) struct FidoLargeBlobListJson {
