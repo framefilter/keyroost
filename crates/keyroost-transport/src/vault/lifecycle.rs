@@ -22,7 +22,7 @@
 use keyroost_ctap::client_pin::permissions::{
     CREDENTIAL_MANAGEMENT, GET_ASSERTION, LARGE_BLOB_WRITE, MAKE_CREDENTIAL,
 };
-use keyroost_ctap::large_blobs::{CredentialData, LargeBlobArray};
+use keyroost_ctap::large_blobs::{BlobCapacity, CredentialData, LargeBlobArray};
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
 use keyroost_vault::{seal, unnamed_user_handle, user_handle, Vault};
 use zeroize::Zeroizing;
@@ -72,7 +72,16 @@ pub fn list_credentials(
     credentials_and_array(key, auth).map(|(creds, _)| creds)
 }
 
-/// Create a vault named `name` holding `initial`, and return it open.
+/// A vault [`create`] or [`rotate`] made, open, and how full the
+/// largeBlob store is after their writes.
+#[derive(Debug)]
+pub struct Created {
+    pub open: OpenVault,
+    pub capacity: BlobCapacity,
+}
+
+/// Create a vault named `name` holding `initial`, and return it open with
+/// how full the largeBlob store is now.
 ///
 /// Refused before anything is sent: a name that is empty or longer than
 /// [`keyroost_vault::MAX_NAME_BYTES`]. Refused before any touch: a name a
@@ -89,7 +98,7 @@ pub fn create(
     name: &str,
     initial: &Vault,
     on_step: &mut dyn FnMut(VaultStep),
-) -> Result<OpenVault, VaultKeyError> {
+) -> Result<Created, VaultKeyError> {
     user_handle(name)?;
     let (existing, array) = credentials_and_array(key, auth)?;
     if existing
@@ -125,7 +134,7 @@ pub(crate) fn create_unchecked(
     name: Option<&str>,
     initial: &Vault,
     on_step: &mut dyn FnMut(VaultStep),
-) -> Result<OpenVault, VaultKeyError> {
+) -> Result<Created, VaultKeyError> {
     let user_id = match name {
         Some(name) => user_handle(name)?,
         None => unnamed_user_handle()?,
@@ -147,26 +156,30 @@ pub(crate) fn create_unchecked(
         Ok(sealed) => sealed,
         Err(cause) => return Err(undo(key, auth, &id, None, cause)),
     };
-    if let Err(cause) = write_array(
+    let written = match write_array(
         key,
         auth,
         &mut |array| Ok(Some(array.with_credential_blob(&lbk, &blob)?)),
         on_step,
     ) {
+        Ok(array) => array,
         // The write may have landed even though it failed (a lost reply),
         // so the data is looked for too.
-        return Err(undo(key, auth, &id, Some(&lbk), cause));
-    }
-    Ok(OpenVault::new(
-        VaultRef {
-            credential_id: id,
-            name: name.map(str::to_owned),
-        },
-        initial.clone(),
-        true,
-        hmac,
-        lbk,
-    ))
+        Err(cause) => return Err(undo(key, auth, &id, Some(&lbk), cause)),
+    };
+    Ok(Created {
+        open: OpenVault::new(
+            VaultRef {
+                credential_id: id,
+                name: name.map(str::to_owned),
+            },
+            initial.clone(),
+            true,
+            hmac,
+            lbk,
+        ),
+        capacity: written.capacity(key.info()),
+    })
 }
 
 /// Unlock the new credential `id` and check it is the one just made (its
@@ -322,7 +335,8 @@ pub(crate) fn delete_known(
 /// Give the vault `old` a new key: make a new vault of the same name,
 /// copy into it what `old` holds on the key now, read both back, and only
 /// then delete `old`. Returns the new vault, open, under the old one's name
-/// (an unnamed vault stays unnamed).
+/// (an unnamed vault stays unnamed), with how full the largeBlob store is
+/// once the old vault's data is gone.
 ///
 /// What is copied is read from the key first, so an entry another writer
 /// saved since unlock comes along. Refused before any touch: data that no
@@ -349,7 +363,7 @@ pub fn rotate(
     auth: &mut VaultAuth,
     old: &OpenVault,
     on_step: &mut dyn FnMut(VaultStep),
-) -> Result<OpenVault, VaultKeyError> {
+) -> Result<Created, VaultKeyError> {
     let (old_hmac, old_lbk) = old.secrets();
     let array = key.read_blobs()?;
     let (now, stored) =
@@ -363,7 +377,8 @@ pub fn rotate(
 
     // The new vault takes the old one's name; one with no name stays
     // unnamed rather than get a made-up one.
-    let new = create_unchecked(key, auth, old.vault_ref.name.as_deref(), &now, on_step)?;
+    let Created { open: new, .. } =
+        create_unchecked(key, auth, old.vault_ref.name.as_deref(), &now, on_step)?;
     let new_id = &new.vault_ref.credential_id[..];
     let (new_hmac, new_lbk) = new.secrets();
 
@@ -397,8 +412,8 @@ pub fn rotate(
         cause: Box::new(cause),
         old,
     };
-    match removed {
-        Ok(_) => {}
+    let after = match removed {
+        Ok(array) => array,
         Err(cause) if !checked || is_rotate_check(&cause) => {
             return Err(undo(key, auth, new_id, Some(new_lbk), cause));
         }
@@ -413,7 +428,7 @@ pub fn rotate(
             };
             return Err(not_deleted(cause, left));
         }
-    }
+    };
     if let Err(cause) = delete_credential(key, auth, &old.vault_ref.credential_id) {
         // With no data to remove, both are the same empty vault.
         let left = if stored {
@@ -423,7 +438,10 @@ pub fn rotate(
         };
         return Err(not_deleted(cause, left));
     }
-    Ok(new)
+    Ok(Created {
+        capacity: after.capacity(key.info()),
+        open: new,
+    })
 }
 
 /// Whether `e` is one of rotate's own checks failing.
@@ -479,7 +497,7 @@ mod tests {
         auth: &mut VaultAuth,
         name: &str,
         initial: &Vault,
-    ) -> (Result<OpenVault, VaultKeyError>, Vec<VaultStep>) {
+    ) -> (Result<Created, VaultKeyError>, Vec<VaultStep>) {
         let mut steps = Vec::new();
         let r = create(key, auth, name, initial, &mut |s| steps.push(s));
         (r, steps)
@@ -507,7 +525,7 @@ mod tests {
     }
 
     /// The cause and `left_over` of a `CreateUndone`.
-    fn undone(r: Result<OpenVault, VaultKeyError>) -> (VaultKeyError, LeftOver) {
+    fn undone(r: Result<Created, VaultKeyError>) -> (VaultKeyError, LeftOver) {
         match r {
             Err(VaultKeyError::CreateUndone { cause, left_over }) => (*cause, left_over),
             other => panic!("expected CreateUndone, got {other:?}"),
@@ -537,7 +555,11 @@ mod tests {
         };
         let mut auth = pin();
         let (r, steps) = run_create(&mut key, &mut auth, "Personal", &initial);
-        let open = r.unwrap_or_else(|e| panic!("{e}"));
+        let made = r.unwrap_or_else(|e| panic!("{e}"));
+        // How full the store is after the write, as the key now holds it.
+        assert_eq!(made.capacity, key.array().capacity(&key.info));
+        assert_eq!(made.capacity.entry_count, 4, "three foreign, the vault");
+        let open = made.open;
         assert_eq!(
             steps,
             vec![
@@ -591,7 +613,7 @@ mod tests {
     fn an_empty_vault_is_stored_too() {
         let mut key = FakeKey::new();
         let (r, _) = run_create(&mut key, &mut pin(), "Work", &Vault::default());
-        let open = r.unwrap_or_else(|e| panic!("{e}"));
+        let open = r.unwrap_or_else(|e| panic!("{e}")).open;
         assert!(open.stored);
         assert_eq!(
             key.vault_on_key(&open.vault_ref.credential_id),
@@ -1090,7 +1112,7 @@ mod tests {
         key: &mut FakeKey,
         auth: &mut VaultAuth,
         old: &OpenVault,
-    ) -> (Result<OpenVault, VaultKeyError>, Vec<VaultStep>) {
+    ) -> (Result<Created, VaultKeyError>, Vec<VaultStep>) {
         let mut steps = Vec::new();
         let r = rotate(key, auth, old, &mut |s| steps.push(s));
         (r, steps)
@@ -1172,7 +1194,7 @@ mod tests {
         assert_eq!(old.vault_ref.name, None);
 
         let (r, _) = run_rotate(&mut key, &mut auth, &old);
-        let new = r.unwrap_or_else(|e| panic!("{e}"));
+        let new = r.unwrap_or_else(|e| panic!("{e}")).open;
         // No name made up for it: it stays unnamed, open and as listed.
         assert_eq!(new.vault_ref.name, None);
         assert_eq!(new.contents, contents);
@@ -1196,7 +1218,11 @@ mod tests {
         let work_before = key.vault_on_key(&work);
 
         let (r, steps) = run_rotate(&mut key, &mut auth, &old);
-        let new = r.unwrap_or_else(|e| panic!("{e}"));
+        let made = r.unwrap_or_else(|e| panic!("{e}"));
+        // How full the store is once the old vault's data is gone.
+        assert_eq!(made.capacity, key.array().capacity(&key.info));
+        assert_eq!(made.capacity.entry_count, 5);
+        let new = made.open;
         assert_eq!(
             steps,
             vec![
@@ -1266,7 +1292,7 @@ mod tests {
         key.put_vault(&old_id, &now);
 
         let (r, _) = run_rotate(&mut key, &mut auth, &old);
-        let new = r.unwrap_or_else(|e| panic!("{e}"));
+        let new = r.unwrap_or_else(|e| panic!("{e}")).open;
         assert_eq!(new.contents, now);
         assert_eq!(key.vault_on_key(&new.vault_ref.credential_id), Some(now));
         assert_eq!(ids_named(&key, "Personal").len(), 1);
@@ -1281,7 +1307,7 @@ mod tests {
         assert!(!old.stored);
         key.log.clear();
         let (r, _) = run_rotate(&mut key, &mut auth, &old);
-        let new = r.unwrap_or_else(|e| panic!("{e}"));
+        let new = r.unwrap_or_else(|e| panic!("{e}")).open;
         assert_eq!(new.contents, Vault::default());
         assert_eq!(
             key.vault_on_key(&new.vault_ref.credential_id),
@@ -1411,9 +1437,7 @@ mod tests {
     }
 
     /// The `OldNotDeleted` parts of `r`.
-    fn not_deleted(
-        r: Result<OpenVault, VaultKeyError>,
-    ) -> (Option<String>, VaultKeyError, OldVault) {
+    fn not_deleted(r: Result<Created, VaultKeyError>) -> (Option<String>, VaultKeyError, OldVault) {
         match r {
             Err(VaultKeyError::OldNotDeleted { name, cause, old }) => (name, *cause, old),
             other => panic!("expected OldNotDeleted, got {other:?}"),

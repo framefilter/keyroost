@@ -27,7 +27,7 @@ mod ops;
 pub use ops::{matching, save, unlock, Change, OpenVault, Saved, Unlocked, VaultOnKey, VaultPick};
 
 mod lifecycle;
-pub use lifecycle::{create, delete, list_credentials, rotate};
+pub use lifecycle::{create, delete, list_credentials, rotate, Created};
 
 #[cfg(test)]
 mod fake;
