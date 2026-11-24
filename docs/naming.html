@@ -219,10 +219,11 @@ keyroostctl name clear signing-yubikey              # remove it, wherever it is 
       <li><strong>Erasing the key's storage:</strong> <code>fido blob clear</code> and a FIDO
         reset erase a name on the key with everything else. <code>fido blob clear
         --keep-name</code> keeps it.</li>
-      <li><strong>Other software:</strong> the FIDO2 standard lets a browser or system tool
-        remove large-blob entries that no passkey uses, which would include the name. We
-        haven't seen it happen. A name lives in one place, so if it disappears from the key,
-        the key shows as unnamed until the name is written back:
+      <li><strong>Other software:</strong> the name is kept in the key's shared large-blob
+        store without belonging to a passkey, so a browser may clear it when the store is
+        full and a website needs room; setting the name again restores it. A name lives in
+        one place, so if it disappears from the key, the key shows as unnamed until the name
+        is written back:
         <code>keyroostctl name list</code> prints the one command that restores it, and the
         app offers <strong>Write it back</strong>.</li>
     </ul>
