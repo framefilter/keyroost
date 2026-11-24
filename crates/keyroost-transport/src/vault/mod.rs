@@ -17,7 +17,7 @@ use keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE;
 use keyroost_ctap::client_pin::PinUvAuthToken;
 use keyroost_ctap::get_assertion::vault_name_from_user_id;
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
-use keyroost_vault::VaultError;
+use keyroost_vault::{VaultError, RP_ID};
 use zeroize::Zeroizing;
 
 mod key;
@@ -25,6 +25,9 @@ pub use key::{CtapVaultKey, VaultKey};
 
 mod ops;
 pub use ops::{matching, save, unlock, Change, OpenVault, Saved, Unlocked, VaultOnKey, VaultPick};
+
+mod lifecycle;
+pub use lifecycle::{create, delete, list_credentials};
 
 #[cfg(test)]
 mod fake;
@@ -302,13 +305,37 @@ impl VaultAuth {
         }
     }
 
+    /// Run one call that waits for a touch (makeCredential or getAssertion):
+    /// a fresh token with `permissions`, bound to the vault RP, then `step`
+    /// reported, then `call`, then the token cut as the key cuts it
+    /// ([`after_presence`](Self::after_presence)), whatever `call` returned.
+    /// Every touch in the vault flows goes through here, so no flow can
+    /// forget the cut. A refused PIN reports no step and makes no call.
+    pub(crate) fn with_touch<K: VaultKey, T>(
+        &mut self,
+        key: &mut K,
+        permissions: u32,
+        step: VaultStep,
+        on_step: &mut dyn FnMut(VaultStep),
+        call: impl FnOnce(&mut K, &PinUvAuthToken) -> Result<T, CtapError>,
+    ) -> Result<T, VaultKeyError> {
+        let result = {
+            let token = self.fresh_token(key, permissions, Some(RP_ID))?;
+            on_step(step);
+            call(key, token)
+        };
+        self.after_presence();
+        Ok(result?)
+    }
+
     /// Mirror the key after a makeCredential or getAssertion was sent with
     /// the current token: a CTAP 2.1 key then keeps only the token's
     /// largeBlobWrite permission (`clearPinUvAuthTokenPermissionsExceptLbw`),
     /// so [`current_for`](Self::current_for) must not offer it for anything
     /// else. Called whatever the call returned: an error does not say
     /// whether the key got that far, and a fresh token is the safe side.
-    pub(crate) fn after_presence(&mut self) {
+    /// Only [`with_touch`](Self::with_touch) calls it.
+    fn after_presence(&mut self) {
         if let Some((_, held, _)) = &mut self.token {
             *held &= LARGE_BLOB_WRITE;
         }
@@ -381,6 +408,7 @@ mod tests {
     use super::*;
     use keyroost_ctap::client_pin::permissions::{
         CREDENTIAL_MANAGEMENT as CM, GET_ASSERTION as GA, LARGE_BLOB_WRITE as LBW,
+        MAKE_CREDENTIAL as MC,
     };
     use keyroost_ctap::client_pin::PinUvAuthToken;
     use keyroost_ctap::get_assertion::Assertion;
@@ -494,6 +522,66 @@ mod tests {
         assert!(auth.current_for(CM | LBW).is_some());
         assert!(auth.current_for(GA).is_none());
         assert!(auth.current_for(GA | LBW).is_none());
+    }
+
+    #[test]
+    fn a_touch_cuts_the_token_on_success_and_on_failure() {
+        for fail in [false, true] {
+            let mut key = FakeKey::new();
+            key.add_vault("Personal", &Vault::default());
+            let mut auth = pin();
+            let mut steps = Vec::new();
+            let r = auth.with_touch(
+                &mut key,
+                GA | LBW,
+                VaultStep::UnlockTouch,
+                &mut |s| steps.push(s),
+                |k, t| {
+                    if fail {
+                        Err(CtapError::StatusCode(0x2F))
+                    } else {
+                        k.assertions(t, None).map(|a| a.len())
+                    }
+                },
+            );
+            assert_eq!(r.ok(), (!fail).then_some(1), "fail = {fail}");
+            assert_eq!(steps, vec![VaultStep::UnlockTouch]);
+            assert_eq!(
+                key.log[0],
+                Call::Token {
+                    perms: GA | LBW,
+                    rp: Some(RP_ID.into())
+                }
+            );
+            // Only the write permission is offered afterwards, whatever the
+            // call returned.
+            assert!(auth.current_for(GA).is_none(), "fail = {fail}");
+            assert!(auth.current_for(LBW).is_some(), "fail = {fail}");
+        }
+    }
+
+    #[test]
+    fn a_touch_is_not_asked_for_when_the_pin_fails() {
+        let mut key = FakeKey::new();
+        let mut auth = VaultAuth::pin(Zeroizing::new("wrong-pin".into()));
+        let mut steps = Vec::new();
+        let mut called = false;
+        let r = auth.with_touch(
+            &mut key,
+            MC,
+            VaultStep::CreateTouch,
+            &mut |s| steps.push(s),
+            |_, _| {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            r,
+            Err(VaultKeyError::Ctap(CtapError::StatusCode(0x31)))
+        ));
+        assert!(steps.is_empty());
+        assert!(!called);
     }
 
     #[test]

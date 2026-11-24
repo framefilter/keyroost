@@ -73,6 +73,9 @@ pub(crate) struct FakeKey {
     /// Status codes the next writes answer, one per write, before anything
     /// else is checked (the store is left as it was).
     pub write_refusals: VecDeque<u8>,
+    /// Status codes the next credential deletes answer, one per delete,
+    /// before anything else is checked (the credential stays).
+    pub delete_refusals: VecDeque<u8>,
     /// The permissions of the token every write was sent with (0 for a
     /// token this key never issued).
     pub write_perms: Vec<u32>,
@@ -127,6 +130,7 @@ impl FakeKey {
             creds: Vec::new(),
             log: Vec::new(),
             write_refusals: VecDeque::new(),
+            delete_refusals: VecDeque::new(),
             write_perms: Vec::new(),
             hook: None,
             mc_without_lbk: false,
@@ -372,6 +376,9 @@ impl VaultKey for FakeKey {
         credential_id: &[u8],
     ) -> Result<(), CtapError> {
         self.log.push(Call::Delete(credential_id.to_vec()));
+        if let Some(code) = self.delete_refusals.pop_front() {
+            return Err(CtapError::StatusCode(code));
+        }
         self.check(token, CREDENTIAL_MANAGEMENT)?;
         if self.delete_fails {
             return Err(CtapError::StatusCode(NOT_ALLOWED));

@@ -16,8 +16,8 @@ use std::fmt;
 
 use keyroost_ctap::client_pin::permissions::{GET_ASSERTION, LARGE_BLOB_WRITE};
 use keyroost_ctap::large_blobs::{BlobCapacity, CredentialData, LargeBlobArray};
-use keyroost_ctap::CtapError;
-use keyroost_vault::{apply_import, canon_id, open, seal, Entry, Vault, VaultError, RP_ID};
+use keyroost_ctap::{AuthenticatorInfo, CtapError};
+use keyroost_vault::{apply_import, canon_id, open, seal, Entry, Vault, VaultError};
 use zeroize::Zeroizing;
 
 use super::{
@@ -150,13 +150,13 @@ pub fn unlock(
     on_step: &mut dyn FnMut(VaultStep),
 ) -> Result<Unlocked, VaultKeyError> {
     check_support(key.info())?;
-    let asserted = {
-        let token = auth.fresh_token(key, GET_ASSERTION | LARGE_BLOB_WRITE, Some(RP_ID))?;
-        on_step(VaultStep::UnlockTouch);
-        key.assertions(token, None)
-    };
-    auth.after_presence();
-    let asserted = asserted?;
+    let asserted = auth.with_touch(
+        key,
+        GET_ASSERTION | LARGE_BLOB_WRITE,
+        VaultStep::UnlockTouch,
+        on_step,
+        |k, token| k.assertions(token, None),
+    )?;
     let array = key.read_blobs()?;
     let capacity = array.capacity(key.info());
 
@@ -315,8 +315,34 @@ const PIN_AUTH_INVALID: u8 = 0x33;
 /// `CTAP2_ERR_PIN_TOKEN_EXPIRED`.
 const PIN_TOKEN_EXPIRED: u8 = 0x38;
 
+/// Whether the key refused a call because it dropped the token or let it
+/// expire: worth one fresh token and one more try, nothing else is.
+pub(super) fn stale_token(e: &CtapError) -> bool {
+    matches!(
+        e,
+        CtapError::StatusCode(PIN_AUTH_INVALID | PIN_TOKEN_EXPIRED)
+    )
+}
+
+/// [`VaultKeyError::Full`] when `array` would not fit the key's store.
+pub(super) fn check_fits(
+    array: &LargeBlobArray,
+    info: &AuthenticatorInfo,
+) -> Result<(), VaultKeyError> {
+    let capacity = array.capacity(info);
+    if capacity.used_bytes > capacity.max_bytes {
+        return Err(VaultKeyError::Full {
+            needed: capacity.used_bytes,
+            max: capacity.max_bytes,
+        });
+    }
+    Ok(())
+}
+
 /// Write the largeBlob array that `build` makes from the array as the key
-/// holds it right now, and return what was written.
+/// holds it right now, and return what was written. `build` returns `None`
+/// when the array needs no change: then nothing is written (no
+/// [`VaultStep::Write`]) and the array as read is returned.
 ///
 /// The token is the current one when it carries largeBlobWrite, else a
 /// fresh largeBlobWrite token. Then the array is read, `build` runs on it,
@@ -332,7 +358,7 @@ const PIN_TOKEN_EXPIRED: u8 = 0x38;
 pub(crate) fn write_array(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
-    build: &mut dyn FnMut(&LargeBlobArray) -> Result<LargeBlobArray, VaultKeyError>,
+    build: &mut dyn FnMut(&LargeBlobArray) -> Result<Option<LargeBlobArray>, VaultKeyError>,
     on_step: &mut dyn FnMut(VaultStep),
 ) -> Result<LargeBlobArray, VaultKeyError> {
     let mut token = match auth.current_for(LARGE_BLOB_WRITE) {
@@ -342,19 +368,15 @@ pub(crate) fn write_array(
     let mut retried = false;
     loop {
         let array = key.read_blobs()?;
-        let next = build(&array)?;
-        let capacity = next.capacity(key.info());
-        if capacity.used_bytes > capacity.max_bytes {
-            return Err(VaultKeyError::Full {
-                needed: capacity.used_bytes,
-                max: capacity.max_bytes,
-            });
-        }
+        let Some(next) = build(&array)? else {
+            return Ok(array);
+        };
+        check_fits(&next, key.info())?;
         let bytes = next.serialize_with_checksum()?;
         on_step(VaultStep::Write);
         match key.write_blobs(&token, &bytes) {
             Ok(()) => return Ok(next),
-            Err(CtapError::StatusCode(PIN_AUTH_INVALID | PIN_TOKEN_EXPIRED)) if !retried => {
+            Err(e) if stale_token(&e) && !retried => {
                 retried = true;
                 token = auth.fresh_token(key, LARGE_BLOB_WRITE, None)?.clone();
             }
@@ -408,7 +430,7 @@ pub fn save(
                         let blob = seal(&next, hmac)?;
                         let array = array.with_credential_blob(lbk, &blob)?;
                         applied = Some((next, added, replaced, removed));
-                        Ok(array)
+                        Ok(Some(array))
                     }
                     Err(e) => {
                         on_key = Some((current, stored));
