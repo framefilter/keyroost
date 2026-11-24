@@ -21,7 +21,7 @@ use keyroost_transport::vault::{
     VaultCredential, VaultKeyError, VaultPick, VaultProblem, VaultRef, VaultStep,
 };
 use keyroost_vault::{Entry, Vault};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::code_import::entries;
 use crate::json_out;
@@ -2057,6 +2057,13 @@ fn moved_text(mut s: Zeroizing<String>) -> String {
     std::mem::take(&mut *s)
 }
 
+/// Set an entry's text field to `value`, wiping what it held first (a
+/// plain assignment or `clone_from` can free the old bytes unwiped).
+fn replace_text(field: &mut String, value: &str) {
+    field.zeroize();
+    field.push_str(value);
+}
+
 fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
     match cmd {
         FidoVaultEntryCmd::List { vault, pin, path } => {
@@ -2197,23 +2204,28 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             let n = pick_entry(&open.contents, title, None, false)?;
             let before = open.contents.entries[n].clone();
             let mut after = before.clone();
+            // The old values are entry data too: wiped as they are replaced.
             if let Some(t) = new_title {
-                after.title.clone_from(t);
+                replace_text(&mut after.title, t);
             }
             if let Some(u) = username {
-                after.username.clone_from(u);
+                replace_text(&mut after.username, u);
             }
             if let Some(u) = url {
-                after.url.clone_from(u);
+                replace_text(&mut after.url, u);
             }
             if let Some(n) = new_notes {
+                after.notes.zeroize();
                 after.notes = n;
             }
             if let Some(p) = new_password {
                 after.password = p;
             }
             after.modified_minutes = vault::now_minutes();
-            let (now_title, now_username) = (after.title.clone(), after.username.clone());
+            let (now_title, now_username) = (
+                Zeroizing::new(after.title.clone()),
+                Zeroizing::new(after.username.clone()),
+            );
             save_change(&mut k, open, &Change::Edit { before, after })?;
             outln!("Entry \"{}\" updated.", sanitize_terminal(title));
             if *generate_password {
@@ -3375,6 +3387,16 @@ mod tests {
         // Anything else goes through vault_error.
         let t = crate::error_text(entry_save_error(VaultKeyError::NoVaults).as_ref());
         assert!(t.contains("keyroostctl fido vault add NAME"), "{t}");
+    }
+
+    #[test]
+    fn replace_text_sets_the_new_value() {
+        let mut f = String::from("an old note");
+        replace_text(&mut f, "new");
+        assert_eq!(f, "new");
+        // An empty value clears the field.
+        replace_text(&mut f, "");
+        assert_eq!(f, "");
     }
 
     #[test]
