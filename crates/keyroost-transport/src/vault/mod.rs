@@ -13,6 +13,7 @@
 
 use std::fmt;
 
+use keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE;
 use keyroost_ctap::client_pin::PinUvAuthToken;
 use keyroost_ctap::get_assertion::vault_name_from_user_id;
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
@@ -21,6 +22,9 @@ use zeroize::Zeroizing;
 
 mod key;
 pub use key::{CtapVaultKey, VaultKey};
+
+mod ops;
+pub use ops::{matching, unlock, OpenVault, Unlocked, VaultOnKey, VaultPick};
 
 #[cfg(test)]
 mod fake;
@@ -267,10 +271,6 @@ impl VaultAuth {
     /// Obtain a new token with `permissions` (bound to `rp_id` when given)
     /// and keep it as the current one. A key that demands a PIN change is
     /// refused before the PIN is sent.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the vault flows that call it come next")
-    )]
     pub(crate) fn fresh_token(
         &mut self,
         key: &mut impl VaultKey,
@@ -303,6 +303,18 @@ impl VaultAuth {
         match &self.token {
             Some((token, held, _)) if held & permissions == permissions => Some(token),
             _ => None,
+        }
+    }
+
+    /// Mirror the key after a makeCredential or getAssertion was sent with
+    /// the current token: a CTAP 2.1 key then keeps only the token's
+    /// largeBlobWrite permission (`clearPinUvAuthTokenPermissionsExceptLbw`),
+    /// so [`current_for`](Self::current_for) must not offer it for anything
+    /// else. Called whatever the call returned: an error does not say
+    /// whether the key got that far, and a fresh token is the safe side.
+    pub(crate) fn after_presence(&mut self) {
+        if let Some((_, held, _)) = &mut self.token {
+            *held &= LARGE_BLOB_WRITE;
         }
     }
 }
@@ -716,5 +728,9 @@ mod tests {
         send::<VaultKeyError>();
         send::<VaultStep>();
         send::<VaultProblem>();
+        send::<OpenVault>();
+        send::<VaultOnKey>();
+        send::<Unlocked>();
+        send::<VaultPick<'static>>();
     }
 }
