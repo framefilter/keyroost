@@ -1608,29 +1608,51 @@ pub(crate) fn entry_matches(v: &Vault, title: &str, username: Option<&str>) -> V
 }
 
 /// `  TITLE  USERNAME  URL` lines with the columns aligned (no username
-/// column when no entry has one).
-fn entry_rows<'a>(rows: impl Iterator<Item = &'a Entry>, indent: &str) -> Vec<String> {
-    let rows: Vec<[String; 3]> = rows
-        .map(|e| {
-            [
-                sanitize_terminal(&e.title),
-                sanitize_terminal(&e.username),
-                sanitize_terminal(&e.url),
-            ]
-        })
+/// column when no entry has one). Titles, usernames and URLs are entry
+/// data, so every cell and line is built in its own wiped buffer, sized up
+/// front so it never grows and leaves no unwiped copy behind.
+fn entry_rows<'a>(rows: impl Iterator<Item = &'a Entry>, indent: &str) -> Vec<Zeroizing<String>> {
+    let rows: Vec<[Zeroizing<String>; 3]> = rows
+        .map(|e| [&e.title, &e.username, &e.url].map(|s| wiped_cell(s)))
         .collect();
     let width = |k: usize| rows.iter().map(|r| r[k].chars().count()).max().unwrap_or(0);
     let (wt, wu) = (width(0), width(1));
     rows.iter()
         .map(|[t, u, url]| {
-            let line = if wu == 0 {
-                format!("{indent}{t:<wt$}  {url}")
-            } else {
-                format!("{indent}{t:<wt$}  {u:<wu$}  {url}")
-            };
-            line.trim_end().to_owned()
+            // Padding is one byte per missing character, as `{:<w$}` pads.
+            let pad = |s: &str, w: usize| w - s.chars().count();
+            let mut size = indent.len() + t.len() + pad(t, wt) + 2 + url.len();
+            if wu != 0 {
+                size += u.len() + pad(u, wu) + 2;
+            }
+            let mut line = Zeroizing::new(String::with_capacity(size));
+            line.push_str(indent);
+            line.push_str(t);
+            line.extend(std::iter::repeat_n(' ', pad(t, wt) + 2));
+            if wu != 0 {
+                line.push_str(u);
+                line.extend(std::iter::repeat_n(' ', pad(u, wu) + 2));
+            }
+            line.push_str(url);
+            let kept = line.trim_end().len();
+            line.truncate(kept);
+            line
         })
         .collect()
+}
+
+/// [`sanitize_terminal`] into a wiped buffer sized up front (each control,
+/// zero-width or bidi character a space, so the text never lengthens).
+fn wiped_cell(s: &str) -> Zeroizing<String> {
+    let mut cell = Zeroizing::new(String::with_capacity(s.len()));
+    cell.extend(s.chars().map(|c| {
+        if keyroost_keyring::is_spoofing_char(c) {
+            ' '
+        } else {
+            c
+        }
+    }));
+    cell
 }
 
 /// Which of `matches` (indices into `v`, all titled `title`) the command
@@ -1688,7 +1710,11 @@ pub(crate) fn choose_entry(
                 "run this in a terminal to pick one"
             };
             let mut lines = vec![heading];
-            lines.extend(entry_rows(many.iter().map(|&i| &v.entries[i]), "  "));
+            lines.extend(
+                entry_rows(many.iter().map(|&i| &v.entries[i]), "  ")
+                    .iter()
+                    .map(|l| l.to_string()),
+            );
             lines.push(next.to_owned());
             Err(lines.join("\n"))
         }
@@ -1965,9 +1991,9 @@ pub(crate) fn entry_show_json(
 }
 
 /// `entry list` as text: one aligned line per entry, `(none)` without any.
-fn entry_list_lines(v: &Vault) -> Vec<String> {
+fn entry_list_lines(v: &Vault) -> Vec<Zeroizing<String>> {
     if v.entries.is_empty() {
-        return vec!["(none)".to_owned()];
+        return vec![Zeroizing::new("(none)".to_owned())];
     }
     entry_rows(v.entries.iter(), "")
 }
@@ -2142,10 +2168,12 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
                     &open.contents,
                 ));
             }
-            for line in entry_list_lines(&open.contents) {
-                outln!("{line}");
-            }
-            Ok(())
+            // Entry data: printed from its wiped lines, never formatted
+            // into a new `String` (as `entry show` prints).
+            Ok(print_lines(
+                &mut io::stdout(),
+                &entry_list_lines(&open.contents),
+            )?)
         }
         FidoVaultEntryCmd::Show {
             title,
@@ -2968,6 +2996,38 @@ mod tests {
         let l = wiped_line("H: ", value);
         assert!(l.capacity() >= "H: ".len() + value.len());
         assert_eq!(l.as_str(), "H:   x");
+    }
+
+    #[test]
+    fn entry_list_lines_align_in_wiped_buffers() {
+        let v = Vault {
+            entries: vec![
+                ent("a", "Gmail", "alice", "https://mail.example"),
+                ent("b", "GitHub\u{1b}[2J", "", ""),
+                ent("c", "Bank", "bob", "https://bank.example"),
+            ],
+        };
+        let lines = entry_list_lines(&v);
+        let text: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+        assert_eq!(
+            text,
+            [
+                "Gmail       alice  https://mail.example",
+                "GitHub [2J",
+                "Bank        bob    https://bank.example",
+            ]
+        );
+        // No username anywhere: no username column.
+        let v = Vault {
+            entries: vec![ent("a", "Gmail", "", "https://mail.example")],
+        };
+        assert_eq!(
+            entry_list_lines(&v)[0].as_str(),
+            "Gmail  https://mail.example"
+        );
+        let mut out = Vec::new();
+        print_lines(&mut out, &entry_list_lines(&Vault::default())).unwrap();
+        assert_eq!(out, b"(none)\n");
     }
 
     #[test]
