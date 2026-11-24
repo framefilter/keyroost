@@ -944,7 +944,7 @@ pub(crate) fn import_json(
                 index: r.index,
                 id: r.id.clone(),
                 title: r.title.clone(),
-                username: r.username.clone(),
+                username: unless_empty(&r.username),
                 plan: r.plan,
                 reason: r.reason,
             })
@@ -1860,6 +1860,12 @@ fn write_json_wiped<T: serde::Serialize>(
 }
 
 /// `entry list --json`: ids and every field but the password and notes.
+/// An optional entry field for JSON: `null` when it is empty (nothing
+/// there), as text output shows `(none)`.
+fn unless_empty(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_owned())
+}
+
 pub(crate) fn entry_list_json(vault: Option<&str>, v: &Vault) -> json_out::FidoVaultEntryListJson {
     json_out::FidoVaultEntryListJson {
         vault: vault.map(str::to_owned),
@@ -1869,8 +1875,8 @@ pub(crate) fn entry_list_json(vault: Option<&str>, v: &Vault) -> json_out::FidoV
             .map(|e| json_out::FidoVaultEntryJson {
                 id: e.id.clone(),
                 title: e.title.clone(),
-                username: e.username.clone(),
-                url: e.url.clone(),
+                username: unless_empty(&e.username),
+                url: unless_empty(&e.url),
                 changed: changed_date(e.modified_minutes),
             })
             .collect(),
@@ -1887,9 +1893,9 @@ pub(crate) fn entry_show_json(
         vault: vault.map(str::to_owned),
         id: e.id.clone(),
         title: e.title.clone(),
-        username: e.username.clone(),
-        url: e.url.clone(),
-        notes: e.notes.clone(),
+        username: unless_empty(&e.username),
+        url: unless_empty(&e.url),
+        notes: unless_empty(&e.notes),
         changed: changed_date(e.modified_minutes),
         password: reveal.then(|| e.password.to_string()),
     }
@@ -3174,6 +3180,37 @@ mod tests {
     }
 
     #[test]
+    fn entry_json_empty_strings_are_null() {
+        let mut v = Vault {
+            entries: vec![ent("id-aaaa", "Gmail", "", "")],
+        };
+        let list = serde_json::to_value(entry_list_json(None, &v)).unwrap();
+        let e = &list["entries"][0];
+        assert!(e["username"].is_null(), "{e}");
+        assert!(e["url"].is_null(), "{e}");
+        assert_eq!(e["title"], "Gmail");
+
+        for reveal in [false, true] {
+            let shown = serde_json::to_value(entry_show_json(None, &v.entries[0], reveal)).unwrap();
+            for field in ["username", "url", "notes"] {
+                assert!(shown[field].is_null(), "{field}: {shown}");
+            }
+        }
+
+        // Filled-in fields stay strings.
+        v.entries[0].username = "alice".into();
+        v.entries[0].url = "https://mail.google.com".into();
+        v.entries[0].notes = "n".into();
+        let list = serde_json::to_value(entry_list_json(None, &v)).unwrap();
+        assert_eq!(list["entries"][0]["username"], "alice");
+        assert_eq!(list["entries"][0]["url"], "https://mail.google.com");
+        let shown = serde_json::to_value(entry_show_json(None, &v.entries[0], false)).unwrap();
+        assert_eq!(shown["username"], "alice");
+        assert_eq!(shown["url"], "https://mail.google.com");
+        assert_eq!(shown["notes"], "n");
+    }
+
+    #[test]
     fn entry_delete_question_uses_the_confirm_form() {
         let mut t = ScriptTerm::new(true, &["y\n"]);
         assert_eq!(
@@ -3586,7 +3623,9 @@ mod tests {
         assert_eq!(e["index"], 2);
         assert_eq!(e["id"], "id-older");
         assert_eq!(e["title"], "Bank");
-        assert_eq!(e["username"], "");
+        // An empty username is nothing there: `null`, never `""`.
+        assert!(e["username"].is_null(), "{e}");
+        assert_eq!(json["entries"][0]["username"], "alice");
         assert_eq!(e["plan"], "skip");
         assert_eq!(e["reason"], "the key's copy is newer (--replace takes it)");
         assert_eq!(json["entries"][0]["reason"], serde_json::Value::Null);

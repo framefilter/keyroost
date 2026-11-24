@@ -617,8 +617,10 @@ pub(crate) struct FidoVaultEntryJson {
     /// The entry's id in the vault, as FidoParole stores it.
     pub id: String,
     pub title: String,
-    pub username: String,
-    pub url: String,
+    /// `null` when the entry has none.
+    pub username: Option<String>,
+    /// `null` when the entry has none.
+    pub url: Option<String>,
     /// Last changed, `YYYY-MM-DD` (UTC).
     pub changed: String,
 }
@@ -643,7 +645,8 @@ pub(crate) struct FidoVaultImportRowJson {
     /// The entry's id, as FidoParole stores it.
     pub id: String,
     pub title: String,
-    pub username: String,
+    /// `null` when the entry has none.
+    pub username: Option<String>,
     /// `add`, `replace`, `exists` or `skip`.
     pub plan: &'static str,
     /// Why a row is not a plain add; `null` for one.
@@ -657,9 +660,10 @@ pub(crate) struct FidoVaultEntryShowJson {
     pub vault: Option<String>,
     pub id: String,
     pub title: String,
-    pub username: String,
-    pub url: String,
-    pub notes: String,
+    /// `null` when the entry has none, as for `url` and `notes`.
+    pub username: Option<String>,
+    pub url: Option<String>,
+    pub notes: Option<String>,
     /// Last changed, `YYYY-MM-DD` (UTC).
     pub changed: String,
     /// The password with `--reveal`; `null` without it (an entry with no
