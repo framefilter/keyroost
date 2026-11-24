@@ -390,11 +390,18 @@ fn rsa_material(n: &[u8], e: &[u8], d: &[u8], a: &[u8], b: &[u8]) -> Result<Mate
 
 /// Fill `buf` from the operating system's random source.
 pub(crate) fn fill_random(buf: &mut [u8]) -> Result<()> {
-    getrandom::fill(buf).map_err(|e| Error::Crypto(format!("no OS randomness: {e}")))
+    getrandom::fill(buf)
+        .map_err(|e| Error::Crypto(format!("the system's random number source failed: {e}")))
 }
 
+/// Generate an RSA key of `bits`. A random source that is already down is
+/// an error; one that fails partway through the prime search still panics
+/// inside the `rsa` crate, which offers no fallible API for this.
 fn rsa_generate(bits: usize) -> Result<Material> {
-    // `rsa` 0.9 takes the RNG of its own `rand_core` generation.
+    // `rsa` 0.9 takes the RNG of its own `rand_core` generation, whose
+    // `OsRng` panics if the OS source fails mid-search. Probe the source
+    // first so a source that is already down is an error, not a panic.
+    fill_random(&mut [0u8; 1])?;
     let mut key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, bits)
         .map_err(|e| Error::Crypto(e.to_string()))?;
     key.precompute().map_err(|e| Error::Crypto(e.to_string()))?;

@@ -17,6 +17,7 @@
 //! (`clientPin` subcommands, getting a pinUvAuthToken, etc.) live in
 //! [`crate::client_pin`].
 
+use crate::cmd::CtapError;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use aes::Aes256;
 use hmac::{Hmac, KeyInit, Mac};
@@ -64,11 +65,12 @@ pub struct EphemeralKey {
 }
 
 impl EphemeralKey {
-    /// Generate a fresh P-256 keypair backed by the OS RNG.
-    pub fn generate() -> Self {
-        Self {
-            secret: EphemeralSecret::generate(),
-        }
+    /// Generate a fresh P-256 keypair backed by the OS RNG. Fails with
+    /// [`CtapError::Random`] if the OS has no randomness to give.
+    pub fn generate() -> Result<Self, CtapError> {
+        Ok(Self {
+            secret: EphemeralSecret::try_generate().map_err(|_| CtapError::Random)?,
+        })
     }
 
     /// `(x, y)` coordinates of the public key, suitable for wire encoding
@@ -160,7 +162,11 @@ pub trait PinProtocol {
     fn version(&self) -> u32;
     /// Encrypt a block-aligned plaintext. v1 prepends nothing; v2 prepends
     /// a random 16-byte IV that is also returned as part of the ciphertext.
-    fn encrypt(&self, plaintext: &[u8]) -> Vec<u8>;
+    ///
+    /// Fails with [`CtapError::Random`] when the OS random source cannot
+    /// supply the IV (v2 only); nothing is encrypted and nothing should be
+    /// sent in that case.
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, CtapError>;
     fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, PinError>;
     /// HMAC tag returned by the authenticator. v1 truncates to 16 bytes,
     /// v2 returns the full 32-byte tag.
@@ -176,8 +182,8 @@ impl PinProtocol for ProtocolV1 {
     fn version(&self) -> u32 {
         PIN_PROTOCOL_V1
     }
-    fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
-        aes256_cbc_encrypt(&self.secret.0, &[0u8; 16], plaintext)
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, CtapError> {
+        Ok(aes256_cbc_encrypt(&self.secret.0, &[0u8; 16], plaintext))
     }
     fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, PinError> {
         aes256_cbc_decrypt(&self.secret.0, &[0u8; 16], ciphertext)
@@ -193,18 +199,30 @@ pub struct ProtocolV2 {
     pub secret: SharedSecretV2,
 }
 
-impl PinProtocol for ProtocolV2 {
-    fn version(&self) -> u32 {
-        PIN_PROTOCOL_V2
-    }
-    fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+impl ProtocolV2 {
+    /// [`PinProtocol::encrypt`] with the IV source passed in, so a failing
+    /// random source can be exercised without a global mock.
+    fn encrypt_with_iv_source(
+        &self,
+        plaintext: &[u8],
+        fill_iv: impl FnOnce(&mut [u8; 16]) -> Result<(), getrandom::Error>,
+    ) -> Result<Vec<u8>, CtapError> {
         let mut iv = [0u8; 16];
-        getrandom_iv(&mut iv);
+        fill_iv(&mut iv).map_err(|_| CtapError::Random)?;
         let body = aes256_cbc_encrypt(&self.secret.aes_key, &iv, plaintext);
         let mut out = Vec::with_capacity(16 + body.len());
         out.extend_from_slice(&iv);
         out.extend_from_slice(&body);
-        out
+        Ok(out)
+    }
+}
+
+impl PinProtocol for ProtocolV2 {
+    fn version(&self) -> u32 {
+        PIN_PROTOCOL_V2
+    }
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, CtapError> {
+        self.encrypt_with_iv_source(plaintext, |iv| getrandom::fill(iv))
     }
     fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, PinError> {
         if ciphertext.len() < 16 {
@@ -278,14 +296,6 @@ fn hkdf_sha256_l32(salt: &[u8; 32], ikm: &[u8], info: &[u8]) -> [u8; 32] {
     buf
 }
 
-/// Fill an IV from the OS RNG. CTAP doesn't allow IV reuse with the same
-/// key, but we generate a fresh ephemeral keypair per session anyway, so a
-/// counter would also be fine — the OS RNG keeps it simple. Panics if the
-/// OS has no randomness to give (as `rand_core`'s `OsRng` did before).
-fn getrandom_iv(iv: &mut [u8; 16]) {
-    getrandom::fill(iv).expect("the OS random source failed");
-}
-
 /// Helper for callers building the `getPinHash` flow: the CTAP spec asks
 /// for `LEFT(SHA-256(pin), 16)` as the value that's encrypted on the wire.
 pub fn left16_sha256(input: &[u8]) -> [u8; 16] {
@@ -315,8 +325,8 @@ mod tests {
 
     #[test]
     fn ephemeral_keys_distinct_and_consistent() {
-        let a = EphemeralKey::generate();
-        let b = EphemeralKey::generate();
+        let a = EphemeralKey::generate().unwrap();
+        let b = EphemeralKey::generate().unwrap();
         let (ax, _ay) = a.public_xy();
         let (bx, _by) = b.public_xy();
         assert_ne!(ax, bx);
@@ -327,8 +337,8 @@ mod tests {
 
     #[test]
     fn ecdh_round_trips_between_two_parties() {
-        let alice = EphemeralKey::generate();
-        let bob = EphemeralKey::generate();
+        let alice = EphemeralKey::generate().unwrap();
+        let bob = EphemeralKey::generate().unwrap();
         let (bx, by) = bob.public_xy();
         let (ax, ay) = alice.public_xy();
         let shared_a = alice.shared_secret_v1(&bx, &by).unwrap();
@@ -338,8 +348,8 @@ mod tests {
 
     #[test]
     fn ecdh_v2_keys_match_between_parties_and_differ_between_purposes() {
-        let alice = EphemeralKey::generate();
-        let bob = EphemeralKey::generate();
+        let alice = EphemeralKey::generate().unwrap();
+        let bob = EphemeralKey::generate().unwrap();
         let (bx, by) = bob.public_xy();
         let (ax, ay) = alice.public_xy();
         let a = alice.shared_secret_v2(&bx, &by).unwrap();
@@ -351,7 +361,7 @@ mod tests {
 
     #[test]
     fn invalid_peer_point_rejected() {
-        let alice = EphemeralKey::generate();
+        let alice = EphemeralKey::generate().unwrap();
         let bad = [0u8; 32];
         assert!(matches!(
             alice.shared_secret_v1(&bad, &bad),
@@ -365,7 +375,7 @@ mod tests {
             secret: SharedSecretV1([0xAB; 32]),
         };
         let plaintext = [0x42u8; 32];
-        let ct = p.encrypt(&plaintext);
+        let ct = p.encrypt(&plaintext).unwrap();
         assert_eq!(ct.len(), 32);
         assert_ne!(ct, plaintext);
         let pt = p.decrypt(&ct).unwrap();
@@ -381,13 +391,28 @@ mod tests {
             },
         };
         let plaintext = [0x42u8; 16];
-        let ct1 = p.encrypt(&plaintext);
-        let ct2 = p.encrypt(&plaintext);
+        let ct1 = p.encrypt(&plaintext).unwrap();
+        let ct2 = p.encrypt(&plaintext).unwrap();
         // Random IV makes successive ciphertexts differ on the IV bytes.
         assert_ne!(ct1[..16], ct2[..16]);
         assert_eq!(ct1.len(), 16 + 16); // IV + one block
         let pt = p.decrypt(&ct1).unwrap();
         assert_eq!(pt, plaintext);
+    }
+
+    #[test]
+    fn v2_encrypt_reports_a_failed_random_source() {
+        let p = ProtocolV2 {
+            secret: SharedSecretV2 {
+                hmac_key: [0x11; 32],
+                aes_key: [0x22; 32],
+            },
+        };
+        let failing = |_: &mut [u8; 16]| Err(getrandom::Error::UNSUPPORTED);
+        assert!(matches!(
+            p.encrypt_with_iv_source(&[0x42u8; 16], failing),
+            Err(crate::cmd::CtapError::Random)
+        ));
     }
 
     #[test]

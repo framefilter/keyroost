@@ -191,7 +191,7 @@ pub fn set_pin(dev: &mut impl CtapTransport, new_pin: &str) -> Result<(), CtapEr
     let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
     let mut padded = pad_pin_to_64(new_pin);
-    let new_pin_enc = proto.encrypt(&padded);
+    let new_pin_enc = proto.encrypt(&padded)?;
     padded.zeroize();
     let pin_auth = proto.authenticate(&new_pin_enc);
 
@@ -217,10 +217,10 @@ pub fn change_pin(
     let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
     let mut padded = pad_pin_to_64(new_pin);
-    let new_pin_enc = proto.encrypt(&padded);
+    let new_pin_enc = proto.encrypt(&padded)?;
     padded.zeroize();
     let mut pin_hash = left16_sha256(old_pin.as_bytes());
-    let pin_hash_enc = proto.encrypt(&pin_hash);
+    let pin_hash_enc = proto.encrypt(&pin_hash)?;
     pin_hash.zeroize();
     let mut auth_input = Vec::with_capacity(new_pin_enc.len() + pin_hash_enc.len());
     auth_input.extend_from_slice(&new_pin_enc);
@@ -269,7 +269,7 @@ fn token_legacy(
     let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
     let mut pin_hash = left16_sha256(pin.as_bytes());
-    let pin_hash_enc = proto.encrypt(&pin_hash);
+    let pin_hash_enc = proto.encrypt(&pin_hash)?;
     pin_hash.zeroize();
 
     let extra = vec![
@@ -374,7 +374,7 @@ fn token_with_permissions(
     let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
     let mut pin_hash = left16_sha256(pin.as_bytes());
-    let pin_hash_enc = proto.encrypt(&pin_hash);
+    let pin_hash_enc = proto.encrypt(&pin_hash)?;
     pin_hash.zeroize();
 
     let extra = pin_uv_auth_token_extra(our_pub, pin_hash_enc, permissions, rp_id);
@@ -446,7 +446,7 @@ pub(crate) fn key_agreement(
     chosen: SelectedPinProtocol,
 ) -> Result<(Box<dyn PinProtocol>, PeerKey), CtapError> {
     let (peer_x, peer_y) = get_key_agreement(dev, chosen.version())?;
-    let our = EphemeralKey::generate();
+    let our = EphemeralKey::generate()?;
     let (our_x, our_y) = our.public_xy();
     let proto: Box<dyn PinProtocol> = match chosen {
         SelectedPinProtocol::V1 => {

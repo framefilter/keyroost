@@ -1646,6 +1646,11 @@ impl Token2OtpSession {
     /// *authenticity* is not cryptographically checked — see the reference
     /// client's identical caveat.
     pub fn open_session(&mut self) -> Result<(), OtpTransportError> {
+        // The ephemeral keypair comes first, so a failed random source
+        // surfaces before anything is sent. The curve operations live in the
+        // byte layer; the transport only carries the two halves of the
+        // exchange.
+        let agreement = t2::crypto::HostAgreement::new()?;
         // The reference sequence reads the PIN flag FIRST (Lc=09) before the
         // handshake — this primes the device PIN state. Skipping it makes a
         // subsequent SET fail with 6985.
@@ -1653,10 +1658,6 @@ impl Token2OtpSession {
         let (_pdata, psw) = self.transport.transmit(&prime, false)?;
         OtpError::check(psw)?;
 
-        // The ephemeral keypair and every curve operation live in the byte
-        // layer, which is where this crate's split puts the crypto; the
-        // transport only carries the two halves of the exchange.
-        let agreement = t2::crypto::HostAgreement::new();
         let apdu = t2::read_agreement_pubkey(agreement.public_xy());
         let (data, sw) = self.transport.transmit(&apdu, false)?;
         OtpError::check(sw)?;
@@ -2324,7 +2325,7 @@ impl Token2OtpSession {
                 .pin_session
                 .as_ref()
                 .ok_or(OtpTransportError::Parse(ParseError::Truncated))?;
-            return Ok(t2::crypto::build_protected_write_data(keys, cleartext));
+            return Ok(t2::crypto::build_protected_write_data(keys, cleartext)?);
         }
         let (device_pub, sw) = self.transport.transmit(&t2::get_ecdh_pubkey(), false)?;
         OtpError::check(sw)?;

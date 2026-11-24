@@ -123,7 +123,10 @@ fn text(s: &str) -> Value {
 /// order (shorter key first, then bytewise): `{"id", "type"}` and
 /// `{"hmac-secret", "largeBlobKey"}`. `"uv"` is never sent: verification
 /// comes from the pinUvAuthToken.
-pub fn encode_get_assertion(r: &GetAssertionRequest) -> Vec<u8> {
+///
+/// Fails with [`CtapError::Random`] when an `hmac-secret` salt needs a fresh
+/// IV and the OS random source cannot supply one.
+pub fn encode_get_assertion(r: &GetAssertionRequest) -> Result<Vec<u8>, CtapError> {
     let mut entries = vec![
         (Value::UInt(KEY_RP_ID), text(r.rp_id)),
         (
@@ -146,7 +149,7 @@ pub fn encode_get_assertion(r: &GetAssertionRequest) -> Vec<u8> {
     // canonical.
     let mut extensions = Vec::new();
     if let Some((session, salt)) = &r.hmac {
-        extensions.push((text(EXT_HMAC_SECRET), session.extension_input(salt)));
+        extensions.push((text(EXT_HMAC_SECRET), session.extension_input(salt)?));
     }
     if r.large_blob_key {
         extensions.push((text(EXT_LARGE_BLOB_KEY), Value::Bool(true)));
@@ -173,7 +176,7 @@ pub fn encode_get_assertion(r: &GetAssertionRequest) -> Vec<u8> {
         ));
     }
 
-    cbor::encode(&Value::Map(entries))
+    Ok(cbor::encode(&Value::Map(entries)))
 }
 
 /// Parse a getAssertion / getNextAssertion response body (the CBOR map after
@@ -407,7 +410,7 @@ pub fn get_assertions(
 ) -> Result<Vec<Assertion>, CtapError> {
     check_request(info, req)?;
     let mut payload = vec![CTAP2_GET_ASSERTION];
-    payload.extend_from_slice(&encode_get_assertion(req));
+    payload.extend_from_slice(&encode_get_assertion(req)?);
     // The responses carry largeBlobKeys; wipe the raw buffers after.
     let resp = Zeroizing::new(with_timeout(dev, GET_ASSERTION_TIMEOUT, |d| {
         d.transact(CTAPHID_CBOR, &payload)
@@ -536,7 +539,7 @@ mod tests {
     fn encode_get_assertion_kat() {
         let token = v1_token();
         let session = v1_session();
-        let encoded = encode_get_assertion(&vault_request(&token, &session));
+        let encoded = encode_get_assertion(&vault_request(&token, &session)).unwrap();
         assert_eq!(encoded, unhex(EXPECTED_KAT));
     }
 
@@ -557,7 +560,7 @@ mod tests {
             "01 6161",
             "02 5820 2222222222222222222222222222222222222222222222222222222222222222",
         ));
-        assert_eq!(encode_get_assertion(&req), expected);
+        assert_eq!(encode_get_assertion(&req).unwrap(), expected);
 
         // largeBlobKey alone.
         let req = GetAssertionRequest {
@@ -570,7 +573,7 @@ mod tests {
             "02 5820 2222222222222222222222222222222222222222222222222222222222222222",
             "04 a1 6c 6c61726765426c6f624b6579 f5",
         ));
-        assert_eq!(encode_get_assertion(&req), expected);
+        assert_eq!(encode_get_assertion(&req).unwrap(), expected);
 
         // up = false (without hmac-secret, which needs presence) sends
         // options {"up": false}.
@@ -585,7 +588,7 @@ mod tests {
             "02 5820 2222222222222222222222222222222222222222222222222222222222222222",
             "05 a1 627570 f4",
         ));
-        assert_eq!(encode_get_assertion(&req), expected);
+        assert_eq!(encode_get_assertion(&req).unwrap(), expected);
     }
 
     /// AES-256-CBC(key = 32 x 0x42, IV = 0, 32 x 0x77), from OpenSSL: the
@@ -867,7 +870,7 @@ mod tests {
         let (cmd, payload, timeout) = &dev.requests[0];
         assert_eq!(*cmd, CTAPHID_CBOR);
         assert_eq!(payload[0], CTAP2_GET_ASSERTION);
-        assert_eq!(&payload[1..], &encode_get_assertion(&req)[..]);
+        assert_eq!(&payload[1..], &encode_get_assertion(&req).unwrap()[..]);
         assert_eq!(*timeout, GET_ASSERTION_TIMEOUT);
         for (cmd, payload, timeout) in &dev.requests[1..] {
             assert_eq!(*cmd, CTAPHID_CBOR);
