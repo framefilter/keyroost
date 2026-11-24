@@ -2966,6 +2966,9 @@ enum FidoCmd {
     /// belongs to a passkey; each vault is kept there as the data of its own
     /// credential. Websites may store data there too, so keep vaults small;
     /// `fido vault list` shows how full the store is.
+    // The URL is help text: --help prints it as is, so rustdoc leaves it
+    // plain too.
+    #[allow(rustdoc::bare_urls)]
     Vault {
         #[command(subcommand)]
         cmd: vault_cmd::FidoVaultCmd,
