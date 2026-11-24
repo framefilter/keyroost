@@ -592,6 +592,18 @@ pub fn max_fragment_length(info: &AuthenticatorInfo) -> usize {
     max.saturating_sub(MSG_SIZE_OVERHEAD).max(1) as usize
 }
 
+/// Largest fragment a `set` sends: [`max_fragment_length`], but never more
+/// than the spec's 1024-byte `maxMsgSize` floor allows (960 bytes).
+///
+/// A YubiKey 5 (firmware 5.7, `maxMsgSize` 1536) refused a single
+/// 1,290-byte `set` fragment with `CTAP1_ERR_OTHER` (libfido2's
+/// `fido2-token -S -b` got the same refusal), and took the same array in
+/// 960-byte fragments. Every authenticator must accept a 1024-byte message,
+/// so smaller fragments only cost round trips.
+pub fn max_write_fragment_length(info: &AuthenticatorInfo) -> usize {
+    max_fragment_length(info).min((DEFAULT_MAX_MSG_SIZE - MSG_SIZE_OVERHEAD) as usize)
+}
+
 fn dispatch(dev: &mut impl CtapTransport, params: Value) -> Result<Value, CtapError> {
     let mut payload = Vec::new();
     payload.push(CTAP2_LARGE_BLOBS);
@@ -768,7 +780,7 @@ pub fn write(
     token: &PinUvAuthToken,
     serialized: &[u8],
 ) -> Result<(), CtapError> {
-    let frag_len = max_fragment_length(info);
+    let frag_len = max_write_fragment_length(info);
     let total = serialized.len() as u64;
     let mut offset: usize = 0;
 
@@ -1405,6 +1417,28 @@ mod tests {
         // Falls back to the 1024 floor when unset.
         let info2 = AuthenticatorInfo::default();
         assert_eq!(max_fragment_length(&info2), (1024 - 64) as usize);
+    }
+
+    #[test]
+    fn writes_never_send_fragments_past_the_spec_floor() {
+        for (reported, expected) in [
+            (Some(1536), 960),
+            (Some(1200), 960),
+            (None, 960),
+            (Some(800), 736),
+        ] {
+            let info = AuthenticatorInfo {
+                max_msg_size: reported,
+                ..Default::default()
+            };
+            assert_eq!(max_write_fragment_length(&info), expected, "{reported:?}");
+        }
+        // Reads keep the size the key reports.
+        let info = AuthenticatorInfo {
+            max_msg_size: Some(1536),
+            ..Default::default()
+        };
+        assert_eq!(max_fragment_length(&info), 1472);
     }
 
     #[test]

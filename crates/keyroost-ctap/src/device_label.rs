@@ -938,11 +938,12 @@ mod tests {
 
     #[test]
     fn apply_writes_exactly_the_planned_bytes() {
-        // Single fragment (default maxMsgSize) and several (1536 → 1472-byte
-        // fragments over a ~2000-byte array).
+        // Single fragment (default maxMsgSize) and several: a key reporting
+        // 1536 still gets 960-byte write fragments (see
+        // `max_write_fragment_length`), so a ~2000-byte array takes three.
         let small = empty().with_text_note("note");
         let big = empty().with_text_note(&"y".repeat(2000));
-        for (arr, max_msg, fragments) in [(small, None, 1), (big, Some(1536), 2)] {
+        for (arr, max_msg, fragments) in [(small, None, 1), (big, Some(1536), 3)] {
             let (current, before) = stored(&arr);
             let mut i = info(true, Some(true));
             i.max_msg_size = max_msg;
