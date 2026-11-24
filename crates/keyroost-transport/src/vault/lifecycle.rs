@@ -22,8 +22,8 @@ use zeroize::Zeroizing;
 
 use super::ops::{check_fits, stale_token, write_array, OpenVault};
 use super::{
-    check_support, StoredData, VaultAuth, VaultCredential, VaultKey, VaultKeyError, VaultProblem,
-    VaultRef, VaultStep,
+    check_support, LeftOver, StoredData, VaultAuth, VaultCredential, VaultKey, VaultKeyError,
+    VaultProblem, VaultRef, VaultStep,
 };
 use crate::ct_eq;
 
@@ -73,9 +73,9 @@ pub fn list_credentials(
 /// vault the largeBlob store has no room for ([`VaultKeyError::Full`]).
 /// Then two touches ([`VaultStep::CreateTouch`], [`VaultStep::UnlockTouch`])
 /// and a [`VaultStep::Write`]. When anything fails after the credential was
-/// made, the credential is deleted again and the error is
-/// [`VaultKeyError::CreateUndone`] with the cause; `left_over` says the
-/// delete failed too.
+/// made, the credential and any data written for it are removed again and
+/// the error is [`VaultKeyError::CreateUndone`] with the cause; its
+/// `left_over` names whatever could not be removed.
 pub fn create(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
@@ -184,7 +184,7 @@ fn unlock_new(
 /// Clean up after a create that failed with `cause` once credential `id`
 /// was made: remove its data when the write stage was reached (`written`,
 /// the largeBlobKey), then delete the credential, attempted whatever the
-/// data removal did. `left_over` says something is still on the key.
+/// data removal did. `left_over` names what is still on the key.
 fn undo(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
@@ -196,7 +196,10 @@ fn undo(
     let credential_left = delete_credential(key, auth, id).is_err();
     VaultKeyError::CreateUndone {
         cause: Box::new(cause),
-        left_over: data_left || credential_left,
+        left_over: LeftOver {
+            credential: credential_left,
+            data: data_left,
+        },
     }
 }
 
@@ -368,7 +371,7 @@ mod tests {
     }
 
     /// The cause and `left_over` of a `CreateUndone`.
-    fn undone(r: Result<OpenVault, VaultKeyError>) -> (VaultKeyError, bool) {
+    fn undone(r: Result<OpenVault, VaultKeyError>) -> (VaultKeyError, LeftOver) {
         match r {
             Err(VaultKeyError::CreateUndone { cause, left_over }) => (*cause, left_over),
             other => panic!("expected CreateUndone, got {other:?}"),
@@ -468,7 +471,7 @@ mod tests {
         let (r, steps) = run_create(&mut key, &mut pin(), "Personal", &Vault::default());
         let (cause, left_over) = undone(r);
         assert!(matches!(cause, VaultKeyError::NoLargeBlobKey), "{cause:?}");
-        assert!(!left_over);
+        assert_eq!(left_over, LeftOver::NONE);
         assert!(key.creds.is_empty(), "no credential left");
         assert_eq!(steps, vec![VaultStep::CreateTouch]);
         assert_eq!(key.stored(), &before[..]);
@@ -505,7 +508,7 @@ mod tests {
             matches!(cause, VaultKeyError::Ctap(CtapError::StatusCode(0x33))),
             "{cause:?}"
         );
-        assert!(!left_over);
+        assert_eq!(left_over, LeftOver::NONE);
         assert_eq!(key.stored(), &before[..], "array unchanged");
         assert!(key.creds.is_empty(), "credential gone");
         assert_eq!(
@@ -534,7 +537,7 @@ mod tests {
             matches!(cause, VaultKeyError::Ctap(CtapError::Transport(_))),
             "{cause:?}"
         );
-        assert!(!left_over);
+        assert_eq!(left_over, LeftOver::NONE);
         assert_eq!(key.stored(), &before[..], "the blob is removed");
         assert!(key.creds.is_empty(), "the credential is removed");
         assert_eq!(
@@ -572,10 +575,54 @@ mod tests {
         ));
         let (r, _) = run_create(&mut key, &mut pin(), "Personal", &Vault::default());
         let (_, left_over) = undone(r);
-        assert!(left_over, "the data is still on the key");
+        assert_eq!(
+            left_over,
+            LeftOver {
+                credential: false,
+                data: true
+            },
+            "only the data is left"
+        );
         assert!(key.creds.is_empty(), "the credential delete still ran");
         assert!(matches!(key.log.last(), Some(Call::Delete(_))));
+        // No vault lists any more; the data is one entry in the store.
+        assert!(listed(&mut key, &mut pin()).is_empty());
         assert_eq!(key.array().len(), 1);
+    }
+
+    #[test]
+    fn failed_cleanup_of_both_reports_both_and_a_vault_delete_clears_them() {
+        // The write lands with its reply lost, removing the data is refused,
+        // and so is the credential delete.
+        let mut key = FakeKey::new();
+        key.lost_write_replies = 1;
+        key.delete_fails = true;
+        key.hook = Some((
+            3,
+            Box::new(|k: &mut FakeKey| k.write_refusals.push_back(0x30)),
+        ));
+        let (r, _) = run_create(&mut key, &mut pin(), "Personal", &Vault::default());
+        let (_, left_over) = undone(r);
+        assert_eq!(
+            left_over,
+            LeftOver {
+                credential: true,
+                data: true
+            }
+        );
+        assert_eq!(key.creds.len(), 1);
+        assert_eq!(key.array().len(), 1);
+
+        // The fix the error points to: the vault lists with its data, and
+        // deleting it removes both.
+        key.delete_fails = false;
+        let creds = listed(&mut key, &mut pin());
+        assert_eq!(creds.len(), 1);
+        assert!(matches!(creds[0].stored, StoredData::Bytes(_)));
+        let (r, _) = run_delete(&mut key, &mut pin(), "Personal");
+        r.unwrap_or_else(|e| panic!("{e}"));
+        assert!(key.creds.is_empty());
+        assert_eq!(key.array().len(), 0);
     }
 
     #[test]
@@ -587,7 +634,13 @@ mod tests {
         let (r, _) = run_create(&mut key, &mut pin(), "Personal", &Vault::default());
         let (cause, left_over) = undone(r);
         assert!(matches!(cause, VaultKeyError::NoLargeBlobKey), "{cause:?}");
-        assert!(left_over);
+        assert_eq!(
+            left_over,
+            LeftOver {
+                credential: true,
+                data: false
+            }
+        );
         assert_eq!(key.creds.len(), 1, "the credential is left on the key");
         assert_eq!(
             key.log
@@ -604,7 +657,14 @@ mod tests {
         key.delete_fails = true;
         let (r, _) = run_create(&mut key, &mut pin(), "Personal", &Vault::default());
         let (_, left_over) = undone(r);
-        assert!(left_over);
+        assert_eq!(
+            left_over,
+            LeftOver {
+                credential: true,
+                data: false
+            },
+            "the refused writes stored nothing"
+        );
         assert_eq!(key.creds.len(), 1);
     }
 
@@ -615,7 +675,7 @@ mod tests {
         key.delete_refusals.extend([0x38]);
         let (r, _) = run_create(&mut key, &mut pin(), "Personal", &Vault::default());
         let (_, left_over) = undone(r);
-        assert!(!left_over);
+        assert_eq!(left_over, LeftOver::NONE);
         assert!(key.creds.is_empty());
         let n = key.log.len();
         assert_eq!(key.log[n - 2], token(CM, None));

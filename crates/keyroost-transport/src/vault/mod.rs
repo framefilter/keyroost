@@ -127,6 +127,37 @@ impl fmt::Display for VaultProblem {
     }
 }
 
+/// What a failed create could not remove again
+/// ([`VaultKeyError::CreateUndone`]), so a front end can name the fix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeftOver {
+    /// The new vault's credential is still on the key. It lists as a vault
+    /// of the name asked for (with or without data, as `data` says), and
+    /// deleting that vault removes it and its data:
+    /// `keyroostctl fido vault delete NAME`.
+    pub credential: bool,
+    /// Data written for the new vault is still in the key's largeBlob store.
+    /// With `credential` the vault delete above removes it too. Without, no
+    /// credential can open or find it any more: `keyroostctl fido blob list`
+    /// shows it as an opaque entry and `keyroostctl fido blob delete INDEX`
+    /// removes it. Nothing tells it apart from another relying party's
+    /// opaque entry, so a front end says so rather than guess an index.
+    pub data: bool,
+}
+
+impl LeftOver {
+    /// Nothing is left: the failed create was fully undone.
+    pub const NONE: LeftOver = LeftOver {
+        credential: false,
+        data: false,
+    };
+
+    /// Whether anything is left on the key.
+    pub fn any(&self) -> bool {
+        self.credential || self.data
+    }
+}
+
 /// Why a vault operation on a key failed.
 #[non_exhaustive]
 #[derive(Debug)]
@@ -152,12 +183,11 @@ pub enum VaultKeyError {
     /// unlock than when it made it.
     KeyMismatch,
     /// Creating a vault failed after its credential was made; the
-    /// credential (and any data written for it) was removed again, unless
-    /// `left_over`: then cleaning up failed, and the new credential or its
-    /// data is still on the key.
+    /// credential and any data written for it were removed again, except
+    /// what `left_over` names.
     CreateUndone {
         cause: Box<VaultKeyError>,
-        left_over: bool,
+        left_over: LeftOver,
     },
     /// What this change touches was changed on the key since the vault was
     /// opened; nothing was written.
@@ -201,20 +231,21 @@ impl fmt::Display for VaultKeyError {
             VaultKeyError::KeyMismatch => f.write_str(
                 "the key returned a different largeBlobKey for the new vault than when it made it",
             ),
-            VaultKeyError::CreateUndone {
-                cause,
-                left_over: false,
-            } => write!(
-                f,
-                "the vault was not created: {cause}; its new credential was removed again"
-            ),
-            VaultKeyError::CreateUndone {
-                cause,
-                left_over: true,
-            } => write!(
-                f,
-                "the vault was not created: {cause}; cleaning up failed too, so its new credential or its data is still on the key"
-            ),
+            VaultKeyError::CreateUndone { cause, left_over } => {
+                write!(f, "the vault was not created: {cause}; ")?;
+                f.write_str(match (left_over.credential, left_over.data) {
+                    (false, false) => "its new credential was removed again",
+                    (true, false) => {
+                        "removing its new credential failed too, so it is left on the key with no data"
+                    }
+                    (false, true) => {
+                        "its new credential was removed, but removing its data failed, so that data is left in the key's largeBlob store with nothing to open it"
+                    }
+                    (true, true) => {
+                        "cleaning up failed too, so its new credential and its data are still on the key"
+                    }
+                })
+            }
             VaultKeyError::Conflict => f.write_str(
                 "this changed on the key since the vault was opened; nothing was written",
             ),
@@ -701,11 +732,14 @@ mod tests {
             VaultKeyError::KeyMismatch,
             VaultKeyError::CreateUndone {
                 cause: Box::new(VaultKeyError::NoLargeBlobKey),
-                left_over: false,
+                left_over: LeftOver::NONE,
             },
             VaultKeyError::CreateUndone {
                 cause: Box::new(VaultKeyError::NoLargeBlobKey),
-                left_over: true,
+                left_over: LeftOver {
+                    credential: true,
+                    data: false,
+                },
             },
             VaultKeyError::Conflict,
             VaultKeyError::Full {
@@ -743,6 +777,42 @@ mod tests {
         assert!(all[12]
             .to_string()
             .contains(&VaultError::Decrypt.to_string()));
+    }
+
+    #[test]
+    fn each_left_over_case_has_its_own_words() {
+        let text = |credential, data| {
+            VaultKeyError::CreateUndone {
+                cause: Box::new(VaultKeyError::NoLargeBlobKey),
+                left_over: LeftOver { credential, data },
+            }
+            .to_string()
+        };
+        let none = text(false, false);
+        let cred = text(true, false);
+        let data = text(false, true);
+        let both = text(true, true);
+        assert!(none.contains("removed again"), "{none}");
+        assert!(
+            cred.contains("credential") && cred.contains("no data"),
+            "{cred}"
+        );
+        assert!(data.contains("nothing to open it"), "{data}");
+        assert!(both.contains("credential and its data"), "{both}");
+        let all = [&none, &cred, &data, &both];
+        for (i, a) in all.iter().enumerate() {
+            assert!(a.starts_with("the vault was not created: "), "{a}");
+            assert!(!a.contains("--"), "{a}");
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert!(!LeftOver::NONE.any());
+        assert!(LeftOver {
+            credential: false,
+            data: true
+        }
+        .any());
     }
 
     #[test]
@@ -831,6 +901,7 @@ mod tests {
         send::<VaultStep>();
         send::<VaultProblem>();
         send::<StoredData>();
+        send::<LeftOver>();
         send::<OpenVault>();
         send::<VaultOnKey>();
         send::<Unlocked>();
