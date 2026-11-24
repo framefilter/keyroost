@@ -223,8 +223,13 @@ mod tests {
     #[test]
     fn tampered_header_or_body_is_decrypt_error() {
         let good = unhex(BACKUP_HEX);
-        // Param bytes are authenticated: changing t within bounds changes the key,
-        // and any byte flip fails the tag either way.
+        // A within-bounds parameter change (t 1 -> 2) is still refused: the
+        // parameters are part of the AAD and change the derived key.
+        assert_eq!(
+            import_backup(&with_params(8, 2, 1), BACKUP_PASS).unwrap_err(),
+            VaultError::Decrypt
+        );
+        // Salt, nonce, body and tag flips fail the tag.
         for i in [18, 34, 46, 60, good.len() - 1] {
             let mut b = good.clone();
             b[i] ^= 1;
