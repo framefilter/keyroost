@@ -16,13 +16,14 @@ use keyroost_ctap::CtapHidDevice;
 use keyroost_proto::codec::hex_encode;
 use keyroost_resolve::{Choice, Picker};
 use keyroost_transport::vault::{
-    self, CtapVaultKey, LeftOver, OldVault, StoredData, Unlocked, VaultAuth, VaultKeyError,
-    VaultPick, VaultProblem, VaultRef, VaultStep,
+    self, CtapVaultKey, LeftOver, OldVault, StoredData, Unlocked, VaultAuth, VaultCredential,
+    VaultKeyError, VaultPick, VaultProblem, VaultRef, VaultStep,
 };
 
 use crate::code_import::entries;
 use crate::json_out;
 use crate::output::{emit_json, json_output};
+use crate::prompt::{confirm, confirm_statement, key_label, RealTerm, TermPicker};
 use crate::secrets::SecretSource;
 use crate::{sanitize_terminal, PATH_HELP};
 
@@ -31,6 +32,57 @@ use crate::{sanitize_terminal, PATH_HELP};
 pub(crate) enum FidoVaultCmd {
     /// List the key's vaults with how many entries each holds (PIN and a touch).
     List {
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<PathBuf>,
+    },
+    /// Create an empty vault on the key (PIN and two touches).
+    ///
+    /// Vault names are unique on a key. If the key is lost or reset, its
+    /// vaults go with it: keep a backup with `fido vault export`.
+    Add {
+        /// The new vault's name: 1 to 32 bytes (accented and non-Latin
+        /// letters take 2 to 4 bytes each).
+        name: String,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<PathBuf>,
+    },
+    /// Delete a vault and its entries (PIN, no touch). Irreversible: asks first (`--yes` to skip).
+    ///
+    /// To keep the entries, export the vault first with `fido vault export`.
+    /// Copies that share a name are told apart by how much each stores.
+    Delete {
+        /// The vault's name, as `fido vault list` shows it.
+        name: String,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<PathBuf>,
+    },
+    /// Give a vault a new key: a new vault takes its entries and the old one is deleted after every entry is checked.
+    ///
+    /// Use it after unlocking the vault on a computer you no longer trust, then change the passwords that matter.
+    Rotate {
+        /// The vault's name, as `fido vault list` shows it.
+        name: String,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
         /// asks.
@@ -59,7 +111,229 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
             }
             Ok(())
         }
+        FidoVaultCmd::Add { name, pin, path } => {
+            // The format's name rule, before a key is looked for.
+            keyroost_vault::user_handle(name)?;
+            let pin = crate::fido_pin(path.as_deref(), pin.as_ref())?;
+            let mut key = open_vault_key(path.as_deref())?;
+            let mut auth = VaultAuth::pin(pin);
+            let mut touches = Touches::new(2);
+            vault::create(
+                &mut key,
+                &mut auth,
+                name,
+                &keyroost_vault::Vault::default(),
+                &mut |s| touches.step(s),
+            )
+            .map_err(vault_error)?;
+            outln!("{}", backup_hint(name));
+            Ok(())
+        }
+        FidoVaultCmd::Delete {
+            name,
+            yes,
+            pin,
+            path,
+        } => {
+            let pin = crate::fido_pin(path.as_deref(), pin.as_ref())?;
+            let dev = crate::target::select_fido(path.as_deref())?;
+            let mut key = open_vault_key(path.as_deref())?;
+            let mut auth = VaultAuth::pin(pin);
+            // Credential management: no touch.
+            let creds = vault::list_credentials(&mut key, &mut auth).map_err(vault_error)?;
+            let matches = vault::matching(&creds, &VaultPick::Name(name)).map_err(vault_error)?;
+            let i = choose_vault(
+                &delete_choices(&creds),
+                &matches,
+                Some(name),
+                &mut TermPicker::new(&mut RealTerm),
+            )?;
+            errln!("{}", delete_note(name));
+            // The open handle ties the question to the key (`confirm_on_held`).
+            delete_question(&mut RealTerm, *yes, name, &key_label(&dev))?;
+            // A touch only on a key that listed no largeBlobKey for the vault.
+            let mut touches = Touches::new(1);
+            vault::delete(&mut key, &mut auth, &creds[i], &mut |s| touches.step(s))
+                .map_err(vault_error)?;
+            outln!("{}", deleted_line(name));
+            Ok(())
+        }
+        FidoVaultCmd::Rotate {
+            name,
+            yes,
+            pin,
+            path,
+        } => {
+            let pin = crate::fido_pin(path.as_deref(), pin.as_ref())?;
+            let dev = crate::target::select_fido(path.as_deref())?;
+            let mut key = open_vault_key(path.as_deref())?;
+            let mut auth = VaultAuth::pin(pin);
+            // One touch to unlock, then the two of the new vault's create.
+            let mut touches = Touches::new(3);
+            let mut unlocked = vault::unlock(&mut key, &mut auth, &mut |s| touches.step(s))
+                .map_err(vault_error)?;
+            let matches =
+                vault::matching(&unlocked.vaults, &VaultPick::Name(name)).map_err(vault_error)?;
+            let i = choose_vault(
+                &unlocked_choices(&unlocked),
+                &matches,
+                Some(name),
+                &mut TermPicker::new(&mut RealTerm),
+            )?;
+            let old = unlocked.vaults[i].open_mut().map_err(vault_error)?;
+            rotate_question(&mut RealTerm, *yes, name, &key_label(&dev))?;
+            let new = vault::rotate(&mut key, &mut auth, old, &mut |s| touches.step(s))
+                .map_err(vault_error)?;
+            outln!("{}", rotated_line(name, new.contents.entries.len()));
+            Ok(())
+        }
     }
+}
+
+/// How the vault named `name` is written in a command line hint: bare when
+/// it is only `[A-Za-z0-9._-]`, else in double quotes, with what a shell
+/// would expand or end the quotes on escaped.
+pub(crate) fn export_hint_arg(name: &str) -> String {
+    let name = sanitize_terminal(name);
+    if !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return name;
+    }
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    for c in name.chars() {
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// The file name a hint suggests for a backup of the vault `name`: lower
+/// case, every run of other characters than `a-z0-9` one `-`, trimmed,
+/// `vault` when nothing is left, then `.t2vault`.
+pub(crate) fn backup_file_name(name: &str) -> String {
+    let mut stem = String::new();
+    for c in name.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            stem.push(c);
+        } else if !stem.is_empty() && !stem.ends_with('-') {
+            stem.push('-');
+        }
+    }
+    let stem = stem.trim_end_matches('-');
+    let stem = if stem.is_empty() { "vault" } else { stem };
+    format!("{stem}.t2vault")
+}
+
+/// The export command the hints name for the vault `name`.
+fn export_command(name: &str) -> String {
+    format!(
+        "keyroostctl fido vault export {} -o {}",
+        export_hint_arg(name),
+        backup_file_name(name)
+    )
+}
+
+/// What `vault add` prints once the vault is made: a backup reminder.
+pub(crate) fn backup_hint(name: &str) -> String {
+    format!(
+        "Vault \"{}\" created on this key.\nIf the key is lost or reset, the vault goes with it. \
+         Keep a backup:\n  {}",
+        sanitize_terminal(name),
+        export_command(name)
+    )
+}
+
+/// The line `vault delete` prints before its question.
+pub(crate) fn delete_note(name: &str) -> String {
+    format!(
+        "Its entries go with it. To keep them, export it first: {}",
+        export_command(name)
+    )
+}
+
+/// `vault delete`'s question, in `confirm`'s form.
+fn delete_question(
+    term: &mut dyn crate::prompt::Term,
+    yes: bool,
+    name: &str,
+    key: &str,
+) -> Result<bool, String> {
+    confirm(
+        term,
+        yes,
+        &format!("delete vault \"{}\"", sanitize_terminal(name)),
+        key,
+    )
+}
+
+/// `vault rotate`'s question, as a statement.
+fn rotate_question(
+    term: &mut dyn crate::prompt::Term,
+    yes: bool,
+    name: &str,
+    key: &str,
+) -> Result<bool, String> {
+    let name = sanitize_terminal(name);
+    confirm_statement(
+        term,
+        yes,
+        &format!(
+            "Rotate the key of vault \"{name}\" on {key}? A new vault replaces it; the old one \
+             is deleted after every entry is checked."
+        ),
+        &format!("rotate the key of vault \"{name}\""),
+        key,
+    )
+}
+
+/// What `vault delete` prints when done.
+fn deleted_line(name: &str) -> String {
+    format!("Vault \"{}\" deleted.", sanitize_terminal(name))
+}
+
+/// What `vault rotate` prints when done; `n` is the new vault's entry count.
+fn rotated_line(name: &str, n: usize) -> String {
+    format!(
+        "Vault \"{}\" rotated: a new vault holds its {} and the old one is deleted.",
+        sanitize_terminal(name),
+        entries(n)
+    )
+}
+
+/// The vaults as `vault delete` tells them apart: by what each stores,
+/// without unlocking any.
+pub(crate) fn delete_choices(creds: &[VaultCredential]) -> Vec<VaultChoice> {
+    creds
+        .iter()
+        .map(|c| VaultChoice {
+            name: c.vault.name.clone(),
+            detail: stored_detail(c.stored),
+        })
+        .collect()
+}
+
+/// An unlocked vault's detail: its entry count, or `(unavailable)` when it
+/// did not open.
+pub(crate) fn count_detail(count: Option<usize>) -> String {
+    count.map_or_else(|| "(unavailable)".to_owned(), entries)
+}
+
+/// The vaults one unlock opened, told apart by their entry counts.
+pub(crate) fn unlocked_choices(u: &Unlocked) -> Vec<VaultChoice> {
+    u.vaults
+        .iter()
+        .map(|v| VaultChoice {
+            name: v.vault_ref.name.clone(),
+            detail: count_detail(v.entry_count()),
+        })
+        .collect()
 }
 
 /// Open the selected FIDO key for the vault flows. A U2F-only key is
@@ -101,28 +375,17 @@ fn shown_name(name: Option<&str>) -> String {
 }
 
 /// One vault a command may mean, as a question or a refusal lists it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the vault delete, rotate and entry commands use it"
-    )
-)]
 pub(crate) struct VaultChoice {
     pub(crate) name: Option<String>,
-    /// What tells copies apart: `entries(n)`, `(unavailable)`,
-    /// `(no data stored yet)`, or, where nothing was unlocked,
-    /// [`stored_detail`].
+    /// What tells copies apart: where the vaults were unlocked,
+    /// [`count_detail`] (`entries(n)` or `(unavailable)`); where nothing was
+    /// unlocked, [`stored_detail`] (the size, `(none)` or `(unavailable)`).
     pub(crate) detail: String,
 }
 
 /// What a vault holds, told without unlocking it, as listings print it:
 /// the size, `(none)`, `(unavailable)`, or nothing when the key could not
 /// say.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the vault delete command uses it")
-)]
 pub(crate) fn stored_detail(stored: StoredData) -> String {
     match stored {
         StoredData::Bytes(n) => format!("{n} bytes stored"),
@@ -155,13 +418,6 @@ fn name_detail_lines<'a>(
 /// `choices`) for the name `asked_for` (`None`: no `--vault` given). One
 /// match is it; several are asked about at a terminal and refused,
 /// listing them, without one.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the vault delete, rotate and entry commands use it"
-    )
-)]
 pub(crate) fn choose_vault(
     choices: &[VaultChoice],
     matches: &[usize],
@@ -801,6 +1057,203 @@ mod tests {
             unknown.contains("then run keyroostctl fido vault rotate NAME again"),
             "{unknown}"
         );
+    }
+
+    #[test]
+    fn backup_hint_text() {
+        assert_eq!(
+            backup_hint("Personal"),
+            "Vault \"Personal\" created on this key.\n\
+             If the key is lost or reset, the vault goes with it. Keep a backup:\n  \
+             keyroostctl fido vault export Personal -o personal.t2vault"
+        );
+        assert!(
+            backup_hint("Work Mail").ends_with(
+                "Keep a backup:\n  keyroostctl fido vault export \"Work Mail\" -o work-mail.t2vault"
+            ),
+            "{}",
+            backup_hint("Work Mail")
+        );
+    }
+
+    #[test]
+    fn export_hint_arg_quotes_only_what_needs_it() {
+        assert_eq!(export_hint_arg("Mail.backup_2-x"), "Mail.backup_2-x");
+        assert_eq!(export_hint_arg("Work Mail"), "\"Work Mail\"");
+        assert_eq!(export_hint_arg("Café"), "\"Café\"");
+        // What a shell would expand or end the quotes on is escaped.
+        assert_eq!(export_hint_arg("a\"b$c`d\\e"), "\"a\\\"b\\$c\\`d\\\\e\"");
+    }
+
+    #[test]
+    fn backup_file_name_is_plain() {
+        assert_eq!(backup_file_name("Personal"), "personal.t2vault");
+        assert_eq!(backup_file_name("Work  Mail!"), "work-mail.t2vault");
+        assert_eq!(backup_file_name("--Home/Bank--"), "home-bank.t2vault");
+        assert_eq!(backup_file_name("Café"), "caf.t2vault");
+        assert_eq!(backup_file_name("ééé"), "vault.t2vault");
+        assert_eq!(backup_file_name("../.."), "vault.t2vault");
+    }
+
+    #[test]
+    fn delete_note_text() {
+        assert_eq!(
+            delete_note("Personal"),
+            "Its entries go with it. To keep them, export it first: \
+             keyroostctl fido vault export Personal -o personal.t2vault"
+        );
+        assert!(delete_note("Work Mail").ends_with("export \"Work Mail\" -o work-mail.t2vault"));
+    }
+
+    #[test]
+    fn delete_question_uses_the_confirm_form() {
+        let mut t = ScriptTerm::new(true, &["y\n"]);
+        assert_eq!(
+            delete_question(&mut t, false, "Personal", "yubi-test"),
+            Ok(true)
+        );
+        assert_eq!(t.asked, ["delete vault \"Personal\" on yubi-test? [y/N] "]);
+
+        let mut t = ScriptTerm::new(true, &["\n"]);
+        assert_eq!(
+            delete_question(&mut t, false, "Personal", "yubi-test"),
+            Err("canceled; nothing was changed".to_owned())
+        );
+
+        // -y asks nothing.
+        let mut t = ScriptTerm::new(true, &[]);
+        assert_eq!(
+            delete_question(&mut t, true, "Personal", "yubi-test"),
+            Ok(false)
+        );
+        assert!(t.asked.is_empty());
+    }
+
+    #[test]
+    fn delete_without_terminal_is_refused() {
+        let mut t = ScriptTerm::new(false, &["y\n"]);
+        assert_eq!(
+            delete_question(&mut t, false, "x", "yubi-test"),
+            Err(
+                "refusing to delete vault \"x\" on yubi-test without confirmation; add --yes"
+                    .to_owned()
+            )
+        );
+        assert!(t.asked.is_empty(), "never reads stdin without a terminal");
+    }
+
+    #[test]
+    fn rotate_question_text() {
+        let mut t = ScriptTerm::new(true, &["y\n"]);
+        assert_eq!(
+            rotate_question(&mut t, false, "Personal", "yubi-test"),
+            Ok(true)
+        );
+        assert_eq!(
+            t.asked,
+            [
+                "Rotate the key of vault \"Personal\" on yubi-test? A new vault replaces it; the \
+              old one is deleted after every entry is checked. Continue? [y/N] "
+            ]
+        );
+
+        let mut t = ScriptTerm::new(false, &[]);
+        assert_eq!(
+            rotate_question(&mut t, false, "Personal", "yubi-test"),
+            Err(
+                "refusing to rotate the key of vault \"Personal\" on yubi-test without \
+                 confirmation; add --yes"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn rotated_and_deleted_lines() {
+        assert_eq!(
+            rotated_line("Personal", 12),
+            "Vault \"Personal\" rotated: a new vault holds its 12 entries and the old one is \
+             deleted."
+        );
+        assert!(rotated_line("Personal", 1).contains("holds its 1 entry and"));
+        assert_eq!(deleted_line("Personal"), "Vault \"Personal\" deleted.");
+        assert!(!deleted_line("a\u{1b}[2Jb").contains('\u{1b}'));
+    }
+
+    fn cred(name: &str, stored: StoredData) -> keyroost_transport::vault::VaultCredential {
+        keyroost_transport::vault::VaultCredential {
+            vault: VaultRef {
+                credential_id: vec![0xAB, 0xCD],
+                name: Some(name.to_owned()),
+            },
+            large_blob_key: None,
+            stored,
+        }
+    }
+
+    #[test]
+    fn duplicate_delete_lists_stored_sizes() {
+        let creds = [
+            cred("Work", StoredData::Bytes(40)),
+            cred("Personal", StoredData::Bytes(812)),
+            cred("Personal", StoredData::Empty),
+            cred("Personal", StoredData::Unreadable),
+        ];
+        let choices = delete_choices(&creds);
+        let details: Vec<&str> = choices.iter().map(|c| c.detail.as_str()).collect();
+        assert_eq!(
+            details,
+            [
+                "40 bytes stored",
+                "812 bytes stored",
+                "(none)",
+                "(unavailable)"
+            ]
+        );
+        let matches = vault::matching(&creds, &VaultPick::Name("Personal")).unwrap();
+
+        let mut t = ScriptTerm::new(false, &[]);
+        let e = {
+            let mut p = crate::prompt::TermPicker::new(&mut t);
+            choose_vault(&choices, &matches, Some("Personal"), &mut p).unwrap_err()
+        };
+        assert_eq!(
+            e,
+            "3 vaults are named \"Personal\":\n  Personal  812 bytes stored\n  Personal  (none)\n  \
+             Personal  (unavailable)\nrun this in a terminal to pick one"
+        );
+        assert!(!e.contains("abcd"), "never an ID: {e}");
+
+        let mut t = ScriptTerm::new(true, &["2\n"]);
+        let picked = {
+            let mut p = crate::prompt::TermPicker::new(&mut t);
+            choose_vault(&choices, &matches, Some("Personal"), &mut p)
+        };
+        assert_eq!(picked, Ok(2), "the copy listed as (none)");
+        assert!(t.said[2].contains("2) Personal") && t.said[2].contains("(none)"));
+    }
+
+    #[test]
+    fn unlocked_copies_are_told_apart_by_entry_count() {
+        assert_eq!(count_detail(Some(12)), "12 entries");
+        assert_eq!(count_detail(Some(1)), "1 entry");
+        assert_eq!(count_detail(Some(0)), "0 entries");
+        assert_eq!(count_detail(None), "(unavailable)");
+
+        let u = Unlocked {
+            vaults: vec![keyroost_transport::vault::VaultOnKey {
+                vault_ref: VaultRef {
+                    credential_id: vec![1],
+                    name: Some("Personal".to_owned()),
+                },
+                state: Err(VaultProblem::NoSecret),
+            }],
+            capacity: cap(),
+        };
+        let choices = unlocked_choices(&u);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].name.as_deref(), Some("Personal"));
+        assert_eq!(choices[0].detail, "(unavailable)");
     }
 
     #[test]

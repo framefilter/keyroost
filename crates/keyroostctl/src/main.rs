@@ -17727,6 +17727,7 @@ mod cli_tests {
             ("fido fingerprint delete", IRREVERSIBLE),
             ("fido blob delete", IRREVERSIBLE),
             ("fido blob clear", IRREVERSIBLE),
+            ("fido vault delete", IRREVERSIBLE),
             ("molto delete", IRREVERSIBLE),
             ("molto reset", IRREVERSIBLE),
             ("oath delete", IRREVERSIBLE),
@@ -17764,7 +17765,9 @@ mod cli_tests {
         // Commands that ask before a change that destroys no key, seed or
         // certificate: a token setting, `piv cert request`, which replaces a
         // key only with the optional `--generate-key`, a key's name, and the
-        // code imports, which replace a code only with `--replace`.
+        // code imports, which replace a code only with `--replace`, and a
+        // vault rotate, whose old vault goes only after its entries are
+        // checked in the new one.
         let confirms_only = [
             "prog config set",
             "piv cert request",
@@ -17773,6 +17776,7 @@ mod cli_tests {
             "oath import",
             "otp import",
             "feitian import",
+            "fido vault rotate",
         ];
         let tree = all_commands();
         for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {

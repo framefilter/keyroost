@@ -39,3 +39,26 @@ fn vault_list_without_a_pin_source_is_refused_before_the_key() {
         "{err}"
     );
 }
+
+/// What `vault add` prints for a name the vault format can't hold: the
+/// format's own refusal, before any key is looked for.
+fn assert_name_refused_before_the_key(name: &str) {
+    let (code, out, err) = run(&["fido", "vault", "add", name, "--pin", "env:KR_TEST_PIN"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(
+        err,
+        format!("error: {}\n", keyroost_vault::VaultError::NameLength),
+        "no key message, only the name's"
+    );
+}
+
+#[test]
+fn vault_add_refuses_a_name_over_32_bytes_before_the_key() {
+    assert_name_refused_before_the_key(&"é".repeat(17));
+}
+
+#[test]
+fn vault_add_refuses_an_empty_name() {
+    assert_name_refused_before_the_key("");
+}
