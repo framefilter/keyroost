@@ -3049,6 +3049,49 @@ enum FidoCredentialCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
+    /// Compare the resident credentials on two keys.
+    ///
+    /// With exactly two FIDO keys connected the keys need no naming; with
+    /// more, name them with --a/--b or pick at the terminal.
+    ///
+    /// Matches on relying-party ID and user handle.
+    Diff {
+        /// Key A to compare, by friendly name, serial, or `list` number
+        /// (prefix name:, serial: or list: to force which); omit both
+        /// selectors with exactly two keys connected.
+        #[arg(long, value_name = "KEY", conflicts_with = "a_path")]
+        a: Option<String>,
+        /// USB HID device path of key A, instead of --a.
+        #[arg(long = "a-path", value_name = "PATH", conflicts_with = "a")]
+        a_path: Option<std::path::PathBuf>,
+        /// Key B to compare, by friendly name, serial, or `list` number
+        /// (prefix name:, serial: or list: to force which); omit both
+        /// selectors with exactly two keys connected.
+        #[arg(long, value_name = "KEY", conflicts_with = "b_path")]
+        b: Option<String>,
+        /// USB HID device path of key B, instead of --b.
+        #[arg(long = "b-path", value_name = "PATH", conflicts_with = "b")]
+        b_path: Option<std::path::PathBuf>,
+        /// The PIN both keys share: env:NAME reads that environment variable,
+        /// stdin reads one line (first line, or second when --a-pin stdin is
+        /// also given; hidden when typed at a terminal). Key B reuses it
+        /// unless --b-pin is also given. With neither this nor the per-key
+        /// flags, a terminal asks. It asks for each key (an empty second
+        /// answer reuses the first).
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// The PIN for key A: env:NAME reads that environment variable,
+        /// stdin reads one line (first line; hidden when typed at a
+        /// terminal). With neither, a terminal asks.
+        #[arg(long = "a-pin", value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        a_pin: Option<SecretSource>,
+        /// The PIN for key B: env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --a-pin stdin or --pin
+        /// stdin is also given; hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long = "b-pin", value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        b_pin: Option<SecretSource>,
+    },
     /// Delete one credential (passkey or security-key sign-in) by its hex
     /// credential ID.
     /// Irreversible: asks first (`--yes` to skip).
@@ -14571,6 +14614,8 @@ fn record_meta_for(
 }
 
 const FIDO_PIN: Spec = Spec::current("PIN", "pin");
+const FIDO_PIN_A: Spec = Spec::current("PIN for key A", "a-pin");
+const FIDO_PIN_B: Spec = Spec::current("PIN for key B", "b-pin");
 const FIDO_OLD_PIN: Spec = Spec::current("current PIN", "pin");
 const FIDO_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
 
@@ -14796,6 +14841,23 @@ fn run_fido_credentials(cmd: &FidoCredentialCmd) -> Result<(), Box<dyn std::erro
             run_fido_creds_metadata(path.as_deref(), &pin)?;
             Ok(())
         }
+        FidoCredentialCmd::Diff {
+            a,
+            a_path,
+            b,
+            b_path,
+            pin,
+            a_pin,
+            b_pin,
+        } => run_fido_creds_diff(FidoCredDiffArgs {
+            a: a.as_deref(),
+            a_path: a_path.as_deref(),
+            b: b.as_deref(),
+            b_path: b_path.as_deref(),
+            pin: pin.as_ref(),
+            a_pin: a_pin.as_ref(),
+            b_pin: b_pin.as_ref(),
+        }),
     }
 }
 
@@ -16247,6 +16309,425 @@ fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn st
         })?;
     } else {
         outln!("{}", pin_status_line(pin_retries));
+    }
+    Ok(())
+}
+
+/// One resident credential as `fido credential diff` compares it: the
+/// identity the two keys are matched on (relying-party ID and user handle)
+/// plus the human labels for display. Credential IDs always differ between
+/// keys, so they are not compared and not carried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiffCred {
+    rp_id: String,
+    rp_name: Option<String>,
+    user_id: Vec<u8>,
+    user_name: Option<String>,
+    user_display_name: Option<String>,
+}
+
+/// The identity two credentials match on: the relying party plus the RP's
+/// own user handle. The handle (not the login string) is what the RP keeps
+/// stable when an account is registered on a second key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct DiffKey<'a> {
+    rp_id: &'a str,
+    user_id: &'a [u8],
+}
+
+/// Split `a` and `b` into (only on A, only on B, on both), each sorted by
+/// relying-party ID then user name. A side holding the same identity twice
+/// counts it once; for an identity on both keys the A side is shown.
+fn diff_creds<'a>(
+    a: &'a [DiffCred],
+    b: &'a [DiffCred],
+) -> (Vec<&'a DiffCred>, Vec<&'a DiffCred>, Vec<&'a DiffCred>) {
+    use std::collections::{HashMap, HashSet};
+    fn first_by_key<'c>(creds: &'c [DiffCred]) -> HashMap<DiffKey<'c>, &'c DiffCred> {
+        let mut map = HashMap::new();
+        for c in creds {
+            map.entry(DiffKey {
+                rp_id: &c.rp_id,
+                user_id: &c.user_id,
+            })
+            .or_insert(c);
+        }
+        map
+    }
+    fn sort_group(group: &mut Vec<&DiffCred>) {
+        group.sort_by(|x, y| {
+            x.rp_id.cmp(&y.rp_id).then_with(|| {
+                x.user_name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .cmp(y.user_name.as_deref().unwrap_or_default())
+                    .then_with(|| x.user_id.cmp(&y.user_id))
+            })
+        });
+    }
+    let a_map = first_by_key(a);
+    let b_map = first_by_key(b);
+    let a_keys: HashSet<DiffKey<'_>> = a_map.keys().copied().collect();
+    let b_keys: HashSet<DiffKey<'_>> = b_map.keys().copied().collect();
+    let mut only_a: Vec<&DiffCred> = a_keys.difference(&b_keys).map(|k| a_map[k]).collect();
+    let mut only_b: Vec<&DiffCred> = b_keys.difference(&a_keys).map(|k| b_map[k]).collect();
+    let mut on_both: Vec<&DiffCred> = a_keys.intersection(&b_keys).map(|k| a_map[k]).collect();
+    sort_group(&mut only_a);
+    sort_group(&mut only_b);
+    sort_group(&mut on_both);
+    (only_a, only_b, on_both)
+}
+
+/// One `diff` line: the RP (sanitized — attacker-controlled, like in
+/// `list`) plus the user handle and names (debug-formatted, like in
+/// `list`). The handle always prints: two credentials can share RP, name
+/// and display name while differing only in the handle (e.g. distinct SSH
+/// keys under one `ssh:` RP), and then it is the only thing telling the
+/// two lines apart.
+fn fmt_diff_cred(c: &DiffCred) -> String {
+    let rp = match &c.rp_name {
+        Some(n) if !n.is_empty() => format!(
+            "{}  ({})",
+            sanitize_terminal(&c.rp_id),
+            sanitize_terminal(n)
+        ),
+        _ => sanitize_terminal(&c.rp_id),
+    };
+    let mut s = format!("  {rp}  user {:?}", String::from_utf8_lossy(&c.user_id));
+    if let Some(n) = &c.user_name {
+        s.push_str(&format!("  name={n:?}"));
+    }
+    if let Some(d) = &c.user_display_name {
+        s.push_str(&format!("  display={d:?}"));
+    }
+    s
+}
+
+/// Read every resident credential on the key at `hid_path` for the diff.
+/// Returns the readable credentials plus the count of relying parties skipped
+/// for a malformed `rpIdHash` (which `fido credential list` reports as
+/// "credentials unavailable"): their credentials can't be listed, so the diff
+/// carries the count instead of claiming two keys are in sync.
+/// Like [`with_credential_manager`] but on an already-resolved path, so two
+/// keys can be read without the single-key selection memo.
+fn read_diff_side(
+    hid_path: &std::path::Path,
+    pin: &str,
+) -> Result<(Vec<DiffCred>, usize), Box<dyn std::error::Error>> {
+    let (mut dev, init) = open_ctap_hid(hid_path)?;
+    if !init.supports_cbor() {
+        return Err("device is U2F-only; CTAP2 credential management not supported".into());
+    }
+    let info = keyroost_ctap::get_info(&mut dev)?;
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        &mut dev,
+        pin,
+        &info,
+        keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
+    )?;
+    let mut mgr = keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
+    let mut out = Vec::new();
+    let mut unavailable = 0;
+    for rp in mgr.list_relying_parties()? {
+        let creds = match rp.rp_id_hash {
+            Some(hash) => mgr.list_credentials(&hash)?,
+            None => {
+                unavailable += 1;
+                Vec::new()
+            }
+        };
+        for c in creds {
+            out.push(DiffCred {
+                rp_id: rp.id.clone(),
+                rp_name: rp.name.clone().filter(|n| !n.is_empty()),
+                user_id: c.user.id.clone(),
+                user_name: c.user.name.clone(),
+                user_display_name: c.user.display_name.clone(),
+            });
+        }
+    }
+    Ok((out, unavailable))
+}
+
+/// One side of the unreadable-RP note: `None` when the side read clean, else
+/// `"1 relying party on key A"` / `"2 relying parties on key B"`.
+fn fmt_unavailable_side(count: usize, side: &str) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    Some(format!(
+        "{count} relying {} on key {side}",
+        if count == 1 { "party" } else { "parties" },
+    ))
+}
+
+/// The unreadable-RP pieces for both sides, in A-then-B order. Empty when
+/// both keys read clean.
+fn unavailable_parts(a: usize, b: usize) -> Vec<String> {
+    [fmt_unavailable_side(a, "A"), fmt_unavailable_side(b, "B")]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The `fido credential diff` refusals issued before any device I/O: the
+/// global `--device` can't name two keys, the shared `--pin` has no side
+/// left once both per-key flags are given, and without a terminal each side
+/// needs its per-key flag or the shared one. Pure so the early errors are
+/// unit-tested without hardware.
+fn check_diff_preconditions(
+    device_flag_present: bool,
+    pin: Option<&SecretSource>,
+    a_pin: Option<&SecretSource>,
+    b_pin: Option<&SecretSource>,
+    terminal_present: bool,
+) -> Result<(), String> {
+    if device_flag_present {
+        return Err(
+            "--device has no effect on `fido credential diff`; use --a and --b to name the two keys"
+                .to_string(),
+        );
+    }
+    // The shared --pin has no side left to supply once both per-key flags
+    // are given; refuse it outright rather than silently ignoring it.
+    if pin.is_some() && a_pin.is_some() && b_pin.is_some() {
+        return Err(
+            "--pin is ignored when both --a-pin and --b-pin are given; pass one or the other"
+                .to_string(),
+        );
+    }
+    // Either side can come from its per-key flag or the shared --pin: name
+    // both sources when neither names it, so a terminal-less run learns the
+    // shared option (the table's `a-pin|pin` / `b-pin|pin` alternatives).
+    if a_pin.is_none() && pin.is_none() && !terminal_present {
+        return Err("no PIN for key A given: pass --a-pin env:NAME or --a-pin stdin, or --pin env:NAME or --pin stdin".to_string());
+    }
+    if b_pin.is_none() && pin.is_none() && !terminal_present {
+        return Err("no PIN for key B given: pass --b-pin env:NAME or --b-pin stdin, or --pin env:NAME or --pin stdin".to_string());
+    }
+    Ok(())
+}
+
+/// What `fido credential diff` compares: the two key selectors plus the
+/// three PIN sources (the shared `--pin` and the per-key `--a-pin`/`--b-pin`).
+/// One struct instead of seven parameters so the runner needs no
+/// `too_many_arguments` allow.
+struct FidoCredDiffArgs<'a> {
+    a: Option<&'a str>,
+    a_path: Option<&'a std::path::Path>,
+    b: Option<&'a str>,
+    b_path: Option<&'a std::path::Path>,
+    pin: Option<&'a SecretSource>,
+    a_pin: Option<&'a SecretSource>,
+    b_pin: Option<&'a SecretSource>,
+}
+
+/// Read key A's PIN then key B's for `fido credential diff` from the three
+/// sources: a shared `--pin` read once for both keys when neither per-key
+/// flag is given, otherwise each side's own source (key A first, then key B).
+/// A side with no source is asked at the terminal with the key named, and an
+/// empty second answer reuses the first PIN — equal PINs are typed once, and
+/// differing PINs never burn a retry on the wrong key. Pure over the secrets
+/// layer (no device I/O) so the stdin line order is unit-testable.
+fn read_diff_pins<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    pin: Option<&SecretSource>,
+    a_pin: Option<&SecretSource>,
+    b_pin: Option<&SecretSource>,
+    label_a: &str,
+    label_b: &str,
+) -> Result<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>), String> {
+    let pin_src = Source::from_flag(pin);
+    let a_src = Source::from_flag(a_pin);
+    let b_src = Source::from_flag(b_pin);
+    // A shared --pin flag is read once for both keys. Otherwise each side
+    // reads its own source; a side with no source is asked at the terminal
+    // with the key named, and an empty second answer reuses the first PIN.
+    if a_pin.is_none() && b_pin.is_none() && pin.is_some() {
+        let shared = sec.read(&FIDO_PIN, pin_src)?;
+        return Ok((shared.clone(), shared));
+    }
+    let pa = if a_pin.is_some() || pin.is_some() {
+        sec.read(
+            if a_pin.is_some() {
+                &FIDO_PIN_A
+            } else {
+                &FIDO_PIN
+            },
+            if a_pin.is_some() { a_src } else { pin_src },
+        )?
+    } else {
+        sec.read_with_fallback(&FIDO_PIN_A, &format!("PIN for {label_a}: "), None)?
+    };
+    let pb = if b_pin.is_some() || pin.is_some() {
+        sec.read(
+            if b_pin.is_some() {
+                &FIDO_PIN_B
+            } else {
+                &FIDO_PIN
+            },
+            if b_pin.is_some() { b_src } else { pin_src },
+        )?
+    } else {
+        sec.read_with_fallback(
+            &FIDO_PIN_B,
+            &format!("PIN for {label_b} (empty for same as key A): "),
+            Some(&pa),
+        )?
+    };
+    Ok((pa, pb))
+}
+
+/// Compare the resident credentials on two keys (`fido credential diff`).
+/// The global `--device` can't name two keys, so it is refused here.
+fn run_fido_creds_diff(args: FidoCredDiffArgs<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let FidoCredDiffArgs {
+        a,
+        a_path,
+        b,
+        b_path,
+        pin,
+        a_pin,
+        b_pin,
+    } = args;
+    // Every required secret is checked before any device I/O; the shared
+    // --pin is validated under its own flag, each side under its per-key
+    // flag (falling back to the shared source when no per-key flag names it).
+    let mut sec = Secrets::real();
+    check_diff_preconditions(
+        crate::target::device_flag().is_some(),
+        pin,
+        a_pin,
+        b_pin,
+        sec.terminal_present(),
+    )?;
+    let pin_src = Source::from_flag(pin);
+    let a_src = Source::from_flag(a_pin);
+    let b_src = Source::from_flag(b_pin);
+    if pin.is_some() {
+        sec.check(&FIDO_PIN, pin_src)?;
+    }
+    sec.check(
+        &FIDO_PIN_A,
+        if a_pin.is_some() {
+            a_src
+        } else if pin.is_some() {
+            pin_src
+        } else {
+            Source::NONE
+        },
+    )?;
+    sec.check(
+        &FIDO_PIN_B,
+        if b_pin.is_some() {
+            b_src
+        } else if pin.is_some() {
+            pin_src
+        } else {
+            Source::NONE
+        },
+    )?;
+    let (dev_a, dev_b) = crate::target::select_fido_pair(a, a_path, b, b_path)?;
+    // Both sides share one prompt/line when neither per-key flag is given;
+    // otherwise each side reads its own source (key A first, then key B).
+    let label_a = crate::prompt::key_label(&dev_a);
+    let label_b = crate::prompt::key_label(&dev_b);
+    let (pin_a, pin_b) = read_diff_pins(&mut sec, pin, a_pin, b_pin, &label_a, &label_b)?;
+    // A typed PIN left a gap in which either key could have been swapped.
+    if sec.prompted() {
+        crate::target::reverify(&dev_a)
+            .map_err(|e| -> Box<dyn std::error::Error> { format!("key A: {e}").into() })?;
+        crate::target::reverify(&dev_b)
+            .map_err(|e| -> Box<dyn std::error::Error> { format!("key B: {e}").into() })?;
+    }
+    let path_a = crate::target::hid_path_of(&dev_a)?;
+    let path_b = crate::target::hid_path_of(&dev_b)?;
+    let (creds_a, unavail_a) = read_diff_side(&path_a, &pin_a)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("key A: {e}").into() })?;
+    let (creds_b, unavail_b) = read_diff_side(&path_b, &pin_b)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("key B: {e}").into() })?;
+    let (only_a, only_b, on_both) = diff_creds(&creds_a, &creds_b);
+    // Relying parties with a malformed rpIdHash can't be listed, so the
+    // comparison is partial — say so loudly, on stderr so it also reaches
+    // --json users without breaking the output schema (as the OATH listing
+    // does for undecodable entries). An invisible entry must never read as
+    // "in sync".
+    let unavailable = unavailable_parts(unavail_a, unavail_b);
+    if !unavailable.is_empty() {
+        crate::output::warn(&format!(
+            "{} not compared (credentials unavailable: device returned a malformed rpIdHash); the comparison is incomplete",
+            unavailable.join(" and ")
+        ));
+    }
+    if json_output() {
+        let entry = |c: &DiffCred| json_out::FidoCredDiffEntryJson {
+            rp_id: c.rp_id.clone(),
+            rp_name: c.rp_name.clone(),
+            user_id: String::from_utf8_lossy(&c.user_id).into_owned(),
+            user_name: c.user_name.clone(),
+            user_display_name: c.user_display_name.clone(),
+        };
+        emit_json(&json_out::FidoCredDiffJson {
+            only_on_a: only_a.iter().map(|c| entry(c)).collect(),
+            only_on_b: only_b.iter().map(|c| entry(c)).collect(),
+            a_total: creds_a.len(),
+            b_total: creds_b.len(),
+            a_unavailable_rps: unavail_a,
+            b_unavailable_rps: unavail_b,
+        })?;
+        return Ok(());
+    }
+    if only_a.is_empty() && only_b.is_empty() {
+        if on_both.is_empty() {
+            if unavailable.is_empty() {
+                outln!("(no resident credentials on either key)");
+            } else {
+                outln!(
+                    "(no readable resident credentials on either key; {} unavailable)",
+                    unavailable.join(" and ")
+                );
+            }
+        } else if unavailable.is_empty() {
+            outln!(
+                "Both keys hold the same {} account(s); in sync.",
+                on_both.len()
+            );
+        } else {
+            outln!(
+                "Both keys hold the same {} readable account(s); {} unavailable, comparison incomplete.",
+                on_both.len(),
+                unavailable.join(" and ")
+            );
+        }
+        return Ok(());
+    }
+    if !only_a.is_empty() {
+        outln!("Only on key A ({}):", only_a.len());
+        for c in &only_a {
+            outln!("{}", fmt_diff_cred(c));
+        }
+    }
+    if !only_b.is_empty() {
+        outln!("Only on key B ({}):", only_b.len());
+        for c in &only_b {
+            outln!("{}", fmt_diff_cred(c));
+        }
+    }
+    if unavailable.is_empty() {
+        outln!(
+            "Key A holds {} credential(s), key B holds {}; {} account(s) on both.",
+            creds_a.len(),
+            creds_b.len(),
+            on_both.len()
+        );
+    } else {
+        outln!(
+            "Key A holds {} credential(s), key B holds {}; {} account(s) on both, {} unavailable.",
+            creds_a.len(),
+            creds_b.len(),
+            on_both.len(),
+            unavailable.join(" and ")
+        );
     }
     Ok(())
 }
@@ -20376,6 +20857,284 @@ mod cli_tests {
         assert_eq!(e.to_string(), "swapped");
     }
 
+    fn diff_cred(rp: &str, user_id: &[u8], name: Option<&str>) -> DiffCred {
+        DiffCred {
+            rp_id: rp.into(),
+            rp_name: None,
+            user_id: user_id.to_vec(),
+            user_name: name.map(str::to_owned),
+            user_display_name: None,
+        }
+    }
+
+    #[test]
+    fn credential_diff_matches_on_rp_id_and_user_handle() {
+        // Same account, re-registered (and renamed) on the second key: the
+        // login string differs, but the RP's user handle is stable, so the
+        // credential counts as on both keys.
+        let a = vec![
+            diff_cred("github.com", b"uid-1", Some("alice@example.com")),
+            diff_cred("github.com", b"uid-2", Some("bob")),
+        ];
+        let b = vec![
+            diff_cred("github.com", b"uid-1", Some("alice-renamed@example.com")),
+            diff_cred("gitlab.com", b"uid-2", Some("bob")),
+        ];
+        let (only_a, only_b, on_both) = diff_creds(&a, &b);
+        assert_eq!(only_a, vec![&a[1]]);
+        assert_eq!(only_b, vec![&b[1]]);
+        // The A side is shown for a shared identity.
+        assert_eq!(on_both, vec![&a[0]]);
+    }
+
+    #[test]
+    fn credential_diff_groups_are_sorted_for_scanning() {
+        let a = vec![
+            diff_cred("z.example", b"u2", Some("x")),
+            diff_cred("a.example", b"u2", Some("x")),
+            diff_cred("a.example", b"u1", Some("x")),
+        ];
+        let (only_a, only_b, on_both) = diff_creds(&a, &[]);
+        assert!(only_b.is_empty() && on_both.is_empty());
+        assert_eq!(
+            only_a
+                .iter()
+                .map(|c| (c.rp_id.as_str(), c.user_id.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a.example", b"u1".as_slice()),
+                ("a.example", b"u2".as_slice()),
+                ("z.example", b"u2".as_slice()),
+            ]
+        );
+    }
+
+    #[test]
+    fn credential_diff_empty_sides_count_once() {
+        // A duplicated identity on one side (re-registration leftovers)
+        // counts as one entry, not two.
+        let a = vec![
+            diff_cred("x.example", b"u", Some("n")),
+            diff_cred("x.example", b"u", Some("n")),
+        ];
+        let (only_a, only_b, on_both) = diff_creds(&a, &a);
+        assert!(only_a.is_empty() && only_b.is_empty());
+        assert_eq!(on_both.len(), 1);
+        let (only_a, only_b, on_both) = diff_creds(&[], &[]);
+        assert!(only_a.is_empty() && only_b.is_empty() && on_both.is_empty());
+    }
+
+    #[test]
+    fn credential_diff_shows_handle_and_names_like_list() {
+        // Same fields as `credential list`: the handle always prints, then
+        // name and display name when present.
+        let mut named = diff_cred("github.com", b"uid-1", Some("alice@example.com"));
+        named.user_display_name = Some("Alice".into());
+        named.rp_name = Some("GitHub".into());
+        let line = fmt_diff_cred(&named);
+        assert!(line.contains("github.com"), "{line}");
+        assert!(line.contains("GitHub"), "{line}");
+        assert!(line.contains(r#"user "uid-1""#), "{line}");
+        assert!(line.contains(r#"name="alice@example.com""#), "{line}");
+        assert!(line.contains(r#"display="Alice""#), "{line}");
+        // Two SSH keys sharing RP, name and display differ only in the
+        // handle — the lines must still tell them apart.
+        let ssh_a = DiffCred {
+            rp_id: "ssh:demo".into(),
+            rp_name: None,
+            user_id: b"key-a".to_vec(),
+            user_name: Some("openssh".into()),
+            user_display_name: Some("openssh".into()),
+        };
+        let mut ssh_b = ssh_a.clone();
+        ssh_b.user_id = b"key-b".to_vec();
+        let (line_a, line_b) = (fmt_diff_cred(&ssh_a), fmt_diff_cred(&ssh_b));
+        assert_ne!(line_a, line_b);
+        assert!(line_a.contains(r#"user "key-a""#), "{line_a}");
+        assert!(line_b.contains(r#"user "key-b""#), "{line_b}");
+    }
+
+    #[test]
+    fn credential_diff_sides_are_optional_but_exclusive() {
+        // Bare, one side, or explicit paths all parse: with exactly two keys
+        // connected no naming is needed at all.
+        assert!(parse(&["keyroostctl", "fido", "credential", "diff"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "credential", "diff", "--a", "A"]).is_ok());
+        // One selector per side, not both spellings.
+        assert!(parse(&[
+            "keyroostctl",
+            "fido",
+            "credential",
+            "diff",
+            "--a",
+            "A",
+            "--a-path",
+            "/dev/hidraw1",
+            "--b",
+            "B",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "fido",
+            "credential",
+            "diff",
+            "--a",
+            "A",
+            "--b",
+            "B",
+            "--b-path",
+            "/dev/hidraw2",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "fido",
+            "credential",
+            "diff",
+            "--a-path",
+            "/dev/hidraw1",
+            "--b-path",
+            "/dev/hidraw2",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn credential_diff_preconditions_fail_before_any_device_io() {
+        let pin = SecretSource::Stdin;
+        let a_pin = SecretSource::Stdin;
+        let b_pin = SecretSource::Stdin;
+        // The global --device can't name two keys.
+        let e = check_diff_preconditions(true, None, None, None, true).unwrap_err();
+        assert!(e.contains("--device"), "{e}");
+        // The shared --pin has no side left once both per-key flags are given.
+        let e = check_diff_preconditions(false, Some(&pin), Some(&a_pin), Some(&b_pin), true)
+            .unwrap_err();
+        assert!(e.contains("--pin is ignored"), "{e}");
+        // Without a terminal each side needs its per-key flag or the shared one.
+        let e = check_diff_preconditions(false, None, None, None, false).unwrap_err();
+        assert!(e.contains("key A"), "{e}");
+        let e = check_diff_preconditions(false, None, Some(&a_pin), None, false).unwrap_err();
+        assert!(e.contains("key B"), "{e}");
+        // Any one source per side (or a terminal) passes this gate; env
+        // validity is checked next by `Secrets::check`.
+        assert!(check_diff_preconditions(false, None, None, None, true).is_ok());
+        assert!(check_diff_preconditions(false, Some(&pin), None, None, false).is_ok());
+        assert!(check_diff_preconditions(false, None, Some(&a_pin), Some(&b_pin), false).is_ok());
+    }
+
+    /// The `fido credential diff` PIN flags read key A first, then key B:
+    /// through the handler's own reader, as the help promises ("first line",
+    /// "second line"). The three-flag shape doesn't fit the two-flag
+    /// `stdin_line_order_per_command` harness, so it is pinned here.
+    fn diff_pins(
+        pin: Option<SecretSource>,
+        a_pin: Option<SecretSource>,
+        b_pin: Option<SecretSource>,
+        io: crate::secrets::fake::FakeIo,
+    ) -> (String, String, crate::secrets::fake::FakeIo) {
+        let mut sec = Secrets::new(io);
+        let (a, b) = read_diff_pins(
+            &mut sec,
+            pin.as_ref(),
+            a_pin.as_ref(),
+            b_pin.as_ref(),
+            "A",
+            "B",
+        )
+        .unwrap();
+        (a.to_string(), b.to_string(), sec.io)
+    }
+
+    #[test]
+    fn credential_diff_stdin_lines_go_to_key_a_then_key_b() {
+        use crate::secrets::fake::FakeIo;
+        // The shared --pin is read once for both keys: a second piped line
+        // is left alone.
+        let (a, b, io) = diff_pins(
+            Some(SecretSource::Stdin),
+            None,
+            None,
+            FakeIo::piped(&["11\n", "22\n"]),
+        );
+        assert_eq!((a.as_str(), b.as_str()), ("11", "11"));
+        assert_eq!(io.lines_read, 1);
+        // One source per side: line 1 is key A, line 2 is key B.
+        let (a, b, io) = diff_pins(
+            None,
+            Some(SecretSource::Stdin),
+            Some(SecretSource::Stdin),
+            FakeIo::piped(&["11\n", "22\n"]),
+        );
+        assert_eq!((a.as_str(), b.as_str()), ("11", "22"));
+        assert_eq!(io.lines_read, 2);
+        // Shared plus per-key: the per-key side reads line 1, the shared
+        // source supplies the other side on line 2.
+        let (a, b, _) = diff_pins(
+            Some(SecretSource::Stdin),
+            Some(SecretSource::Stdin),
+            None,
+            FakeIo::piped(&["11\n", "22\n"]),
+        );
+        assert_eq!((a.as_str(), b.as_str()), ("11", "22"));
+        let (a, b, _) = diff_pins(
+            Some(SecretSource::Stdin),
+            None,
+            Some(SecretSource::Stdin),
+            FakeIo::piped(&["11\n", "22\n"]),
+        );
+        assert_eq!((a.as_str(), b.as_str()), ("11", "22"));
+        // An env side reads no stdin line: key B's piped line stays line 1.
+        let (a, b, io) = diff_pins(
+            None,
+            Some(SecretSource::Env("KR_A".into())),
+            Some(SecretSource::Stdin),
+            FakeIo::piped(&["22\n"]).var("KR_A", "11"),
+        );
+        assert_eq!((a.as_str(), b.as_str()), ("11", "22"));
+        assert_eq!(io.lines_read, 1);
+    }
+
+    #[test]
+    fn credential_diff_prompts_name_the_key_and_reuse_is_explicit() {
+        use crate::secrets::fake::FakeIo;
+        // No flag at a terminal: each side is asked with its key named, and
+        // an empty second answer reuses the first PIN.
+        let (a, b, io) = diff_pins(None, None, None, FakeIo::terminal().typing(&["12", ""]));
+        assert_eq!((a.as_str(), b.as_str()), ("12", "12"));
+        assert_eq!(
+            io.prompts,
+            vec![
+                "PIN for A: ".to_string(),
+                "PIN for B (empty for same as key A): ".to_string(),
+            ]
+        );
+        // Differing PINs are kept separate.
+        let (a, b, _) = diff_pins(None, None, None, FakeIo::terminal().typing(&["12", "34"]));
+        assert_eq!((a.as_str(), b.as_str()), ("12", "34"));
+    }
+
+    #[test]
+    fn credential_diff_unavailable_parts_name_each_side_once() {
+        assert!(unavailable_parts(0, 0).is_empty());
+        assert_eq!(
+            unavailable_parts(1, 0),
+            vec!["1 relying party on key A".to_string()]
+        );
+        assert_eq!(
+            unavailable_parts(0, 2),
+            vec!["2 relying parties on key B".to_string()]
+        );
+        assert_eq!(
+            unavailable_parts(1, 2),
+            vec![
+                "1 relying party on key A".to_string(),
+                "2 relying parties on key B".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn always_uv_pre_pin_needs_authnr_cfg_only_to_change() {
         let info = |opts: &[(&str, bool)]| keyroost_ctap::AuthenticatorInfo {
@@ -22228,6 +22987,16 @@ mod cli_tests {
             &["keyroostctl", "fido", "credential", "list"],
             &["keyroostctl", "fido", "credential", "status"],
             &["keyroostctl", "fido", "credential", "delete", "00"],
+            &[
+                "keyroostctl",
+                "fido",
+                "credential",
+                "diff",
+                "--a",
+                "A",
+                "--b",
+                "B",
+            ],
             &["keyroostctl", "fido", "fingerprint", "list"],
             &["keyroostctl", "fido", "fingerprint", "add"],
             &["keyroostctl", "fido", "fingerprint", "rename", "00", "x"],

@@ -561,6 +561,37 @@ pub(crate) struct FidoCredentialJson {
     pub algorithm_name: Option<&'static str>,
 }
 
+/// `keyroostctl fido --json credential diff` — resident credentials on two
+/// keys compared by (relying-party ID, user handle). Credential IDs always
+/// differ between keys, so they are not part of the comparison and not shown.
+/// The groups hold distinct identities; `a_total`/`b_total` are the readable
+/// entry counts, as `fido credential list` counts them. Relying parties whose
+/// `rpIdHash` came back malformed can't be listed, so their credentials are
+/// neither compared nor counted in the totals; per-side RP counts go in
+/// `a_unavailable_rps`/`b_unavailable_rps`.
+#[derive(Serialize)]
+pub(crate) struct FidoCredDiffJson {
+    pub only_on_a: Vec<FidoCredDiffEntryJson>,
+    pub only_on_b: Vec<FidoCredDiffEntryJson>,
+    pub a_total: usize,
+    pub b_total: usize,
+    /// Relying parties skipped on each key (malformed `rpIdHash`, as
+    /// `fido credential list` reports them).
+    pub a_unavailable_rps: usize,
+    pub b_unavailable_rps: usize,
+}
+
+/// One resident credential in the `credential diff` output.
+#[derive(Serialize)]
+pub(crate) struct FidoCredDiffEntryJson {
+    pub rp_id: String,
+    pub rp_name: Option<String>,
+    /// The user handle, rendered as UTF-8 (lossy), as the human prints it.
+    pub user_id: String,
+    pub user_name: Option<String>,
+    pub user_display_name: Option<String>,
+}
+
 /// `keyroostctl fido ssh --json list` — one entry per resident SSH credential
 /// (an `ssh:*` relying party), as the text form prints one line each.
 #[derive(Serialize)]
@@ -1371,6 +1402,61 @@ mod tests {
                 ],
             );
         }
+    }
+
+    #[test]
+    fn creds_diff_shape() {
+        let v = to_v(&FidoCredDiffJson {
+            only_on_a: vec![FidoCredDiffEntryJson {
+                rp_id: "example.com".into(),
+                rp_name: Some("Example".into()),
+                user_id: "u".into(),
+                user_name: Some("n".into()),
+                user_display_name: None,
+            }],
+            only_on_b: vec![FidoCredDiffEntryJson {
+                rp_id: "other.example".into(),
+                rp_name: None,
+                user_id: "v".into(),
+                user_name: None,
+                user_display_name: None,
+            }],
+            a_total: 2,
+            b_total: 1,
+            a_unavailable_rps: 1,
+            b_unavailable_rps: 0,
+        });
+        assert_shape(
+            &v,
+            &[
+                ("only_on_a", "array"),
+                ("only_on_b", "array"),
+                ("a_total", "number"),
+                ("b_total", "number"),
+                ("a_unavailable_rps", "number"),
+                ("b_unavailable_rps", "number"),
+            ],
+        );
+        assert_shape(
+            &v["only_on_a"][0],
+            &[
+                ("rp_id", "string"),
+                ("rp_name", "string|null"),
+                ("user_id", "string"),
+                ("user_name", "string|null"),
+                ("user_display_name", "string|null"),
+            ],
+        );
+        assert_shape(
+            &v["only_on_b"][0],
+            &[
+                ("rp_id", "string"),
+                ("rp_name", "string|null"),
+                ("user_id", "string"),
+                ("user_name", "string|null"),
+                ("user_display_name", "string|null"),
+            ],
+        );
     }
 
     #[test]
