@@ -69,11 +69,12 @@ impl HmacSecretSession {
     }
 
     /// The `hmac-secret` value for the getAssertion `extensions` map, asking
-    /// for one 32-byte salt.
-    pub fn extension_input(&self, salt1: &[u8; 32]) -> Value {
+    /// for one 32-byte salt. Fails with [`CtapError::Random`] when the OS
+    /// random source cannot supply the protocol-2 IV.
+    pub fn extension_input(&self, salt1: &[u8; 32]) -> Result<Value, CtapError> {
         // v1: 32 bytes under a zero IV, 16-byte tag. v2: random IV || 32
         // bytes, 32-byte tag. The protocol object carries both differences.
-        let salt_enc = self.proto.encrypt(salt1);
+        let salt_enc = self.proto.encrypt(salt1)?;
         let salt_auth = self.proto.authenticate(&salt_enc);
         // Keys ascending, as CTAP canonical CBOR requires.
         let mut entries = vec![
@@ -87,7 +88,7 @@ impl HmacSecretSession {
                 Value::UInt(u64::from(self.protocol)),
             ));
         }
-        Value::Map(entries)
+        Ok(Value::Map(entries))
     }
 
     /// Decrypt the authenticator's `hmac-secret` output (the bytes under the
@@ -174,14 +175,14 @@ mod tests {
         let session = HmacSecretSession::for_test(Box::new(v1()), dummy_cose());
         assert_eq!(session.protocol(), PIN_PROTOCOL_V1);
         let salt1 = [0x5a; 32];
-        let input = session.extension_input(&salt1);
+        let input = session.extension_input(&salt1).unwrap();
 
         assert_eq!(keys(&input), vec![1, 2, 3]);
         assert_eq!(input.get_uint_key(1), Some(&dummy_cose()));
         let salt_enc = bytes_at(&input, 2);
         assert_eq!(salt_enc.len(), 32);
         // v1 uses a zero IV, so the ciphertext is deterministic.
-        assert_eq!(salt_enc, v1().encrypt(&salt1));
+        assert_eq!(salt_enc, v1().encrypt(&salt1).unwrap());
         let salt_auth = bytes_at(&input, 3);
         assert_eq!(salt_auth.len(), 16);
         assert_eq!(salt_auth, v1().authenticate(&salt_enc));
@@ -192,7 +193,7 @@ mod tests {
         let session = HmacSecretSession::for_test(Box::new(v2()), dummy_cose());
         assert_eq!(session.protocol(), PIN_PROTOCOL_V2);
         let salt1 = [0x5a; 32];
-        let input = session.extension_input(&salt1);
+        let input = session.extension_input(&salt1).unwrap();
 
         assert_eq!(keys(&input), vec![1, 2, 3, 4]);
         assert_eq!(input.get_uint_key(1), Some(&dummy_cose()));
@@ -214,11 +215,11 @@ mod tests {
         ];
         for (device, platform) in protos {
             let session = HmacSecretSession::for_test(platform, dummy_cose());
-            let enc = device.encrypt(&output);
+            let enc = device.encrypt(&output).unwrap();
             assert_eq!(*session.decrypt_output(&enc).unwrap(), output);
 
             // Two outputs (salt1 and salt2) decrypt to 64 bytes: refused.
-            let enc64 = device.encrypt(&[0x33; 64]);
+            let enc64 = device.encrypt(&[0x33; 64]).unwrap();
             let shape_error = |r: Result<Zeroizing<[u8; 32]>, CtapError>| {
                 matches!(
                     r,
@@ -281,7 +282,7 @@ mod tests {
     #[test]
     fn begin_negotiates_a_secret_the_authenticator_shares() {
         for (advertised, expected) in [(vec![2u64, 1], PIN_PROTOCOL_V2), (vec![1], 1)] {
-            let authenticator = EphemeralKey::generate();
+            let authenticator = EphemeralKey::generate().unwrap();
             let mut dev = KeyAgreementDevice {
                 public: authenticator.public_xy(),
                 requests: Vec::new(),
@@ -305,7 +306,7 @@ mod tests {
             assert_eq!(req.get_uint_key(2).unwrap().as_uint(), Some(2));
 
             let salt1 = [0xa5; 32];
-            let input = session.extension_input(&salt1);
+            let input = session.extension_input(&salt1).unwrap();
             let (x, y) = cose_xy(input.get_uint_key(1).unwrap());
             let device: Box<dyn PinProtocol> = if expected == PIN_PROTOCOL_V2 {
                 Box::new(ProtocolV2 {
@@ -321,7 +322,7 @@ mod tests {
             assert_eq!(bytes_at(&input, 3), device.authenticate(&salt_enc));
 
             let output = [0x5c; 32];
-            let enc = device.encrypt(&output);
+            let enc = device.encrypt(&output).unwrap();
             assert_eq!(*session.decrypt_output(&enc).unwrap(), output);
         }
     }
