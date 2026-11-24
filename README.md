@@ -740,7 +740,7 @@ keyroostctl fido ssh list                     # list SSH certs stored in residen
 keyroostctl fido ssh export --rp ssh:demo --out demo-cert.pub
 keyroostctl fido vault add Personal           # a new password vault on the key (two touches)
 keyroostctl fido vault entry add GitHub --username alice --generate-password
-keyroostctl fido vault entry show GitHub --reveal | wl-copy
+keyroostctl fido vault entry show GitHub --reveal
 keyroostctl fido vault export Personal -o personal.t2vault
 keyroostctl fido vault import -i personal.t2vault --dry-run   # preview; writes nothing
 
