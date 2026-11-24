@@ -1677,7 +1677,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hidapi"
 version = "2.6.7"
-source = "git+https://github.com/Snrat/hidapi-rs?rev=625b3ec01ba57fde9103c33fa840718b03c0f0e8#625b3ec01ba57fde9103c33fa840718b03c0f0e8"
+source = "git+https://github.com/framefilter/hidapi-rs?rev=625b3ec01ba57fde9103c33fa840718b03c0f0e8#625b3ec01ba57fde9103c33fa840718b03c0f0e8"
 dependencies = [
  "cc",
  "cfg-if",
