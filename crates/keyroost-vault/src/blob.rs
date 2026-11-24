@@ -9,7 +9,7 @@ use crate::kdf::hkdf_sha256;
 use crate::model::{from_json, to_json, Vault};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAGIC: &[u8; 5] = b"T2VLT";
 const VERSION: u8 = 1;
@@ -25,11 +25,20 @@ pub(crate) fn deflate(b: &[u8]) -> Vec<u8> {
 
 /// Raw inflate, refusing to produce more than 16 MiB.
 pub(crate) fn inflate(b: &[u8]) -> Result<Zeroizing<Vec<u8>>, VaultError> {
-    use miniz_oxide::inflate::{decompress_to_vec_with_limit, TINFLStatus};
-    match decompress_to_vec_with_limit(b, MAX_INFLATED) {
+    match miniz_oxide::inflate::decompress_to_vec_with_limit(b, MAX_INFLATED) {
         Ok(v) => Ok(Zeroizing::new(v)),
-        Err(e) if e.status == TINFLStatus::HasMoreOutput => Err(VaultError::TooLarge),
-        Err(_) => Err(VaultError::Corrupt("decompression failed")),
+        Err(mut e) => Err(inflate_error(&mut e)),
+    }
+}
+
+/// Map a failed inflate to its error, wiping the partial output first: the
+/// input passed the AEAD tag, so that output is decrypted vault JSON.
+fn inflate_error(e: &mut miniz_oxide::inflate::DecompressError) -> VaultError {
+    e.output.zeroize();
+    if e.status == miniz_oxide::inflate::TINFLStatus::HasMoreOutput {
+        VaultError::TooLarge
+    } else {
+        VaultError::Corrupt("decompression failed")
     }
 }
 
@@ -157,6 +166,16 @@ mod tests {
             inflate(&[0xff, 0xff, 0xff]).unwrap_err(),
             VaultError::Corrupt("decompression failed")
         );
+    }
+
+    #[test]
+    fn inflate_error_wipes_the_partial_output() {
+        let big = deflate(&vec![b'x'; MAX_INFLATED + 1]);
+        let mut e = miniz_oxide::inflate::decompress_to_vec_with_limit(&big, MAX_INFLATED)
+            .unwrap_err();
+        assert!(!e.output.is_empty(), "the fixture must carry partial output");
+        assert_eq!(inflate_error(&mut e), VaultError::TooLarge);
+        assert!(e.output.is_empty());
     }
 
     #[test]
