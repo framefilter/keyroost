@@ -27,7 +27,7 @@ mod ops;
 pub use ops::{matching, save, unlock, Change, OpenVault, Saved, Unlocked, VaultOnKey, VaultPick};
 
 mod lifecycle;
-pub use lifecycle::{create, delete, list_credentials};
+pub use lifecycle::{create, delete, list_credentials, rotate};
 
 #[cfg(test)]
 mod fake;
@@ -158,6 +158,26 @@ impl LeftOver {
     }
 }
 
+/// What is left of the old vault after a rotate that made and checked the
+/// new vault but could not delete the old one
+/// ([`VaultKeyError::OldNotDeleted`]). The two share a name; the new one
+/// always holds every checked entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldVault {
+    /// The old vault still holds the same checked entries as the new one
+    /// (or both hold none), so deleting either is safe.
+    Kept,
+    /// The old vault's data is removed but its credential is left: it lists
+    /// as a vault of the same name with no data, and that is the one to
+    /// delete. Deleting the other would lose the entries.
+    Emptied,
+    /// The key stopped answering while the old data was being removed, so
+    /// whether it is still there is not known. The copy with no data, if
+    /// there is one, is the one to delete; when both hold data they hold
+    /// the same checked entries and deleting either is safe.
+    Unknown,
+}
+
 /// Why a vault operation on a key failed.
 #[non_exhaustive]
 #[derive(Debug)]
@@ -201,10 +221,11 @@ pub enum VaultKeyError {
     /// The old vault changed on the key while its key was being rotated.
     ChangedDuringRotate,
     /// A rotate made and checked the new vault but could not delete the old
-    /// one: both hold the same checked entries.
+    /// one; `old` says what is left of it.
     OldNotDeleted {
         name: Option<String>,
         cause: Box<VaultKeyError>,
+        old: OldVault,
     },
 }
 
@@ -260,15 +281,26 @@ impl fmt::Display for VaultKeyError {
             VaultKeyError::ChangedDuringRotate => {
                 f.write_str("the vault changed on the key while its key was being rotated")
             }
-            VaultKeyError::OldNotDeleted { name, cause } => {
+            VaultKeyError::OldNotDeleted { name, cause, old } => {
                 let which = match name {
                     Some(n) => format!("vault \"{n}\""),
                     None => "vault".to_owned(),
                 };
                 write!(
                     f,
-                    "the new {which} is in place, but deleting the old one failed: {cause}; both vaults hold the same checked entries, so deleting either is safe"
-                )
+                    "the new {which} is in place with every entry checked, but deleting the old one failed: {cause}; "
+                )?;
+                f.write_str(match old {
+                    OldVault::Kept => {
+                        "both vaults hold the same checked entries, so deleting either is safe"
+                    }
+                    OldVault::Emptied => {
+                        "its data is already removed, so it is left as a vault of the same name with no data, and that is the one to delete"
+                    }
+                    OldVault::Unknown => {
+                        "whether it still holds its data is not known: if one of the two holds no data, delete that one; if both hold data, they hold the same checked entries and deleting either is safe"
+                    }
+                })
             }
         }
     }
@@ -753,6 +785,7 @@ mod tests {
             VaultKeyError::OldNotDeleted {
                 name: Some("Personal".into()),
                 cause: Box::new(VaultKeyError::Ctap(CtapError::StatusCode(0x30))),
+                old: OldVault::Kept,
             },
         ];
         for e in &all {
@@ -813,6 +846,45 @@ mod tests {
             data: true
         }
         .any());
+    }
+
+    #[test]
+    fn each_old_vault_case_has_its_own_words() {
+        let text = |old| {
+            VaultKeyError::OldNotDeleted {
+                name: Some("Personal".into()),
+                cause: Box::new(VaultKeyError::Ctap(CtapError::StatusCode(0x30))),
+                old,
+            }
+            .to_string()
+        };
+        let kept = text(OldVault::Kept);
+        let emptied = text(OldVault::Emptied);
+        let unknown = text(OldVault::Unknown);
+        for t in [&kept, &emptied, &unknown] {
+            assert!(t.contains("new vault \"Personal\""), "{t}");
+            assert!(t.contains("every entry checked"), "{t}");
+            assert!(!t.contains("--"), "{t}");
+        }
+        assert!(kept.ends_with("deleting either is safe"), "{kept}");
+        // Only where it is true does it say so outright.
+        assert!(!emptied.contains("either"), "{emptied}");
+        assert!(emptied.contains("no data"), "{emptied}");
+        assert!(unknown.contains("not known"), "{unknown}");
+        assert!(
+            unknown.contains("holds no data, delete that one"),
+            "{unknown}"
+        );
+        let unnamed = VaultKeyError::OldNotDeleted {
+            name: None,
+            cause: Box::new(VaultKeyError::Conflict),
+            old: OldVault::Kept,
+        }
+        .to_string();
+        assert!(
+            unnamed.starts_with("the new vault is in place"),
+            "{unnamed}"
+        );
     }
 
     #[test]

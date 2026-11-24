@@ -12,18 +12,25 @@
 //! an interruption leaves at worst a credential with no data, which reads
 //! as an empty vault and can be deleted again, never data no credential
 //! can find.
+//!
+//! Rotating a vault's key (after unlocking it somewhere untrusted) makes a
+//! new vault of the same name, copies what the old one holds, reads the
+//! copy back, and only then deletes the old vault, data first: anyone who
+//! learned the old vault's secret can read the largeBlob store without a
+//! PIN, so its data must not outlive its credential.
 
 use keyroost_ctap::client_pin::permissions::{
     CREDENTIAL_MANAGEMENT, GET_ASSERTION, LARGE_BLOB_WRITE, MAKE_CREDENTIAL,
 };
 use keyroost_ctap::large_blobs::{CredentialData, LargeBlobArray};
+use keyroost_ctap::{AuthenticatorInfo, CtapError};
 use keyroost_vault::{seal, user_handle, Vault};
 use zeroize::Zeroizing;
 
-use super::ops::{check_fits, stale_token, write_array, OpenVault};
+use super::ops::{check_fits, stale_token, vault_state, write_array, OpenVault};
 use super::{
-    check_support, LeftOver, StoredData, VaultAuth, VaultCredential, VaultKey, VaultKeyError,
-    VaultProblem, VaultRef, VaultStep,
+    check_support, LeftOver, OldVault, StoredData, VaultAuth, VaultCredential, VaultKey,
+    VaultKeyError, VaultProblem, VaultRef, VaultStep,
 };
 use crate::ct_eq;
 
@@ -91,12 +98,21 @@ pub fn create(
     {
         return Err(VaultKeyError::DuplicateName(name.to_owned()));
     }
-    // The size the array would have: sealing under a stand-in secret and
-    // key gives the same length as the real ones. The write checks again.
+    check_room(&array, initial, key.info())?;
+    create_unchecked(key, auth, name, initial, on_step)
+}
+
+/// [`VaultKeyError::Full`] when `array` has no room for one more vault
+/// holding `initial`. Sealing under a stand-in secret and key gives the
+/// same length as the real ones; the write checks again.
+fn check_room(
+    array: &LargeBlobArray,
+    initial: &Vault,
+    info: &AuthenticatorInfo,
+) -> Result<(), VaultKeyError> {
     let stand_in = [0u8; 32];
     let blob = seal(initial, &stand_in)?;
-    check_fits(&array.with_credential_blob(&stand_in, &blob)?, key.info())?;
-    create_unchecked(key, auth, name, initial, on_step)
+    check_fits(&array.with_credential_blob(&stand_in, &blob)?, info)
 }
 
 /// [`create`] without the name and size checks: make the credential, unlock
@@ -300,6 +316,117 @@ pub(crate) fn delete_known(
     delete_credential(key, auth, id)
 }
 
+/// Give the vault `old` a new key: make a new vault of the same name,
+/// copy into it what `old` holds on the key now, read both back, and only
+/// then delete `old`. Returns the new vault, open.
+///
+/// What is copied is read from the key first, so an entry another writer
+/// saved since unlock comes along. Refused before any touch: data that no
+/// longer opens ([`VaultKeyError::CannotOpen`]), data that was there at
+/// unlock and is gone ([`VaultKeyError::Conflict`]: the vault was deleted
+/// or rotated elsewhere), and a store with no room for a second copy
+/// ([`VaultKeyError::Full`]). Then the two touches and the write of a
+/// create ([`VaultStep::CreateTouch`], [`VaultStep::UnlockTouch`],
+/// [`VaultStep::Write`]); a create that fails is undone as [`create`]
+/// undoes it.
+///
+/// One read then checks both: the new vault must open to exactly what was
+/// copied ([`VaultKeyError::RotateNotVerified`]) and the old one must
+/// still hold it ([`VaultKeyError::ChangedDuringRotate`]); otherwise the new
+/// vault is removed again ([`VaultKeyError::CreateUndone`] with that
+/// cause) and the old one is left as it is. The old vault's data is removed
+/// in the write that follows that same read, so nothing it checked can
+/// change before the data goes (a retry with a fresh token checks again).
+/// Then the old credential is deleted. When removing the old vault fails,
+/// the new one stays and the error is [`VaultKeyError::OldNotDeleted`],
+/// saying what is left of the old one ([`OldVault`]).
+pub fn rotate(
+    key: &mut impl VaultKey,
+    auth: &mut VaultAuth,
+    old: &OpenVault,
+    on_step: &mut dyn FnMut(VaultStep),
+) -> Result<OpenVault, VaultKeyError> {
+    let (old_hmac, old_lbk) = old.secrets();
+    let array = key.read_blobs()?;
+    let (now, stored) =
+        vault_state(array.credential_data(old_lbk), old_hmac).map_err(VaultKeyError::CannotOpen)?;
+    if old.stored && !stored {
+        return Err(VaultKeyError::Conflict);
+    }
+    check_room(&array, &now, key.info())?;
+
+    let name = old.vault_ref.name.as_deref().unwrap_or("Vault");
+    let new = create_unchecked(key, auth, name, &now, on_step)?;
+    let new_id = &new.vault_ref.credential_id[..];
+    let (new_hmac, new_lbk) = new.secrets();
+
+    // The check and the old data's removal share one read. `checked`: the
+    // copy passed the check at least once; `sent`: a write went out.
+    let mut checked = false;
+    let mut sent = false;
+    let removed = write_array(
+        key,
+        auth,
+        &mut |array| {
+            match vault_state(array.credential_data(new_lbk), new_hmac) {
+                Ok((copy, true)) if copy == now => {}
+                _ => return Err(VaultKeyError::RotateNotVerified),
+            }
+            let old_data = array.credential_data(old_lbk);
+            let has_data = !matches!(old_data, CredentialData::Absent);
+            match vault_state(old_data, old_hmac) {
+                Ok((still, s)) if still == now && s == stored => {}
+                _ => return Err(VaultKeyError::ChangedDuringRotate),
+            }
+            checked = true;
+            Ok(has_data.then(|| array.without_credential_blob(old_lbk)))
+        },
+        // Removing data is not a step a front end reports; this only notes
+        // that a write went out.
+        &mut |_| sent = true,
+    );
+    let not_deleted = |cause, old| VaultKeyError::OldNotDeleted {
+        name: new.vault_ref.name.clone(),
+        cause: Box::new(cause),
+        old,
+    };
+    match removed {
+        Ok(_) => {}
+        Err(cause) if !checked || is_rotate_check(&cause) => {
+            return Err(undo(key, auth, new_id, Some(new_lbk), cause));
+        }
+        Err(cause) => {
+            // A refusal stores nothing, nor does a failure before any write
+            // went out; anything else may have landed.
+            let refused = matches!(cause, VaultKeyError::Ctap(CtapError::StatusCode(_)));
+            let left = if refused || !sent {
+                OldVault::Kept
+            } else {
+                OldVault::Unknown
+            };
+            return Err(not_deleted(cause, left));
+        }
+    }
+    if let Err(cause) = delete_credential(key, auth, &old.vault_ref.credential_id) {
+        // With no data to remove, both are the same empty vault.
+        let left = if stored {
+            OldVault::Emptied
+        } else {
+            OldVault::Kept
+        };
+        return Err(not_deleted(cause, left));
+    }
+    Ok(new)
+}
+
+/// Whether `e` is one of rotate's own checks failing.
+fn is_rotate_check(e: &VaultKeyError) -> bool {
+    matches!(
+        e,
+        VaultKeyError::RotateNotVerified | VaultKeyError::ChangedDuringRotate
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::fake::{Call, FakeKey};
@@ -312,7 +439,9 @@ mod tests {
     use keyroost_vault::{user_handle, Entry, Vault, VaultError, RP_ID};
     use zeroize::Zeroizing;
 
-    use super::super::{VaultAuth, VaultCredential, VaultKeyError, VaultRef, VaultStep};
+    use super::super::{
+        unlock, OldVault, VaultAuth, VaultCredential, VaultKeyError, VaultRef, VaultStep,
+    };
 
     fn entry(title: &str) -> Entry {
         Entry {
@@ -933,5 +1062,491 @@ mod tests {
         );
         assert_eq!(key.stored(), &before[..]);
         assert!(key.creds.is_empty());
+    }
+
+    // ----- rotate -----
+
+    /// Unlock `key` and return the vault named `name`, open.
+    fn opened(key: &mut FakeKey, auth: &mut VaultAuth, name: &str) -> OpenVault {
+        let unlocked = unlock(key, auth, &mut |_| {}).unwrap_or_else(|e| panic!("{e}"));
+        unlocked
+            .vaults
+            .into_iter()
+            .find(|v| v.vault_ref.name.as_deref() == Some(name))
+            .expect("the test's vault is on the key")
+            .state
+            .unwrap_or_else(|p| panic!("{p}"))
+    }
+
+    /// `rotate` of `old`, returning the result and the steps reported.
+    fn run_rotate(
+        key: &mut FakeKey,
+        auth: &mut VaultAuth,
+        old: &OpenVault,
+    ) -> (Result<OpenVault, VaultKeyError>, Vec<VaultStep>) {
+        let mut steps = Vec::new();
+        let r = rotate(key, auth, old, &mut |s| steps.push(s));
+        (r, steps)
+    }
+
+    /// The IDs of the credentials named `name`.
+    fn ids_named(key: &FakeKey, name: &str) -> Vec<Vec<u8>> {
+        key.creds
+            .iter()
+            .filter(|c| c.user_name.as_deref() == Some(name))
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
+    fn lbk_of(key: &FakeKey, id: &[u8]) -> [u8; 32] {
+        key.creds
+            .iter()
+            .find(|c| c.id == id)
+            .and_then(|c| c.lbk)
+            .expect("a credential with a largeBlobKey")
+    }
+
+    fn two_entries() -> Vault {
+        Vault {
+            entries: vec![entry("GitHub"), entry("Mail")],
+        }
+    }
+
+    /// A key with foreign entries, a Work vault and a Personal vault holding
+    /// `two_entries()`; the Personal vault unlocked, and the log cleared.
+    struct Rotating {
+        key: FakeKey,
+        auth: VaultAuth,
+        old: OpenVault,
+        old_id: Vec<u8>,
+        contents: Vault,
+    }
+
+    fn rotating() -> Rotating {
+        let mut key = FakeKey::new();
+        key.add_foreign_entries();
+        key.add_vault(
+            "Work",
+            &Vault {
+                entries: vec![entry("Jira")],
+            },
+        );
+        let contents = two_entries();
+        let old_id = key.add_vault("Personal", &contents);
+        let mut auth = pin();
+        let old = opened(&mut key, &mut auth, "Personal");
+        key.log.clear();
+        Rotating {
+            key,
+            auth,
+            old,
+            old_id,
+            contents,
+        }
+    }
+
+    #[test]
+    fn rotate_copies_checks_then_deletes_the_old() {
+        let Rotating {
+            mut key,
+            mut auth,
+            old,
+            old_id,
+            contents,
+        } = rotating();
+        let old_lbk = lbk_of(&key, &old_id);
+        let work = ids_named(&key, "Work").remove(0);
+        let work_before = key.vault_on_key(&work);
+
+        let (r, steps) = run_rotate(&mut key, &mut auth, &old);
+        let new = r.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            steps,
+            vec![
+                VaultStep::CreateTouch,
+                VaultStep::UnlockTouch,
+                VaultStep::Write
+            ]
+        );
+
+        // One vault of that name, a different credential, the same entries.
+        let named = ids_named(&key, "Personal");
+        assert_eq!(named.len(), 1);
+        let new_id = named[0].clone();
+        assert_ne!(new_id, old_id);
+        assert_eq!(new.vault_ref.credential_id, new_id);
+        assert_eq!(new.vault_ref.name.as_deref(), Some("Personal"));
+        assert_eq!(new.contents, contents);
+        assert!(new.stored);
+        assert_eq!(key.vault_on_key(&new_id), Some(contents));
+        assert_ne!(new.secrets(), old.secrets());
+
+        // The old credential and its data are gone; everything else stays.
+        assert!(!key.creds.iter().any(|c| c.id == old_id));
+        assert!(key.array().credential_blob(&old_lbk).is_none());
+        assert_eq!(key.vault_on_key(&work), work_before);
+        assert_eq!(key.array().len(), 5, "three foreign, Work, the new vault");
+
+        assert_eq!(
+            key.log,
+            vec![
+                // What the old vault holds now.
+                Call::Read,
+                token(MC, Some(RP_ID)),
+                Call::MakeCredential,
+                token(GA | LBW, Some(RP_ID)),
+                Call::Assertions(Some(new_id.clone())),
+                Call::Read,
+                Call::Write,
+                // The verifying read, then the old data's removal.
+                Call::Read,
+                Call::Write,
+                token(CM, None),
+                Call::Delete(old_id.clone()),
+            ]
+        );
+        let verifying = key.log.iter().rposition(|c| *c == Call::Read).unwrap();
+        let deleted = key
+            .log
+            .iter()
+            .position(|c| *c == Call::Delete(old_id.clone()))
+            .unwrap();
+        assert!(verifying < deleted);
+    }
+
+    #[test]
+    fn rotate_copies_what_is_on_the_key_now() {
+        let Rotating {
+            mut key,
+            mut auth,
+            old,
+            old_id,
+            contents,
+        } = rotating();
+        // Another writer adds an entry after the unlock.
+        let mut now = contents.clone();
+        now.entries.push(entry("Bank"));
+        key.put_vault(&old_id, &now);
+
+        let (r, _) = run_rotate(&mut key, &mut auth, &old);
+        let new = r.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(new.contents, now);
+        assert_eq!(key.vault_on_key(&new.vault_ref.credential_id), Some(now));
+        assert_eq!(ids_named(&key, "Personal").len(), 1);
+    }
+
+    #[test]
+    fn rotating_a_vault_without_data_skips_the_removal_write() {
+        let mut key = FakeKey::new();
+        let old_id = key.add_credential(user_handle("Empty").unwrap(), Some("Empty"));
+        let mut auth = pin();
+        let old = opened(&mut key, &mut auth, "Empty");
+        assert!(!old.stored);
+        key.log.clear();
+        let (r, _) = run_rotate(&mut key, &mut auth, &old);
+        let new = r.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(new.contents, Vault::default());
+        assert_eq!(
+            key.vault_on_key(&new.vault_ref.credential_id),
+            Some(Vault::default())
+        );
+        assert!(!key.creds.iter().any(|c| c.id == old_id));
+        let n = key.log.len();
+        assert_eq!(
+            key.log[n - 4..].to_vec(),
+            vec![
+                Call::Write,
+                Call::Read,
+                token(CM, None),
+                Call::Delete(old_id)
+            ],
+            "one write (the new vault's), then the delete"
+        );
+    }
+
+    #[test]
+    fn unverified_copy_is_removed_and_old_kept() {
+        // The new entry, right after it is written: data that does not
+        // open, then a vault that opens to other entries.
+        let corruptions: [fn(&mut FakeKey); 2] = [
+            |k| {
+                let id = k.creds.last().unwrap().id.clone();
+                k.put_blob(&id, b"not a vault");
+            },
+            |k| {
+                let id = k.creds.last().unwrap().id.clone();
+                k.put_vault(
+                    &id,
+                    &Vault {
+                        entries: vec![entry("Other")],
+                    },
+                );
+            },
+        ];
+        for corrupt in corruptions {
+            let Rotating {
+                mut key,
+                mut auth,
+                old,
+                old_id,
+                contents,
+            } = rotating();
+            let before = key.stored().to_vec();
+            key.after_write = Some((1, Box::new(corrupt)));
+            let (r, _) = run_rotate(&mut key, &mut auth, &old);
+            let (cause, left_over) = undone(r);
+            assert!(
+                matches!(cause, VaultKeyError::RotateNotVerified),
+                "{cause:?}"
+            );
+            assert_eq!(left_over, LeftOver::NONE);
+            assert_eq!(ids_named(&key, "Personal"), vec![old_id.clone()]);
+            assert_eq!(key.vault_on_key(&old_id), Some(contents));
+            assert_eq!(key.stored(), &before[..], "the copy's data is removed");
+            assert!(!key.log.contains(&Call::Delete(old_id)));
+        }
+    }
+
+    #[test]
+    fn old_changed_during_rotate_removes_the_copy() {
+        let Rotating {
+            mut key,
+            mut auth,
+            old,
+            old_id,
+            contents,
+        } = rotating();
+        let before_ids = key.creds.len();
+        let mut changed = contents;
+        changed.entries.pop();
+        let theirs = changed.clone();
+        // Reads: 1 unlock, 2 rotate's, 3 the new vault's write. Another
+        // writer changes the old vault after the rotate read it.
+        key.hook = Some((
+            2,
+            Box::new(move |k: &mut FakeKey| {
+                let id = ids_named(k, "Personal").remove(0);
+                k.put_vault(&id, &theirs);
+            }),
+        ));
+        let (r, _) = run_rotate(&mut key, &mut auth, &old);
+        let (cause, left_over) = undone(r);
+        assert!(
+            matches!(cause, VaultKeyError::ChangedDuringRotate),
+            "{cause:?}"
+        );
+        assert_eq!(left_over, LeftOver::NONE);
+        assert_eq!(key.creds.len(), before_ids, "the copy is gone");
+        assert_eq!(key.vault_on_key(&old_id), Some(changed), "theirs is kept");
+    }
+
+    #[test]
+    fn a_change_before_the_old_data_goes_is_caught_on_the_retry() {
+        // The verifying read (4) passes, the removal's write is refused as
+        // stale, and before the retry reads again another writer changes
+        // the old vault: the retry checks again and keeps their change.
+        let Rotating {
+            mut key,
+            mut auth,
+            old,
+            old_id,
+            contents,
+        } = rotating();
+        let mut changed = contents;
+        changed.entries.push(entry("Bank"));
+        let theirs = changed.clone();
+        key.hook = Some((
+            4,
+            Box::new(move |k: &mut FakeKey| {
+                k.write_refusals.push_back(0x33);
+                let id = ids_named(k, "Personal").remove(0);
+                k.put_vault(&id, &theirs);
+            }),
+        ));
+        let (r, _) = run_rotate(&mut key, &mut auth, &old);
+        let (cause, _) = undone(r);
+        assert!(
+            matches!(cause, VaultKeyError::ChangedDuringRotate),
+            "{cause:?}"
+        );
+        assert_eq!(ids_named(&key, "Personal"), vec![old_id.clone()]);
+        assert_eq!(key.vault_on_key(&old_id), Some(changed));
+    }
+
+    /// The `OldNotDeleted` parts of `r`.
+    fn not_deleted(
+        r: Result<OpenVault, VaultKeyError>,
+    ) -> (Option<String>, VaultKeyError, OldVault) {
+        match r {
+            Err(VaultKeyError::OldNotDeleted { name, cause, old }) => (name, *cause, old),
+            other => panic!("expected OldNotDeleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_old_delete_is_reported_with_both_vaults_kept() {
+        let Rotating {
+            mut key,
+            mut auth,
+            old,
+            old_id,
+            contents,
+        } = rotating();
+        // The key refuses the write that removes the old vault's data.
+        key.hook = Some((
+            4,
+            Box::new(|k: &mut FakeKey| k.write_refusals.push_back(0x30)),
+        ));
+        let (r, _) = run_rotate(&mut key, &mut auth, &old);
+        let (name, cause, left) = not_deleted(r);
+        assert_eq!(name.as_deref(), Some("Personal"));
+        assert!(
+            matches!(cause, VaultKeyError::Ctap(CtapError::StatusCode(0x30))),
+            "{cause:?}"
+        );
+        assert_eq!(left, OldVault::Kept);
+
+        // Both vaults stay, hold the same entries, and the new one opens.
+        let named = ids_named(&key, "Personal");
+        assert_eq!(named.len(), 2);
+        assert!(named.contains(&old_id));
+        let unlocked = unlock(&mut key, &mut pin(), &mut |_| {}).unwrap();
+        let personal: Vec<_> = unlocked
+            .vaults
+            .iter()
+            .filter(|v| v.vault_ref.name.as_deref() == Some("Personal"))
+            .collect();
+        assert_eq!(personal.len(), 2);
+        for v in personal {
+            let open = v.state.as_ref().unwrap_or_else(|p| panic!("{p}"));
+            assert_eq!(open.contents, contents);
+            assert!(open.stored);
+        }
+    }
+
+    #[test]
+    fn old_credential_left_without_data_is_reported_as_emptied() {
+        let Rotating {
+            mut key,
+            mut auth,
+            old,
+            old_id,
+            contents,
+        } = rotating();
+        key.delete_fails = true;
+        let (r, _) = run_rotate(&mut key, &mut auth, &old);
+        let (_, cause, left) = not_deleted(r);
+        assert!(
+            matches!(cause, VaultKeyError::Ctap(CtapError::StatusCode(0x30))),
+            "{cause:?}"
+        );
+        assert_eq!(left, OldVault::Emptied);
+        // The old one lists with no data; the new one holds the entries.
+        let creds = listed(&mut key, &mut pin());
+        let old_listed = creds
+            .iter()
+            .find(|c| c.vault.credential_id == old_id)
+            .unwrap();
+        assert_eq!(old_listed.stored, StoredData::Empty);
+        let new_id = ids_named(&key, "Personal")
+            .into_iter()
+            .find(|id| *id != old_id)
+            .unwrap();
+        assert_eq!(key.vault_on_key(&new_id), Some(contents));
+    }
+
+    #[test]
+    fn a_lost_reply_on_the_old_data_is_reported_as_unknown() {
+        let Rotating {
+            mut key,
+            mut auth,
+            old,
+            old_id,
+            contents,
+        } = rotating();
+        key.hook = Some((4, Box::new(|k: &mut FakeKey| k.lost_write_replies = 1)));
+        let (r, _) = run_rotate(&mut key, &mut auth, &old);
+        let (_, cause, left) = not_deleted(r);
+        assert!(
+            matches!(cause, VaultKeyError::Ctap(CtapError::Transport(_))),
+            "{cause:?}"
+        );
+        assert_eq!(left, OldVault::Unknown);
+        assert!(key.creds.iter().any(|c| c.id == old_id), "not deleted");
+        let new_id = ids_named(&key, "Personal")
+            .into_iter()
+            .find(|id| *id != old_id)
+            .unwrap();
+        assert_eq!(key.vault_on_key(&new_id), Some(contents));
+    }
+
+    #[test]
+    fn failed_delete_of_an_old_vault_without_data_is_kept() {
+        // Nothing to remove, so both are the same empty vault.
+        let mut key = FakeKey::new();
+        key.add_credential(user_handle("Empty").unwrap(), Some("Empty"));
+        let mut auth = pin();
+        let old = opened(&mut key, &mut auth, "Empty");
+        key.delete_fails = true;
+        let (r, _) = run_rotate(&mut key, &mut auth, &old);
+        let (_, _, left) = not_deleted(r);
+        assert_eq!(left, OldVault::Kept);
+    }
+
+    #[test]
+    fn rotate_refuses_what_cannot_fit_before_the_touch() {
+        let Rotating {
+            mut key,
+            mut auth,
+            old,
+            ..
+        } = rotating();
+        // Room for what is there now, not for a second copy.
+        key.set_max_bytes(key.stored().len() as u64 + 16);
+        let before = key.stored().to_vec();
+        let (r, steps) = run_rotate(&mut key, &mut auth, &old);
+        assert!(matches!(r, Err(VaultKeyError::Full { .. })), "{r:?}");
+        assert!(steps.is_empty());
+        assert_eq!(key.log, vec![Call::Read]);
+        assert_eq!(key.stored(), &before[..]);
+    }
+
+    #[test]
+    fn rotate_refuses_a_vault_whose_data_went_since_unlock() {
+        // Another writer deleted (or rotated) it: copying "nothing" would
+        // make an empty vault, so nothing is made.
+        let Rotating {
+            mut key,
+            mut auth,
+            old,
+            old_id,
+            ..
+        } = rotating();
+        let lbk = lbk_of(&key, &old_id);
+        let without = key.array().without_credential_blob(&lbk);
+        key.set_array(&without);
+        let (r, steps) = run_rotate(&mut key, &mut auth, &old);
+        assert!(matches!(r, Err(VaultKeyError::Conflict)), "{r:?}");
+        assert!(steps.is_empty());
+        assert_eq!(key.log, vec![Call::Read]);
+    }
+
+    #[test]
+    fn rotate_refuses_a_vault_that_no_longer_opens() {
+        let Rotating {
+            mut key,
+            mut auth,
+            old,
+            old_id,
+            ..
+        } = rotating();
+        key.put_blob(&old_id, b"not a vault");
+        let (r, steps) = run_rotate(&mut key, &mut auth, &old);
+        assert!(
+            matches!(r, Err(VaultKeyError::CannotOpen(VaultProblem::Damaged(_)))),
+            "{r:?}"
+        );
+        assert!(steps.is_empty());
+        assert_eq!(key.log, vec![Call::Read]);
     }
 }

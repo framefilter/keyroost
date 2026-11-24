@@ -101,6 +101,10 @@ pub(crate) struct FakeKey {
     pub write_perms: Vec<u32>,
     /// `(n, hook)`: run `hook` right after the `n`th read.
     pub hook: Option<(usize, Hook)>,
+    /// `(n, hook)`: run `hook` right after the `n`th write that stored the
+    /// array (counting from 1), before its reply: another writer changing
+    /// the store between a flow's write and its next read.
+    pub after_write: Option<(usize, Hook)>,
     /// makeCredential returns no largeBlobKey (the credential has none).
     pub mc_without_lbk: bool,
     /// Credential management lists no largeBlobKeys.
@@ -114,6 +118,8 @@ pub(crate) struct FakeKey {
     /// The bytes of the one token the key accepts now.
     current: Option<Vec<u8>>,
     reads: usize,
+    /// Writes that stored the array.
+    writes: usize,
     next: u8,
 }
 
@@ -154,6 +160,7 @@ impl FakeKey {
             lost_write_replies: 0,
             write_perms: Vec::new(),
             hook: None,
+            after_write: None,
             mc_without_lbk: false,
             credmgmt_without_lbk: false,
             delete_fails: false,
@@ -161,6 +168,7 @@ impl FakeKey {
             issued: Vec::new(),
             current: None,
             reads: 0,
+            writes: 0,
             next: 0,
         }
     }
@@ -458,6 +466,15 @@ impl VaultKey for FakeKey {
             .ok_or(CtapError::InvalidArgument("no checksum"))?;
         LargeBlobArray::parse(&serialized[..body])?;
         self.stored = serialized.to_vec();
+        self.writes += 1;
+        if self
+            .after_write
+            .as_ref()
+            .is_some_and(|(n, _)| *n == self.writes)
+        {
+            let (_, hook) = self.after_write.take().expect("checked above");
+            hook(self);
+        }
         if self.lost_write_replies > 0 {
             self.lost_write_replies -= 1;
             return Err(CtapError::Transport("the reply was lost".into()));
@@ -556,6 +573,30 @@ mod tests {
         assert_eq!(key.read_blobs().unwrap().len(), 4);
         assert!(key.hook.is_none());
         assert_eq!(key.vault_on_key(&id), Some(Vault::default()));
+    }
+
+    #[test]
+    fn the_after_write_hook_runs_after_its_stored_write() {
+        let mut key = FakeKey::new();
+        key.write_refusals.push_back(0x30);
+        key.after_write = Some((
+            1,
+            Box::new(|k: &mut FakeKey| {
+                k.add_foreign_entries();
+            }),
+        ));
+        let t = token(&mut key, LARGE_BLOB_WRITE);
+        let note = key
+            .array()
+            .with_text_note("x")
+            .serialize_with_checksum()
+            .unwrap();
+        // A refused write stores nothing and is not counted.
+        assert!(key.write_blobs(&t, &note).is_err());
+        assert!(key.after_write.is_some());
+        key.write_blobs(&t, &note).unwrap();
+        assert!(key.after_write.is_none());
+        assert_eq!(key.array().len(), 4, "the note, then the hook's three");
     }
 
     #[test]
