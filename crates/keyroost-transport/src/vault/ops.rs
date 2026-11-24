@@ -14,7 +14,9 @@
 
 use std::fmt;
 
-use keyroost_ctap::client_pin::permissions::{GET_ASSERTION, LARGE_BLOB_WRITE};
+use keyroost_ctap::client_pin::permissions::{
+    CREDENTIAL_MANAGEMENT, GET_ASSERTION, LARGE_BLOB_WRITE,
+};
 use keyroost_ctap::large_blobs::{BlobCapacity, CredentialData, LargeBlobArray};
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
 use keyroost_vault::{apply_import, canon_id, open, seal, Entry, Vault, VaultError};
@@ -138,18 +140,29 @@ pub struct Unlocked {
 /// Unlock every vault on the key with one touch.
 ///
 /// The key is checked first ([`check_support`](super::check_support)), so a
-/// key that cannot hold a vault is refused before the PIN is sent. Then one
-/// token (getAssertion and largeBlobWrite, bound to the vault RP), a
-/// [`VaultStep::UnlockTouch`], one getAssertion over every vault credential
-/// and one read of the largeBlob array. A vault the key gives no secret for,
-/// or whose data does not open, is listed with its [`VaultProblem`]; the
-/// others open regardless. No vault credential is an empty list.
+/// key that cannot hold a vault is refused before the PIN is sent. Then
+/// credential management looks for vault credentials, which needs no touch
+/// (every key that passes the check has it): with none, the result is an
+/// empty list after one read of the largeBlob array, and no touch is asked
+/// for. Otherwise one token (getAssertion and largeBlobWrite, bound to the
+/// vault RP), a [`VaultStep::UnlockTouch`], one getAssertion over every
+/// vault credential and one read of the largeBlob array. A vault the key
+/// gives no secret for, or whose data does not open, is listed with its
+/// [`VaultProblem`]; the others open regardless.
 pub fn unlock(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
     on_step: &mut dyn FnMut(VaultStep),
 ) -> Result<Unlocked, VaultKeyError> {
     check_support(key.info())?;
+    if !has_vault_credential(key, auth)? {
+        let array = key.read_blobs()?;
+        let capacity = array.capacity(key.info());
+        return Ok(Unlocked {
+            vaults: Vec::new(),
+            capacity,
+        });
+    }
     let asserted = auth.with_touch(
         key,
         GET_ASSERTION | LARGE_BLOB_WRITE,
@@ -179,6 +192,28 @@ pub fn unlock(
         })
         .collect();
     Ok(Unlocked { vaults, capacity })
+}
+
+/// Whether credential management lists any vault credential: no touch.
+/// The current token serves when it allows credential management (a listing
+/// just made took one); otherwise a fresh one, with largeBlobWrite too as
+/// [`list_credentials`](super::list_credentials) takes it. A held token the
+/// key dropped or let expire gets one fresh token and one more try.
+fn has_vault_credential(
+    key: &mut impl VaultKey,
+    auth: &mut VaultAuth,
+) -> Result<bool, VaultKeyError> {
+    if let Some(token) = auth.current_for(CREDENTIAL_MANAGEMENT).cloned() {
+        match key.credentials(&token) {
+            Ok(creds) => return Ok(!creds.is_empty()),
+            Err(e) if stale_token(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let token = auth
+        .fresh_token(key, CREDENTIAL_MANAGEMENT | LARGE_BLOB_WRITE, None)?
+        .clone();
+    Ok(!key.credentials(&token)?.is_empty())
 }
 
 /// How a command names the vault it means.
@@ -530,9 +565,16 @@ mod tests {
         let (r, steps) = run(&mut key, &mut auth);
         let u = r.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(steps, vec![VaultStep::UnlockTouch]);
+        // One PIN exchange per token, the PIN read once: credential
+        // management to see there is a vault, then the touch's own token.
         assert_eq!(
             key.log,
             vec![
+                Call::Token {
+                    perms: CM | LBW,
+                    rp: None
+                },
+                Call::Credentials,
                 Call::Token {
                     perms: GA | LBW,
                     rp: Some(RP_ID.into())
@@ -641,13 +683,94 @@ mod tests {
     fn no_vault_credentials_is_an_empty_list() {
         let mut key = FakeKey::new();
         key.add_foreign_entries();
-        let u = unlocked(&mut key);
+        let (r, steps) = run(&mut key, &mut pin());
+        let u = r.unwrap_or_else(|e| panic!("{e}"));
+        // Credential management shows there is nothing to unlock: no touch
+        // is asked for and no assertion is sent.
+        assert!(steps.is_empty(), "{steps:?}");
+        assert_eq!(
+            key.log,
+            vec![
+                Call::Token {
+                    perms: CM | LBW,
+                    rp: None
+                },
+                Call::Credentials,
+                Call::Read,
+            ]
+        );
         assert!(u.vaults.is_empty());
         assert_eq!(u.capacity.entry_count, 3);
         assert!(matches!(
             matching(&u.vaults, &VaultPick::Only),
             Err(VaultKeyError::NoVaults)
         ));
+    }
+
+    #[test]
+    fn unlock_after_a_listing_reuses_its_token_for_the_check() {
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &Vault::default());
+        let mut auth = pin();
+        let listed =
+            super::super::list_credentials(&mut key, &mut auth).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(listed.len(), 1);
+        let before = key.log.len();
+        let (r, steps) = run(&mut key, &mut auth);
+        assert_eq!(r.unwrap_or_else(|e| panic!("{e}")).vaults.len(), 1);
+        assert_eq!(steps, vec![VaultStep::UnlockTouch]);
+        assert_eq!(
+            key.log[before..],
+            [
+                Call::Credentials,
+                Call::Token {
+                    perms: GA | LBW,
+                    rp: Some(RP_ID.into())
+                },
+                Call::Assertions(None),
+                Call::Read,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dropped_listing_token_is_replaced_once() {
+        let mut key = FakeKey::new();
+        key.add_foreign_entries();
+        let mut auth = pin();
+        super::super::list_credentials(&mut key, &mut auth).unwrap_or_else(|e| panic!("{e}"));
+        // Another token makes the held one stale on the key.
+        pin()
+            .fresh_token(&mut key, LBW, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let before = key.log.len();
+        let (r, steps) = run(&mut key, &mut auth);
+        assert!(r.unwrap_or_else(|e| panic!("{e}")).vaults.is_empty());
+        assert!(steps.is_empty());
+        assert_eq!(
+            key.log[before..],
+            [
+                Call::Credentials,
+                Call::Token {
+                    perms: CM | LBW,
+                    rp: None
+                },
+                Call::Credentials,
+                Call::Read,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_pin_on_a_key_without_vaults_asks_for_no_touch() {
+        let mut key = FakeKey::new();
+        let (r, steps) = run(&mut key, &mut VaultAuth::pin(Zeroizing::new("0000".into())));
+        assert!(matches!(
+            r,
+            Err(VaultKeyError::Ctap(CtapError::StatusCode(0x31)))
+        ));
+        assert!(steps.is_empty());
+        assert!(!key.log.iter().any(|c| matches!(c, Call::Assertions(_))));
     }
 
     #[test]
@@ -941,6 +1064,7 @@ mod tests {
             },
         );
         let (mut auth, mut open) = open_first(&mut key);
+        let unlocked_at = key.log.len();
 
         let c = entry("Bank");
         let (r, steps) = save_with(&mut key, &mut auth, &mut open, &Change::Add(c.clone()));
@@ -983,13 +1107,13 @@ mod tests {
         };
         assert_eq!(key.vault_on_key(&id), Some(want.clone()));
         assert_eq!(open.contents, want);
-        // One unlock token served every write.
+        // The unlock's token served every write: none was taken after it.
         assert_eq!(
-            key.log
+            key.log[unlocked_at..]
                 .iter()
                 .filter(|c| matches!(c, Call::Token { .. }))
                 .count(),
-            1
+            0
         );
     }
 
