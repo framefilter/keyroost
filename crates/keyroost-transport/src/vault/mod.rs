@@ -237,8 +237,8 @@ pub enum VaultKeyError {
     Conflict,
     /// The vault's data, there when it was unlocked, is no longer on the
     /// key: another writer deleted or rotated the vault. Nothing was
-    /// written, and every later save on the same open vault is refused the
-    /// same way; unlock again to see what the key holds now.
+    /// written, and every later save or rotate of the same open vault is
+    /// refused the same way; unlock again to see what the key holds now.
     VaultGone { name: Option<String> },
     /// The large-blob store is too small for the result; nothing was
     /// written.
@@ -467,12 +467,13 @@ impl fmt::Debug for VaultAuth {
 }
 
 /// A vault credential's name: the one its user handle carries, else the
-/// credential's user name, else none. The one naming rule for listing
-/// credentials and for unlocking.
+/// credential's user name, else none; an empty name is none. The one
+/// naming rule for listing credentials and for unlocking.
 pub fn vault_name(user_id: Option<&[u8]>, user_name: Option<&str>) -> Option<String> {
     user_id
         .and_then(vault_name_from_user_id)
         .or_else(|| user_name.map(str::to_owned))
+        .filter(|n| !n.is_empty())
 }
 
 /// Whether `info` describes a key that can hold a vault: the `hmac-secret`,
@@ -745,6 +746,10 @@ mod tests {
         assert_eq!(vault_name(None, Some("Work")).as_deref(), Some("Work"));
         assert_eq!(vault_name(Some(b"plain-id"), None), None);
         assert_eq!(vault_name(None, None), None);
+        // An empty name is no name: what a rotate of an unnamed vault makes.
+        let unnamed = keyroost_vault::unnamed_user_handle().unwrap();
+        assert_eq!(vault_name(Some(&unnamed), Some("")), None);
+        assert_eq!(vault_name(None, Some("")), None);
     }
 
     #[test]

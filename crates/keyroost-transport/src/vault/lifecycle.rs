@@ -24,7 +24,7 @@ use keyroost_ctap::client_pin::permissions::{
 };
 use keyroost_ctap::large_blobs::{CredentialData, LargeBlobArray};
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
-use keyroost_vault::{seal, user_handle, Vault};
+use keyroost_vault::{seal, unnamed_user_handle, user_handle, Vault};
 use zeroize::Zeroizing;
 
 use super::ops::{check_fits, stale_token, vault_state, write_array, OpenVault};
@@ -99,7 +99,7 @@ pub fn create(
         return Err(VaultKeyError::DuplicateName(name.to_owned()));
     }
     check_room(&array, initial, key.info())?;
-    create_unchecked(key, auth, name, initial, on_step)
+    create_unchecked(key, auth, Some(name), initial, on_step)
 }
 
 /// [`VaultKeyError::Full`] when `array` has no room for one more vault
@@ -118,21 +118,24 @@ fn check_room(
 /// [`create`] without the name and size checks: make the credential, unlock
 /// it, seal `initial` and write it, removing the credential (and any data
 /// written for it) again on any failure. A rotate uses it to make a vault of
-/// the same name.
+/// the same name, or one with no name (`None`) for a vault that had none.
 pub(crate) fn create_unchecked(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
-    name: &str,
+    name: Option<&str>,
     initial: &Vault,
     on_step: &mut dyn FnMut(VaultStep),
 ) -> Result<OpenVault, VaultKeyError> {
-    let user_id = user_handle(name)?;
+    let user_id = match name {
+        Some(name) => user_handle(name)?,
+        None => unnamed_user_handle()?,
+    };
     let made = auth.with_touch(
         key,
         MAKE_CREDENTIAL,
         VaultStep::CreateTouch,
         on_step,
-        |k, token| k.make_credential(token, &user_id, name),
+        |k, token| k.make_credential(token, &user_id, name.unwrap_or_default()),
     )?;
     let id = made.credential_id;
     let Some(lbk) = made.large_blob_key else {
@@ -157,7 +160,7 @@ pub(crate) fn create_unchecked(
     Ok(OpenVault::new(
         VaultRef {
             credential_id: id,
-            name: Some(name.to_owned()),
+            name: name.map(str::to_owned),
         },
         initial.clone(),
         true,
@@ -318,12 +321,13 @@ pub(crate) fn delete_known(
 
 /// Give the vault `old` a new key: make a new vault of the same name,
 /// copy into it what `old` holds on the key now, read both back, and only
-/// then delete `old`. Returns the new vault, open.
+/// then delete `old`. Returns the new vault, open, under the old one's name
+/// (an unnamed vault stays unnamed).
 ///
 /// What is copied is read from the key first, so an entry another writer
 /// saved since unlock comes along. Refused before any touch: data that no
 /// longer opens ([`VaultKeyError::CannotOpen`]), data that was there at
-/// unlock and is gone ([`VaultKeyError::Conflict`]: the vault was deleted
+/// unlock and is gone ([`VaultKeyError::VaultGone`]: the vault was deleted
 /// or rotated elsewhere), and a store with no room for a second copy
 /// ([`VaultKeyError::Full`]). Then the two touches and the write of a
 /// create ([`VaultStep::CreateTouch`], [`VaultStep::UnlockTouch`],
@@ -351,12 +355,15 @@ pub fn rotate(
     let (now, stored) =
         vault_state(array.credential_data(old_lbk), old_hmac).map_err(VaultKeyError::CannotOpen)?;
     if old.stored && !stored {
-        return Err(VaultKeyError::Conflict);
+        return Err(VaultKeyError::VaultGone {
+            name: old.vault_ref.name.clone(),
+        });
     }
     check_room(&array, &now, key.info())?;
 
-    let name = old.vault_ref.name.as_deref().unwrap_or("Vault");
-    let new = create_unchecked(key, auth, name, &now, on_step)?;
+    // The new vault takes the old one's name; one with no name stays
+    // unnamed rather than get a made-up one.
+    let new = create_unchecked(key, auth, old.vault_ref.name.as_deref(), &now, on_step)?;
     let new_id = &new.vault_ref.credential_id[..];
     let (new_hmac, new_lbk) = new.secrets();
 
@@ -1146,6 +1153,36 @@ mod tests {
     }
 
     #[test]
+    fn rotate_keeps_an_unnamed_vault_unnamed() {
+        let mut key = FakeKey::new();
+        // A vault credential whose handle carries no name, and no user
+        // name: it lists as unnamed.
+        let old_id = key.add_credential(vec![0x07; 12], None);
+        let contents = two_entries();
+        key.put_vault(&old_id, &contents);
+        let mut auth = pin();
+        let unlocked = unlock(&mut key, &mut auth, &mut |_| {}).unwrap_or_else(|e| panic!("{e}"));
+        let old = unlocked
+            .vaults
+            .into_iter()
+            .next()
+            .expect("the vault")
+            .state
+            .unwrap_or_else(|p| panic!("{p}"));
+        assert_eq!(old.vault_ref.name, None);
+
+        let (r, _) = run_rotate(&mut key, &mut auth, &old);
+        let new = r.unwrap_or_else(|e| panic!("{e}"));
+        // No name made up for it: it stays unnamed, open and as listed.
+        assert_eq!(new.vault_ref.name, None);
+        assert_eq!(new.contents, contents);
+        let listed = list_credentials(&mut key, &mut auth).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].vault.credential_id, new.vault_ref.credential_id);
+        assert_eq!(listed[0].vault.name, None);
+    }
+
+    #[test]
     fn rotate_copies_checks_then_deletes_the_old() {
         let Rotating {
             mut key,
@@ -1526,7 +1563,10 @@ mod tests {
         let without = key.array().without_credential_blob(&lbk);
         key.set_array(&without);
         let (r, steps) = run_rotate(&mut key, &mut auth, &old);
-        assert!(matches!(r, Err(VaultKeyError::Conflict)), "{r:?}");
+        assert!(
+            matches!(&r, Err(VaultKeyError::VaultGone { name: Some(n) }) if n == "Personal"),
+            "{r:?}"
+        );
         assert!(steps.is_empty());
         assert_eq!(key.log, vec![Call::Read]);
     }
