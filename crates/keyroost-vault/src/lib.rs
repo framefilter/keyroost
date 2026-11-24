@@ -1,15 +1,15 @@
-//! FIDO2 password vault (fidoparole-compatible formats) for keyroost.
+//! FIDO2 password vault (FidoParole-compatible formats) for keyroost.
 //! Pure byte/format layer; no hardware.
 //!
 //! The vault design and its formats (the `T2VLT` key blob, the `T2VBK`
 //! backup file, the entry JSON, and the credential's relying party,
 //! hmac-secret input and user handle) come from Token2's
-//! [fidoparole](https://github.com/token2/fidoparole). Token2 approved their
+//! [FidoParole](https://github.com/token2/fidoparole). Token2 approved their
 //! reuse in keyroost in
 //! [discussion #74](https://github.com/framefilter/keyroost/discussions/74#discussioncomment-19674707);
 //! thank you, Token2. This crate is an independent implementation that reads
 //! and writes the same bytes, checked against vectors produced by
-//! fidoparole's own code.
+//! FidoParole's own code.
 
 mod backup;
 mod blob;

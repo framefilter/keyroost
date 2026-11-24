@@ -1,4 +1,4 @@
-//! Random password generator (same character sets as fidoparole).
+//! Random password generator (same character sets as FidoParole).
 
 use crate::error::VaultError;
 use zeroize::Zeroizing;

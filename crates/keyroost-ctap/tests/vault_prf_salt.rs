@@ -1,4 +1,4 @@
-//! `prf_salt` of the vault's own input, against fidoparole's `hmac_salt()`
+//! `prf_salt` of the vault's own input, against FidoParole's `hmac_salt()`
 //! captured independently. Lives here, not in the unit tests, because it
 //! reads `PRF_INPUT` from the path-only `keyroost-vault` dev-dependency,
 //! which the published package neither carries nor builds this file with.

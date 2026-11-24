@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "FIDO2 password vault (fidoparole-compatible formats) for keyroost."
+description = "FIDO2 password vault (FidoParole-compatible formats) for keyroost."
 
 [lints]
 workspace = true
