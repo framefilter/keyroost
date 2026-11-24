@@ -28,7 +28,7 @@ use crate::json_out;
 use crate::output::{emit_json, json_output};
 use crate::prompt::{confirm, confirm_statement, key_label, RealTerm, TermPicker};
 use crate::secrets::{SecretIo, SecretSource, Secrets, Source, Spec};
-use crate::{sanitize_multiline, sanitize_terminal, PATH_HELP};
+use crate::{sanitize_terminal, PATH_HELP};
 
 /// `fido vault` subcommands.
 #[derive(Subcommand)]
@@ -1077,52 +1077,73 @@ pub(crate) fn changed_date(minutes: i64) -> String {
 /// label, so the value lines up with the others.
 const REVEAL_LABEL: &str = "Password: ";
 
-/// `Label:` padded to the value column.
-fn label(name: &str) -> String {
-    format!("{:<w$}", format!("{name}:"), w = REVEAL_LABEL.len())
+/// One wiped line: `head`, then `value` with every control, zero-width and
+/// bidi character a space (tabs kept), then trailing spaces dropped. Built
+/// in a buffer sized up front: sanitizing never lengthens text, so it never
+/// grows and leaves no unwiped copy behind ([`sanitize_terminal`] would
+/// collect into a growing `String`).
+fn wiped_line(head: &str, value: &str) -> Zeroizing<String> {
+    let mut line = Zeroizing::new(String::with_capacity(head.len() + value.len()));
+    line.push_str(head);
+    for c in value.chars() {
+        line.push(if c != '\t' && keyroost_keyring::is_spoofing_char(c) {
+            ' '
+        } else {
+            c
+        });
+    }
+    let kept = line.trim_end().len();
+    line.truncate(kept);
+    line
 }
 
 /// `entry show` as text: Title, Username, URL, Notes, Changed, then
 /// `Password: (hidden)` or `(none)`. Never the password, never the ID.
-/// Notes over several lines stay under their column.
-pub(crate) fn entry_lines(e: &Entry) -> Vec<String> {
-    let value = |s: &str| {
-        if s.is_empty() {
-            "(none)".to_owned()
-        } else {
-            sanitize_terminal(s)
-        }
-    };
+///
+/// Laid out like [`crate::output::kv_block`] (each value one space after the
+/// longest `Key:`), but not built with it: notes are secret and may span
+/// lines, and `kv_block` joins plain `String`s, so every line here is its
+/// own wiped buffer and a note's later lines stay under its column.
+pub(crate) fn entry_lines(e: &Entry) -> Vec<Zeroizing<String>> {
+    let head = |name: &str| format!("{:<w$}", format!("{name}:"), w = REVEAL_LABEL.len());
+    let field =
+        |name: &str, v: &str| wiped_line(&head(name), if v.is_empty() { "(none)" } else { v });
     let mut lines = vec![
-        format!("{}{}", label("Title"), value(&e.title)),
-        format!("{}{}", label("Username"), value(&e.username)),
-        format!("{}{}", label("URL"), value(&e.url)),
+        field("Title", &e.title),
+        field("Username", &e.username),
+        field("URL", &e.url),
     ];
     if e.notes.is_empty() {
-        lines.push(format!("{}(none)", label("Notes")));
+        lines.push(field("Notes", ""));
     } else {
-        let notes = Zeroizing::new(sanitize_multiline(&e.notes));
-        for (n, l) in notes.split('\n').enumerate() {
-            let head = if n == 0 {
-                label("Notes")
+        let indent = " ".repeat(REVEAL_LABEL.len());
+        for (n, l) in e.notes.split('\n').enumerate() {
+            let h = if n == 0 {
+                head("Notes")
             } else {
-                " ".repeat(REVEAL_LABEL.len())
+                indent.clone()
             };
-            lines.push(format!("{head}{l}").trim_end().to_owned());
+            lines.push(wiped_line(&h, l));
         }
     }
-    lines.push(format!(
-        "{}{}",
-        label("Changed"),
-        changed_date(e.modified_minutes)
-    ));
+    lines.push(field("Changed", &changed_date(e.modified_minutes)));
     let password = if e.password.is_empty() {
         "(none)"
     } else {
         "(hidden)"
     };
-    lines.push(format!("{REVEAL_LABEL}{password}"));
+    lines.push(wiped_line(REVEAL_LABEL, password));
     lines
+}
+
+/// Print `lines` to stdout as they are, with no formatted copy on the way
+/// (`outln!` would format each into a new `String`).
+fn print_lines(out: &mut impl Write, lines: &[Zeroizing<String>]) -> io::Result<()> {
+    for l in lines {
+        out.write_all(l.as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()
 }
 
 /// How `entry show --reveal` gives the password.
@@ -1189,22 +1210,18 @@ fn terminal_opens() -> io::Result<()> {
 /// the PIN), then the password line erased.
 fn show_until_enter(e: &Entry) -> Result<(), Box<dyn Error>> {
     let lines = entry_lines(e);
+    let mut out = io::stdout();
     if e.password.is_empty() {
-        for l in &lines {
-            outln!("{l}");
-        }
+        print_lines(&mut out, &lines)?;
         return Ok(());
     }
     terminal_opens().map_err(|err| {
         format!("could not open the terminal to wait for Enter ({err}); the password was not shown")
     })?;
-    for l in &lines[..lines.len() - 1] {
-        outln!("{l}");
-    }
-    // Shown on a terminal: no control characters reach it.
-    let shown = Zeroizing::new(sanitize_terminal(&e.password));
-    let mut out = io::stdout();
-    out.write_all(REVEAL_LABEL.as_bytes())?;
+    print_lines(&mut out, &lines[..lines.len() - 1])?;
+    // Shown on a terminal: no control characters reach it. (Trailing
+    // spaces trimmed: invisible there anyway.)
+    let shown = wiped_line(REVEAL_LABEL, &e.password);
     out.write_all(shown.as_bytes())?;
     out.flush()?;
     let waited = rpassword::prompt_password("").map(Zeroizing::new);
@@ -1393,10 +1410,18 @@ fn reveal_hint(title: &str, vault: Option<&str>, username: Option<&str>) -> Stri
 }
 
 /// [`reveal_hint`] for the entry just saved as `title` / `username` in the
-/// vault `name`, out of `vaults` on the key.
-fn reveal_hint_for(open: &vault::OpenVault, vaults: usize, title: &str, username: &str) -> String {
-    let name = open.vault_ref.name.as_deref();
-    let shared = entry_matches(&open.contents, title, None).len() > 1;
+/// vault `name` (one of `vaults` on the key). `contents` must be the vault
+/// as saved: `save` updates the open vault in place (transport test
+/// `add_edit_delete_apply_to_current_contents`), so a title the new entry
+/// shares is seen there.
+fn reveal_hint_for(
+    name: Option<&str>,
+    contents: &Vault,
+    vaults: usize,
+    title: &str,
+    username: &str,
+) -> String {
+    let shared = entry_matches(contents, title, None).len() > 1;
     reveal_hint(
         title,
         name.filter(|_| vaults > 1),
@@ -1464,12 +1489,7 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
                 (_, RevealPlan::Json) => {
                     write_json_wiped(&mut io::stdout().lock(), &entry_show_json(name, e, *reveal))
                 }
-                (false, _) => {
-                    for line in entry_lines(e) {
-                        outln!("{line}");
-                    }
-                    Ok(())
-                }
+                (false, _) => Ok(print_lines(&mut io::stdout(), &entry_lines(e))?),
                 (true, RevealPlan::ShowUntilEnter) => show_until_enter(e),
                 (true, RevealPlan::PasswordOnly) => {
                     let mut out = io::stdout().lock();
@@ -1522,7 +1542,16 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             save_change(&mut k, open, &Change::Add(entry))?;
             outln!("{}", added_line(title, open.vault_ref.name.as_deref()));
             if *generate_password {
-                outln!("{}", reveal_hint_for(open, vaults, title, &username));
+                outln!(
+                    "{}",
+                    reveal_hint_for(
+                        open.vault_ref.name.as_deref(),
+                        &open.contents,
+                        vaults,
+                        title,
+                        &username
+                    )
+                );
             }
             Ok(())
         }
@@ -1586,7 +1615,13 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             if *generate_password {
                 outln!(
                     "{}",
-                    reveal_hint_for(open, vaults, &now_title, &now_username)
+                    reveal_hint_for(
+                        open.vault_ref.name.as_deref(),
+                        &open.contents,
+                        vaults,
+                        &now_title,
+                        &now_username,
+                    )
                 );
             }
             Ok(())
@@ -2228,6 +2263,62 @@ mod tests {
         }
     }
 
+    fn texts(lines: &[Zeroizing<String>]) -> Vec<&str> {
+        lines.iter().map(|l| l.as_str()).collect()
+    }
+
+    #[test]
+    fn wiped_line_sanitizes_in_a_buffer_that_never_grows() {
+        let l = wiped_line("Notes:    ", "a\u{1b}[2J\tb\u{202e}c  ");
+        assert_eq!(l.as_str(), "Notes:    a [2J\tb c");
+        // Sized up front for head + value: sanitizing only shortens.
+        let value = "\u{202e}\u{202e}x";
+        let l = wiped_line("H: ", value);
+        assert!(l.capacity() >= "H: ".len() + value.len());
+        assert_eq!(l.as_str(), "H:   x");
+    }
+
+    #[test]
+    fn entry_lines_print_as_they_are() {
+        let mut e = ent("id", "Gmail", "alice", "");
+        e.notes = "one\ntwo".to_owned();
+        let mut out = Vec::new();
+        print_lines(&mut out, &entry_lines(&e)).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("Title:    Gmail\n"), "{text}");
+        assert!(text.contains("\nNotes:    one\n          two\n"), "{text}");
+        assert!(text.ends_with("Password: (hidden)\n"), "{text}");
+    }
+
+    /// The hint reads the vault as saved: a title the new entry now shares
+    /// adds `--username`, which the vault as read before the save would miss.
+    #[test]
+    fn reveal_hint_for_sees_the_saved_contents() {
+        let before = Vault {
+            entries: vec![ent("1", "Gmail", "alice", "")],
+        };
+        let mut saved = before.clone();
+        saved.entries.push(ent("2", "Gmail", "bob", ""));
+        assert_eq!(
+            reveal_hint_for(Some("Personal"), &saved, 1, "Gmail", "bob"),
+            "See the new password with keyroostctl fido vault entry show Gmail --username bob \
+             --reveal"
+        );
+        assert_eq!(
+            reveal_hint_for(Some("Personal"), &before, 1, "Gmail", "bob"),
+            "See the new password with keyroostctl fido vault entry show Gmail --reveal"
+        );
+        // Several vaults: the vault is named too; a shared title with no
+        // username can't be narrowed by one.
+        let mut no_user = saved.clone();
+        no_user.entries[1].username.clear();
+        assert_eq!(
+            reveal_hint_for(Some("Personal"), &no_user, 2, "Gmail", ""),
+            "See the new password with keyroostctl fido vault entry show Gmail --vault Personal \
+             --reveal"
+        );
+    }
+
     #[test]
     fn entry_matches_by_title_and_username() {
         let v = gmail_vault();
@@ -2351,7 +2442,7 @@ mod tests {
         e.notes = "recovery codes in the safe".to_owned();
         let lines = entry_lines(&e);
         assert_eq!(
-            lines,
+            texts(&lines),
             [
                 "Title:    Gmail",
                 "Username: alice@example.com",
@@ -2362,15 +2453,15 @@ mod tests {
             ]
         );
         for l in &lines {
-            assert!(!l.contains("hunter2"), "{l}");
-            assert!(!l.contains("id-aaaa"), "no ID in text: {l}");
+            assert!(!l.contains("hunter2"), "{}", l.as_str());
+            assert!(!l.contains("id-aaaa"), "no ID in text: {}", l.as_str());
         }
 
         // Nothing there: (none), the password too.
         let mut empty = ent("id", "Bare", "", "");
         empty.password = Zeroizing::new(String::new());
         assert_eq!(
-            entry_lines(&empty),
+            texts(&entry_lines(&empty)),
             [
                 "Title:    Bare",
                 "Username: (none)",
@@ -2385,8 +2476,8 @@ mod tests {
         let mut multi = ent("id", "X", "u", "");
         multi.notes = "one\ntwo".to_owned();
         let lines = entry_lines(&multi);
-        assert_eq!(lines[3], "Notes:    one");
-        assert_eq!(lines[4], "          two");
+        assert_eq!(lines[3].as_str(), "Notes:    one");
+        assert_eq!(lines[4].as_str(), "          two");
     }
 
     #[test]
@@ -2432,7 +2523,10 @@ mod tests {
     fn reveal_line_is_the_hidden_lines_label() {
         let e = ent("id", "Gmail", "alice", "");
         let lines = entry_lines(&e);
-        assert_eq!(lines.last().unwrap(), &format!("{REVEAL_LABEL}(hidden)"));
+        assert_eq!(
+            lines.last().unwrap().as_str(),
+            format!("{REVEAL_LABEL}(hidden)")
+        );
     }
 
     #[test]
