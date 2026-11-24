@@ -166,7 +166,9 @@ pub enum PivExtension {
     /// distinction matters there specifically).
     GetSlotKeyStatus,
     /// Yubico ATTEST (`INS 0xF9`) — a slot's self-signed attestation
-    /// certificate, proving on-card key generation.
+    /// certificate, proving on-card key generation. A card of
+    /// [`PivDialect::Feitian`] has it under an instruction of its own
+    /// ([`crate::attest_feitian`]).
     Attest,
     /// Unlocking PIV management functionality (key-gen, cert import,
     /// retry counts, management-key rotation, …) via PIN VERIFY instead of the
@@ -490,6 +492,8 @@ pub enum PivDialect {
     ///   ([`crate::PolicyTags::Feitian`]) in GENERATE and in the import, and
     ///   a slot's policy is read with the card's own command
     ///   ([`crate::get_slot_policy_feitian`]) rather than GET METADATA.
+    /// - [`PivExtension::Attest`] is `INS 0xFB` with the slot in `P1`
+    ///   ([`crate::attest_feitian`]), where Yubico's is `INS 0xF9`.
     ///
     /// Hardware-observed on a Feitian ePass FIDO NFC Plus (USB `096E:0853`),
     /// 2026-11-22. Feitian's own client software (its Android SDK and its
@@ -516,6 +520,15 @@ pub enum PivDialect {
     /// authenticates and the old one is answered `6A80`. The same command
     /// with an AES algorithm byte is answered `6A80` on this key and changes
     /// nothing.
+    ///
+    /// *How long a management-key authentication lasts.* Until the key loses
+    /// power: Feitian describes the state as cleared on reset, at power-off,
+    /// and names no command that ends it. On this key commands that need the
+    /// authentication were answered `9000` in later connections that did not
+    /// authenticate, after a SELECT of PIV and of another application, after
+    /// a warm reset through PC/SC and after a PIV reset, and `6982` once the
+    /// key had been unplugged and plugged in again. Nothing in keyroost
+    /// relies on the state having ended.
     ///
     /// *The slot policies.* A GENERATE with Yubico's `AA`/`AB` is answered
     /// `6984`. With `BA`/`BC` the key is generated and the read returns the
@@ -3244,6 +3257,19 @@ const FEITIAN_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
     ],
 }];
 
+/// The PIV application version the ePass FIDO NFC Plus's rows were measured
+/// at: `91 66`, read with
+/// [`crate::fingerprint::FEITIAN_APPLICATION_VERSION`] and listed by Feitian
+/// as PIV 9166. Two keys of the product were measured, both at this version;
+/// the COS version of the one it was read on was `01 08 26` (COS 1.826).
+const FEITIAN_EPASS_NFC_PLUS_PIV_VERSION: &[u8] = &[0x91, 0x66];
+
+/// The PIV application version the BioPass FIDO Pro's rows were measured at:
+/// `47 17`, read the same way. Feitian lists no PIV number for the product;
+/// the two bytes are the first two of the key's COS version, `47 17 00`
+/// (COS 4.7.17).
+const FEITIAN_BIOPASS_PRO_PIV_VERSION: &[u8] = &[0x47, 0x17];
+
 /// The ePass FIDO NFC Plus's ([`FeitianModel::EPassFidoNfcPlus`]) applet-axis
 /// known-support table: what a key of that product (USB `096E:0853`) was
 /// measured to do. See
@@ -3259,24 +3285,33 @@ const FEITIAN_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// [`PivExtension::Reset`], the PIV-scoped reset, is a different matter:
 /// `Verdict::KnownSupported`, through Feitian's own instruction byte — see
 /// [`PivDialect::Feitian`] for the hardware observation (an ePass FIDO NFC
-/// Plus, USB `096E:0853`). That unit reports no applet version at all
-/// (GET VERSION answers `9000` with no data), so the row sits at the
-/// universal `[]` sentinel rather than at the `[0]` the rows below were
-/// observed at: a known-supported verdict says nothing about versions
-/// before it, and the unit it was seen on has none to pin it to. It
-/// therefore covers every Feitian applet version, which rests on that one
-/// unit plus Feitian's own client software sending the same reset to every
-/// key it manages. The deliberate PIN/PUK burn this verdict allows is still
+/// Plus, USB `096E:0853`). The row sits at the universal `[]` sentinel, for
+/// every version of the product: Feitian names `00 FC 00 00 00` as its PIV
+/// reset, and Feitian's own client software sends it to every key it
+/// manages. The deliberate PIN/PUK burn this verdict allows is still
 /// only reached after the card itself has answered the bare reset with one
 /// of the "not allowed yet" status words
 /// (`keyroost_transport::PivSession::force_reset`), so a Feitian card that
 /// does not know the instruction is not burned.
 ///
+/// **Every other row sits at the PIV application version it was measured
+/// at**, [`FEITIAN_EPASS_NFC_PLUS_PIV_VERSION`]. Feitian says that a later
+/// version of one product has the larger number, and that a change to the
+/// PIV application, to the COS or to the hardware can each change what PIV
+/// does. So a key of this product with an earlier version, or one whose
+/// version could not be read, is not taken to do what this one did: what was
+/// seen to work is unverified there, and the card answers for itself. It is
+/// still sent Feitian's instructions ([`FEITIAN_EPASS_NFC_PLUS_APPLET_QUIRKS`]).
+/// The COS version is not part of the key. Feitian says a change to the COS
+/// alone can change PIV too, and nothing measured tells two such keys apart
+/// yet; a difference found between two would be the reason to add it.
+///
 /// The [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`]/
 /// [`PivExtension::GetMetadata`] rows below are hardware-observed
-/// `Verdict::KnownUnsupported` at applet version `[0]` on a live unit —
-/// none of Yubico's vendor-extension APDUs these three represent are
-/// accepted. The ePass FIDO NFC Plus answers each `6D00`.
+/// `Verdict::KnownUnsupported`: none of Yubico's vendor-extension APDUs
+/// these three represent are accepted. The ePass FIDO NFC Plus answers each
+/// `6D00`, and Feitian says its PIV application has no command to delete a
+/// slot's key or to read a slot's key information.
 /// [`PivExtension::PinManagementAuth`] joins the same row on the same live
 /// unit: PIN VERIFY doesn't unlock the standard
 /// [`crate::OBJECT_PIN_PROTECTED_DATA`] object the indirect mechanism reads.
@@ -3286,8 +3321,7 @@ const FEITIAN_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// its own — see `GENERIC_APPLET_VERDICTS`'s doc for why.
 ///
 /// **What the card does through instructions and tags of its own.** One
-/// `Verdict::KnownSupported` row at the `[]` sentinel, on the reasoning the
-/// [`PivExtension::Reset`] row gives for sitting there. All of it was
+/// `Verdict::KnownSupported` row. All of it was
 /// measured on the ePass FIDO NFC Plus, first with a WinSCard script and then
 /// with `keyroostctl` itself; Feitian's own client software sends every key
 /// it manages the same commands. Yubico's form of each is refused by the
@@ -3298,7 +3332,7 @@ const FEITIAN_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// - [`PivExtension::SetManagementKey`], with
 ///   [`PivExtension::ManagementKeyAlgorithm`]`(`[`MgmtAlgChoice::TripleDes`]`)`:
 ///   see [`PivDialect::Feitian`]. The three AES sizes are
-///   `Verdict::KnownUnsupportedSince` in the row after: the card answered
+///   `Verdict::KnownUnsupported` in the row after: the card answered
 ///   `6A80` for each and kept the key it had.
 /// - [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`]: see
 ///   [`PivDialect::Feitian`].
@@ -3310,12 +3344,14 @@ const FEITIAN_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 ///   Yubico's `05`/`16` is answered `6A80`; with `21`/`22` the card made a
 ///   3072-bit key in 20 to 70 seconds and a 4096-bit key in 20 to 30, and
 ///   each then signed and decrypted correctly in the slot self-test.
-///   [`KeyAlg::EccP521`], [`KeyAlg::Ed25519`] and [`KeyAlg::X25519`] stay in
-///   the `[0]` row above: that unit's GENERATE rejects all three.
+///   [`KeyAlg::EccP521`], [`KeyAlg::Ed25519`] and [`KeyAlg::X25519`] are in
+///   the refused row above: the card's GENERATE answers `6A80` for each, and
+///   the `[0]` unit's rejects all three too.
 /// - [`PivExtension::ImportKey`] for the same six: the card's own import
 ///   ([`crate::ImportLayout::Feitian`]). A key of each kind was imported
 ///   from a PKCS#12 file and passed the slot self-test. The other three are
-///   `Verdict::KnownUnsupportedSince`, as the card cannot hold them.
+///   `Verdict::KnownUnsupported`, as the card cannot hold them.
+/// - [`PivExtension::Attest`]: see [`crate::attest_feitian`].
 ///
 /// keyroost's former import, Yubico's `INS 0xFE`, is on this card the
 /// command that sets the retry counts: `00 FE 03 03` with no data is
@@ -3353,7 +3389,7 @@ const FEITIAN_EPASS_NFC_PLUS_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
         ],
         verdicts: &[VersionVerdict {
-            version: &[0],
+            version: FEITIAN_EPASS_NFC_PLUS_PIV_VERSION,
             verdict: Verdict::KnownUnsupported,
         }],
     },
@@ -3376,9 +3412,10 @@ const FEITIAN_EPASS_NFC_PLUS_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::ImportKey(KeyAlg::Rsa4096),
             PivExtension::ImportKey(KeyAlg::EccP256),
             PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::Attest,
         ],
         verdicts: &[VersionVerdict {
-            version: &[],
+            version: FEITIAN_EPASS_NFC_PLUS_PIV_VERSION,
             verdict: Verdict::KnownSupported,
         }],
     },
@@ -3392,8 +3429,8 @@ const FEITIAN_EPASS_NFC_PLUS_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::ImportKey(KeyAlg::X25519),
         ],
         verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupportedSince,
+            version: FEITIAN_EPASS_NFC_PLUS_PIV_VERSION,
+            verdict: Verdict::KnownUnsupported,
         }],
     },
 ];
@@ -3401,19 +3438,28 @@ const FEITIAN_EPASS_NFC_PLUS_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
 /// See [`YUBIKEY_FIRMWARE_VERDICTS`]'s doc — empty.
 const FEITIAN_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 
-/// The ePass FIDO NFC Plus's quirks: [`FEITIAN_APPLET_QUIRKS`]'s without the
-/// four it was measured not to need. It answers a reset that is not allowed
-/// yet `6982`, its reset takes no touch, it answers the four-byte
-/// retry-counter query, and an import sent to it in one extended-length APDU
-/// works.
-const FEITIAN_EPASS_NFC_PLUS_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
-    version: &[],
-    quirks: &[
-        PivQuirk::Default9bManagementKey(FEITIAN_DEFAULT_MGMT_KEY),
-        FEITIAN_DEFAULT_PIN_PUK,
-        PivQuirk::Dialect(PivDialect::Feitian),
-    ],
-}];
+/// The ePass FIDO NFC Plus's quirks. At the version it was measured at
+/// ([`FEITIAN_EPASS_NFC_PLUS_PIV_VERSION`]) and later ones they are
+/// [`FEITIAN_APPLET_QUIRKS`]'s without the four it was measured not to
+/// need: it answers a reset that is not allowed yet `6982`, its reset takes
+/// no touch, it answers the four-byte retry-counter query, and an import
+/// sent to it in one extended-length APDU works. A key of the product with
+/// an earlier version, or one whose version could not be read, gets all of
+/// [`FEITIAN_APPLET_QUIRKS`]'s, as a key of an unmeasured product does.
+const FEITIAN_EPASS_NFC_PLUS_APPLET_QUIRKS: &[VersionQuirks] = &[
+    VersionQuirks {
+        version: &[],
+        quirks: FEITIAN_APPLET_QUIRKS[0].quirks,
+    },
+    VersionQuirks {
+        version: FEITIAN_EPASS_NFC_PLUS_PIV_VERSION,
+        quirks: &[
+            PivQuirk::Default9bManagementKey(FEITIAN_DEFAULT_MGMT_KEY),
+            FEITIAN_DEFAULT_PIN_PUK,
+            PivQuirk::Dialect(PivDialect::Feitian),
+        ],
+    },
+];
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const FEITIAN_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
@@ -3421,10 +3467,11 @@ const FEITIAN_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// The BioPass FIDO Pro's ([`FeitianModel::BioPassFidoPro`]) applet-axis
 /// known-support table. All of it was measured on one key (USB `096E:086A`,
 /// 2026-11-22), first with a WinSCard script and then with `keyroostctl`
-/// itself. The card reports no applet version (GET VERSION answers `6A86`),
-/// so every row sits at the universal `[]` sentinel, on the reasoning
-/// [`FEITIAN_EPASS_NFC_PLUS_APPLET_VERDICTS`]'s doc gives for its own rows
-/// there.
+/// itself. The rows sit at the PIV application version the key reported,
+/// [`FEITIAN_BIOPASS_PRO_PIV_VERSION`], and the reset at the universal `[]`
+/// sentinel, each on the reasoning
+/// [`FEITIAN_EPASS_NFC_PLUS_APPLET_VERDICTS`]'s doc gives for its own.
+/// (The card answers Yubico's GET VERSION `6A86`.)
 ///
 /// The card takes the instructions and tags of the ePass FIDO NFC Plus
 /// — the reset (`FC`), the retry counts (`FE`), the management key (`CF`),
@@ -3453,6 +3500,7 @@ const FEITIAN_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 ///   on this key.
 /// - [`PivExtension::Reset`]: see [`PivQuirk::ResetNotAllowedIs6984`] and
 ///   [`PivQuirk::ResetMayWaitForTouch`].
+/// - [`PivExtension::Attest`]: see [`crate::attest_feitian`].
 ///
 /// [`PivExtension::ResetGlobal`] and
 /// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
@@ -3470,8 +3518,14 @@ const FEITIAN_BIOPASS_PRO_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         }],
     },
     ExtensionVerdicts {
+        extensions: &[PivExtension::Reset],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    ExtensionVerdicts {
         extensions: &[
-            PivExtension::Reset,
             PivExtension::SetManagementKey,
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
@@ -3486,9 +3540,10 @@ const FEITIAN_BIOPASS_PRO_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::ImportKey(KeyAlg::Rsa1024),
             PivExtension::ImportKey(KeyAlg::Rsa2048),
             PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::Attest,
         ],
         verdicts: &[VersionVerdict {
-            version: &[],
+            version: FEITIAN_BIOPASS_PRO_PIV_VERSION,
             verdict: Verdict::KnownSupported,
         }],
     },
@@ -3511,13 +3566,15 @@ const FEITIAN_BIOPASS_PRO_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::ImportKey(KeyAlg::X25519),
         ],
         verdicts: &[VersionVerdict {
-            version: &[],
+            version: FEITIAN_BIOPASS_PRO_PIV_VERSION,
             verdict: Verdict::KnownUnsupported,
         }],
     },
 ];
 
-/// The BioPass FIDO Pro's quirks: all of [`FEITIAN_APPLET_QUIRKS`]'s, each
+/// The BioPass FIDO Pro's quirks, for every version of the product: all of
+/// [`FEITIAN_APPLET_QUIRKS`]'s, which are also what a key whose version was
+/// not measured gets, each
 /// measured on the key (USB `096E:086A`). It accepted the factory management
 /// key, PIN and PUK and takes Feitian's instructions and tags
 /// ([`PivDialect::Feitian`]); it answers a reset that is not allowed yet
@@ -4989,6 +5046,34 @@ fn merge_quirk_sets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The versions a Feitian ePass FIDO NFC Plus's rows are tried at: the
+    /// PIV application version they were measured at, a later one, an
+    /// earlier one (8063, the other PIV number Feitian lists under the
+    /// product's name), and, as `None`, no version read.
+    const EPASS_AT: Option<&[u8]> = Some(FEITIAN_EPASS_NFC_PLUS_PIV_VERSION);
+    const EPASS_LATER: Option<&[u8]> = Some(&[0x91, 0x70]);
+    const EPASS_EARLIER: Option<&[u8]> = Some(&[0x80, 0x63]);
+    /// The version a Feitian BioPass FIDO Pro's rows were measured at.
+    const BIOPASS_AT: Option<&[u8]> = Some(FEITIAN_BIOPASS_PRO_PIV_VERSION);
+    /// What a row that was seen to work resolves to at each of the ePass's
+    /// four versions: supported where it was measured and later, unverified
+    /// before and with no version read.
+    const EPASS_WORKS: [(Option<&[u8]>, FeatureGate); 4] = [
+        (EPASS_AT, FeatureGate::Supported),
+        (EPASS_LATER, FeatureGate::Supported),
+        (EPASS_EARLIER, FeatureGate::Unverified),
+        (None, FeatureGate::Unverified),
+    ];
+    /// What a row that was seen refused resolves to at each: unsupported
+    /// where it was measured, before, and with no version read; unverified
+    /// later, where the card may have gained it.
+    const EPASS_REFUSES: [(Option<&[u8]>, FeatureGate); 4] = [
+        (EPASS_AT, FeatureGate::Unsupported),
+        (EPASS_LATER, FeatureGate::Unverified),
+        (EPASS_EARLIER, FeatureGate::Unsupported),
+        (None, FeatureGate::Unsupported),
+    ];
 
     // --- User-facing wording: requirement() + a suffix -------------------
 
@@ -7227,18 +7312,14 @@ mod tests {
 
     #[test]
     fn feitian_slot_policies_go_under_its_own_tags() {
-        // Hardware-observed on a unit that reports no applet version: the
-        // card refuses Yubico's `AA`/`AB` and takes `BA`/`BC` (see
-        // `PivDialect::Feitian`), so both policies are offered and the
-        // dialect that picks the tags is in force with them.
+        // Hardware-observed at PIV application version 9166: the card
+        // refuses Yubico's `AA`/`AB` and takes `BA`/`BC` (see
+        // `PivDialect::Feitian`), so both policies are offered there and
+        // later. The dialect that picks the tags is in force at any version.
         let fp = AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus);
-        for v in [None, Some(&[0][..]), Some(&[1][..])] {
+        for (v, gate) in EPASS_WORKS {
             for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
-                assert_eq!(
-                    resolve(ext, fp, v, None),
-                    FeatureGate::Supported,
-                    "{ext:?} {v:?}"
-                );
+                assert_eq!(resolve(ext, fp, v, None), gate, "{ext:?} {v:?}");
             }
             assert_eq!(
                 PivDialect::of(&resolve_quirks(fp, v, None)),
@@ -7338,14 +7419,14 @@ mod tests {
     fn feitian_imports_what_it_generates_through_its_own_instruction() {
         // Hardware-observed: each of the six went in with the card's own
         // import (`ImportLayout::Feitian`) and passed the slot self-test.
-        // The three the card cannot generate stay refused.
+        // The three the card cannot generate are refused.
         let fp = AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus);
         assert_eq!(import_layout(fp), crate::ImportLayout::Feitian);
         assert_eq!(
             import_layout(AppletFingerprint::YubiKey),
             crate::ImportLayout::Yubico
         );
-        for v in [None, Some(&[][..]), Some(&[0][..]), Some(&[2, 0][..])] {
+        for (v, gate) in EPASS_WORKS {
             for alg in [
                 KeyAlg::Rsa1024,
                 KeyAlg::Rsa2048,
@@ -7356,14 +7437,16 @@ mod tests {
             ] {
                 assert_eq!(
                     resolve(PivExtension::ImportKey(alg), fp, v, None),
-                    FeatureGate::Supported,
+                    gate,
                     "{alg:?} {v:?}"
                 );
             }
+        }
+        for (v, gate) in EPASS_REFUSES {
             for alg in [KeyAlg::EccP521, KeyAlg::Ed25519, KeyAlg::X25519] {
                 assert_eq!(
                     resolve(PivExtension::ImportKey(alg), fp, v, None),
-                    FeatureGate::Unsupported,
+                    gate,
                     "{alg:?} {v:?}"
                 );
             }
@@ -7371,34 +7454,36 @@ mod tests {
     }
 
     #[test]
-    fn feitian_generates_its_six_algorithms_with_no_reported_version() {
-        // Hardware-observed on a unit that reports no applet version: the
-        // known-supported row sits at the `[]` sentinel, so that unit is not
-        // left unverified. The other three stay known unsupported there, by
-        // the `[0]` row's reach backward.
+    fn feitian_generates_its_six_algorithms_at_the_version_measured() {
+        // Hardware-observed at PIV application version 9166. A key of the
+        // product with an earlier version, or with none read, is not taken
+        // to generate them: they are unverified there. The three the card
+        // refused are refused there too, by that row's reach backward.
         let fp = AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus);
-        for alg in [
-            KeyAlg::Rsa1024,
-            KeyAlg::Rsa2048,
-            KeyAlg::Rsa3072,
-            KeyAlg::Rsa4096,
-            KeyAlg::EccP256,
-            KeyAlg::EccP384,
-        ] {
-            for v in [None, Some(&[0][..]), Some(&[1][..])] {
+        for (v, gate) in EPASS_WORKS {
+            for alg in [
+                KeyAlg::Rsa1024,
+                KeyAlg::Rsa2048,
+                KeyAlg::Rsa3072,
+                KeyAlg::Rsa4096,
+                KeyAlg::EccP256,
+                KeyAlg::EccP384,
+            ] {
                 assert_eq!(
                     resolve(PivExtension::SlotKeyAlgorithm(alg), fp, v, None),
-                    FeatureGate::Supported,
+                    gate,
                     "{alg:?} {v:?}"
                 );
             }
         }
-        for alg in [KeyAlg::EccP521, KeyAlg::Ed25519, KeyAlg::X25519] {
-            assert_eq!(
-                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, None, None),
-                FeatureGate::Unsupported,
-                "{alg:?}"
-            );
+        for (v, gate) in EPASS_REFUSES {
+            for alg in [KeyAlg::EccP521, KeyAlg::Ed25519, KeyAlg::X25519] {
+                assert_eq!(
+                    resolve(PivExtension::SlotKeyAlgorithm(alg), fp, v, None),
+                    gate,
+                    "{alg:?} {v:?}"
+                );
+            }
         }
     }
 
@@ -7433,12 +7518,16 @@ mod tests {
 
     #[test]
     fn feitian_reset_is_supported_through_its_own_instruction() {
-        // Hardware-observed on a unit that reports no applet version at all
-        // — see `PivDialect::Feitian`'s and `FEITIAN_APPLET_VERDICTS`'s
-        // docs. The row sits at the `[]` sentinel, so it resolves the same
-        // with no reported version (that unit) and at any reported one.
+        // See `PivDialect::Feitian`'s and `FEITIAN_APPLET_VERDICTS`'s docs.
+        // The row sits at the `[]` sentinel, so it resolves the same with no
+        // version read and at any reported one.
         let fp = AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus);
-        for version in [None, Some(&[0][..]), Some(&[1][..]), Some(&[5, 7, 4][..])] {
+        for (version, measured) in [
+            (None, false),
+            (EPASS_EARLIER, false),
+            (EPASS_AT, true),
+            (EPASS_LATER, true),
+        ] {
             assert_eq!(
                 resolve(PivExtension::Reset, fp, version, None),
                 FeatureGate::Supported,
@@ -7450,10 +7539,12 @@ mod tests {
                 PivDialect::Feitian,
                 "the reset instruction at {version:?}"
             );
-            // This product answers a reset that is not allowed yet 6982.
-            assert!(
-                !quirks.contains(&PivQuirk::ResetNotAllowedIs6984),
-                "no 6984 at {version:?}"
+            // Where it was measured this product answers a reset that is not
+            // allowed yet 6982. Where it was not, 6984 is read that way too.
+            assert_eq!(
+                quirks.contains(&PivQuirk::ResetNotAllowedIs6984),
+                !measured,
+                "6984 at {version:?}"
             );
             // The card wants its PIN and PUK blocked, not a management-key
             // session: the bare reset was refused with nothing blocked and
@@ -7892,64 +7983,28 @@ mod tests {
     // --- KnownUnsupported at v[0] -------------------------------------------
 
     #[test]
-    fn feitian_yubico_extensions_are_known_unsupported_at_v0() {
-        // Hardware-observed on a live unit at applet version `[0]` — see
-        // `FEITIAN_APPLET_VERDICTS`'s doc.
+    fn feitian_yubico_extensions_are_known_unsupported_where_measured() {
+        // Hardware-observed on an ePass FIDO NFC Plus at PIV application
+        // version 9166: each is answered `6D00`.
+        let fp = AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus);
         for ext in [
             PivExtension::MoveKey,
             PivExtension::DeleteKey,
             PivExtension::GetMetadata,
         ] {
-            // Neither axis reported at all: `resolve` substitutes the
-            // universal `[]` sentinel on both, which orders *below* the
-            // row's only verdict at `[0]` — the reported version is older
-            // than every verdict on record, so `resolve` falls back to that
-            // (lowest) verdict, and a `KnownUnsupported` fallback is assumed
-            // to hold at every earlier, untested version too.
+            // At the version measured it is a direct observation. Before it,
+            // and with no version read (`resolve` substitutes the universal
+            // `[]` sentinel, which orders below the row's only verdict), a
+            // `KnownUnsupported` verdict is assumed to hold as well. Above
+            // it, it softens to `Unverified`: `KnownUnsupported`, unlike
+            // `KnownUnsupportedSince`, doesn't extend forward past itself.
+            for (v, gate) in EPASS_REFUSES {
+                assert_eq!(resolve(ext, fp, v, None), gate, "{ext:?} {v:?}");
+            }
             assert_eq!(
-                resolve(
-                    ext,
-                    AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
-                    None,
-                    None
-                ),
-                FeatureGate::Unsupported,
-                "{ext:?} with no reported version"
-            );
-            // An exact version match against the row's only verdict.
-            assert_eq!(
-                resolve(
-                    ext,
-                    AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
-                    Some(&[0]),
-                    None
-                ),
-                FeatureGate::Unsupported,
-                "{ext:?} at v[0]"
-            );
-            // A version above the row's only (and therefore last/highest)
-            // verdict softens to `Unverified` — `KnownUnsupported`, unlike
-            // `KnownUnsupportedSince`, doesn't extend forward past itself:
-            // a later firmware may simply have added the extension.
-            assert_eq!(
-                resolve(
-                    ext,
-                    AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
-                    Some(&[1]),
-                    None
-                ),
+                resolve(ext, fp, Some(&[0x99, 0x99]), Some(&[5, 7, 4])),
                 FeatureGate::Unverified,
-                "{ext:?} above v[0]"
-            );
-            assert_eq!(
-                resolve(
-                    ext,
-                    AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
-                    Some(&[5, 7, 4]),
-                    Some(&[5, 7, 4]),
-                ),
-                FeatureGate::Unverified,
-                "{ext:?} at a reported version well above v[0]"
+                "{ext:?} at a reported version well above the measured one"
             );
         }
     }
@@ -7990,6 +8045,7 @@ mod tests {
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
             PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::Attest,
         ] {
             assert_eq!(
                 resolve(ext, fp, None, None),
@@ -8004,7 +8060,7 @@ mod tests {
             resolve(
                 p384,
                 AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
-                None,
+                EPASS_AT,
                 None
             ),
             FeatureGate::Supported
@@ -8013,7 +8069,7 @@ mod tests {
             resolve(
                 p384,
                 AppletFingerprint::Feitian(FeitianModel::BioPassFidoPro),
-                None,
+                BIOPASS_AT,
                 None
             ),
             FeatureGate::Unsupported
@@ -8021,42 +8077,99 @@ mod tests {
     }
 
     #[test]
+    fn a_measured_feitian_product_at_an_unmeasured_version_is_read_as_an_unmeasured_one() {
+        // With an earlier version, or none read, the ePass FIDO NFC Plus
+        // gets the quirks a key of an unmeasured product gets, the four it
+        // was measured not to need among them.
+        let epass = AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus);
+        let generic = resolve_quirks(
+            AppletFingerprint::Feitian(FeitianModel::Generic),
+            None,
+            None,
+        );
+        for v in [None, EPASS_EARLIER] {
+            assert_eq!(resolve_quirks(epass, v, None), generic, "{v:?}");
+        }
+        for v in [EPASS_AT, EPASS_LATER] {
+            let quirks = resolve_quirks(epass, v, None);
+            assert_eq!(PivDialect::of(&quirks), PivDialect::Feitian, "{v:?}");
+            assert_eq!(quirks.len(), 3, "{v:?}");
+        }
+        // The BioPass FIDO Pro was measured to need all of them, so its set
+        // is the same at any version.
+        let biopass = AppletFingerprint::Feitian(FeitianModel::BioPassFidoPro);
+        for v in [
+            None,
+            Some(&[0x40, 0x00][..]),
+            BIOPASS_AT,
+            Some(&[0x50, 0x00][..]),
+        ] {
+            assert_eq!(resolve_quirks(biopass, v, None), generic, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn feitian_attests_a_generated_key_where_it_was_measured() {
+        // Hardware-observed on both products with the card's own
+        // instruction (`crate::attest_feitian`); Feitian names the command.
+        let epass = AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus);
+        for (v, gate) in EPASS_WORKS {
+            assert_eq!(resolve(PivExtension::Attest, epass, v, None), gate, "{v:?}");
+        }
+        let biopass = AppletFingerprint::Feitian(FeitianModel::BioPassFidoPro);
+        assert_eq!(
+            resolve(PivExtension::Attest, biopass, BIOPASS_AT, None),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            resolve(PivExtension::Attest, biopass, None, None),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
     fn feitian_biopass_pro_rows_are_what_the_086a_key_did() {
-        // Hardware-observed on a Feitian BioPass FIDO Pro (USB 096E:086A) that reports no
-        // applet version — see `FEITIAN_BIOPASS_PRO_APPLET_VERDICTS`.
+        // Hardware-observed on a Feitian BioPass FIDO Pro (USB 096E:086A) at
+        // PIV application version 4717 — see
+        // `FEITIAN_BIOPASS_PRO_APPLET_VERDICTS`.
         let fp = AppletFingerprint::Feitian(FeitianModel::BioPassFidoPro);
-        for v in [None, Some(&[][..])] {
-            for ext in [
-                PivExtension::Reset,
-                PivExtension::SetPinPukRetries,
-                PivExtension::SetManagementKey,
-                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
-                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
-                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
-                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
-                PivExtension::SlotPinPolicy,
-                PivExtension::SlotTouchPolicy,
-            ] {
-                assert_eq!(
-                    resolve(ext, fp, v, None),
-                    FeatureGate::Supported,
-                    "{ext:?} {v:?}"
-                );
-            }
-            // What the card generated and took as an import...
-            for alg in [KeyAlg::Rsa1024, KeyAlg::Rsa2048, KeyAlg::EccP256] {
-                for ext in [
-                    PivExtension::SlotKeyAlgorithm(alg),
-                    PivExtension::ImportKey(alg),
-                ] {
-                    assert_eq!(
-                        resolve(ext, fp, v, None),
-                        FeatureGate::Supported,
-                        "{ext:?} {v:?}"
-                    );
-                }
-            }
-            // ...and what it answered `6A81` (GENERATE) or `6A86` (import).
+        let works = [
+            PivExtension::SetPinPukRetries,
+            PivExtension::SetManagementKey,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            // What the card generated and took as an import.
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+        ];
+        for ext in works {
+            assert_eq!(
+                resolve(ext, fp, BIOPASS_AT, None),
+                FeatureGate::Supported,
+                "{ext:?}"
+            );
+            // With no version read it is not taken to work.
+            assert_eq!(
+                resolve(ext, fp, None, None),
+                FeatureGate::Unverified,
+                "{ext:?} with no version"
+            );
+        }
+        for v in [None, BIOPASS_AT] {
+            assert_eq!(
+                resolve(PivExtension::Reset, fp, v, None),
+                FeatureGate::Supported,
+                "{v:?}"
+            );
+            // What it answered `6A81` (GENERATE) or `6A86` (import).
             for alg in [
                 KeyAlg::Rsa3072,
                 KeyAlg::Rsa4096,
@@ -8097,7 +8210,7 @@ mod tests {
             resolve(
                 PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
                 other,
-                None,
+                EPASS_AT,
                 None
             ),
             FeatureGate::Supported
@@ -8106,7 +8219,7 @@ mod tests {
             resolve(
                 PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
                 other,
-                None,
+                EPASS_AT,
                 None
             ),
             FeatureGate::Unsupported
@@ -8123,12 +8236,12 @@ mod tests {
         ];
         let otp = resolve_quirks(
             AppletFingerprint::Feitian(FeitianModel::BioPassFidoPro),
-            None,
+            BIOPASS_AT,
             None,
         );
         let feitian = resolve_quirks(
             AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
-            None,
+            EPASS_AT,
             None,
         );
         for quirk in &feitian {
@@ -8152,7 +8265,7 @@ mod tests {
             resolve(
                 PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
                 fp,
-                None,
+                BIOPASS_AT,
                 None
             ),
             FeatureGate::Unsupported
@@ -8161,40 +8274,48 @@ mod tests {
 
     #[test]
     fn feitian_retries_and_management_key_go_through_its_own_instructions() {
-        // Hardware-observed on a unit that reports no applet version: Yubico's
+        // Hardware-observed at PIV application version 9166: Yubico's
         // `FA` and `FF` are answered `6D00`; `FE` sets the retry counts and
         // `CF` the management key (see `PivDialect::Feitian`). A 3DES key
         // only: the card answered `6A80` for each AES size.
         let fp = AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus);
-        for v in [None, Some(&[0][..]), Some(&[1][..])] {
+        for (v, gate) in EPASS_WORKS {
             for ext in [
                 PivExtension::SetPinPukRetries,
                 PivExtension::SetManagementKey,
                 PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
             ] {
-                assert_eq!(
-                    resolve(ext, fp, v, None),
-                    FeatureGate::Supported,
-                    "{ext:?} {v:?}"
-                );
+                assert_eq!(resolve(ext, fp, v, None), gate, "{ext:?} {v:?}");
             }
-            for choice in [
-                MgmtAlgChoice::Aes128,
-                MgmtAlgChoice::Aes192,
-                MgmtAlgChoice::Aes256,
-                MgmtAlgChoice::Delete,
-            ] {
-                assert_eq!(
-                    resolve(PivExtension::ManagementKeyAlgorithm(choice), fp, v, None),
-                    FeatureGate::Unsupported,
-                    "{choice:?} {v:?}"
-                );
-            }
+            // keyroost has no way to delete the key, at any version.
+            assert_eq!(
+                resolve(
+                    PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+                    fp,
+                    v,
+                    None
+                ),
+                FeatureGate::Unsupported,
+                "{v:?}"
+            );
             assert_eq!(
                 PivDialect::of(&resolve_quirks(fp, v, None)),
                 PivDialect::Feitian,
                 "{v:?}"
             );
+        }
+        for (v, gate) in EPASS_REFUSES {
+            for choice in [
+                MgmtAlgChoice::Aes128,
+                MgmtAlgChoice::Aes192,
+                MgmtAlgChoice::Aes256,
+            ] {
+                assert_eq!(
+                    resolve(PivExtension::ManagementKeyAlgorithm(choice), fp, v, None),
+                    gate,
+                    "{choice:?} {v:?}"
+                );
+            }
         }
         // No other card is sent those instructions.
         for other in [AppletFingerprint::Generic, AppletFingerprint::YubiKey] {
@@ -8238,14 +8359,13 @@ mod tests {
     #[test]
     fn feitian_algorithm_support_at_v0_covers_what_it_generates() {
         // RSA-1024/2048 and the two curves were hardware-observed on a live
-        // v0 unit; RSA-3072/4096 on a unit that reports no version, under
-        // the card's own algorithm bytes. See `FEITIAN_APPLET_VERDICTS`'s doc.
-        let fp = AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus);
+        // unit that answers Yubico's GET VERSION `[0]`; its product is not
+        // known, so its rows are the ones a key of an unmeasured product
+        // gets. See `FEITIAN_APPLET_VERDICTS`'s doc.
+        let fp = AppletFingerprint::Feitian(FeitianModel::Generic);
         for alg in [
             KeyAlg::Rsa1024,
             KeyAlg::Rsa2048,
-            KeyAlg::Rsa3072,
-            KeyAlg::Rsa4096,
             KeyAlg::EccP256,
             KeyAlg::EccP384,
         ] {

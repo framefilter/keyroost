@@ -48,4 +48,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = keyroost_piv::fingerprint::feitian_product(data);
     let _ = keyroost_piv::fingerprint::feitian_model(data);
     let _ = keyroost_piv::parse_slot_policy_feitian(data);
+    // And the reply to its application-version read.
+    let _ = keyroost_piv::fingerprint::feitian_application_version(data);
 });
