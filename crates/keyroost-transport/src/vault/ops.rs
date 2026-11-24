@@ -426,7 +426,10 @@ pub(crate) fn write_array(
 /// is applied to what it holds then: another writer's change to a different
 /// entry is kept, and a change to an entry this one touches is refused with
 /// [`VaultKeyError::Conflict`], nothing written, and `open.contents`
-/// reloaded with what the key holds now. Data that no
+/// reloaded with what the key holds now. A vault whose data was there at
+/// unlock and is gone now (another writer deleted or rotated it) is
+/// [`VaultKeyError::VaultGone`], nothing written and `open` left as it was,
+/// so every later save on it is refused too. Data that no
 /// longer opens (damaged, or saved by a newer app) is refused with
 /// [`VaultKeyError::CannotOpen`] and never written over. A store too small
 /// for the result is [`VaultKeyError::Full`], nothing written. Every other
@@ -446,6 +449,7 @@ pub fn save(
         let (hmac, lbk) = open.secrets();
         let base = &open.contents;
         let was_stored = open.stored;
+        let vault_name = &open.vault_ref.name;
         write_array(
             key,
             auth,
@@ -455,10 +459,13 @@ pub fn save(
                 // Data that was there at unlock and is gone now means
                 // another writer deleted or rotated this vault: writing
                 // would leave a blob no credential finds and lose the
-                // change, so it is a conflict, never an empty vault.
+                // change, so it is refused, never an empty vault. The open
+                // vault is left as it was (still `stored`), so a retried
+                // save on it is refused the same way.
                 if was_stored && !stored {
-                    on_key = Some((current, stored));
-                    return Err(VaultKeyError::Conflict);
+                    return Err(VaultKeyError::VaultGone {
+                        name: vault_name.clone(),
+                    });
                 }
                 match apply_change(base, &current, change) {
                     Ok((next, added, replaced, removed)) => {
@@ -1130,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn vault_data_gone_since_unlock_is_a_conflict() {
+    fn vault_data_gone_since_unlock_is_refused_on_every_save() {
         let a = entry("GitHub");
         let seeded = Vault {
             entries: vec![a.clone()],
@@ -1162,17 +1169,24 @@ mod tests {
             assert!(open.stored);
             let stored = key.stored().to_vec();
 
-            let (r, steps) = save_with(&mut key, &mut auth, &mut open, &change);
-            assert!(
-                matches!(r, Err(VaultKeyError::Conflict)),
-                "{change:?}: {r:?}"
-            );
-            assert_eq!(writes(&key), 0, "{change:?}");
-            assert!(steps.is_empty());
-            assert_eq!(key.stored(), &stored[..], "no orphan blob");
-            // Reloaded as the key holds it now: no data.
-            assert!(!open.stored);
-            assert_eq!(open.contents, Vault::default());
+            let before = open.contents.clone();
+
+            // Saved twice on the same open vault (a front end's retry): the
+            // vault is still gone, so both are refused and nothing is
+            // written, never an empty vault no credential finds.
+            for attempt in 1..=2 {
+                let (r, steps) = save_with(&mut key, &mut auth, &mut open, &change);
+                assert!(
+                    matches!(&r, Err(VaultKeyError::VaultGone { name: Some(n) }) if n == "Personal"),
+                    "{change:?} attempt {attempt}: {r:?}"
+                );
+                assert_eq!(writes(&key), 0, "{change:?} attempt {attempt}");
+                assert!(steps.is_empty());
+                assert_eq!(key.stored(), &stored[..], "no orphan blob");
+                // Not reloaded as an empty vault.
+                assert!(open.stored);
+                assert_eq!(open.contents, before);
+            }
         }
     }
 

@@ -165,7 +165,9 @@ impl LeftOver {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OldVault {
     /// The old vault still holds the same checked entries as the new one
-    /// (or both hold none), so deleting either is safe.
+    /// (or both hold none), but one of the two still uses the old key and
+    /// nothing tells which: delete either, then rotate the one left again
+    /// so it ends up on a fresh key.
     Kept,
     /// The old vault's data is removed but its credential is left: it lists
     /// as a vault of the same name with no data, and that is the one to
@@ -173,10 +175,31 @@ pub enum OldVault {
     Emptied,
     /// The key stopped answering while the old data was being removed, so
     /// whether it is still there is not known. The copy with no data, if
-    /// there is one, is the one to delete; when both hold data they hold
-    /// the same checked entries and deleting either is safe.
+    /// there is one, is the one to delete; when both hold data it is as
+    /// [`OldVault::Kept`]: delete either, then rotate the one left again.
     Unknown,
 }
+
+impl OldVault {
+    /// What to do about the copy left, in plain words that name no command
+    /// (ruling: never "delete either" without rotating the one left again).
+    pub fn next_step(self) -> &'static str {
+        match self {
+            OldVault::Kept => BOTH_COPIES,
+            OldVault::Emptied => "the old copy is left with no data: delete the copy with no data",
+            OldVault::Unknown => concat!(
+                "whether the old copy still holds its data is not known: if a copy holds no data, ",
+                "delete that one; otherwise both copies hold the same checked entries, but one ",
+                "still uses the old key: delete either, then rotate the one left again so it ",
+                "gets a fresh key"
+            ),
+        }
+    }
+}
+
+/// [`OldVault::Kept`]'s next step, also the end of [`OldVault::Unknown`]'s.
+const BOTH_COPIES: &str = "both copies hold the same checked entries, but one still uses the \
+     old key: delete either, then rotate the one left again so it gets a fresh key";
 
 /// Why a vault operation on a key failed.
 #[non_exhaustive]
@@ -212,7 +235,13 @@ pub enum VaultKeyError {
     /// What this change touches was changed on the key since the vault was
     /// opened; nothing was written.
     Conflict,
-    /// The largeBlob store is too small for the result; nothing was written.
+    /// The vault's data, there when it was unlocked, is no longer on the
+    /// key: another writer deleted or rotated the vault. Nothing was
+    /// written, and every later save on the same open vault is refused the
+    /// same way; unlock again to see what the key holds now.
+    VaultGone { name: Option<String> },
+    /// The large-blob store is too small for the result; nothing was
+    /// written.
     Full { needed: u64, max: u64 },
     /// The vault cannot be opened, so it is not changed.
     CannotOpen(VaultProblem),
@@ -260,7 +289,7 @@ impl fmt::Display for VaultKeyError {
                         "removing its new credential failed too, so it is left on the key with no data"
                     }
                     (false, true) => {
-                        "its new credential was removed, but removing its data failed, so that data is left in the key's largeBlob store with nothing to open it"
+                        "its new credential was removed, but removing its data failed, so that data is left in the key's large-blob store with nothing to open it"
                     }
                     (true, true) => {
                         "cleaning up failed too, so its new credential and its data are still on the key"
@@ -270,9 +299,16 @@ impl fmt::Display for VaultKeyError {
             VaultKeyError::Conflict => f.write_str(
                 "this changed on the key since the vault was opened; nothing was written",
             ),
+            VaultKeyError::VaultGone { name } => {
+                match name {
+                    Some(n) => write!(f, "vault \"{n}\" is no longer on the key")?,
+                    None => f.write_str("this vault is no longer on the key")?,
+                }
+                f.write_str("; it was deleted or rotated elsewhere, and nothing was written")
+            }
             VaultKeyError::Full { needed, max } => write!(
                 f,
-                "the key's largeBlob storage is too small: this needs {needed} bytes, and it holds {max}; nothing was written"
+                "the key's large-blob store is too small: this needs {needed} bytes, and it holds {max}; nothing was written"
             ),
             VaultKeyError::CannotOpen(p) => write!(f, "this vault cannot be opened: {p}"),
             VaultKeyError::RotateNotVerified => {
@@ -290,17 +326,7 @@ impl fmt::Display for VaultKeyError {
                     f,
                     "the new {which} is in place with every entry checked, but deleting the old one failed: {cause}; "
                 )?;
-                f.write_str(match old {
-                    OldVault::Kept => {
-                        "both vaults hold the same checked entries, so deleting either is safe"
-                    }
-                    OldVault::Emptied => {
-                        "its data is already removed, so it is left as a vault of the same name with no data, and that is the one to delete"
-                    }
-                    OldVault::Unknown => {
-                        "whether it still holds its data is not known: if one of the two holds no data, delete that one; if both hold data, they hold the same checked entries and deleting either is safe"
-                    }
-                })
+                f.write_str(old.next_step())
             }
         }
     }
@@ -459,7 +485,7 @@ pub fn check_support(info: &AuthenticatorInfo) -> Result<(), VaultKeyError> {
         }
     }
     for (option, what) in [
-        ("largeBlobs", "largeBlob storage"),
+        ("largeBlobs", "the large-blob store"),
         ("pinUvAuthToken", "CTAP 2.1 permission tokens"),
         ("credMgmt", "credential management"),
     ] {
@@ -787,6 +813,9 @@ mod tests {
                 cause: Box::new(VaultKeyError::Ctap(CtapError::StatusCode(0x30))),
                 old: OldVault::Kept,
             },
+            VaultKeyError::VaultGone {
+                name: Some("Personal".into()),
+            },
         ];
         for e in &all {
             let s = e.to_string();
@@ -806,7 +835,19 @@ mod tests {
         assert_ne!(all[7].to_string(), all[8].to_string());
         let old = all[15].to_string();
         assert!(old.contains("same checked entries"), "{old}");
-        assert!(old.contains("deleting either is safe"), "{old}");
+        assert!(old.contains("one still uses the old key"), "{old}");
+        assert!(old.contains("rotate the one left again"), "{old}");
+        assert!(!old.contains("is safe"), "{old}");
+        let gone = all[16].to_string();
+        assert!(
+            gone.contains("\"Personal\" is no longer on the key"),
+            "{gone}"
+        );
+        assert!(gone.contains("deleted or rotated elsewhere"), "{gone}");
+        assert!(all[10].to_string().contains("large-blob store"), "{full}");
+        for e in &all {
+            assert!(!e.to_string().contains("largeBlob st"), "{e}");
+        }
         assert!(all[12]
             .to_string()
             .contains(&VaultError::Decrypt.to_string()));
@@ -866,15 +907,25 @@ mod tests {
             assert!(t.contains("every entry checked"), "{t}");
             assert!(!t.contains("--"), "{t}");
         }
-        assert!(kept.ends_with("deleting either is safe"), "{kept}");
-        // Only where it is true does it say so outright.
+        // Never "deleting either is safe" on its own: the copy left may
+        // be the one still on the old key, so it is rotated again.
+        let rotate_again = "delete either, then rotate the one left again so it gets a fresh key";
+        assert!(kept.contains("one still uses the old key"), "{kept}");
+        assert!(kept.ends_with(rotate_again), "{kept}");
+        for t in [&kept, &emptied, &unknown] {
+            assert!(!t.contains("is safe"), "{t}");
+        }
         assert!(!emptied.contains("either"), "{emptied}");
-        assert!(emptied.contains("no data"), "{emptied}");
+        assert!(
+            emptied.contains("delete the copy with no data"),
+            "{emptied}"
+        );
         assert!(unknown.contains("not known"), "{unknown}");
         assert!(
-            unknown.contains("holds no data, delete that one"),
+            unknown.contains("if a copy holds no data, delete that one"),
             "{unknown}"
         );
+        assert!(unknown.ends_with(rotate_again), "{unknown}");
         let unnamed = VaultKeyError::OldNotDeleted {
             name: None,
             cause: Box::new(VaultKeyError::Conflict),
