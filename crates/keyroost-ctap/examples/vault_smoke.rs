@@ -34,15 +34,13 @@ use keyroost_ctap::hmac_secret::{self, prf_salt};
 use keyroost_ctap::large_blobs::{self, LargeBlobArray};
 use keyroost_ctap::make_credential::{make_credential, MakeCredentialRequest};
 use keyroost_ctap::{get_info, AuthenticatorInfo, CtapError, CtapHidDevice};
-use keyroost_vault::{new_id, open, seal, Entry, Vault};
+use keyroost_vault::{
+    new_id, open, seal, user_handle, Entry, Vault, MAX_NAME_BYTES, PRF_INPUT, RP_ID, RP_NAME,
+};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use zeroize::Zeroizing;
 
-const RP_ID: &str = "fido2-vault.token2";
-const RP_NAME: &str = "FidoParole";
-const PRF_INPUT: &[u8] = b"Token2 fido2-vault v1 / hmac-secret salt";
-const MAX_NAME_BYTES: usize = 32;
 /// What `create --out DIR` writes.
 const OUT_FILES: [&str; 4] = ["lbk.b64", "hmac.bin", "cred_id.b64", "cred_id.hex"];
 
@@ -289,12 +287,7 @@ fn create(
         }
     }
 
-    // 0x01 || 8 random bytes || UTF-8 name, as the vault spec lays it out.
-    let mut user_id = vec![0x01u8];
-    let mut rnd = [0u8; 8];
-    getrandom::fill(&mut rnd).map_err(|_| CtapError::Random)?;
-    user_id.extend_from_slice(&rnd);
-    user_id.extend_from_slice(name.as_bytes());
+    let user_id = user_handle(name)?;
 
     let mc_tok = token(dev, info, pin, permissions::MAKE_CREDENTIAL, Some(RP_ID))?;
     let req = MakeCredentialRequest {

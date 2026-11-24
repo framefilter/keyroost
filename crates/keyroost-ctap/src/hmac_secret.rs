@@ -138,10 +138,6 @@ mod tests {
         EphemeralKey, ProtocolV1, ProtocolV2, SharedSecretV1, SharedSecretV2, PIN_PROTOCOL_V1,
     };
 
-    /// The vault's PRF input (keyroost-vault's `PRF_INPUT`), repeated here so
-    /// this crate does not depend on the vault.
-    const VAULT_PRF_INPUT: &[u8] = b"Token2 fido2-vault v1 / hmac-secret salt";
-
     fn v1() -> ProtocolV1 {
         ProtocolV1 {
             secret: SharedSecretV1([0x42; 32]),
@@ -161,10 +157,6 @@ mod tests {
         Value::Map(vec![(Value::UInt(1), Value::UInt(2))])
     }
 
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
     fn keys(map: &Value) -> Vec<u64> {
         map.as_map()
             .unwrap()
@@ -175,15 +167,6 @@ mod tests {
 
     fn bytes_at(map: &Value, key: u64) -> Vec<u8> {
         map.get_uint_key(key).unwrap().as_bytes().unwrap().to_vec()
-    }
-
-    #[test]
-    fn prf_salt_of_vault_input() {
-        // fidoparole's hmac_salt(), captured independently.
-        assert_eq!(
-            hex(&prf_salt(VAULT_PRF_INPUT)),
-            "2cb008f0aa5722f2396e4a7fb744ff15189d98a932e843cc9a6d65eaaf3726c8"
-        );
     }
 
     #[test]

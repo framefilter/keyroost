@@ -3,6 +3,7 @@
 
 mod backup;
 mod blob;
+mod credential;
 mod error;
 mod generate;
 mod kdf;
@@ -14,6 +15,7 @@ pub(crate) mod test_vectors;
 
 pub use backup::{export_backup, import_backup, KdfParams, BACKUP_KDF};
 pub use blob::{open, seal};
+pub use credential::{user_handle, MAX_NAME_BYTES, PRF_INPUT, RP_ID, RP_NAME};
 pub use error::VaultError;
 pub use generate::{generate_password, GenOptions};
 pub use merge::{apply_import, classify, ImportStatus};

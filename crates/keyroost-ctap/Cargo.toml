@@ -6,8 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "CTAP HID transport, CBOR codec, and high-level CTAP2 commands for FIDO authenticators."
-# The hardware smoke test needs a path-only dev-dependency; not shipped.
-exclude = ["examples/vault_smoke.rs"]
+# The hardware smoke test and the vault PRF-salt test need the path-only
+# keyroost-vault dev-dependency, which the package does not carry; not shipped.
+exclude = ["examples/vault_smoke.rs", "tests/vault_prf_salt.rs"]
 
 [lints]
 workspace = true
