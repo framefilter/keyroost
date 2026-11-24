@@ -136,8 +136,8 @@ fn ctap_status_hint(code: u8) -> Option<&'static str> {
         0x3B => "the key needs a physical touch to continue",
         0x3C => "user verification is temporarily blocked \u{2014} remove and re-insert the key",
         0x2F => "timed out waiting for you to act on the key",
-        // Not always a timeout, but some keys (seen on a YubiKey 5) answer
-        // this when the touch didn't come in time, never 0x2F.
+        // Not always a timeout. A YubiKey 5 (firmware 5.7) answered a
+        // touch that didn't come in time with this, where 0x2F was expected.
         0x27 => {
             "the key refused the operation; on some keys this means the touch \
                  didn't come in time"
