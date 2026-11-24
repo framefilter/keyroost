@@ -191,36 +191,19 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
 }
 
 /// How the vault named `name` is written in a command line hint: bare when
-/// it is only `[A-Za-z0-9._-]`, else in double quotes, with what a shell
-/// would expand or end the quotes on escaped.
+/// safe, else in POSIX single quotes, as the `-d` hints quote a key.
 pub(crate) fn export_hint_arg(name: &str) -> String {
-    let name = sanitize_terminal(name);
-    if !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    {
-        return name;
-    }
-    let mut quoted = String::with_capacity(name.len() + 2);
-    quoted.push('"');
-    for c in name.chars() {
-        if matches!(c, '"' | '\\' | '$' | '`') {
-            quoted.push('\\');
-        }
-        quoted.push(c);
-    }
-    quoted.push('"');
-    quoted
+    keyroost_resolve::shell_quote(&sanitize_terminal(name))
 }
 
 /// The file name a hint suggests for a backup of the vault `name`: lower
-/// case, every run of other characters than `a-z0-9` one `-`, trimmed,
-/// `vault` when nothing is left, then `.t2vault`.
+/// case, letters and digits (any script) kept, every run of anything else
+/// one `-`, trimmed, `vault` when nothing is left, then `.t2vault`. Never a
+/// path: no separator survives, and the only dot is the extension's.
 pub(crate) fn backup_file_name(name: &str) -> String {
     let mut stem = String::new();
     for c in name.to_lowercase().chars() {
-        if c.is_ascii_alphanumeric() {
+        if c.is_alphanumeric() {
             stem.push(c);
         } else if !stem.is_empty() && !stem.ends_with('-') {
             stem.push('-');
@@ -1069,7 +1052,7 @@ mod tests {
         );
         assert!(
             backup_hint("Work Mail").ends_with(
-                "Keep a backup:\n  keyroostctl fido vault export \"Work Mail\" -o work-mail.t2vault"
+                "Keep a backup:\n  keyroostctl fido vault export 'Work Mail' -o work-mail.t2vault"
             ),
             "{}",
             backup_hint("Work Mail")
@@ -1079,10 +1062,12 @@ mod tests {
     #[test]
     fn export_hint_arg_quotes_only_what_needs_it() {
         assert_eq!(export_hint_arg("Mail.backup_2-x"), "Mail.backup_2-x");
-        assert_eq!(export_hint_arg("Work Mail"), "\"Work Mail\"");
-        assert_eq!(export_hint_arg("Café"), "\"Café\"");
-        // What a shell would expand or end the quotes on is escaped.
-        assert_eq!(export_hint_arg("a\"b$c`d\\e"), "\"a\\\"b\\$c\\`d\\\\e\"");
+        assert_eq!(export_hint_arg("Work Mail"), "'Work Mail'");
+        assert_eq!(export_hint_arg("Café"), "'Café'");
+        // Single quotes keep everything literal; a quote in the name is closed,
+        // escaped and reopened.
+        assert_eq!(export_hint_arg("a'b$c"), r"'a'\''b$c'");
+        assert!(!export_hint_arg("a\u{1b}[2Jb").contains('\u{1b}'));
     }
 
     #[test]
@@ -1090,8 +1075,20 @@ mod tests {
         assert_eq!(backup_file_name("Personal"), "personal.t2vault");
         assert_eq!(backup_file_name("Work  Mail!"), "work-mail.t2vault");
         assert_eq!(backup_file_name("--Home/Bank--"), "home-bank.t2vault");
-        assert_eq!(backup_file_name("Café"), "caf.t2vault");
-        assert_eq!(backup_file_name("ééé"), "vault.t2vault");
+        assert_eq!(backup_file_name("Café"), "café.t2vault");
+        assert_eq!(backup_file_name("Почта 2"), "почта-2.t2vault");
+        assert_eq!(backup_file_name("ééé"), "ééé.t2vault");
+        assert_eq!(backup_file_name("!!!"), "vault.t2vault");
+        // Never a path: no separator, and the only dot is the extension's.
+        for name in ["../..", "a/../b", "C:\\x", "..", ".hidden", "a.b.c"] {
+            let f = backup_file_name(name);
+            assert!(
+                !f.contains('/') && !f.contains('\\') && !f.contains(':'),
+                "{f}"
+            );
+            assert_eq!(f.matches('.').count(), 1, "{f}");
+            assert!(!f.starts_with('.') && !f.starts_with('-'), "{f}");
+        }
         assert_eq!(backup_file_name("../.."), "vault.t2vault");
     }
 
@@ -1102,7 +1099,7 @@ mod tests {
             "Its entries go with it. To keep them, export it first: \
              keyroostctl fido vault export Personal -o personal.t2vault"
         );
-        assert!(delete_note("Work Mail").ends_with("export \"Work Mail\" -o work-mail.t2vault"));
+        assert!(delete_note("Work Mail").ends_with("export 'Work Mail' -o work-mail.t2vault"));
     }
 
     #[test]
