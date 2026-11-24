@@ -13723,23 +13723,10 @@ fn write_private_file(
         return fill_new_file(path, f, data, |f| f.sync_all());
     }
 
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let fname = path
-        .file_name()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "output path has no file name"))?;
-
     // 1) Create the temp file first. create_new = O_CREAT|O_EXCL, which refuses
     //    to follow a symlink at the final component and fails if the path already
     //    exists — so this file is unambiguously fresh and owned by our euid.
-    let tmp = parent.join(format!(
-        ".{}.keyroost-tmp-{}",
-        fname.to_string_lossy(),
-        std::process::id()
-    ));
+    let tmp = temp_beside(path)?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
     let mut f = opts.open(&tmp)?;
@@ -13797,8 +13784,10 @@ fn write_private_file(
     Ok(())
 }
 
-/// Non-Unix fallback: create/overwrite with owner-intent semantics. Windows ACL
-/// hardening is out of scope for this helper.
+/// Non-Unix fallback: a new file is created exclusively; an agreed
+/// overwrite goes through a temp file renamed over the old one
+/// ([`replace_via_temp`]), so a failed write never leaves the old file
+/// truncated. Windows ACL hardening is out of scope for this helper.
 #[cfg(not(unix))]
 fn write_private_file(
     path: &std::path::Path,
@@ -13809,8 +13798,68 @@ fn write_private_file(
         crate::prompt::OutMode::New => {
             fill_new_file(path, mode.open(path)?, data, |f| f.sync_all())
         }
-        crate::prompt::OutMode::Replace => mode.write(path, data),
+        crate::prompt::OutMode::Replace => replace_via_temp(
+            path,
+            data,
+            |tmp| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(tmp)
+            },
+            |f| f.sync_all(),
+        ),
     }
+}
+
+/// The temp file a replacing write goes through: hidden, beside `path` (so
+/// the rename stays on one file system), named for this process.
+fn temp_beside(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let fname = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output path has no file name",
+        )
+    })?;
+    Ok(parent.join(format!(
+        ".{}.keyroost-tmp-{}",
+        fname.to_string_lossy(),
+        std::process::id()
+    )))
+}
+
+/// Replace `path` with `data` without truncating it in place: `open` makes
+/// a fresh temp file beside it (exclusively, so it is this run's own),
+/// `data` is written and synced there, then the temp is renamed over
+/// `path`. A write or rename that fails removes the temp and leaves the old
+/// file whole. A symbolic link at `path` is refused, never written through.
+/// The non-Unix `--overwrite` path (Unix has its own, with owner and 0600
+/// checks); `open` and `sync` are seams for tests.
+#[cfg_attr(all(unix, not(test)), allow(dead_code))]
+fn replace_via_temp<W: std::io::Write>(
+    path: &std::path::Path,
+    data: &[u8],
+    open: impl FnOnce(&std::path::Path) -> std::io::Result<W>,
+    sync: impl FnOnce(&mut W) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "refusing to write secret output through a symlink",
+        ));
+    }
+    let tmp = temp_beside(path)?;
+    fill_new_file(&tmp, open(&tmp)?, data, sync)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Write `data` into `f`, the file this run just created at `path`, then
@@ -22158,6 +22207,76 @@ mod cli_tests {
         std::fs::write(&path, b"kept").unwrap();
         fill_new_file(&path, Full(100), b"kept", |_| Ok(())).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An agreed overwrite outside Unix goes through a temp file: a write
+    /// that fails partway leaves the old file whole and no temp behind; one
+    /// that goes through replaces it; a symbolic link is refused.
+    #[test]
+    fn replace_via_temp_never_truncates_the_old_file() {
+        struct Full(std::fs::File, usize);
+        impl std::io::Write for Full {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                if self.1 == 0 {
+                    return Err(std::io::Error::other("no space left on device"));
+                }
+                let n = self.0.write(&b[..b.len().min(self.1)])?;
+                self.1 -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.flush()
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("keyroost_replace_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("backup.t2vault");
+        let only_the_file = |dir: &std::path::Path| {
+            let names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["backup.t2vault"], "a temp file was left behind");
+        };
+        let open = |room: usize| {
+            move |tmp: &std::path::Path| {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(tmp)?;
+                Ok(Full(f, room))
+            }
+        };
+
+        std::fs::write(&path, b"the old backup").unwrap();
+        let err =
+            replace_via_temp(&path, b"a new backup", open(4), |f| f.0.sync_all()).unwrap_err();
+        assert!(err.to_string().contains("no space"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"the old backup");
+        only_the_file(&dir);
+
+        let err = replace_via_temp(&path, b"a new backup", open(100), |_| {
+            Err(std::io::Error::other("sync failed"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("sync failed"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"the old backup");
+        only_the_file(&dir);
+
+        replace_via_temp(&path, b"a new backup", open(100), |f| f.0.sync_all()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"a new backup");
+        only_the_file(&dir);
+
+        #[cfg(unix)]
+        {
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            let err = replace_via_temp(&link, b"x", open(100), |_| Ok(())).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(&path).unwrap(), b"a new backup");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
