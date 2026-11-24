@@ -1294,6 +1294,12 @@ pub(crate) fn vault_error(e: VaultKeyError) -> Box<dyn Error> {
         VaultKeyError::OldNotDeleted { name, cause, old } => {
             old_not_deleted_text(name.as_deref(), &cause, old).into()
         }
+        VaultKeyError::VaultGone { name } => format!(
+            "vault \"{}\" is no longer on the key; it was deleted or rotated elsewhere, and \
+             nothing was written",
+            shown_name(name.as_deref())
+        )
+        .into(),
         e => Box::new(e),
     }
 }
@@ -3369,6 +3375,26 @@ mod tests {
         // Anything else goes through vault_error.
         let t = crate::error_text(entry_save_error(VaultKeyError::NoVaults).as_ref());
         assert!(t.contains("keyroostctl fido vault add NAME"), "{t}");
+    }
+
+    #[test]
+    fn a_vanished_vault_has_its_own_words() {
+        let gone = |name: Option<&str>| VaultKeyError::VaultGone {
+            name: name.map(str::to_owned),
+        };
+        let expected = "vault \"Personal\" is no longer on the key; it was deleted or rotated \
+                        elsewhere, and nothing was written";
+        for t in [
+            crate::error_text(entry_save_error(gone(Some("Personal"))).as_ref()),
+            crate::error_text(import_save_error(gone(Some("Personal"))).as_ref()),
+        ] {
+            assert_eq!(t, expected);
+        }
+        let t = crate::error_text(entry_save_error(gone(None)).as_ref());
+        assert!(t.starts_with("vault \"(unnamed)\" is no longer"), "{t}");
+        // Key-supplied names are neutralized.
+        let t = crate::error_text(entry_save_error(gone(Some("a\u{1b}[2Jb"))).as_ref());
+        assert!(!t.contains('\u{1b}'), "{t}");
     }
 
     #[test]
