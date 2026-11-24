@@ -820,7 +820,13 @@ pub fn trace_line(line: impl FnOnce() -> String) {
 ///   are ciphertexts under an ephemeral ECDH secret the trace never shows,
 ///   but they are withheld anyway, the way PIN VERIFY is on the APDU path;
 /// - authenticatorConfig (`0x0D`): every subcommand carries a
-///   pinUvAuthParam.
+///   pinUvAuthParam;
+/// - authenticatorMakeCredential (`0x01`), authenticatorGetAssertion
+///   (`0x02`) and authenticatorGetNextAssertion (`0x08`): requests carry the
+///   user entity (a vault's name, in `user.name` and in the user handle) and
+///   responses return the user entity and the per-credential largeBlobKey
+///   in clear. getNextAssertion's request is the bare command byte, so the
+///   command alone decides.
 ///
 /// Vendor commands (`0x40`–`0x7F`, sent as `0xC0`–`0xFF`) are redacted
 /// whole: this crate can't tell what they carry, and Token2's OTP tunnel
@@ -838,6 +844,7 @@ fn exchange_is_sensitive(cmd: u8, payload: &[u8]) -> bool {
     }
     match payload.first() {
         Some(0x0A) | Some(0x41) | Some(0x09) | Some(0x40) | Some(0x0C) | Some(0x0D) => true,
+        Some(0x01) | Some(0x02) | Some(0x08) => true,
         Some(0x06) => !matches!(
             client_pin_subcommand(&payload[1..]),
             Some(0x01) | Some(0x02)
@@ -1391,14 +1398,21 @@ mod tests {
         // enumerates fingerprint template friendly names; largeBlobs carries
         // keyroost's plaintext notes. All (and the vendor-preview forms) must
         // be redacted from the debug trace, in both directions.
-        for cbor_cmd in [0x0A, 0x41, 0x09, 0x40, 0x0C] {
+        // makeCredential, getAssertion and getNextAssertion carry the user
+        // entity (a vault's name) and return the largeBlobKey.
+        for cbor_cmd in [0x0A, 0x41, 0x09, 0x40, 0x0C, 0x01, 0x02, 0x08] {
             assert!(
                 exchange_is_sensitive(CTAPHID_CBOR, &[cbor_cmd]),
                 "CBOR cmd 0x{cbor_cmd:02x} must be redacted"
             );
         }
-        // getInfo stays visible.
-        assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[0x04]));
+        // getInfo, reset and selection stay visible.
+        for cbor_cmd in [0x04, 0x07, 0x0B] {
+            assert!(
+                !exchange_is_sensitive(CTAPHID_CBOR, &[cbor_cmd]),
+                "CBOR cmd 0x{cbor_cmd:02x} must stay visible"
+            );
+        }
         // Non-CBOR frames (INIT, PING) are never redacted.
         assert!(!exchange_is_sensitive(CTAPHID_INIT, &[0x0A]));
         assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[]));

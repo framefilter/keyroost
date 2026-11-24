@@ -29,6 +29,8 @@ keyroost-p12 = { path = "../crates/keyroost-p12" }
 keyroost-openpgp = { path = "../crates/keyroost-openpgp" }
 keyroost-pgpkey = { path = "../crates/keyroost-pgpkey" }
 keyroost-piv = { path = "../crates/keyroost-piv" }
+# cargo-fuzz's `--cfg fuzzing` lowers the backup-chosen Argon2 bounds.
+keyroost-vault = { path = "../crates/keyroost-vault" }
 keyroost-token2otp = { path = "../crates/keyroost-token2otp" }
 keyroost-feitianotp = { path = "../crates/keyroost-feitianotp" }
 # winwebauthn is Windows-only for its FFI, but parse_detail_path is pure and
@@ -170,6 +172,13 @@ bench = false
 [[bin]]
 name = "p12_parse"
 path = "fuzz_targets/p12_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_parse"
+path = "fuzz_targets/vault_parse.rs"
 test = false
 doc = false
 bench = false

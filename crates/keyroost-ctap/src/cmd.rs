@@ -32,6 +32,11 @@ pub enum CtapError {
     /// pinUvAuthToken. This can be known from GetInfo or reported by a token
     /// request as CTAP2_ERR_PIN_POLICY_VIOLATION (0x37).
     PinChangeRequired,
+    /// The key holds no credential matching the request
+    /// (CTAP2_ERR_NO_CREDENTIALS, 0x2E, from getAssertion). Kept apart from
+    /// [`CtapError::StatusCode`] so a caller can tell "nothing stored here"
+    /// from a failure.
+    NoCredentials,
     EmptyResponse,
     InvalidResponseShape(&'static str),
     /// A caller-supplied argument was rejected before anything was sent to
@@ -50,6 +55,9 @@ pub enum CtapError {
         sw1: u8,
         sw2: u8,
     },
+    /// The operating system's random source failed, so nothing that needs
+    /// a fresh nonce was built (there is no fallback).
+    Random,
 }
 
 impl CtapError {
@@ -87,6 +95,7 @@ impl std::fmt::Display for CtapError {
             CtapError::PinChangeRequired => {
                 write!(f, "the key requires a PIN change before this operation")
             }
+            CtapError::NoCredentials => write!(f, "this key holds no matching credential"),
             CtapError::EmptyResponse => write!(f, "authenticator returned an empty CBOR response"),
             CtapError::InvalidResponseShape(s) => {
                 write!(f, "authenticator response had wrong shape: {}", s)
@@ -97,6 +106,7 @@ impl std::fmt::Display for CtapError {
             CtapError::Apdu { sw1, sw2 } => {
                 write!(f, "the card refused the FIDO request ({sw1:02X}{sw2:02X})")
             }
+            CtapError::Random => write!(f, "the system's random number source failed"),
         }
     }
 }
@@ -250,7 +260,7 @@ pub fn reset(dev: &mut impl CtapTransport) -> Result<(), CtapError> {
     Ok(())
 }
 
-fn split_status(resp: &[u8]) -> Result<(u8, &[u8]), CtapError> {
+pub(crate) fn split_status(resp: &[u8]) -> Result<(u8, &[u8]), CtapError> {
     resp.split_first()
         .map(|(s, rest)| (*s, rest))
         .ok_or(CtapError::EmptyResponse)

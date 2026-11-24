@@ -74,6 +74,16 @@ def bad(msg):
     fail = True
     print(f"FAIL: {msg}", file=sys.stderr)
 
+def sections(text):
+    """(header, body) for each `[table]` of a Cargo.toml, the header
+    without brackets; text before the first header has header ""."""
+    out, header, start = [], "", 0
+    for m in re.finditer(r'^\s*\[([^\]\n]+)\]\s*$', text, re.M):
+        out.append((header, text[start:m.start()]))
+        header, start = m.group(1).strip(), m.end()
+    out.append((header, text[start:]))
+    return out
+
 def members_of(text):
     m = re.search(r'^members\s*=\s*\[(.*?)\]', text, re.S | re.M)
     if not m:
@@ -146,9 +156,20 @@ for c in cur:
         continue
     # Path deps only: a `version = "x"` pin without a path is an external
     # crate that happens to share the prefix, and dev-deps on self (the
-    # "test with all features" trick) are not publish-order edges.
-    for dep in sorted(set(re.findall(
-            r'^\s*(keyroost[A-Za-z0-9_-]*)\s*=\s*\{[^}]*path\s*=', txt, re.M))):
+    # "test with all features" trick) are not publish-order edges. A
+    # path-only dev-dependency (no `version`) is not an edge either: cargo
+    # strips it from the published manifest, so publishing never waits on
+    # it. A versioned dev-dependency stays in the manifest and still counts.
+    deps = set()
+    for header, body in sections(txt):
+        dev = header.endswith("dev-dependencies")
+        for m in re.finditer(
+                r'^\s*(keyroost[A-Za-z0-9_-]*)\s*=\s*(\{[^}]*path\s*=[^}]*\})',
+                body, re.M):
+            if dev and not re.search(r'\bversion\s*=', m.group(2)):
+                continue
+            deps.add(m.group(1))
+    for dep in sorted(deps):
         if dep == c:
             continue
         edges += 1

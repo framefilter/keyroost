@@ -55,6 +55,7 @@ use crate::hid::CTAPHID_CBOR;
 use crate::pin::left16_sha256;
 use crate::ssh_cert;
 use crate::transport::CtapTransport;
+use zeroize::{Zeroize, Zeroizing};
 
 /// CTAP command byte for `authenticatorLargeBlobs`.
 const CTAP2_LARGE_BLOBS: u8 = 0x0C;
@@ -418,6 +419,82 @@ impl LargeBlobArray {
         self.changed(items)
     }
 
+    /// This credential's own data: the plaintext of the first conforming
+    /// entry sealed under `key` (its largeBlobKey) that also inflates
+    /// (zlib-wrapped or raw DEFLATE, as libfido2 reads it, bounded by
+    /// 1 MiB and by the entry's `origSize`). An entry whose
+    /// tag verifies but whose plaintext does not inflate is passed over, as
+    /// the certificate reader always has. Skipped elements are never tried.
+    /// The decrypted and inflated buffers are wiped when dropped.
+    pub fn credential_blob(&self, key: &[u8; 32]) -> Option<Zeroizing<Vec<u8>>> {
+        self.entry_iter().find_map(|e| {
+            let compressed = open_entry(key, e)?;
+            inflate_blob(&compressed, e.orig_size).map(Zeroizing::new)
+        })
+    }
+
+    /// A copy with `plaintext` stored as this credential's entry (CTAP 2.1
+    /// §6.10.3): raw DEFLATE (RFC 1951, as current libfido2 writes), then
+    /// AES-256-GCM under `key` with a fresh random 12-byte nonce and AAD
+    /// `b"blob" || u64le(origSize)`.
+    ///
+    /// The entry already sealed under `key` is replaced where it stands;
+    /// with none, the new entry is appended. Should more than one entry be
+    /// sealed under `key` (which should not happen), the first is replaced and
+    /// the others are removed, so the credential is left with exactly one.
+    /// Every other element — other credentials' entries, keyroost's notes
+    /// and name, skipped elements — serializes byte for byte as before.
+    ///
+    /// Capacity is not checked here: compare [`capacity`](Self::capacity)
+    /// of the result against the key's `maxSerializedLargeBlobArray` before
+    /// writing. An array read with bytes after its end still refuses to
+    /// serialize. Fails when `plaintext` is larger than a reader will
+    /// inflate (1 MiB) or the OS random source fails.
+    pub fn with_credential_blob(
+        &self,
+        key: &[u8; 32],
+        plaintext: &[u8],
+    ) -> Result<LargeBlobArray, CtapError> {
+        if plaintext.len() > MAX_BLOB_PLAINTEXT {
+            return Err(CtapError::InvalidArgument(
+                "largeBlobs: the credential's data is larger than a reader will inflate",
+            ));
+        }
+        let mut nonce = [0u8; 12];
+        getrandom::fill(&mut nonce).map_err(|_| CtapError::Random)?;
+        let orig_size = plaintext.len() as u64;
+        let compressed = Zeroizing::new(miniz_oxide::deflate::compress_to_vec(plaintext, 9));
+        let sealed = LargeBlobEntry::built(
+            gcm_encrypt(key, &nonce, &compressed, orig_size),
+            nonce.to_vec(),
+            orig_size,
+        );
+        let mut new = Some(Item::Entry(sealed));
+        let mut items = Vec::with_capacity(self.items.len() + 1);
+        for item in &self.items {
+            if is_sealed_under(item, key) {
+                // The first takes the new entry; any later one is dropped.
+                items.extend(new.take());
+            } else {
+                items.push(item.clone());
+            }
+        }
+        items.extend(new);
+        Ok(self.changed(items))
+    }
+
+    /// A copy without any entry sealed under `key` (this credential's
+    /// data). Everything else serializes byte for byte as before.
+    pub fn without_credential_blob(&self, key: &[u8; 32]) -> LargeBlobArray {
+        let items = self
+            .items
+            .iter()
+            .filter(|i| !is_sealed_under(i, key))
+            .cloned()
+            .collect();
+        self.changed(items)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_entry_for_test(&self, e: LargeBlobEntry) -> LargeBlobArray {
         let mut items = self.items.clone();
@@ -439,6 +516,17 @@ impl LargeBlobArray {
             entry_count: self.len(),
         }
     }
+}
+
+/// `e`'s decrypted (still compressed) plaintext when its GCM tag verifies
+/// under `key`; wiped when dropped.
+fn open_entry(key: &[u8; 32], e: &LargeBlobEntry) -> Option<Zeroizing<Vec<u8>>> {
+    gcm_decrypt(key, &e.nonce, &e.ciphertext, e.orig_size).map(Zeroizing::new)
+}
+
+/// Whether `item` is a conforming entry sealed under `key` (tag verifies).
+fn is_sealed_under(item: &Item, key: &[u8; 32]) -> bool {
+    matches!(item, Item::Entry(e) if open_entry(key, e).is_some())
 }
 
 /// Whether `item` is a name entry ([`device_label`]).
@@ -763,8 +851,28 @@ pub(crate) fn inflate_raw(compressed: &[u8], orig_size: u64) -> Option<Vec<u8>> 
     // The RAW (non-zlib) limited inflate. `decompress_to_vec_with_limit` is
     // raw DEFLATE with a size cap; the `_zlib` variants expect a zlib header,
     // which the largeBlob plaintext does NOT have.
-    let out = miniz_oxide::inflate::decompress_to_vec_with_limit(compressed, limit).ok()?;
-    (out.len() as u64 == orig_size).then_some(out)
+    exact_or_wipe(
+        miniz_oxide::inflate::decompress_to_vec_with_limit(compressed, limit),
+        orig_size,
+    )
+}
+
+/// An inflate result when it is exactly `orig_size` long. A failed or
+/// mis-sized attempt may still hold decrypted plaintext, so it is wiped.
+fn exact_or_wipe(
+    result: Result<Vec<u8>, miniz_oxide::inflate::DecompressError>,
+    orig_size: u64,
+) -> Option<Vec<u8>> {
+    match result {
+        Ok(out) if out.len() as u64 == orig_size => Some(out),
+        Ok(mut out)
+        | Err(miniz_oxide::inflate::DecompressError {
+            output: mut out, ..
+        }) => {
+            out.zeroize();
+            None
+        }
+    }
 }
 
 /// A credential's large-blob plaintext as libfido2 reads it: zlib-wrapped
@@ -778,10 +886,11 @@ pub(crate) fn inflate_blob(compressed: &[u8], orig_size: u64) -> Option<Vec<u8>>
     if limit > MAX_BLOB_PLAINTEXT {
         return None;
     }
-    miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(compressed, limit)
-        .ok()
-        .filter(|out| out.len() as u64 == orig_size)
-        .or_else(|| inflate_raw(compressed, orig_size))
+    exact_or_wipe(
+        miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(compressed, limit),
+        orig_size,
+    )
+    .or_else(|| inflate_raw(compressed, orig_size))
 }
 
 /// Find and decode this credential's SSH certificate from the largeBlob
@@ -793,25 +902,14 @@ pub(crate) fn inflate_blob(compressed: &[u8], orig_size: u64) -> Option<Vec<u8>>
 /// text as `fido2-token -S -b` stores it). None when no entry is this
 /// credential's, or the decrypted blob is not a certificate. Pure over an
 /// already-read array; skipped (non-conforming) elements are never tried.
+/// The lookup is [`LargeBlobArray::credential_blob`].
 pub fn extract_cert_from_entries(
     large_blob_key: &[u8; 32],
     array: &LargeBlobArray,
 ) -> Option<ssh_cert::StoredCert> {
-    for e in array.entry_iter() {
-        let Some(plain) = gcm_decrypt(large_blob_key, &e.nonce, &e.ciphertext, e.orig_size) else {
-            continue; // not this credential's entry (tag failed)
-        };
-        let Some(wire) = inflate_blob(&plain, e.orig_size) else {
-            continue; // decrypted but not valid DEFLATE / size mismatch
-        };
-        if let Some(cert) = ssh_cert::from_stored(&wire) {
-            return Some(cert);
-        }
-        // Decrypted + inflated but not a cert: it's this credential's blob but
-        // holds non-cert data. Stop — this IS the credential's entry.
-        return None;
-    }
-    None
+    // The first entry that decrypts and inflates IS this credential's blob:
+    // when it holds something other than a certificate, there is none.
+    ssh_cert::from_stored(&array.credential_blob(large_blob_key)?)
 }
 
 #[cfg(test)]
@@ -1472,5 +1570,322 @@ mod tests {
             original: None,
         };
         assert!(matches!(rp.classify(), EntryKind::Opaque));
+    }
+
+    // ---- per-credential entries (CTAP 2.1 §6.10.3/§6.10.4) ----
+
+    const VAULT_KEY: [u8; 32] = [0x5a; 32];
+    const RP_KEY: [u8; 32] = [0x6b; 32];
+    const SSH_KEY: [u8; 32] = [0x7c; 32];
+
+    /// The serialized elements of `arr`, its checksum and skipped count
+    /// verified on the way.
+    fn elements(arr: &LargeBlobArray) -> Vec<Vec<u8>> {
+        let s = arr.serialize_with_checksum().unwrap();
+        let skipped = arr.skipped_count();
+        split_checked(&s, skipped)
+    }
+
+    /// An array as read from a key: a keyroost note, the key's name, an
+    /// opaque RP entry under another credential's key, an SSH certificate
+    /// stored for a third credential, and a non-conforming element.
+    fn read_back_mixed() -> (LargeBlobArray, Vec<Vec<u8>>) {
+        let file = format!(
+            "{} kr-test\n",
+            crate::ssh_cert::tests_fixture::FIXTURE_CERT_PUB.trim()
+        );
+        let built = array_of(Vec::new())
+            .with_text_note("a keyroost note")
+            .with_label(
+                Some(&DeviceLabel {
+                    label: "desk key".into(),
+                    writer: Some("keyroost".into()),
+                }),
+                [0x44; 12],
+            )
+            .unwrap()
+            .with_entry_for_test(sealed_entry(&RP_KEY, b"someone else's data"))
+            .with_entry_for_test(sealed_entry(&SSH_KEY, file.as_bytes()));
+        let mut items = built.items.clone();
+        items.push(Item::Skipped(vec![0xc1, 0x01]));
+        let built = built.changed(items);
+        let s = built.serialize_with_checksum().unwrap();
+        let arr = LargeBlobArray::parse(&s[..s.len() - CHECKSUM_LEN]).unwrap();
+        assert_eq!((arr.len(), arr.skipped_count()), (4, 1));
+        let els = elements(&arr);
+        (arr, els)
+    }
+
+    #[test]
+    fn credential_blob_roundtrip() {
+        let plain = b"T2VLT\x01 a vault payload, opaque to this layer".repeat(4);
+        let arr = array_of(Vec::new())
+            .with_credential_blob(&VAULT_KEY, &plain)
+            .unwrap();
+        // Through the wire form and back.
+        let s = arr.serialize_with_checksum().unwrap();
+        let back = LargeBlobArray::parse(&s[..s.len() - CHECKSUM_LEN]).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back.credential_blob(&VAULT_KEY).as_deref().map(|v| &v[..]),
+            Some(&plain[..])
+        );
+        assert!(back.credential_blob(&RP_KEY).is_none());
+
+        // The entry is what §6.10.3 describes: a 12-byte nonce, origSize the
+        // uncompressed length, raw DEFLATE (not zlib) under AES-256-GCM with
+        // AAD "blob" || origSize LE.
+        let e = back.entry(0).unwrap();
+        assert_eq!(e.nonce.len(), 12);
+        assert_eq!(e.orig_size, plain.len() as u64);
+        let compressed = gcm_decrypt(&VAULT_KEY, &e.nonce, &e.ciphertext, e.orig_size).unwrap();
+        assert_eq!(inflate_raw(&compressed, e.orig_size).unwrap(), plain);
+        assert!(
+            miniz_oxide::inflate::decompress_to_vec_zlib(&compressed).is_err(),
+            "raw DEFLATE, no zlib header"
+        );
+        // Not a keyroost note, not a name: opaque to everyone else.
+        assert_eq!(e.classify(), EntryKind::Opaque);
+
+        // A fresh nonce on every write.
+        let again = array_of(Vec::new())
+            .with_credential_blob(&VAULT_KEY, &plain)
+            .unwrap();
+        assert_ne!(again.entry(0).unwrap().nonce, e.nonce);
+
+        // An empty payload round-trips too.
+        let empty = array_of(Vec::new())
+            .with_credential_blob(&VAULT_KEY, b"")
+            .unwrap();
+        assert_eq!(
+            empty
+                .credential_blob(&VAULT_KEY)
+                .as_deref()
+                .map(|v| v.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn credential_blob_reads_zlib_and_skips_undecodable() {
+        // What an older libfido2 wrote: zlib-wrapped. Read like the cert path.
+        let plain = b"old writer".to_vec();
+        let zlib = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let arr = array_of(vec![sealed_compressed(
+            &VAULT_KEY,
+            &zlib,
+            plain.len() as u64,
+        )]);
+        assert_eq!(
+            arr.credential_blob(&VAULT_KEY).as_deref().map(|v| &v[..]),
+            Some(&plain[..])
+        );
+        // A declared size over the ceiling is refused, not inflated.
+        let huge = array_of(vec![sealed_compressed(
+            &VAULT_KEY,
+            &zlib,
+            MAX_BLOB_PLAINTEXT as u64 + 1,
+        )]);
+        assert!(huge.credential_blob(&VAULT_KEY).is_none());
+    }
+
+    #[test]
+    fn with_credential_blob_keeps_other_entries() {
+        let (arr, before) = read_back_mixed();
+        let written = arr.with_credential_blob(&VAULT_KEY, b"vault v1").unwrap();
+        let after = elements(&written);
+        assert_eq!(after.len(), before.len() + 1, "appended");
+        assert_eq!(
+            &after[..before.len()],
+            &before[..],
+            "all others byte for byte"
+        );
+        assert_eq!(
+            written
+                .credential_blob(&VAULT_KEY)
+                .as_deref()
+                .map(|v| &v[..]),
+            Some(&b"vault v1"[..])
+        );
+
+        // Each neighbour still reads as what it was.
+        assert_eq!(
+            written.entry(0).unwrap().as_text().as_deref(),
+            Some("a keyroost note")
+        );
+        assert_eq!(written.label().unwrap().1.label, "desk key");
+        assert_eq!(
+            written.credential_blob(&RP_KEY).as_deref().map(|v| &v[..]),
+            Some(&b"someone else's data"[..])
+        );
+        assert!(extract_cert_from_entries(&SSH_KEY, &written).is_some());
+
+        // Replacing keeps them too; removing gives back exactly the original.
+        let rewritten = written
+            .with_credential_blob(&VAULT_KEY, b"vault v2")
+            .unwrap();
+        assert_eq!(&elements(&rewritten)[..before.len()], &before[..]);
+        assert_eq!(
+            elements(&rewritten.without_credential_blob(&VAULT_KEY)),
+            before
+        );
+        assert_eq!(
+            elements(&written.without_credential_blob(&VAULT_KEY)),
+            before
+        );
+    }
+
+    #[test]
+    fn second_write_replaces_not_duplicates() {
+        let (arr, before) = read_back_mixed();
+        // Put this credential's entry in the middle so "in place" is visible.
+        let first = arr.with_credential_blob(&VAULT_KEY, b"first").unwrap();
+        let mut items = first.items.clone();
+        let mine = items.pop().unwrap();
+        items.insert(2, mine);
+        let first = first.changed(items);
+        let s = first.serialize_with_checksum().unwrap();
+        let first = LargeBlobArray::parse(&s[..s.len() - CHECKSUM_LEN]).unwrap();
+        let first_els = elements(&first);
+
+        let second = first.with_credential_blob(&VAULT_KEY, b"second").unwrap();
+        let second_els = elements(&second);
+        assert_eq!(second.len(), first.len(), "no duplicate");
+        assert_eq!(second_els.len(), first_els.len());
+        for (i, (a, b)) in first_els.iter().zip(&second_els).enumerate() {
+            if i == 2 {
+                assert_ne!(a, b, "this credential's entry, rewritten in place");
+            } else {
+                assert_eq!(a, b, "element {i} untouched");
+            }
+        }
+        assert_eq!(
+            second
+                .credential_blob(&VAULT_KEY)
+                .as_deref()
+                .map(|v| &v[..]),
+            Some(&b"second"[..])
+        );
+        assert_eq!(
+            elements(&second.without_credential_blob(&VAULT_KEY)),
+            before
+        );
+    }
+
+    #[test]
+    fn duplicate_entries_for_one_key_collapse_into_the_first() {
+        let arr = array_of(vec![
+            sealed_entry(&VAULT_KEY, b"dup one"),
+            sealed_entry(&RP_KEY, b"other"),
+            sealed_entry(&VAULT_KEY, b"dup two"),
+        ]);
+        // Reading takes the first.
+        assert_eq!(
+            arr.credential_blob(&VAULT_KEY).as_deref().map(|v| &v[..]),
+            Some(&b"dup one"[..])
+        );
+        let w = arr.with_credential_blob(&VAULT_KEY, b"new").unwrap();
+        assert_eq!(w.len(), 2);
+        assert_eq!(
+            w.credential_blob(&VAULT_KEY).as_deref().map(|v| &v[..]),
+            Some(&b"new"[..])
+        );
+        assert!(
+            gcm_decrypt(
+                &VAULT_KEY,
+                &w.entry(0).unwrap().nonce,
+                &w.entry(0).unwrap().ciphertext,
+                w.entry(0).unwrap().orig_size
+            )
+            .is_some(),
+            "replaced at the first one's place"
+        );
+        assert_eq!(w.entry(1), arr.entry(1));
+    }
+
+    #[test]
+    fn without_credential_blob_removes_only_it() {
+        let (arr, before) = read_back_mixed();
+        // Nothing of ours there: nothing changes.
+        assert_eq!(elements(&arr.without_credential_blob(&VAULT_KEY)), before);
+
+        let mut items = arr.items.clone();
+        items.insert(1, Item::Entry(sealed_entry(&VAULT_KEY, b"a")));
+        items.push(Item::Entry(sealed_entry(&VAULT_KEY, b"b")));
+        let with_two = arr.changed(items);
+        let gone = with_two.without_credential_blob(&VAULT_KEY);
+        assert!(
+            gone.credential_blob(&VAULT_KEY).is_none(),
+            "every copy removed"
+        );
+        assert_eq!(elements(&gone), before);
+        assert!(gone.raw_array().is_empty());
+
+        // The SSH credential's entry goes only when asked for by its key.
+        let no_cert = arr.without_credential_blob(&SSH_KEY);
+        assert!(extract_cert_from_entries(&SSH_KEY, &no_cert).is_none());
+        assert_eq!(no_cert.len(), arr.len() - 1);
+        assert_eq!(no_cert.skipped_count(), 1);
+    }
+
+    #[test]
+    fn credential_blob_writes_respect_trailing_bytes_refusal() {
+        let note = encode_entry(&LargeBlobEntry::from_text("kept"));
+        let mut bytes = raw_array_of(&[&note]);
+        bytes.push(0x00);
+        let arr = LargeBlobArray::parse(&bytes).unwrap();
+        let w = arr.with_credential_blob(&VAULT_KEY, b"x").unwrap();
+        assert!(w.raw_array().is_empty());
+        assert!(w.serialize_with_checksum().is_err());
+        assert!(arr
+            .without_credential_blob(&VAULT_KEY)
+            .serialize_with_checksum()
+            .is_err());
+    }
+
+    #[test]
+    fn with_credential_blob_refuses_what_could_not_be_read_back() {
+        let too_big = vec![0u8; MAX_BLOB_PLAINTEXT + 1];
+        assert!(matches!(
+            array_of(Vec::new()).with_credential_blob(&VAULT_KEY, &too_big),
+            Err(CtapError::InvalidArgument(_))
+        ));
+        // Exactly at the ceiling is fine.
+        let at = vec![0u8; MAX_BLOB_PLAINTEXT];
+        let w = array_of(Vec::new())
+            .with_credential_blob(&VAULT_KEY, &at)
+            .unwrap();
+        assert_eq!(
+            w.credential_blob(&VAULT_KEY).map(|v| v.len()),
+            Some(at.len())
+        );
+    }
+
+    #[test]
+    fn extract_cert_still_works() {
+        // A certificate written through the per-credential path is found by
+        // the cert reader, which now goes through credential_blob.
+        let file = format!(
+            "{} kr-test\n",
+            crate::ssh_cert::tests_fixture::FIXTURE_CERT_PUB.trim()
+        );
+        let (arr, _) = read_back_mixed();
+        let w = arr
+            .with_credential_blob(&VAULT_KEY, file.as_bytes())
+            .unwrap();
+        assert_eq!(
+            extract_cert_from_entries(&VAULT_KEY, &w).unwrap().cert_pub,
+            file
+        );
+        assert_eq!(
+            extract_cert_from_entries(&SSH_KEY, &w).unwrap().cert_pub,
+            file
+        );
+        // This credential's blob holding something else is not a cert.
+        let v = arr
+            .with_credential_blob(&VAULT_KEY, b"T2VLT not a cert")
+            .unwrap();
+        assert!(extract_cert_from_entries(&VAULT_KEY, &v).is_none());
+        assert!(extract_cert_from_entries(&[0x99; 32], &v).is_none());
     }
 }

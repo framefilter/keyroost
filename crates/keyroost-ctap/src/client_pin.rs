@@ -419,16 +419,19 @@ fn pin_uv_auth_token_extra(
     extra
 }
 
-/// Bundle of negotiated v1 state used by every subsequent sub-command.
-struct PeerKey {
-    /// Authenticator's public key — we keep this so we can echo it as the
-    /// `keyAgreement` parameter (CTAP echoes the host's, not the peer's).
+/// The platform's ephemeral public key from one key agreement (PIN/UV auth
+/// protocol 1 or 2), sent as the `keyAgreement` parameter of every
+/// subsequent sub-command or `hmac-secret` input under that agreement.
+pub(crate) struct PeerKey {
+    /// The platform's (our) public key, not the authenticator's: CTAP
+    /// requests carry the host's key so the authenticator can derive the
+    /// same shared secret.
     our_x: [u8; 32],
     our_y: [u8; 32],
 }
 
 impl PeerKey {
-    fn our_public_cose(&self) -> Value {
+    pub(crate) fn our_public_cose(&self) -> Value {
         cose_p256_public(&self.our_x, &self.our_y)
     }
 }
@@ -438,7 +441,7 @@ impl PeerKey {
 /// `chosen` is the protocol [`select_pin_protocol`] picked for this device. The
 /// returned [`PinProtocol`] is boxed so the v1/v2 split key derivation and
 /// AES/HMAC framing stay behind one interface; callers don't branch on version.
-fn key_agreement(
+pub(crate) fn key_agreement(
     dev: &mut impl CtapTransport,
     chosen: SelectedPinProtocol,
 ) -> Result<(Box<dyn PinProtocol>, PeerKey), CtapError> {

@@ -31,13 +31,14 @@ tool. Workspace contains:
 | `keyroost-proto` | Pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC) | none |
 | `keyroost-transport` | PC/SC reader discovery, Molto2 session, YubiKey CCID serial, OATH + OpenPGP applets, Feitian OTP session (in-tree `keyroost-feitianotp`), import writers for OATH / Token2 OTP / Feitian OTP / Molto2 (in-tree `keyroost-import`), PIV key import from .p12/.pfx (in-tree `keyroost-p12`) and the slot self-test (in-tree `keyroost-pivtest`) | `pcsc`; `aes`/`des`/`cipher`/`getrandom`/`zeroize` (PIV mgmt-key auth); `hidapi` (non-Linux HID) |
 | `keyroost-hid` | USB HID enumeration of FIDO devices via sysfs; the shared `UsbDeviceKey` "same physical USB device" evidence and the Windows device-tree decision (`usb_device_node`) | `hidapi` (non-Linux only; Linux uses sysfs); in-tree `keyroost-proto` (trace format), `keyroost-windevtree` (Windows only) |
-| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt, largeBlob (incl. the on-key name entry, `docs/PROTOCOL-device-label.md`) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`aes-gcm`), `getrandom`, `zeroize`, `miniz_oxide` (largeBlob DEFLATE); `hidapi` (non-Linux HID) |
+| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt, makeCredential / getAssertion with the `hmac-secret`, `largeBlobKey` and `credProtect` extensions, largeBlob (incl. the on-key name entry, `docs/PROTOCOL-device-label.md`, and per-credential entries) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`aes-gcm`), `getrandom`, `zeroize`, `miniz_oxide` (largeBlob DEFLATE); `hidapi` (non-Linux HID); in-tree `keyroost-vault` as a path-only **dev**-dependency (the unpublished `vault_smoke` hardware example and one test, both excluded from the package) |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management (status, GENERAL AUTHENTICATE, key-gen, cert import, PIN/PUK/mgmt-key, reset) + SPKI/PEM | `zeroize` |
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO management byte layer (APDU + HID framing, ECDH+AES seed encryption) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`), `getrandom`, `zeroize` |
 | `keyroost-feitianotp` | Pure-Rust Feitian OTP applet byte layer (APDU + TLV; `docs/PROTOCOL-feitianotp.md`) | `zeroize`; in-tree `keyroost-proto` |
 | `keyroost-token2prog` | Pure-Rust Token2 2nd-gen single-profile programmable-token protocol (SM4 seed/MAC, config TLV); reuses `keyroost-proto` | `zeroize` |
+| `keyroost-vault` | FIDO2 password vault stored in a key's largeBlob: fidoparole-compatible vault and backup formats, merge, password generator; pure, no hardware | `aes-gcm`, `hmac`, `sha2`, `miniz_oxide`, `serde`/`serde_json`, `getrandom`, `zeroize`, `argon2` + its `blake2` (scoped exception, backup passphrase KDF) |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints); no hardware | `serde`, `serde_json`, `getrandom` (per-computer salt); in-tree `keyroost-proto` (SHA-256) |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) and naming (on-key names, first-seen records); the AAGUID model table and the bundled FIDO metadata (MDS) the CLI and the app both show | `serde`/`serde_json` (the bundled MDS JSON); in-tree (incl. `keyroost-ctap`) |
 | `keyroost-rsakey` | Host-side RSA key loading (PKCS#1/PKCS#8 PEM/DER, 2048-4096 bits) for OpenPGP import | `rsa`, `zeroize` (scoped exception) |
@@ -113,7 +114,7 @@ workflow during bring-up is:
   `eframe`/`egui` + platform UI crates, `serde`, `rpassword` for the hidden
   terminal prompt), FFI-only crates
   (`hidapi` off-Linux, `windows-sys` on Windows), and vetted RustCrypto/`rsa`/
-  `scrypt`/`aes-gcm`/`zeroize`/`getrandom` where hand-rolling the primitive
+  `scrypt`/`argon2`/`aes-gcm`/`zeroize`/`getrandom` where hand-rolling the primitive
   would be irresponsible (see the per-crate deps in the table above). No new
   deps without a discussion first.
 - **No documentation files unless explicitly asked.** `docs/` holds the protocol

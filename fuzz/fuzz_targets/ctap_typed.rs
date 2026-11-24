@@ -5,6 +5,11 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    // Raw device bytes, not a decoded map: authenticator data and the
+    // makeCredential and getAssertion response bodies.
+    let _ = keyroost_ctap::auth_data::parse_auth_data(data);
+    let _ = keyroost_ctap::make_credential::parse_make_credential(data);
+    let _ = keyroost_ctap::get_assertion::parse_get_assertion(data, None);
     if let Ok((value, _)) = keyroost_ctap::cbor::decode(data) {
         let _ = keyroost_ctap::cmd::parse_authenticator_info(&value);
         let _ = keyroost_ctap::client_pin::parse_pin_response(&value);
