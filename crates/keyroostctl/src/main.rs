@@ -14045,7 +14045,7 @@ fn plan_key_label(
         writer: Some(keyroost_ctap::device_label::WRITER_KEYROOST.to_string()),
     });
     let used = current.capacity(&info).used_bytes;
-    plan_label_change(&current, &info, new.as_ref(), random_nonce())
+    plan_label_change(&current, &info, new.as_ref(), random_nonce()?)
         .map_err(|e| label_refusal(e, v, used).into())
 }
 

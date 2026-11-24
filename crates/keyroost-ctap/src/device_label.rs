@@ -293,12 +293,20 @@ pub fn apply_label_plan(
     Ok(())
 }
 
-/// A fresh random 12-byte nonce for [`encode_entry`]. Panics if the OS has
-/// no randomness to give (as `rand_core`'s `OsRng` did before).
-pub fn random_nonce() -> [u8; 12] {
+/// A fresh random 12-byte nonce for [`encode_entry`]. Fails with
+/// [`CtapError::Random`] if the OS has no randomness to give.
+pub fn random_nonce() -> Result<[u8; 12], CtapError> {
+    nonce_from(|n| getrandom::fill(n))
+}
+
+/// [`random_nonce`] with the source passed in, so a failing random source
+/// can be exercised without a global mock.
+fn nonce_from(
+    fill: impl FnOnce(&mut [u8; 12]) -> Result<(), getrandom::Error>,
+) -> Result<[u8; 12], CtapError> {
     let mut nonce = [0u8; 12];
-    getrandom::fill(&mut nonce).expect("the OS random source failed");
-    nonce
+    fill(&mut nonce).map_err(|_| CtapError::Random)?;
+    Ok(nonce)
 }
 
 #[cfg(test)]
@@ -952,6 +960,14 @@ mod tests {
 
     #[test]
     fn random_nonces_differ() {
-        assert_ne!(random_nonce(), random_nonce());
+        assert_ne!(random_nonce().unwrap(), random_nonce().unwrap());
+    }
+
+    #[test]
+    fn a_failed_random_source_is_an_error_not_a_panic() {
+        assert!(matches!(
+            nonce_from(|_| Err(getrandom::Error::UNSUPPORTED)),
+            Err(CtapError::Random)
+        ));
     }
 }
