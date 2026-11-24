@@ -28,6 +28,8 @@ pub enum VaultError {
     Random,
     /// A vault name is empty or longer than 32 bytes of UTF-8.
     NameLength,
+    /// A backup lists two entries with the same id.
+    DuplicateId,
 }
 
 impl fmt::Display for VaultError {
@@ -54,6 +56,9 @@ impl fmt::Display for VaultError {
             }
             VaultError::TooLarge => f.write_str("the vault data is too large"),
             VaultError::Random => f.write_str("the system's random number source failed"),
+            VaultError::DuplicateId => f.write_str(
+                "this backup lists two entries with the same id; it may be damaged",
+            ),
             VaultError::NameLength => f.write_str(
                 "a vault name must be 1 to 32 bytes long (accented and non-Latin letters take 2 to 4 bytes each)",
             ),

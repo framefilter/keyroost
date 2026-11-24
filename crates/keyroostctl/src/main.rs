@@ -13713,14 +13713,14 @@ fn write_private_file(
     if mode == crate::prompt::OutMode::New {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true).mode(0o600);
-        let mut f = opts.open(path).map_err(|e| {
+        let f = opts.open(path).map_err(|e| {
             if e.kind() == ErrorKind::AlreadyExists {
                 Error::new(ErrorKind::AlreadyExists, crate::prompt::APPEARED)
             } else {
                 e
             }
         })?;
-        return f.write_all(data).and_then(|_| f.sync_all());
+        return fill_new_file(path, f, data, |f| f.sync_all());
     }
 
     let parent = path
@@ -13805,7 +13805,32 @@ fn write_private_file(
     data: &[u8],
     mode: crate::prompt::OutMode,
 ) -> std::io::Result<()> {
-    mode.write(path, data)
+    match mode {
+        crate::prompt::OutMode::New => {
+            fill_new_file(path, mode.open(path)?, data, |f| f.sync_all())
+        }
+        crate::prompt::OutMode::Replace => mode.write(path, data),
+    }
+}
+
+/// Write `data` into `f`, the file this run just created at `path`, then
+/// `sync` it. When either fails (a full disk), the partial file is removed
+/// before the error is returned: a truncated secret output is worse than
+/// none, and a retry would refuse it as a file that is already there. Only
+/// for a file created exclusively (`create_new`), so what is removed is
+/// this run's own.
+fn fill_new_file<W: std::io::Write>(
+    path: &std::path::Path,
+    mut f: W,
+    data: &[u8],
+    sync: impl FnOnce(&mut W) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let written = f.write_all(data).and_then(|()| sync(&mut f));
+    if written.is_err() {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+    }
+    written
 }
 
 /// Accept a certificate as DER or PEM, returning DER bytes.
@@ -22086,6 +22111,51 @@ mod cli_tests {
         assert_eq!(mode & 0o777, 0o600, "re-write should tighten to 0600");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A new file whose write fails (a full disk, here a writer that
+    /// fails partway) is removed, not left truncated; a write that goes
+    /// through keeps it.
+    #[test]
+    fn fill_new_file_removes_a_partial_file() {
+        struct Full(usize);
+        impl std::io::Write for Full {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::other("no space left on device"));
+                }
+                let n = b.len().min(self.0);
+                self.0 -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("keyroost_fill_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("backup.t2vault");
+
+        std::fs::write(&path, b"part").unwrap();
+        let err = fill_new_file(&path, Full(4), b"partial data", |_| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("no space"), "{err}");
+        assert!(!path.exists(), "a partial file was left behind");
+
+        // A failing sync removes it too.
+        std::fs::write(&path, b"all").unwrap();
+        let err = fill_new_file(&path, Full(100), b"all", |_| {
+            Err(std::io::Error::other("sync failed"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("sync failed"), "{err}");
+        assert!(!path.exists());
+
+        // Success leaves the file alone.
+        std::fs::write(&path, b"kept").unwrap();
+        fill_new_file(&path, Full(100), b"kept", |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
