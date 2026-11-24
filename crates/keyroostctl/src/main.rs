@@ -2952,7 +2952,10 @@ enum FidoCmd {
         #[command(subcommand)]
         cmd: SshCertCmd,
     },
-    /// Keep passwords in vaults on the key, in FidoParole's vault format.
+    /// Keep passwords in vaults on the key, in FidoParole's vault format (experimental).
+    ///
+    /// Experimental: please report problems at
+    /// https://github.com/framefilter/keyroost/issues and keep a backup.
     ///
     /// Each vault is a FIDO2 credential on the key; its entries are sealed
     /// with a secret only the key gives out (after the PIN and a touch) and

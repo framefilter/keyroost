@@ -48,7 +48,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   Resident SSH credentials can be listed and their stored OpenSSH certificate
   extracted from largeBlob to a `-cert.pub` file (`fido ssh`). Also an
   encrypted password vault on FIDO2 keys with a large-blob store, opened with
-  the PIN and a touch (`fido vault`); it uses Token2 FidoParole's vault and
+  the PIN and a touch (`fido vault`, experimental); it uses Token2 FidoParole's vault and
   backup formats, checked against FidoParole's own vault code and libfido2.
   The large-blob store is shared space on the key, meant for data that
   belongs to a passkey; each vault is kept there as the data of its own
