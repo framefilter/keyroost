@@ -4,12 +4,13 @@ use std::fmt;
 
 /// Why a vault operation failed. Messages are plain English for end users.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VaultError {
     /// The data does not start with the vault magic.
     NotAVault,
     /// The file does not start with the backup magic.
     NotABackup,
-    /// A blob or backup version this build does not know.
+    /// A key-blob or backup-file version this build does not know.
     UnsupportedVersion(u8),
     /// The JSON format number is newer than this build understands.
     NewerFormat(u32),
@@ -32,7 +33,10 @@ impl fmt::Display for VaultError {
         match self {
             VaultError::NotAVault => f.write_str("the data on this key is not a vault"),
             VaultError::NotABackup => f.write_str("this is not a vault backup file"),
-            VaultError::UnsupportedVersion(v) => write!(f, "unsupported vault version {v}"),
+            VaultError::UnsupportedVersion(v) => write!(
+                f,
+                "this vault or backup uses version {v} of its file format, which this app cannot read"
+            ),
             VaultError::NewerFormat(n) => {
                 write!(f, "this vault was saved by a newer app (format {n})")
             }
@@ -53,3 +57,17 @@ impl fmt::Display for VaultError {
 }
 
 impl std::error::Error for VaultError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_message_fits_blobs_and_backups() {
+        // Both the key blob and the backup file report this variant.
+        assert_eq!(
+            VaultError::UnsupportedVersion(2).to_string(),
+            "this vault or backup uses version 2 of its file format, which this app cannot read"
+        );
+    }
+}

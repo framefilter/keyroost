@@ -5,6 +5,7 @@ use crate::model::{canon_id, Vault};
 
 /// How an incoming entry relates to the current vault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ImportStatus {
     /// No entry with this id in the current vault (a deleted entry shows up
     /// here too; the user decides).

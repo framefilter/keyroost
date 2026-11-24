@@ -171,9 +171,12 @@ mod tests {
     #[test]
     fn inflate_error_wipes_the_partial_output() {
         let big = deflate(&vec![b'x'; MAX_INFLATED + 1]);
-        let mut e = miniz_oxide::inflate::decompress_to_vec_with_limit(&big, MAX_INFLATED)
-            .unwrap_err();
-        assert!(!e.output.is_empty(), "the fixture must carry partial output");
+        let mut e =
+            miniz_oxide::inflate::decompress_to_vec_with_limit(&big, MAX_INFLATED).unwrap_err();
+        assert!(
+            !e.output.is_empty(),
+            "the fixture must carry partial output"
+        );
         assert_eq!(inflate_error(&mut e), VaultError::TooLarge);
         assert!(e.output.is_empty());
     }
