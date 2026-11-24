@@ -225,7 +225,8 @@ pub fn matching<T: AsRef<VaultRef>>(
 pub enum Change {
     /// A new entry.
     Add(Entry),
-    /// `before` becomes `after`, which keeps `before`'s id.
+    /// `before` becomes `after`; the entry keeps its id whatever id `after`
+    /// carries.
     Edit { before: Entry, after: Entry },
     /// `before` is removed.
     Delete { before: Entry },
@@ -277,7 +278,10 @@ pub(crate) fn apply_change(
         }
         Change::Edit { before, after } => match position(&next, &before.id) {
             Some(i) if next.entries[i] == *before => {
-                next.entries[i] = after.clone();
+                let mut edited = after.clone();
+                // The entry keeps its id, whatever `after` carries.
+                edited.id.clone_from(&next.entries[i].id);
+                next.entries[i] = edited;
                 Ok((next, 0, 1, 0))
             }
             _ => Err(VaultKeyError::Conflict),
@@ -384,12 +388,21 @@ pub fn save(
     let written = {
         let (hmac, lbk) = open.secrets();
         let base = &open.contents;
+        let was_stored = open.stored;
         write_array(
             key,
             auth,
             &mut |array| {
                 let (current, stored) = vault_state(array.credential_data(lbk), hmac)
                     .map_err(VaultKeyError::CannotOpen)?;
+                // Data that was there at unlock and is gone now means
+                // another writer deleted or rotated this vault: writing
+                // would leave a blob no credential finds and lose the
+                // change, so it is a conflict, never an empty vault.
+                if was_stored && !stored {
+                    on_key = Some((current, stored));
+                    return Err(VaultKeyError::Conflict);
+                }
                 match apply_change(base, &current, change) {
                     Ok((next, added, replaced, removed)) => {
                         let blob = seal(&next, hmac)?;
@@ -968,6 +981,77 @@ mod tests {
         saved(&mut key, &mut auth, &mut open, &Change::Add(e.clone()));
         assert!(open.stored);
         assert_eq!(key.vault_on_key(&id), Some(Vault { entries: vec![e] }));
+    }
+
+    #[test]
+    fn vault_data_gone_since_unlock_is_a_conflict() {
+        let a = entry("GitHub");
+        let seeded = Vault {
+            entries: vec![a.clone()],
+        };
+        for change in [
+            Change::Add(entry("Mail")),
+            Change::Import {
+                incoming: Vault {
+                    entries: vec![entry("Bank")],
+                },
+                chosen: vec![0],
+            },
+            Change::Delete { before: a.clone() },
+        ] {
+            let mut key = FakeKey::new();
+            key.add_foreign_entries();
+            let id = key.add_vault("Personal", &seeded);
+            // Another writer deletes or rotates this vault after our unlock:
+            // its data leaves the store.
+            let lbk = lbk_of(&key, &id);
+            key.hook = Some((
+                1,
+                Box::new(move |k: &mut FakeKey| {
+                    let rest = k.array().without_credential_blob(&lbk);
+                    k.set_array(&rest);
+                }),
+            ));
+            let (mut auth, mut open) = open_first(&mut key);
+            assert!(open.stored);
+            let stored = key.stored().to_vec();
+
+            let (r, steps) = save_with(&mut key, &mut auth, &mut open, &change);
+            assert!(
+                matches!(r, Err(VaultKeyError::Conflict)),
+                "{change:?}: {r:?}"
+            );
+            assert_eq!(writes(&key), 0, "{change:?}");
+            assert!(steps.is_empty());
+            assert_eq!(key.stored(), &stored[..], "no orphan blob");
+            // Reloaded as the key holds it now: no data.
+            assert!(!open.stored);
+            assert_eq!(open.contents, Vault::default());
+        }
+    }
+
+    #[test]
+    fn an_edit_keeps_the_entry_id() {
+        let a = entry("GitHub");
+        let base = Vault {
+            entries: vec![a.clone()],
+        };
+        let mut after = edited(&a, "x");
+        after.id = keyroost_vault::new_id();
+        let (v, _, replaced, _) = apply_change(
+            &base,
+            &base,
+            &Change::Edit {
+                before: a.clone(),
+                after: after.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(replaced, 1);
+        assert_eq!(v.entries.len(), 1);
+        assert_eq!(v.entries[0].id, a.id);
+        assert_eq!(*v.entries[0].password, "x");
+        assert_eq!(v.entries[0].modified_minutes, after.modified_minutes);
     }
 
     #[test]
