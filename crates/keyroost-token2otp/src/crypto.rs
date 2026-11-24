@@ -103,7 +103,8 @@ pub fn encrypt_seed_payload(
         .ok_or(EncryptError::BadDevicePubkey)?;
 
     // Fresh ephemeral host keypair (spec §7: per-command).
-    let host_secret = SecretKey::from(p256::NonZeroScalar::generate());
+    let host_secret =
+        SecretKey::from(p256::NonZeroScalar::try_generate().map_err(|_| EncryptError::RngFailed)?);
     let host_pub = host_secret.public_key();
 
     // shared X coordinate -> SHA-256 -> 32-byte AES-256 key.
@@ -164,7 +165,7 @@ mod tests {
     fn blob_shape_and_block_alignment() {
         // Stand in for the device with a known keypair so we can validate shape
         // and that the ciphertext is a whole number of AES blocks.
-        let device_secret = SecretKey::from(p256::NonZeroScalar::generate());
+        let device_secret = SecretKey::from(p256::NonZeroScalar::try_generate().unwrap());
         let device_xy = {
             let pt = device_secret.public_key().to_sec1_point(false);
             pt.as_bytes()[1..].to_vec()
@@ -184,7 +185,7 @@ mod tests {
         use cbc::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
         type Dec = cbc::Decryptor<aes::Aes256>;
 
-        let device_secret = SecretKey::from(p256::NonZeroScalar::generate());
+        let device_secret = SecretKey::from(p256::NonZeroScalar::try_generate().unwrap());
         let device_pub = device_secret.public_key();
         let device_xy = {
             let pt = device_pub.to_sec1_point(false);
@@ -286,13 +287,16 @@ pub struct HostAgreement {
 }
 
 impl HostAgreement {
-    /// Generate a fresh ephemeral P-256 keypair for one session.
-    pub fn new() -> Self {
-        let secret = SecretKey::from(p256::NonZeroScalar::generate());
+    /// Generate a fresh ephemeral P-256 keypair for one session. Fails with
+    /// [`EncryptError::RngFailed`] if the OS has no randomness to give.
+    pub fn new() -> Result<Self, EncryptError> {
+        let secret = SecretKey::from(
+            p256::NonZeroScalar::try_generate().map_err(|_| EncryptError::RngFailed)?,
+        );
         let point = secret.public_key().to_sec1_point(false);
         let mut public_xy = [0u8; 64];
         public_xy.copy_from_slice(&point.as_bytes()[1..]);
-        Self { secret, public_xy }
+        Ok(Self { secret, public_xy })
     }
 
     /// The host public key as raw `X || Y` — the body of the
@@ -308,12 +312,6 @@ impl HostAgreement {
         device_agreement_xy: &[u8],
     ) -> Result<SessionKeys, EncryptError> {
         derive_session_keys(&self.secret, device_agreement_xy)
-    }
-}
-
-impl Default for HostAgreement {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -406,15 +404,18 @@ pub fn verify_auth_tag(mac_key: &[u8; 32], data: &[u8], tag: &[u8]) -> Result<()
 ///
 /// (`GET_ECDH_PUBKEY` is rejected with 6A81 on a protected key, so no ECDH blob
 /// is possible; this session-key format is what the Token2 companion app sends.)
-pub fn build_protected_write_data(keys: &SessionKeys, cleartext: &[u8]) -> Vec<u8> {
-    let iv = random_iv();
+pub fn build_protected_write_data(
+    keys: &SessionKeys,
+    cleartext: &[u8],
+) -> Result<Vec<u8>, EncryptError> {
+    let iv = random_iv()?;
     let enc = session_encrypt(&keys.enc, &iv, cleartext);
     let auth = session_auth_tag(&keys.mac, &enc);
     let mut out = Vec::with_capacity(16 + enc.len() + 16);
     out.extend_from_slice(&iv);
     out.extend_from_slice(&enc);
     out.extend_from_slice(&auth);
-    out
+    Ok(out)
 }
 
 /// Build the `SET_OTP_PIN` data field: `IV || NewPinEnc || NewPinAuth`, where
@@ -431,7 +432,7 @@ pub fn build_set_pin_data(
     // The block carries the PIN length in one byte; a longer PIN cannot be
     // expressed and must not be silently truncated into a different PIN.
     let pin_len = u8::try_from(pin.len()).map_err(|_| EncryptError::BadLength)?;
-    let iv = random_iv();
+    let iv = random_iv()?;
     let mut newpin = Zeroizing::new(Vec::with_capacity(3 + pin.len()));
     newpin.push(PIN_ALG_AES256);
     newpin.push(retry);
@@ -477,7 +478,7 @@ pub fn build_verify_pin_data(
     let inner = aes256_cbc_encrypt_nopad(&pin_hash, &iv2, rand)?;
 
     // Outer layer under the session key with a fresh IV.
-    let iv = random_iv();
+    let iv = random_iv()?;
     let outer = aes256_cbc_encrypt_nopad(&keys.enc, &iv, &inner)?;
 
     let mut out = Vec::with_capacity(16 + outer.len());
@@ -509,7 +510,7 @@ pub fn build_verify_pin_data_with_config(
     iv2.copy_from_slice(&iv2_full[..16]);
     let inner = aes256_cbc_encrypt_nopad(&pin_hash, &iv2, rand)?;
 
-    let iv = random_iv();
+    let iv = random_iv()?;
     let outer = aes256_cbc_encrypt_nopad(&keys.enc, &iv, &inner)?;
 
     // EncConfig: PKCS#5-pad the single FpEnable byte to one block, encrypt under
@@ -569,7 +570,7 @@ pub fn build_change_pin_data(
     body.extend_from_slice(new_pin);
     let body = pkcs7_pad16(&body);
 
-    let iv = random_iv();
+    let iv = random_iv()?;
     let new_pin_enc = aes256_cbc_encrypt_nopad(&keys.enc, &iv, &body)?;
 
     let old_hash_full = Zeroizing::new(sha256(current_pin));
@@ -629,12 +630,20 @@ fn pkcs7_pad16(data: &[u8]) -> Zeroizing<Vec<u8>> {
     out
 }
 
-/// Panics if the OS has no randomness to give (as `rand_core`'s `OsRng` did
-/// before).
-fn random_iv() -> [u8; 16] {
+/// A fresh random IV. Fails with [`EncryptError::RngFailed`] if the OS has no
+/// randomness to give.
+fn random_iv() -> Result<[u8; 16], EncryptError> {
+    iv_from(|iv| getrandom::fill(iv))
+}
+
+/// [`random_iv`] with the source passed in, so a failing random source can be
+/// exercised without a global mock.
+fn iv_from(
+    fill: impl FnOnce(&mut [u8; 16]) -> Result<(), getrandom::Error>,
+) -> Result<[u8; 16], EncryptError> {
     let mut iv = [0u8; 16];
-    getrandom::fill(&mut iv).expect("the OS random source failed");
-    iv
+    fill(&mut iv).map_err(|_| EncryptError::RngFailed)?;
+    Ok(iv)
 }
 
 /// The PIN session crypto, pinned byte-for-byte.
@@ -724,7 +733,7 @@ mod pin_crypto_tests {
 
     #[test]
     fn agreement_public_half_is_the_raw_xy_the_command_wants() {
-        let a = HostAgreement::new();
+        let a = HostAgreement::new().unwrap();
         // 64 bytes, no SEC1 0x04 tag, and a real point (the device rebuilds it).
         assert_eq!(a.public_xy().len(), 64);
         let mut sec1 = [0u8; 65];
@@ -847,10 +856,18 @@ mod pin_crypto_tests {
     }
 
     #[test]
+    fn a_failed_random_source_is_an_error_not_a_panic() {
+        assert_eq!(
+            iv_from(|_| Err(getrandom::Error::UNSUPPORTED)),
+            Err(EncryptError::RngFailed)
+        );
+    }
+
+    #[test]
     fn protected_write_data_field_layout() {
         let keys = fixed_keys();
         let cleartext = [0xABu8; 23];
-        let out = build_protected_write_data(&keys, &cleartext);
+        let out = build_protected_write_data(&keys, &cleartext).unwrap();
 
         // IV(16) || AES-CBC(EncKey, IV, pt)(32 after PKCS#7) || HMAC[:16]
         assert_eq!(out.len(), 16 + 32 + 16);
