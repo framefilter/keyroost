@@ -65,9 +65,9 @@ pub struct MakeCredentialRequest<'a> {
     pub cred_protect: Option<u8>,
     pub hmac_secret: bool,
     pub large_blob_key: bool,
-    /// The pinUvAuthToken and the pinUvAuthProtocol (1 or 2) it was obtained
-    /// under; the protocol must match the token's own.
-    pub pin_uv_auth: Option<(&'a PinUvAuthToken, u32)>,
+    /// The pinUvAuthToken; the request names the pinUvAuthProtocol (1 or 2)
+    /// the token was obtained under.
+    pub pin_uv_auth: Option<&'a PinUvAuthToken>,
 }
 
 /// What keyroost keeps from a makeCredential response.
@@ -158,14 +158,14 @@ pub fn encode_make_credential(r: &MakeCredentialRequest) -> Vec<u8> {
         ));
     }
 
-    if let Some((token, protocol)) = r.pin_uv_auth {
+    if let Some(token) = r.pin_uv_auth {
         entries.push((
             Value::UInt(KEY_PIN_UV_AUTH_PARAM),
             Value::Bytes(token.authenticate(&r.client_data_hash)),
         ));
         entries.push((
             Value::UInt(KEY_PIN_UV_AUTH_PROTOCOL),
-            Value::UInt(u64::from(protocol)),
+            Value::UInt(u64::from(token.protocol)),
         ));
     }
 
@@ -259,13 +259,6 @@ fn check_request(info: &AuthenticatorInfo, req: &MakeCredentialRequest) -> Resul
             "the credential's user ID must be 1 to 64 bytes",
         ));
     }
-    if let Some((token, protocol)) = req.pin_uv_auth {
-        if token.protocol != protocol {
-            return Err(CtapError::InvalidArgument(
-                "the PIN/UV auth protocol does not match the token's",
-            ));
-        }
-    }
     let has = |ext: &str| info.extensions.iter().any(|e| e == ext);
     if let Some(policy) = req.cred_protect {
         if !(1..=3).contains(&policy) {
@@ -355,7 +348,7 @@ mod tests {
             cred_protect: Some(3),
             hmac_secret: true,
             large_blob_key: true,
-            pin_uv_auth: Some((token, PIN_PROTOCOL_V1)),
+            pin_uv_auth: Some(token),
         }
     }
 
@@ -444,6 +437,30 @@ mod tests {
             "04 81 a2 63616c67 26 6474797065 6a 7075626c69632d6b6579",
         ));
         assert_eq!(encode_make_credential(&req), expected);
+    }
+
+    #[test]
+    fn encode_names_the_tokens_own_protocol() {
+        let token = PinUvAuthToken {
+            protocol: 2,
+            token: vec![0x5a; 32],
+        };
+        let req = MakeCredentialRequest {
+            pin_uv_auth: Some(&token),
+            ..vault_request(&token)
+        };
+        let (v, _) = cbor::decode(&encode_make_credential(&req)).unwrap();
+        assert_eq!(
+            v.get_uint_key(KEY_PIN_UV_AUTH_PROTOCOL).unwrap().as_uint(),
+            Some(2)
+        );
+        assert_eq!(
+            v.get_uint_key(KEY_PIN_UV_AUTH_PARAM)
+                .unwrap()
+                .as_bytes()
+                .unwrap(),
+            &token.authenticate(&[0x11; 32])[..]
+        );
     }
 
     /// Authenticator data with AT and ED, credential ID `cafe`, extensions
@@ -621,7 +638,6 @@ mod tests {
             with(|r| r.user_id = &[]),
             with(|r| r.user_id = &[0u8; 65]),
             with(|r| r.cred_protect = Some(4)),
-            with(|r| r.pin_uv_auth = r.pin_uv_auth.map(|(t, _)| (t, 2))),
         ];
         for req in bad {
             let mut dev = FixedDevice::new(vec![0x00]);

@@ -72,9 +72,9 @@ pub struct GetAssertionRequest<'a> {
     /// authenticators refuse it without user presence (CTAP 2.1 §12.5), so
     /// [`get_assertions`] rejects that combination before sending.
     pub up: bool,
-    /// The pinUvAuthToken and the pinUvAuthProtocol (1 or 2) it was obtained
-    /// under; the protocol must match the token's own.
-    pub pin_uv_auth: Option<(&'a PinUvAuthToken, u32)>,
+    /// The pinUvAuthToken; the request names the pinUvAuthProtocol (1 or 2)
+    /// the token was obtained under.
+    pub pin_uv_auth: Option<&'a PinUvAuthToken>,
 }
 
 /// What keyroost keeps from one getAssertion / getNextAssertion response.
@@ -162,14 +162,14 @@ pub fn encode_get_assertion(r: &GetAssertionRequest) -> Vec<u8> {
         ));
     }
 
-    if let Some((token, protocol)) = r.pin_uv_auth {
+    if let Some(token) = r.pin_uv_auth {
         entries.push((
             Value::UInt(KEY_PIN_UV_AUTH_PARAM),
             Value::Bytes(token.authenticate(&r.client_data_hash)),
         ));
         entries.push((
             Value::UInt(KEY_PIN_UV_AUTH_PROTOCOL),
-            Value::UInt(u64::from(protocol)),
+            Value::UInt(u64::from(token.protocol)),
         ));
     }
 
@@ -333,13 +333,6 @@ fn parse_assertion(
 /// Check a request against the key's getInfo, so an unsupported request
 /// fails with a clear message before the key is asked for a touch.
 fn check_request(info: &AuthenticatorInfo, req: &GetAssertionRequest) -> Result<(), CtapError> {
-    if let Some((token, protocol)) = req.pin_uv_auth {
-        if token.protocol != protocol {
-            return Err(CtapError::InvalidArgument(
-                "the PIN/UV auth protocol does not match the token's",
-            ));
-        }
-    }
     // CTAP 2.1 §12.5: an authenticator answers hmac-secret with
     // {"up": false} with CTAP2_ERR_UNSUPPORTED_OPTION, every time.
     if req.hmac.is_some() && !req.up {
@@ -506,7 +499,7 @@ mod tests {
             hmac: Some((session, SALT)),
             large_blob_key: true,
             up: true,
-            pin_uv_auth: Some((token, PIN_PROTOCOL_V1)),
+            pin_uv_auth: Some(token),
         }
     }
 
@@ -1049,16 +1042,6 @@ mod tests {
             assert!(matches!(err, CtapError::Unsupported(_)), "{err:?}");
             assert!(dev.requests.is_empty());
         }
-
-        // A PIN protocol that does not match the token's.
-        let req = GetAssertionRequest {
-            pin_uv_auth: Some((&token, 2)),
-            ..vault_request(&token, &session)
-        };
-        let mut dev = ScriptedDevice::new(vec![]);
-        let err = get_assertions(&mut dev, &full_info(), &req).unwrap_err();
-        assert!(matches!(err, CtapError::InvalidArgument(_)), "{err:?}");
-        assert!(dev.requests.is_empty());
     }
 
     #[test]

@@ -267,7 +267,7 @@ fn vault_assertions(
         hmac: Some((&session, prf_salt(PRF_INPUT))),
         large_blob_key: true,
         up: true,
-        pin_uv_auth: Some((tok, tok.protocol)),
+        pin_uv_auth: Some(tok),
     };
     println!(">>> touch the key now (getAssertion)");
     Ok(get_assertions(dev, info, &req)?)
@@ -307,7 +307,7 @@ fn create(
         cred_protect: Some(3),
         hmac_secret: true,
         large_blob_key: true,
-        pin_uv_auth: Some((&mc_tok, mc_tok.protocol)),
+        pin_uv_auth: Some(&mc_tok),
     };
     println!(">>> touch the key now (makeCredential)");
     let made = make_credential(dev, info, &req)?;
