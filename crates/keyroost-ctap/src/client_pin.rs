@@ -419,10 +419,13 @@ fn pin_uv_auth_token_extra(
     extra
 }
 
-/// Bundle of negotiated v1 state used by every subsequent sub-command.
+/// The platform's ephemeral public key from one key agreement (PIN/UV auth
+/// protocol 1 or 2), sent as the `keyAgreement` parameter of every
+/// subsequent sub-command or `hmac-secret` input under that agreement.
 pub(crate) struct PeerKey {
-    /// Authenticator's public key — we keep this so we can echo it as the
-    /// `keyAgreement` parameter (CTAP echoes the host's, not the peer's).
+    /// The platform's (our) public key, not the authenticator's: CTAP
+    /// requests carry the host's key so the authenticator can derive the
+    /// same shared secret.
     our_x: [u8; 32],
     our_y: [u8; 32],
 }

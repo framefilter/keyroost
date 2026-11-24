@@ -201,8 +201,9 @@ const NO_CREDENTIAL: CtapError =
     CtapError::InvalidResponseShape("getAssertion response names no credential");
 
 /// The parser behind [`parse_get_assertion`], leaving the credential ID
-/// optional: CTAP 2.1 §6.2 lets the key omit it when the allowList held
-/// exactly one entry, which only [`get_assertions`] knows. The returned
+/// optional: CTAP 2.0 §5.2 lets the key omit it when the allowList held
+/// exactly one entry (CTAP 2.1 §6.2 makes it required; older keys still
+/// omit it), which only [`get_assertions`] knows. The returned
 /// `Assertion` has an empty `credential_id`.
 fn parse_assertion(
     resp: &[u8],
@@ -367,7 +368,8 @@ fn read_one(resp: &[u8], req: &GetAssertionRequest, first: bool) -> Result<Asser
     }
     let (credential_id, assertion) = parse_assertion(body, req.hmac.as_ref().map(|(s, _)| *s))?;
     // The key may leave the credential out when the allowList held exactly
-    // one entry (CTAP 2.1 §6.2); keyroost only ever sends one.
+    // one entry (a CTAP 2.0 §5.2 allowance; CTAP 2.1 requires it);
+    // keyroost only ever sends one.
     let credential_id = credential_id
         .or_else(|| req.allow.map(<[u8]>::to_vec))
         .ok_or(NO_CREDENTIAL)?;
@@ -891,8 +893,8 @@ mod tests {
 
     #[test]
     fn credential_falls_back_to_the_allow_list_entry() {
-        // CTAP 2.1 §6.2: the credential may be omitted when the allowList
-        // held exactly one entry.
+        // CTAP 2.0 §5.2: the credential may be omitted when the allowList
+        // held exactly one entry (CTAP 2.1 makes it required).
         let token = v1_token();
         let session = v1_session();
         let req = vault_request(&token, &session);
