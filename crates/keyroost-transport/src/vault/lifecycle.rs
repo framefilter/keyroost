@@ -22,8 +22,8 @@ use zeroize::Zeroizing;
 
 use super::ops::{check_fits, stale_token, write_array, OpenVault};
 use super::{
-    check_support, VaultAuth, VaultCredential, VaultKey, VaultKeyError, VaultProblem, VaultRef,
-    VaultStep,
+    check_support, StoredData, VaultAuth, VaultCredential, VaultKey, VaultKeyError, VaultProblem,
+    VaultRef, VaultStep,
 };
 use crate::ct_eq;
 
@@ -39,19 +39,20 @@ fn credentials_and_array(
     let mut creds = key.credentials(token)?;
     let array = key.read_blobs()?;
     for c in &mut creds {
-        c.stored_bytes =
-            c.large_blob_key
-                .as_ref()
-                .and_then(|lbk| match array.credential_data(lbk) {
-                    CredentialData::Present(data) => Some(data.len()),
-                    CredentialData::Absent | CredentialData::Unreadable => None,
-                });
+        c.stored = match &c.large_blob_key {
+            None => StoredData::Unknown,
+            Some(lbk) => match array.credential_data(lbk) {
+                CredentialData::Absent => StoredData::Empty,
+                CredentialData::Present(data) => StoredData::Bytes(data.len()),
+                CredentialData::Unreadable => StoredData::Unreadable,
+            },
+        };
     }
     Ok((creds, array))
 }
 
 /// The vault credentials on the key, through credential management: no
-/// touch. Each carries how many bytes of data the key holds for it (one
+/// touch. Each carries what the key holds for it ([`StoredData`], from one
 /// read of the largeBlob array), which tells apart vaults that share a name
 /// without unlocking them.
 ///
@@ -99,8 +100,9 @@ pub fn create(
 }
 
 /// [`create`] without the name and size checks: make the credential, unlock
-/// it, seal `initial` and write it, deleting the credential again on any
-/// failure. A rotate uses it to make a vault of the same name.
+/// it, seal `initial` and write it, removing the credential (and any data
+/// written for it) again on any failure. A rotate uses it to make a vault of
+/// the same name.
 pub(crate) fn create_unchecked(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
@@ -117,24 +119,46 @@ pub(crate) fn create_unchecked(
         |k, token| k.make_credential(token, &user_id, name),
     )?;
     let id = made.credential_id;
-    let filled = match made.large_blob_key {
-        None => Err(VaultKeyError::NoLargeBlobKey),
-        Some(lbk) => fill(key, auth, &id, name, lbk, initial, on_step),
+    let Some(lbk) = made.large_blob_key else {
+        return Err(undo(key, auth, &id, None, VaultKeyError::NoLargeBlobKey));
     };
-    filled.map_err(|cause| undo(key, auth, &id, cause))
+    let sealed = unlock_new(key, auth, &id, &lbk, on_step)
+        .and_then(|hmac| Ok((seal(initial, &hmac)?, hmac)));
+    let (blob, hmac) = match sealed {
+        Ok(sealed) => sealed,
+        Err(cause) => return Err(undo(key, auth, &id, None, cause)),
+    };
+    if let Err(cause) = write_array(
+        key,
+        auth,
+        &mut |array| Ok(Some(array.with_credential_blob(&lbk, &blob)?)),
+        on_step,
+    ) {
+        // The write may have landed even though it failed (a lost reply),
+        // so the data is looked for too.
+        return Err(undo(key, auth, &id, Some(&lbk), cause));
+    }
+    Ok(OpenVault::new(
+        VaultRef {
+            credential_id: id,
+            name: Some(name.to_owned()),
+        },
+        initial.clone(),
+        true,
+        hmac,
+        lbk,
+    ))
 }
 
-/// Unlock the new credential `id`, check it is the one just made, and
-/// store `initial` sealed under its secret.
-fn fill(
+/// Unlock the new credential `id` and check it is the one just made (its
+/// largeBlobKey `lbk` from makeCredential); its hmac-secret output.
+fn unlock_new(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
     id: &[u8],
-    name: &str,
-    lbk: Zeroizing<[u8; 32]>,
-    initial: &Vault,
+    lbk: &[u8; 32],
     on_step: &mut dyn FnMut(VaultStep),
-) -> Result<OpenVault, VaultKeyError> {
+) -> Result<Zeroizing<[u8; 32]>, VaultKeyError> {
     let asserted = auth.with_touch(
         key,
         GET_ASSERTION | LARGE_BLOB_WRITE,
@@ -154,38 +178,50 @@ fn fill(
     if !ct_eq(&unlocked_lbk[..], &lbk[..]) {
         return Err(VaultKeyError::KeyMismatch);
     }
-    let blob = seal(initial, &hmac)?;
-    write_array(
-        key,
-        auth,
-        &mut |array| Ok(Some(array.with_credential_blob(&lbk, &blob)?)),
-        on_step,
-    )?;
-    Ok(OpenVault::new(
-        VaultRef {
-            credential_id: id.to_vec(),
-            name: Some(name.to_owned()),
-        },
-        initial.clone(),
-        true,
-        hmac,
-        lbk,
-    ))
+    Ok(hmac)
 }
 
-/// Delete the credential a failed create made, and say why the create
-/// failed.
+/// Clean up after a create that failed with `cause` once credential `id`
+/// was made: remove its data when the write stage was reached (`written`,
+/// the largeBlobKey), then delete the credential, attempted whatever the
+/// data removal did. `left_over` says something is still on the key.
 fn undo(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
     id: &[u8],
+    written: Option<&[u8; 32]>,
     cause: VaultKeyError,
 ) -> VaultKeyError {
-    let left_over = delete_credential(key, auth, id).is_err();
+    let data_left = written.is_some_and(|lbk| remove_data(key, auth, lbk).is_err());
+    let credential_left = delete_credential(key, auth, id).is_err();
     VaultKeyError::CreateUndone {
         cause: Box::new(cause),
-        left_over,
+        left_over: data_left || credential_left,
     }
+}
+
+/// Remove the data sealed under `lbk` from the largeBlob array: one read,
+/// and a write only when there is some (damaged data included).
+fn remove_data(
+    key: &mut impl VaultKey,
+    auth: &mut VaultAuth,
+    lbk: &[u8; 32],
+) -> Result<(), VaultKeyError> {
+    write_array(
+        key,
+        auth,
+        &mut |array| {
+            Ok(match array.credential_data(lbk) {
+                CredentialData::Absent => None,
+                CredentialData::Present(_) | CredentialData::Unreadable => {
+                    Some(array.without_credential_blob(lbk))
+                }
+            })
+        },
+        // Removing data is not a step a front end reports.
+        &mut |_| {},
+    )
+    .map(drop)
 }
 
 /// Delete credential `id` with the current token when it allows credential
@@ -257,20 +293,7 @@ pub(crate) fn delete_known(
     id: &[u8],
     lbk: &[u8; 32],
 ) -> Result<(), VaultKeyError> {
-    write_array(
-        key,
-        auth,
-        &mut |array| {
-            Ok(match array.credential_data(lbk) {
-                CredentialData::Absent => None,
-                CredentialData::Present(_) | CredentialData::Unreadable => {
-                    Some(array.without_credential_blob(lbk))
-                }
-            })
-        },
-        // Removing data is not a step a front end reports.
-        &mut |_| {},
-    )?;
+    remove_data(key, auth, lbk)?;
     delete_credential(key, auth, id)
 }
 
@@ -498,6 +521,64 @@ mod tests {
     }
 
     #[test]
+    fn a_write_whose_reply_is_lost_is_undone() {
+        // The write lands, but its reply does not arrive: the undo finds
+        // the data and removes it, then deletes the credential.
+        let mut key = FakeKey::new();
+        key.add_foreign_entries();
+        let before = key.stored().to_vec();
+        key.lost_write_replies = 1;
+        let (r, steps) = run_create(&mut key, &mut pin(), "Personal", &Vault::default());
+        let (cause, left_over) = undone(r);
+        assert!(
+            matches!(cause, VaultKeyError::Ctap(CtapError::Transport(_))),
+            "{cause:?}"
+        );
+        assert!(!left_over);
+        assert_eq!(key.stored(), &before[..], "the blob is removed");
+        assert!(key.creds.is_empty(), "the credential is removed");
+        assert_eq!(
+            steps,
+            vec![
+                VaultStep::CreateTouch,
+                VaultStep::UnlockTouch,
+                VaultStep::Write
+            ],
+            "removing the data reports no step"
+        );
+        let n = key.log.len();
+        assert_eq!(
+            key.log[n - 6..n - 1].to_vec(),
+            vec![
+                Call::Read,
+                Call::Write,
+                Call::Read,
+                Call::Write,
+                token(CM, None)
+            ]
+        );
+        assert!(matches!(key.log[n - 1], Call::Delete(_)));
+    }
+
+    #[test]
+    fn failed_data_removal_still_deletes_the_credential() {
+        let mut key = FakeKey::new();
+        key.lost_write_replies = 1;
+        // The undo's read is the third (listing, create's write, undo):
+        // refuse the write that follows it.
+        key.hook = Some((
+            3,
+            Box::new(|k: &mut FakeKey| k.write_refusals.push_back(0x30)),
+        ));
+        let (r, _) = run_create(&mut key, &mut pin(), "Personal", &Vault::default());
+        let (_, left_over) = undone(r);
+        assert!(left_over, "the data is still on the key");
+        assert!(key.creds.is_empty(), "the credential delete still ran");
+        assert!(matches!(key.log.last(), Some(Call::Delete(_))));
+        assert_eq!(key.array().len(), 1);
+    }
+
+    #[test]
     fn failed_cleanup_reports_the_left_over_credential() {
         // Missing largeBlobKey, then a delete the key refuses.
         let mut key = FakeKey::new();
@@ -592,7 +673,7 @@ mod tests {
     // ----- list_credentials -----
 
     #[test]
-    fn list_credentials_reports_stored_sizes() {
+    fn list_credentials_reports_what_each_vault_stores() {
         let mut key = FakeKey::new();
         key.add_foreign_entries();
         let p = key.add_vault(
@@ -602,25 +683,30 @@ mod tests {
             },
         );
         let e = key.add_credential(user_handle("Empty").unwrap(), Some("Empty"));
+        let d = key.add_credential(user_handle("Damaged").unwrap(), Some("Damaged"));
+        key.put_unreadable(&d);
 
         let creds = listed(&mut key, &mut pin());
-        assert_eq!(creds.len(), 2);
+        assert_eq!(creds.len(), 3);
         assert_eq!(creds[0].vault.credential_id, p);
         assert_eq!(creds[0].vault.name.as_deref(), Some("Personal"));
         let lbk = key.creds[0].lbk.unwrap();
         let sealed = key.array().credential_blob(&lbk).unwrap().len();
-        assert_eq!(creds[0].stored_bytes, Some(sealed));
+        assert_eq!(creds[0].stored, StoredData::Bytes(sealed));
         assert_eq!(creds[1].vault.credential_id, e);
-        assert_eq!(creds[1].stored_bytes, None);
+        assert_eq!(creds[1].stored, StoredData::Empty);
+        // Damaged data is never reported as no data.
+        assert_eq!(creds[2].vault.credential_id, d);
+        assert_eq!(creds[2].stored, StoredData::Unreadable);
         assert_eq!(
             key.log,
             vec![token(CM | LBW, None), Call::Credentials, Call::Read]
         );
 
-        // Without a largeBlobKey the data can't be found: no size.
+        // Without a largeBlobKey the data can't be looked for.
         key.credmgmt_without_lbk = true;
         let creds = listed(&mut key, &mut pin());
-        assert!(creds.iter().all(|c| c.stored_bytes.is_none()));
+        assert!(creds.iter().all(|c| c.stored == StoredData::Unknown));
     }
 
     // ----- delete -----
@@ -670,6 +756,23 @@ mod tests {
         let (r, _) = run_delete(&mut key, &mut pin(), "Odd");
         r.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(key.array().len(), 0);
+        assert!(key.creds.is_empty());
+    }
+
+    #[test]
+    fn delete_removes_unreadable_data() {
+        let mut key = FakeKey::new();
+        key.add_foreign_entries();
+        let kept = key.stored().to_vec();
+        let id = key.add_credential(user_handle("Damaged").unwrap(), Some("Damaged"));
+        key.put_unreadable(&id);
+        let (r, _) = run_delete(&mut key, &mut pin(), "Damaged");
+        r.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            key.log.contains(&Call::Write),
+            "the damaged entry is removed"
+        );
+        assert_eq!(key.stored(), &kept[..]);
         assert!(key.creds.is_empty());
     }
 

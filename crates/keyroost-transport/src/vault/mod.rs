@@ -49,10 +49,26 @@ pub struct VaultCredential {
     pub vault: VaultRef,
     /// The credential's largeBlobKey, when the key returned it.
     pub large_blob_key: Option<Zeroizing<[u8; 32]>>,
-    /// How many bytes of data the key holds for this vault (the length of
-    /// its decrypted largeBlob entry); `None` when there is none, or no
-    /// largeBlobKey to find it with.
-    pub stored_bytes: Option<usize>,
+    /// What the key holds for this vault, told without unlocking it.
+    pub stored: StoredData,
+}
+
+/// What the key holds for one vault credential, as far as can be told
+/// without unlocking it: how vaults that share a name are told apart.
+/// Deliberately exhaustive, so a front end handles every state and never
+/// shows damaged data as no data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredData {
+    /// No data: the vault opens empty.
+    Empty,
+    /// Data of this many bytes (decrypted).
+    Bytes(usize),
+    /// Data sealed under the vault's largeBlobKey that does not decompress:
+    /// damaged, never empty.
+    Unreadable,
+    /// Credential management gave no largeBlobKey for it, so the data could
+    /// not be looked for.
+    Unknown,
 }
 
 impl AsRef<VaultRef> for VaultCredential {
@@ -70,7 +86,7 @@ impl fmt::Debug for VaultCredential {
                 "large_blob_key",
                 &self.large_blob_key.as_ref().map(|_| "<redacted>"),
             )
-            .field("stored_bytes", &self.stored_bytes)
+            .field("stored", &self.stored)
             .finish()
     }
 }
@@ -136,7 +152,9 @@ pub enum VaultKeyError {
     /// unlock than when it made it.
     KeyMismatch,
     /// Creating a vault failed after its credential was made; the
-    /// credential was deleted again, unless `left_over`.
+    /// credential (and any data written for it) was removed again, unless
+    /// `left_over`: then cleaning up failed, and the new credential or its
+    /// data is still on the key.
     CreateUndone {
         cause: Box<VaultKeyError>,
         left_over: bool,
@@ -195,7 +213,7 @@ impl fmt::Display for VaultKeyError {
                 left_over: true,
             } => write!(
                 f,
-                "the vault was not created: {cause}; removing its new credential failed too, so it is left on the key with no data"
+                "the vault was not created: {cause}; cleaning up failed too, so its new credential or its data is still on the key"
             ),
             VaultKeyError::Conflict => f.write_str(
                 "this changed on the key since the vault was opened; nothing was written",
@@ -762,7 +780,7 @@ mod tests {
         assert_eq!(creds[0].vault.name.as_deref(), Some("Personal"));
         assert_eq!(creds[0].as_ref().credential_id, id);
         assert!(creds[0].large_blob_key.is_some());
-        assert_eq!(creds[0].stored_bytes, None);
+        assert_eq!(creds[0].stored, StoredData::Unknown);
         assert_eq!(
             key.log,
             vec![
@@ -789,7 +807,7 @@ mod tests {
                 name: Some("Personal".into()),
             },
             large_blob_key: Some(Zeroizing::new([0xAB; 32])),
-            stored_bytes: Some(10),
+            stored: StoredData::Bytes(10),
         };
         let shown = format!("{c:?}");
         assert!(!shown.contains("171"), "{shown}");
@@ -812,6 +830,7 @@ mod tests {
         send::<VaultKeyError>();
         send::<VaultStep>();
         send::<VaultProblem>();
+        send::<StoredData>();
         send::<OpenVault>();
         send::<VaultOnKey>();
         send::<Unlocked>();

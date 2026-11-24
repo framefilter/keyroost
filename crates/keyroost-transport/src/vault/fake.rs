@@ -24,7 +24,7 @@ use keyroost_ctap::{AuthenticatorInfo, CtapError};
 use keyroost_vault::{open, seal, user_handle, Vault};
 use zeroize::Zeroizing;
 
-use super::{vault_name, VaultCredential, VaultKey, VaultRef};
+use super::{vault_name, StoredData, VaultCredential, VaultKey, VaultRef};
 
 /// `CTAP2_ERR_PIN_INVALID`.
 const PIN_INVALID: u8 = 0x31;
@@ -39,6 +39,23 @@ const NO_CREDENTIALS: u8 = 0x2E;
 const STORAGE_FULL: u8 = 0x3B;
 /// The checksum trailer after a serialized largeBlob array.
 const CHECKSUM_LEN: usize = 16;
+
+/// The largeBlobKey [`UNREADABLE_ENTRY`] is sealed under.
+pub(crate) const UNREADABLE_LBK: [u8; 32] = [0x5E; 32];
+
+/// A largeBlob entry whose GCM tag verifies under [`UNREADABLE_LBK`] but
+/// whose plaintext is not DEFLATE, so it never inflates: `{1: ciphertext,
+/// 2: nonce, 3: origSize}` with AES-256-GCM under `[0x5E; 32]`, nonce
+/// `[0x22; 12]`, AAD `b"blob" || u64le(32)`, plaintext
+/// `b"\xff\xff not deflate"` (0xFF opens a block of the reserved type), as
+/// keyroost-ctap's own `credential_data` test seals it. Precomputed because
+/// this crate has no AES-GCM of its own.
+const UNREADABLE_ENTRY: &[u8] = &[
+    0xa3, 0x01, 0x58, 0x1e, 0xb0, 0xba, 0xb0, 0xf7, 0x17, 0xa7, 0x4a, 0x1f, 0xa1, 0xa1, 0xba, 0x83,
+    0x8f, 0x01, 0xf6, 0x21, 0x61, 0xa7, 0x1e, 0x9f, 0xf5, 0x65, 0xb4, 0x8d, 0x10, 0xa5, 0x3c, 0x1f,
+    0x4a, 0x1b, 0x02, 0x4c, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+    0x03, 0x18, 0x20,
+];
 
 /// One credential on the fake key.
 #[derive(Clone)]
@@ -73,6 +90,9 @@ pub(crate) struct FakeKey {
     /// Status codes the next writes answer, one per write, before anything
     /// else is checked (the store is left as it was).
     pub write_refusals: VecDeque<u8>,
+    /// How many of the next writes store the array and then fail anyway,
+    /// as a write whose reply was lost.
+    pub lost_write_replies: usize,
     /// Status codes the next credential deletes answer, one per delete,
     /// before anything else is checked (the credential stays).
     pub delete_refusals: VecDeque<u8>,
@@ -131,6 +151,7 @@ impl FakeKey {
             log: Vec::new(),
             write_refusals: VecDeque::new(),
             delete_refusals: VecDeque::new(),
+            lost_write_replies: 0,
             write_perms: Vec::new(),
             hook: None,
             mc_without_lbk: false,
@@ -209,6 +230,24 @@ impl FakeKey {
     pub fn put_vault(&mut self, id: &[u8], vault: &Vault) {
         let blob = seal(vault, &self.cred(id).hmac).unwrap();
         self.put_blob(id, &blob);
+    }
+
+    /// Give credential `id` the largeBlobKey [`UNREADABLE_LBK`] and store
+    /// [`UNREADABLE_ENTRY`] as its data: sealed under its key, but damaged.
+    pub fn put_unreadable(&mut self, id: &[u8]) {
+        self.creds
+            .iter_mut()
+            .find(|c| c.id == id)
+            .expect("a credential the test made")
+            .lbk = Some(UNREADABLE_LBK);
+        let serialized = self.array().serialize_with_checksum().unwrap();
+        let body = &serialized[..serialized.len() - CHECKSUM_LEN];
+        // A short array's header is one byte, 0x80 + its length.
+        assert!((0x80..0x97).contains(&body[0]), "a short array");
+        let mut grown = vec![body[0] + 1];
+        grown.extend_from_slice(&body[1..]);
+        grown.extend_from_slice(UNREADABLE_ENTRY);
+        self.set_array(&LargeBlobArray::parse(&grown).unwrap());
     }
 
     /// Add what other tools keep in the store: another relying party's
@@ -365,7 +404,7 @@ impl VaultKey for FakeKey {
                 } else {
                     c.lbk.map(Zeroizing::new)
                 },
-                stored_bytes: None,
+                stored: StoredData::Unknown,
             })
             .collect())
     }
@@ -419,6 +458,10 @@ impl VaultKey for FakeKey {
             .ok_or(CtapError::InvalidArgument("no checksum"))?;
         LargeBlobArray::parse(&serialized[..body])?;
         self.stored = serialized.to_vec();
+        if self.lost_write_replies > 0 {
+            self.lost_write_replies -= 1;
+            return Err(CtapError::Transport("the reply was lost".into()));
+        }
         Ok(())
     }
 }
@@ -601,6 +644,40 @@ mod tests {
         let t = token(&mut key, GET_ASSERTION);
         assert!(key.assertions(&t, Some(b"nope")).unwrap().is_empty());
         assert_eq!(key.perms_of(&t), GET_ASSERTION);
+    }
+
+    #[test]
+    fn the_unreadable_entry_is_sealed_under_its_key_and_damaged() {
+        use keyroost_ctap::large_blobs::CredentialData;
+        let mut key = FakeKey::new();
+        key.add_foreign_entries();
+        let id = key.add_credential(b"plain".to_vec(), None);
+        key.put_unreadable(&id);
+        let array = key.array();
+        assert_eq!(array.len(), 4);
+        assert!(matches!(
+            array.credential_data(&UNREADABLE_LBK),
+            CredentialData::Unreadable
+        ));
+        assert_eq!(array.without_credential_blob(&UNREADABLE_LBK).len(), 3);
+    }
+
+    #[test]
+    fn a_lost_reply_still_stores() {
+        let mut key = FakeKey::new();
+        key.lost_write_replies = 1;
+        let t = token(&mut key, LARGE_BLOB_WRITE);
+        let note = key
+            .array()
+            .with_text_note("x")
+            .serialize_with_checksum()
+            .unwrap();
+        assert!(matches!(
+            key.write_blobs(&t, &note),
+            Err(CtapError::Transport(_))
+        ));
+        assert_eq!(key.array().len(), 1);
+        key.write_blobs(&t, &note).unwrap();
     }
 
     #[test]

@@ -12,7 +12,7 @@ use keyroost_ctap::{get_info, AuthenticatorInfo, CtapError};
 use keyroost_vault::{PRF_INPUT, RP_ID, RP_NAME};
 use zeroize::Zeroizing;
 
-use super::{check_support, vault_name, VaultCredential, VaultKeyError, VaultRef};
+use super::{check_support, vault_name, StoredData, VaultCredential, VaultKeyError, VaultRef};
 
 /// The key calls a vault flow makes. Every call is one CTAP exchange (or one
 /// largeBlob read/write); the flows decide order, tokens and retries.
@@ -46,7 +46,7 @@ pub trait VaultKey {
     ) -> Result<Vec<Assertion>, CtapError>;
 
     /// The vault credentials through credential management (no touch). No
-    /// vault credential is an empty list; `stored_bytes` is left `None`.
+    /// vault credential is an empty list; `stored` is left [`StoredData::Unknown`].
     fn credentials(&mut self, token: &PinUvAuthToken) -> Result<Vec<VaultCredential>, CtapError>;
 
     /// Delete one credential through credential management (no touch).
@@ -165,7 +165,7 @@ impl<T: CtapTransport> VaultKey for CtapVaultKey<T> {
                     name: vault_name(Some(&c.user.id), c.user.name.as_deref()),
                 },
                 large_blob_key: c.large_blob_key.map(Zeroizing::new),
-                stored_bytes: None,
+                stored: StoredData::Unknown,
             })
             .collect())
     }

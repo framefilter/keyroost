@@ -467,7 +467,7 @@ pub fn save(
 #[cfg(test)]
 mod tests {
     use super::super::fake::{Call, FakeKey};
-    use super::super::VaultCredential;
+    use super::super::{StoredData, VaultCredential};
     use super::*;
     use keyroost_ctap::client_pin::permissions::{GET_ASSERTION as GA, LARGE_BLOB_WRITE as LBW};
     use keyroost_ctap::CtapError;
@@ -792,7 +792,7 @@ mod tests {
         let cred = |vault: VaultRef| VaultCredential {
             vault,
             large_blob_key: None,
-            stored_bytes: None,
+            stored: StoredData::Unknown,
         };
         let none: Vec<VaultCredential> = Vec::new();
         assert!(matches!(
