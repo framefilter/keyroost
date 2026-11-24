@@ -1,9 +1,11 @@
 //! Vault data model and its JSON (format 2 written, format 1 read).
 
 use crate::error::VaultError;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-/// One password entry.
+/// One password entry. Every field is wiped when it is dropped: usernames
+/// and notes (where people keep recovery codes) are as private as the
+/// password.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Entry {
     pub id: String,
@@ -15,6 +17,26 @@ pub struct Entry {
     /// Last modified, minutes since the Unix epoch.
     pub modified_minutes: i64,
 }
+
+impl Zeroize for Entry {
+    fn zeroize(&mut self) {
+        self.id.zeroize();
+        self.title.zeroize();
+        self.username.zeroize();
+        self.password.zeroize();
+        self.url.zeroize();
+        self.notes.zeroize();
+        self.modified_minutes.zeroize();
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Entry {}
 
 // Debug never prints the password.
 impl std::fmt::Debug for Entry {
@@ -351,6 +373,24 @@ mod tests {
         );
         // 6f 1f 0c 3e 6a 2b -> base64url
         assert_eq!(canon_id("6f1f0c3e-6a2b-4c7e-9a3b-0f2c1d4e5a6b"), "bx8MPmor");
+    }
+
+    #[test]
+    fn zeroize_clears_every_text_field() {
+        use zeroize::Zeroize;
+        let mut e = entry("https://mail.example", "recovery codes");
+        e.zeroize();
+        for (name, f) in [
+            ("id", e.id.as_str()),
+            ("title", e.title.as_str()),
+            ("username", e.username.as_str()),
+            ("password", e.password.as_str()),
+            ("url", e.url.as_str()),
+            ("notes", e.notes.as_str()),
+        ] {
+            assert!(f.is_empty(), "{name} not wiped");
+        }
+        assert_eq!(e.modified_minutes, 0);
     }
 
     #[test]
