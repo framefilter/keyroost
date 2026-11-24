@@ -346,8 +346,13 @@ fn write_key_name(
         label: l.to_string(),
         writer: Some(WRITER_KEYROOST.to_string()),
     });
-    let plan = plan_label_change(&current, &info, new.as_ref(), random_nonce().map_err(|e| e.to_string())?)
-        .map_err(|e| key_name_failure(e, used))?;
+    let plan = plan_label_change(
+        &current,
+        &info,
+        new.as_ref(),
+        random_nonce().map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| key_name_failure(e, used))?;
     // An unreadable name on the key counts as none: only a readable one
     // other than the name the dialog showed is a change to refuse.
     let previous = plan

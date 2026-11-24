@@ -17,10 +17,10 @@
 //! (`clientPin` subcommands, getting a pinUvAuthToken, etc.) live in
 //! [`crate::client_pin`].
 
+use crate::cmd::CtapError;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use aes::Aes256;
 use hmac::{Hmac, KeyInit, Mac};
-use crate::cmd::CtapError;
 use p256::ecdh::EphemeralSecret;
 use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
 use p256::elliptic_curve::Generate;
