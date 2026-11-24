@@ -65,6 +65,19 @@ Being worked on right now — check with whoever holds it before starting.
   bug can refuse a keyroost backup restored into GnuPG on Ubuntu 26.04
   ("Bad passphrase" on first decrypt); keyroost's export is not at fault.
 
+- **Drop the carried hidapi fix once a hidapi release has it — waits on
+  hidapi.** The root `Cargo.toml` patches hidapi to the commit of
+  [ruabmbua/hidapi-rs#189](https://github.com/ruabmbua/hidapi-rs/pull/189),
+  carried on the `keyroost-windows-serial-fallback-fix` branch of
+  framefilter/hidapi-rs, because hidapi 2.6.7 can panic while listing HID
+  devices on some Windows PCs ([#281](https://github.com/framefilter/keyroost/pull/281)).
+  Check upstream at the end of every dev cycle, with the Windows test round:
+  is #189 merged, and is there a hidapi release on crates.io with it? When
+  there is, delete the `[patch.crates-io]` section and the `outputHashes`
+  entry in `flake.nix`, run `cargo update -p hidapi`, re-run the Windows
+  round, and then delete the fork's branch. Until then, leave that branch as
+  it is: the builds and the Flatpak fetch from it.
+
 - **OnlyKey recognition
   ([#37](https://github.com/framefilter/keyroost/issues/37), filed as "serial
   number detection on hardware keys") — needs testing on an OnlyKey.**
