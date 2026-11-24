@@ -612,7 +612,8 @@ pub(crate) struct FidoVaultEntryListJson {
     pub entries: Vec<FidoVaultEntryJson>,
 }
 
-/// One entry in `fido vault entry list`.
+/// One entry in `fido vault entry list`. Its fields are entry data, wiped
+/// when it is dropped.
 #[derive(Serialize)]
 pub(crate) struct FidoVaultEntryJson {
     /// The entry's id in the vault, as FidoParole stores it.
@@ -624,6 +625,16 @@ pub(crate) struct FidoVaultEntryJson {
     pub url: Option<String>,
     /// Last changed, `YYYY-MM-DD` (UTC).
     pub changed: String,
+}
+
+impl Drop for FidoVaultEntryJson {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.id.zeroize();
+        self.title.zeroize();
+        self.username.zeroize();
+        self.url.zeroize();
+    }
 }
 
 /// `keyroostctl --json fido vault import` — what the import does with each
@@ -638,7 +649,8 @@ pub(crate) struct FidoVaultImportJson {
     pub entries: Vec<FidoVaultImportRowJson>,
 }
 
-/// One backup entry in `fido vault import`.
+/// One backup entry in `fido vault import`. Its text is entry data, wiped
+/// when it is dropped.
 #[derive(Serialize)]
 pub(crate) struct FidoVaultImportRowJson {
     /// Its place in the backup, from 0.
@@ -652,6 +664,15 @@ pub(crate) struct FidoVaultImportRowJson {
     pub plan: &'static str,
     /// Why a row is not a plain add; `null` for one.
     pub reason: Option<&'static str>,
+}
+
+impl Drop for FidoVaultImportRowJson {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.id.zeroize();
+        self.title.zeroize();
+        self.username.zeroize();
+    }
 }
 
 /// `keyroostctl --json fido vault entry show` — one entry; the password
@@ -675,9 +696,13 @@ pub(crate) struct FidoVaultEntryShowJson {
 impl Drop for FidoVaultEntryShowJson {
     fn drop(&mut self) {
         use zeroize::Zeroize;
+        self.vault.zeroize();
+        self.id.zeroize();
+        self.title.zeroize();
         self.username.zeroize();
         self.url.zeroize();
         self.notes.zeroize();
+        self.changed.zeroize();
         self.password.zeroize();
     }
 }

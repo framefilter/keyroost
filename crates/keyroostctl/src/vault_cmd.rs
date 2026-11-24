@@ -764,6 +764,7 @@ fn imported_line(vault: Option<&str>, added: usize, replaced: usize) -> String {
 }
 
 /// One backup entry in the import preview: what the import does with it.
+/// Its text is entry data, wiped when it is dropped.
 #[derive(Debug, Clone)]
 pub(crate) struct ImportRow {
     /// Its place in the backup, from 0.
@@ -775,6 +776,14 @@ pub(crate) struct ImportRow {
     /// `add`, `replace`, `exists` or `skip`.
     pub(crate) plan: &'static str,
     pub(crate) reason: Option<&'static str>,
+}
+
+impl Drop for ImportRow {
+    fn drop(&mut self) {
+        self.id.zeroize();
+        self.title.zeroize();
+        self.username.zeroize();
+    }
 }
 
 const NEWER: &str = "the backup's copy is newer";
