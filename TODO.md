@@ -152,6 +152,13 @@ plan's two-key manual steps were never executed):
 
 ## Deferred to a later release
 
+- **Interactive CLI import for vault backups.** Start from the
+  `fido vault import` preview, where each row says `add`, `replace`,
+  `exists` or `skip` with its reason, and explore letting the user pick, in
+  the terminal, which rows to bring in or overwrite. The owner isn't sure it
+  will be built, since vaults may grow large, but wants a smoother CLI path
+  than `--entry`. Vault CLI PR: #NNN (fill in when the PR is opened).
+
 - **Keep copied codes out of clipboard history on native Wayland** (waits for
   GNOME). Copies are marked `x-kde-passwordManagerHint=secret` on X11 and
   with the platform markers on Windows and macOS, but on native Wayland they

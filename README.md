@@ -46,7 +46,10 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   direct USB. Resident-credential metadata surfaces the fuller passkey detail
   too: the user's UPN, display name, user id, and the full credential id.
   Resident SSH credentials can be listed and their stored OpenSSH certificate
-  extracted from largeBlob to a `-cert.pub` file (`fido ssh`).
+  extracted from largeBlob to a `-cert.pub` file (`fido ssh`). Also an
+  encrypted password vault on FIDO2 keys with largeBlob storage, opened with
+  the PIN and a touch (`fido vault`); it uses Token2 FidoParole's vault and
+  backup formats, checked against FidoParole's own vault code and libfido2.
 - **OATH (TOTP/HOTP)** — list, add, delete, and compute codes over PC/SC,
   including applet-password set / clear / unlock, and a factory reset of the
   applet (`oath reset`) — the recovery path for a forgotten password. In
@@ -735,6 +738,11 @@ keyroostctl fido pin status
 keyroostctl fido credential list             # asks for the PIN (nothing is shown as you type)
 keyroostctl fido ssh list                     # list SSH certs stored in resident credentials
 keyroostctl fido ssh export --rp ssh:demo --out demo-cert.pub
+keyroostctl fido vault add Personal           # a new password vault on the key (two touches)
+keyroostctl fido vault entry add GitHub --username alice --generate-password
+keyroostctl fido vault entry show GitHub --reveal | wl-copy
+keyroostctl fido vault export Personal -o personal.t2vault
+keyroostctl fido vault import -i personal.t2vault --dry-run   # preview; writes nothing
 
 # --- OATH over PC/SC ---
 keyroostctl oath list
@@ -1110,7 +1118,7 @@ old script.
 | `keyroost-winwebauthn` | Windows-only helper for the non-admin FIDO2 path: detect a FIDO key via the HID access-denied signal, open Windows' security-key settings, and relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-windevtree` | Windows-only device-tree lookups that let a key's FIDO HID node and smart-card reader be recognized as one physical key, without opening the device or connecting to the card; isolates the unsafe Win32 FFI; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-screengrab` | Windows-only still screen capture (GDI `BitBlt`) for QR-from-screen; isolates the unsafe Win32 FFI from the GUI crate; inert on non-Windows | `windows-sys` (Windows only) |
-| `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `serde`/`serde_json`, `zeroize`, `rpassword` (hidden PIN/password prompt) |
+| `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `serde`/`serde_json`, `zeroize`, `rpassword` (hidden PIN/password prompt); in-tree `keyroost-vault` |
 | `keyroost` | egui desktop GUI | `eframe`, `egui`, `arboard`, `rfd`, `pollster`, `png`, `base64`, `serde`/`serde_json`, `zeroize`; `x11rb`/`ashpd` on Linux (`qr` feature); `wgpu` (DirectX 12 only) on Windows; `winresource` build-dep on Windows |
 
 ## Protocol
