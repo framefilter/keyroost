@@ -63,7 +63,7 @@ impl std::fmt::Display for EncryptError {
             EncryptError::BadDevicePubkey => {
                 write!(f, "device ECDH public key was not a valid P-256 point")
             }
-            EncryptError::RngFailed => write!(f, "host RNG failed generating ephemeral key"),
+            EncryptError::RngFailed => write!(f, "the system's random number source failed"),
             EncryptError::BadCiphertext => write!(f, "session ciphertext failed to decrypt"),
             EncryptError::BadAuthTag => write!(f, "session HMAC authentication tag mismatch"),
             EncryptError::BadLength => {
