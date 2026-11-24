@@ -155,6 +155,13 @@ fn warm_reset(context: &Context, reader: &std::ffi::CStr) -> bool {
     ok
 }
 
+/// Constant-time slice equality (fold-XOR; no early exit on the bytes): how
+/// one secret is compared with another anywhere in this crate (a PIV
+/// management-key witness, a vault's largeBlobKey).
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 mod oath;
 pub use oath::OathSession;
 
@@ -221,6 +228,8 @@ pub mod trace;
 /// Bulk-import adapters: store a planned import on OATH, Token2 OTP and Molto2
 /// keys one code at a time (see `keyroost_import::run`).
 pub mod import;
+
+pub mod vault;
 
 /// Read-only identity reads (#51) used to match a key's FIDO-HID node to its
 /// smart-card reader.
@@ -2799,6 +2808,29 @@ pub(crate) fn transmit_applet(
             }
             Continuation::Done => return Ok((acc, u16::from_be_bytes([sw[0], sw[1]]))),
         }
+    }
+}
+
+#[cfg(test)]
+mod ct_eq_tests {
+    use super::ct_eq;
+
+    #[test]
+    fn equal_slices_match() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(&[0x5A; 32], &[0x5A; 32]));
+    }
+
+    #[test]
+    fn any_differing_byte_or_length_does_not_match() {
+        let a = [0x5A; 32];
+        for i in 0..a.len() {
+            let mut b = a;
+            b[i] ^= 0x01;
+            assert!(!ct_eq(&a, &b), "byte {i}");
+        }
+        assert!(!ct_eq(&a, &a[..31]));
+        assert!(!ct_eq(b"", b"x"));
     }
 }
 

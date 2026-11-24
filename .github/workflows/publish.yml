@@ -106,10 +106,11 @@ jobs:
           # keyroost-feitianotp (new after 0.16.0) depends only on
           # keyroost-proto and keyroost-transport depends on it, so it sits
           # next to keyroost-token2otp; same one-time hand publish first.
-          # keyroost-vault (new after 0.16.0) has no in-tree deps; only
-          # keyroost-ctap names it, as a path-only dev-dependency that cargo
-          # strips, so it goes before keyroost-ctap for the transport layer
-          # that will depend on both; same one-time hand publish first.
+          # keyroost-vault (new after 0.16.0) has no in-tree deps;
+          # keyroost-ctap names it only as a path-only dev-dependency that
+          # cargo strips, and keyroost-transport depends on it (for its vault
+          # sessions), so it goes before keyroost-ctap and well before
+          # keyroost-transport; same one-time hand publish first.
           for crate in keyroost-proto keyroost-windevtree keyroost-hid \
                        keyroost-keyring keyroost-rsakey keyroost-vault \
                        keyroost-ctap keyroost-oath keyroost-openpgp keyroost-piv \
