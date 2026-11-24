@@ -50,6 +50,10 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   encrypted password vault on FIDO2 keys with a large-blob store, opened with
   the PIN and a touch (`fido vault`); it uses Token2 FidoParole's vault and
   backup formats, checked against FidoParole's own vault code and libfido2.
+  The large-blob store is shared space on the key, meant for data that
+  belongs to a passkey; each vault is kept there as the data of its own
+  credential. Websites may store data there too, so keep vaults small;
+  `fido vault list` shows how full the store is.
 - **OATH (TOTP/HOTP)** — list, add, delete, and compute codes over PC/SC,
   including applet-password set / clear / unlock, and a factory reset of the
   applet (`oath reset`) — the recovery path for a forgotten password. In

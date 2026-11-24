@@ -2958,6 +2958,11 @@ enum FidoCmd {
     /// with a secret only the key gives out (after the PIN and a touch) and
     /// stored in the key's large-blob store. If the key is lost or reset,
     /// its vaults go with it: keep a backup.
+    ///
+    /// The large-blob store is shared space on the key, meant for data that
+    /// belongs to a passkey; each vault is kept there as the data of its own
+    /// credential. Websites may store data there too, so keep vaults small;
+    /// `fido vault list` shows how full the store is.
     Vault {
         #[command(subcommand)]
         cmd: vault_cmd::FidoVaultCmd,
