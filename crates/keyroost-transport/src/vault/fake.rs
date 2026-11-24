@@ -5,8 +5,10 @@
 //!
 //! It behaves like a CTAP 2.1 key where it matters to the flows: one token
 //! is current at a time (a new one invalidates the old), a token must carry
-//! the permission a call needs, and a write larger than the store is
-//! refused.
+//! the permission a call needs, a successful makeCredential or
+//! getAssertion leaves the token only its largeBlobWrite permission (CTAP
+//! 2.1 `clearPinUvAuthTokenPermissionsExceptLbw`), and a write larger than
+//! the store is refused.
 
 use std::collections::VecDeque;
 
@@ -251,6 +253,15 @@ impl FakeKey {
             Err(CtapError::StatusCode(PIN_AUTH_INVALID))
         }
     }
+
+    /// CTAP 2.1 `clearPinUvAuthTokenPermissionsExceptLbw`: after a
+    /// makeCredential or getAssertion with user presence, `token` keeps only
+    /// its largeBlobWrite permission.
+    fn keep_only_lbw(&mut self, token: &PinUvAuthToken) {
+        if let Some((_, perms)) = self.issued.iter_mut().find(|(t, _)| *t == token.token) {
+            *perms &= LARGE_BLOB_WRITE;
+        }
+    }
 }
 
 impl VaultKey for FakeKey {
@@ -293,6 +304,7 @@ impl VaultKey for FakeKey {
         if self.mc_without_lbk {
             self.creds.last_mut().expect("just added").lbk = None;
         }
+        self.keep_only_lbw(token);
         Ok(MadeCredential {
             credential_id: id.clone(),
             large_blob_key: self.cred(&id).lbk.map(Zeroizing::new),
@@ -313,7 +325,7 @@ impl VaultKey for FakeKey {
             .filter(|c| allow.is_none_or(|id| c.id == id))
             .collect();
         let count = matching.len() as u32;
-        Ok(matching
+        let found: Vec<Assertion> = matching
             .into_iter()
             .enumerate()
             .map(|(i, c)| Assertion {
@@ -324,7 +336,13 @@ impl VaultKey for FakeKey {
                 large_blob_key: c.lbk.map(Zeroizing::new),
                 number_of_credentials: (i == 0).then_some(count),
             })
-            .collect())
+            .collect();
+        // A key with no matching credential answers NO_CREDENTIALS before
+        // any touch, so the token keeps its permissions then.
+        if !found.is_empty() {
+            self.keep_only_lbw(token);
+        }
+        Ok(found)
     }
 
     fn credentials(&mut self, token: &PinUvAuthToken) -> Result<Vec<VaultCredential>, CtapError> {
@@ -512,6 +530,7 @@ mod tests {
         assert!(key.vault_on_key(&made.credential_id).is_none());
 
         key.mc_without_lbk = false;
+        let mc = token(&mut key, MAKE_CREDENTIAL);
         let made = key
             .make_credential(&mc, &user_handle("B").unwrap(), "B")
             .unwrap();
@@ -521,6 +540,7 @@ mod tests {
         let only = key.assertions(&ga, Some(&made.credential_id)).unwrap();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].number_of_credentials, Some(1));
+        let ga = token(&mut key, GET_ASSERTION);
         let none = key.assertions(&ga, Some(b"nope")).unwrap();
         assert!(none.is_empty());
 
@@ -543,6 +563,37 @@ mod tests {
             Err(CtapError::StatusCode(NO_CREDENTIALS))
         ));
         assert_eq!(key.creds.len(), 1);
+    }
+
+    #[test]
+    fn makecredential_and_getassertion_leave_only_lbw() {
+        let mut key = FakeKey::new();
+        let id = key.add_vault("Personal", &Vault::default());
+        let t = token(&mut key, GET_ASSERTION | LARGE_BLOB_WRITE);
+        assert_eq!(key.assertions(&t, None).unwrap().len(), 1);
+        assert_eq!(key.perms_of(&t), LARGE_BLOB_WRITE);
+        assert!(matches!(
+            key.assertions(&t, Some(&id)),
+            Err(CtapError::StatusCode(PIN_AUTH_INVALID))
+        ));
+        let bytes = key.stored().to_vec();
+        key.write_blobs(&t, &bytes).unwrap();
+        assert_eq!(key.write_perms, vec![LARGE_BLOB_WRITE]);
+
+        let t = token(&mut key, MAKE_CREDENTIAL | LARGE_BLOB_WRITE);
+        key.make_credential(&t, &user_handle("Work").unwrap(), "Work")
+            .unwrap();
+        assert_eq!(key.perms_of(&t), LARGE_BLOB_WRITE);
+        assert!(matches!(
+            key.make_credential(&t, &user_handle("Other").unwrap(), "Other"),
+            Err(CtapError::StatusCode(PIN_AUTH_INVALID))
+        ));
+        key.write_blobs(&t, &bytes).unwrap();
+
+        // No credential matched: nothing was touched, nothing cleared.
+        let t = token(&mut key, GET_ASSERTION);
+        assert!(key.assertions(&t, Some(b"nope")).unwrap().is_empty());
+        assert_eq!(key.perms_of(&t), GET_ASSERTION);
     }
 
     #[test]

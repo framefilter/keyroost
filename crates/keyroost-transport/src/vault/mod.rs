@@ -195,7 +195,7 @@ impl fmt::Display for VaultKeyError {
             ),
             VaultKeyError::Full { needed, max } => write!(
                 f,
-                "the key's largeBlob storage is too small: this needs {needed} of its {max} bytes; nothing was written"
+                "the key's largeBlob storage is too small: this needs {needed} bytes, and it holds {max}; nothing was written"
             ),
             VaultKeyError::CannotOpen(p) => write!(f, "this vault cannot be opened: {p}"),
             VaultKeyError::RotateNotVerified => {
@@ -293,7 +293,8 @@ impl VaultAuth {
     }
 
     /// The current token, only when its permissions include every bit of
-    /// `permissions`.
+    /// `permissions`. The stored RP is not checked: largeBlobWrite and
+    /// credential-management tokens are requested without one.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "the vault flows that call it come next")
@@ -614,7 +615,10 @@ mod tests {
         }
         assert!(all[3].to_string().contains("\"Personal\""));
         let full = all[10].to_string();
-        assert!(full.contains("2048") && full.contains("1024"), "{full}");
+        assert!(
+            full.contains("needs 2048 bytes") && full.contains("holds 1024"),
+            "{full}"
+        );
         assert!(all[7]
             .to_string()
             .contains(&VaultKeyError::NoLargeBlobKey.to_string()));
