@@ -75,6 +75,12 @@ pub struct MadeCredential {
     pub credential_id: Vec<u8>,
     /// The per-credential `largeBlobKey` (response key 0x05), when the
     /// authenticator returned one.
+    ///
+    /// `None` even when the request asked for one is not an error here: the
+    /// credential already exists on the key, and the caller needs
+    /// `credential_id` to remove it. A caller that needs the key (a vault
+    /// create does) must treat `None` as a failure and delete the
+    /// credential it just made.
     pub large_blob_key: Option<Zeroizing<[u8; 32]>>,
     /// The `credProtect` policy the authenticator reports in its
     /// authenticator-data extension outputs, when present.
@@ -277,10 +283,19 @@ fn check_request(info: &AuthenticatorInfo, req: &MakeCredentialRequest) -> Resul
             "this key does not support the hmac-secret extension",
         ));
     }
-    if req.large_blob_key && !has(EXT_LARGE_BLOB_KEY) {
-        return Err(CtapError::Unsupported(
-            "this key does not support large-blob keys (largeBlobKey)",
-        ));
+    if req.large_blob_key {
+        if !has(EXT_LARGE_BLOB_KEY) || info.option("largeBlobs") != Some(true) {
+            return Err(CtapError::Unsupported(
+                "this key does not support large-blob keys (largeBlobKey)",
+            ));
+        }
+        // CTAP 2.1 §12.3: the key answers largeBlobKey without rk with
+        // CTAP2_ERR_INVALID_OPTION; refuse it before the touch.
+        if !req.resident {
+            return Err(CtapError::InvalidArgument(
+                "a large-blob key needs a resident (discoverable) credential",
+            ));
+        }
     }
     if req.resident && info.option("rk") != Some(true) {
         return Err(CtapError::Unsupported(
@@ -359,7 +374,7 @@ mod tests {
                 EXT_HMAC_SECRET.into(),
                 EXT_LARGE_BLOB_KEY.into(),
             ],
-            options: vec![("rk".into(), true)],
+            options: vec![("rk".into(), true), ("largeBlobs".into(), true)],
             ..Default::default()
         }
     }
@@ -614,7 +629,16 @@ mod tests {
             without(EXT_HMAC_SECRET),
             without(EXT_LARGE_BLOB_KEY),
             AuthenticatorInfo {
-                options: vec![("rk".into(), false)],
+                options: vec![("rk".into(), false), ("largeBlobs".into(), true)],
+                ..full_info()
+            },
+            // largeBlobKey is only useful with largeBlob storage.
+            AuthenticatorInfo {
+                options: vec![("rk".into(), true), ("largeBlobs".into(), false)],
+                ..full_info()
+            },
+            AuthenticatorInfo {
+                options: vec![("rk".into(), true)],
                 ..full_info()
             },
         ];
@@ -638,6 +662,8 @@ mod tests {
             with(|r| r.user_id = &[]),
             with(|r| r.user_id = &[0u8; 65]),
             with(|r| r.cred_protect = Some(4)),
+            // CTAP 2.1 §12.3: largeBlobKey without rk is INVALID_OPTION.
+            with(|r| r.resident = false),
         ];
         for req in bad {
             let mut dev = FixedDevice::new(vec![0x00]);
