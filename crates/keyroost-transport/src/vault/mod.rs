@@ -24,7 +24,7 @@ mod key;
 pub use key::{CtapVaultKey, VaultKey};
 
 mod ops;
-pub use ops::{matching, unlock, OpenVault, Unlocked, VaultOnKey, VaultPick};
+pub use ops::{matching, save, unlock, Change, OpenVault, Saved, Unlocked, VaultOnKey, VaultPick};
 
 #[cfg(test)]
 mod fake;
@@ -295,10 +295,6 @@ impl VaultAuth {
     /// The current token, only when its permissions include every bit of
     /// `permissions`. The stored RP is not checked: largeBlobWrite and
     /// credential-management tokens are requested without one.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the vault flows that call it come next")
-    )]
     pub(crate) fn current_for(&self, permissions: u32) -> Option<&PinUvAuthToken> {
         match &self.token {
             Some((token, held, _)) if held & permissions == permissions => Some(token),
