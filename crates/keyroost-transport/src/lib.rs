@@ -308,7 +308,7 @@ pub enum TransportError {
     PivManagementKeyDeleteUnsupported,
     /// [`PivSession::set_management_key`] was asked for a key that needs a
     /// touch on a card whose own management-key command has no such form (a
-    /// Feitian card). Nothing was sent.
+    /// Feitian card, or one that takes OpenFIPS201's). Nothing was sent.
     PivManagementKeyTouchUnsupported,
     /// A PIV PIN/PUK verification failed; `tries_remaining` is the count the
     /// card reported (`63 Cx`), or `None` when blocked / unknown.

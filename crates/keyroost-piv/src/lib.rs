@@ -2174,6 +2174,40 @@ pub fn set_management_key_feitian(alg: MgmtAlg, key: &[u8]) -> Vec<u8> {
     )
 }
 
+/// OpenFIPS201's change of the 9B card-management key: CHANGE REFERENCE DATA
+/// in its administrative form, `00 24 <alg> 9B <Lc> 30 <len> 80 <len> <key>`
+/// (the algorithm in `P1`, the key reference in `P2`, the key as element `80`
+/// of a sequence; see [`compat::PivDialect::OpenFips201`]). Needs
+/// management-key authentication. There is no touch-required form.
+///
+/// Measured on an Identiv/Hirsch uTrust FIDO2 NFC key (firmware 3.33, PIV
+/// application 1.10.6) with an AES-128 key, the only management-key algorithm
+/// that card holds: `00 24 08 9B 14 30 12 80 10 <16 bytes>` is answered
+/// `9000` and the card then authenticates with the new key. With an AES-192
+/// key it is answered `6A88` and nothing changes.
+///
+/// # Panics
+/// If `key` is longer than 123 bytes, the most the two one-byte lengths
+/// around it can carry.
+#[must_use]
+pub fn set_management_key_openfips201(alg: MgmtAlg, key: &[u8]) -> Vec<u8> {
+    assert!(key.len() <= 0x7B, "management key too long");
+    // Holds the new management key; wipe on drop.
+    let mut body = Zeroizing::new(Vec::with_capacity(4 + key.len()));
+    body.push(0x30);
+    body.push(2 + key.len() as u8);
+    body.push(0x80);
+    body.push(key.len() as u8);
+    body.extend_from_slice(key);
+    build_apdu(
+        0x00,
+        Instruction::ChangeReference.code(),
+        alg.id(),
+        KEY_REF_MANAGEMENT,
+        &body,
+    )
+}
+
 /// Feitian's read of a slot's PIN and touch policy: `00 EC 00 <key_ref> 00`.
 /// No authentication needed. Parse the answer with
 /// [`parse_slot_policy_feitian`].
@@ -3292,6 +3326,30 @@ mod tests {
         // produced by this crate.
         assert_eq!(reset_feitian(), vec![0x00, 0xFC, 0x00, 0x00, 0x00]);
         assert_eq!(Instruction::ResetFeitian.name(), "RESET (feitian)");
+    }
+
+    #[test]
+    fn openfips201_management_key_command_is_the_one_the_key_answered() {
+        // Captured, 2026-11-25, Identiv/Hirsch uTrust FIDO2 NFC (USB
+        // 04E6:5A11, firmware 3.33, PIV application 1.10.6): this command,
+        // sent after AES-128 mutual authentication, was answered 9000, and
+        // the card then authenticated with the key in it. The expected bytes
+        // are the ones sent then, not produced by this crate.
+        let key = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08,
+        ];
+        let mut want = vec![0x00, 0x24, 0x08, 0x9B, 0x14, 0x30, 0x12, 0x80, 0x10];
+        want.extend_from_slice(&key);
+        assert_eq!(set_management_key_openfips201(MgmtAlg::Aes128, &key), want);
+        // The algorithm goes in P1 and the two lengths follow the key's.
+        let key24 = [0x5A; 24];
+        let got = set_management_key_openfips201(MgmtAlg::Aes192, &key24);
+        assert_eq!(
+            &got[..9],
+            &[0x00, 0x24, 0x0A, 0x9B, 0x1C, 0x30, 0x1A, 0x80, 0x18]
+        );
+        assert_eq!(&got[9..], &key24);
     }
 
     #[test]

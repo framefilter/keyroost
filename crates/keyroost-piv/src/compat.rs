@@ -529,6 +529,39 @@ pub enum PivDialect {
     /// same day; what it does with them is in
     /// `FEITIAN_BIOPASS_PRO_APPLET_VERDICTS`'s doc.
     Feitian,
+    /// OpenFIPS201's own administrative command for the management key, on
+    /// a card that takes it once the management key is authenticated:
+    ///
+    /// - [`PivExtension::SetManagementKey`] is CHANGE REFERENCE DATA in its
+    ///   administrative form ([`crate::set_management_key_openfips201`],
+    ///   `00 24 <alg> 9B <Lc> 30 <len> 80 <len> <key>`): the algorithm in
+    ///   `P1`, the key reference in `P2`, the key as element `80` of a
+    ///   sequence. There is no touch-required form.
+    ///
+    /// Nothing else is this dialect's: keyroost knows no command of such a
+    /// card for the retry counts or for a slot's policies, and those
+    /// extensions' own rows say so.
+    ///
+    /// The command is OpenFIPS201's
+    /// (<https://github.com/makinako/OpenFIPS201>,
+    /// `doc/asn1/OpenFIPS201-CHANGE-REFERENCE-DATA.asn`), which upstream
+    /// takes over a GlobalPlatform secure channel only. The card measured
+    /// takes it on the plain channel after management-key authentication,
+    /// and it is what Identiv's own uTrust Token Manager sends that card to
+    /// change the key.
+    ///
+    /// Hardware-observed on an Identiv/Hirsch uTrust FIDO2 NFC key (USB
+    /// `04E6:5A11`, firmware 3.33, PIV application 1.10.6), 2026-11-25 and
+    /// 2026-11-26. `00 24 08 9B 14 30 12 80 10 <16 bytes>`, sent after
+    /// AES-128 mutual authentication with the key in force, is answered
+    /// `9000`. The card then authenticates with the new key, and its
+    /// certificates, private keys and PIN try counter are as they were.
+    /// `keyroostctl piv mgmt-key change` changed the key to a test value
+    /// this way and back to the default. With an AES-192 key (`P1` `0A`)
+    /// the command is answered `6A88` and changes nothing: the card holds
+    /// no management key of that algorithm. Yubico's `00 FF FF FF` was not
+    /// sent to it.
+    OpenFips201,
 }
 
 impl PivDialect {
@@ -688,7 +721,11 @@ pub enum PivQuirk {
     ///   algorithm AES-128 — hence the 16-byte length matching this value
     ///   rather than `YUBIKEY_DEFAULT_MGMT_KEY`'s 24) — hence the constant's
     ///   name naming both fingerprints rather than just the one it was
-    ///   originally seeded for.
+    ///   originally seeded for. And measured on a uTrust FIDO2 NFC key that is
+    ///   not sold as Gov, whose PIV application is OpenFIPS201
+    ///   ([`OpenFips201Variant::UTrust`]): AES-128 mutual authentication with
+    ///   this value succeeds on the key as delivered — see
+    ///   `UTRUST_OPENFIPS201_APPLET_QUIRKS`.
     ///
     /// Most seeded values happen to be 24 bytes, but that's a fact about
     /// what's been observed so far, not a constraint this variant enforces —
@@ -1121,6 +1158,9 @@ fn applet_verdicts(
             AppletFingerprint::OpenFips201(OpenFips201Variant::Generic) => {
                 OPENFIPS201_GENERIC_APPLET_VERDICTS
             }
+            AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust) => {
+                UTRUST_OPENFIPS201_APPLET_VERDICTS
+            }
             AppletFingerprint::Thetis => THETIS_APPLET_VERDICTS,
             AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic) => {
                 AREKINATH_GENERIC_APPLET_VERDICTS
@@ -1179,6 +1219,9 @@ fn firmware_verdicts(
             }
             AppletFingerprint::OpenFips201(OpenFips201Variant::Generic) => {
                 OPENFIPS201_GENERIC_FIRMWARE_VERDICTS
+            }
+            AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust) => {
+                UTRUST_OPENFIPS201_FIRMWARE_VERDICTS
             }
             AppletFingerprint::Thetis => THETIS_FIRMWARE_VERDICTS,
             AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic) => {
@@ -1247,6 +1290,9 @@ fn applet_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
         AppletFingerprint::OpenFips201(OpenFips201Variant::Generic) => {
             OPENFIPS201_GENERIC_APPLET_QUIRKS
         }
+        AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust) => {
+            UTRUST_OPENFIPS201_APPLET_QUIRKS
+        }
         AppletFingerprint::Thetis => THETIS_APPLET_QUIRKS,
         AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic) => {
             AREKINATH_GENERIC_APPLET_QUIRKS
@@ -1294,6 +1340,9 @@ fn firmware_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
         AppletFingerprint::OpenFips201(OpenFips201Variant::Generic) => {
             OPENFIPS201_GENERIC_FIRMWARE_QUIRKS
         }
+        AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust) => {
+            UTRUST_OPENFIPS201_FIRMWARE_QUIRKS
+        }
         AppletFingerprint::Thetis => THETIS_FIRMWARE_QUIRKS,
         AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic) => {
             AREKINATH_GENERIC_FIRMWARE_QUIRKS
@@ -1333,6 +1382,9 @@ fn axis_merge_mode(fingerprint: AppletFingerprint) -> AxisMergeMode {
         }
         AppletFingerprint::OpenFips201(OpenFips201Variant::Generic) => {
             OPENFIPS201_GENERIC_AXIS_MERGE_MODE
+        }
+        AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust) => {
+            UTRUST_OPENFIPS201_AXIS_MERGE_MODE
         }
         AppletFingerprint::Thetis => THETIS_AXIS_MERGE_MODE,
         AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic) => {
@@ -4056,6 +4108,147 @@ const OPENFIPS201_GENERIC_APPLET_QUIRKS: &[VersionQuirks] = &[];
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const OPENFIPS201_GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// The Identiv/Hirsch uTrust FIDO2 key on OpenFIPS201's
+/// (`OpenFips201::UTrust`) cross-axis merge mode — see [`AxisMergeMode`]'s
+/// doc.
+const UTRUST_OPENFIPS201_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
+/// The Identiv/Hirsch uTrust FIDO2 key on OpenFIPS201's
+/// ([`OpenFips201Variant::UTrust`]) applet-axis known-support table.
+///
+/// One key was measured: a uTrust FIDO2 NFC (USB `04E6:5A11`) with firmware
+/// 3.33 printed on it, 2026-11-25 and 2026-11-26. Its PIV application answers
+/// Yubico's GET VERSION (`00 FD 00 00 00`) with `01 0A 06`, and that reply is
+/// the version these rows are keyed on: every measured row sits at
+/// `[1, 10, 6]`, so a `Verdict::KnownSupported` row holds from 1.10.6 up and
+/// says nothing of an earlier application, and a `Verdict::KnownUnsupported`
+/// row holds at 1.10.6 and below and softens to [`FeatureGate::Unverified`]
+/// above it. The firmware number is not read here and gates nothing.
+///
+/// * [`PivExtension::SetManagementKey`]/
+///   [`PivExtension::ManagementKeyAlgorithm`]`(`[`MgmtAlgChoice::Aes128`]`)`/
+///   [`PivExtension::SlotKeyAlgorithm`]`(`[`KeyAlg::Rsa2048`]/[`KeyAlg::EccP256`]/
+///   [`KeyAlg::EccP384`]`)` — measured, `Verdict::KnownSupported`. The
+///   management key is AES-128 and is changed with the card's own command
+///   ([`PivDialect::OpenFips201`]). GENERATE ASYMMETRIC KEYPAIR is answered
+///   `9000` for each of the three key types in each of 9A, 9C, 9D and 9E,
+///   and the slot self-test then passes on each (decrypt and sign for RSA,
+///   key agreement and sign for the curves). A slot holds one key per key
+///   type, side by side: generating one leaves the other two in place.
+/// * [`PivExtension::GetMetadata`]/[`PivExtension::Attest`]/
+///   [`PivExtension::ManagementKeyAlgorithm`]`(`[`MgmtAlgChoice::TripleDes`]/
+///   [`MgmtAlgChoice::Aes192`]/[`MgmtAlgChoice::Aes256`]`)`/
+///   [`PivExtension::SlotKeyAlgorithm`]`(`[`KeyAlg::Rsa1024`]/[`KeyAlg::Rsa3072`]/
+///   [`KeyAlg::Rsa4096`]/[`KeyAlg::EccP521`]/[`KeyAlg::Ed25519`]/
+///   [`KeyAlg::X25519`]`)` — measured, `Verdict::KnownUnsupported`. `00 F7`
+///   and `00 F9` are answered `6D00`. The witness request of a management-key
+///   authentication is answered `6A86` for 3DES, AES-192 and AES-256.
+///   GENERATE is answered `6A80` for RSA-1024 (in every one of the four
+///   slots, though the card's SELECT answer lists the algorithm), for ECC
+///   P-521, Ed25519 and X25519, and `6F00` for RSA-3072 and RSA-4096.
+/// * [`PivExtension::ResetGlobal`]/[`PivExtension::Reset`]/
+///   [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`]/
+///   [`PivExtension::ManagementKeyAlgorithm`]`(`[`MgmtAlgChoice::Delete`]`)`/
+///   [`PivExtension::SetPinPukRetries`]/[`PivExtension::MoveKey`]/
+///   [`PivExtension::DeleteKey`] — the row
+///   [`OPENFIPS201_GENERIC_APPLET_VERDICTS`] has, which is what this key
+///   resolved to before it had a fingerprint of its own, kept on that table's
+///   reasoning. Yubico's commands for these were not sent to the key.
+///   [`PivExtension::Reset`] stays there for a reason of its own: the card
+///   does take `00 FB 00 00` once the management key is authenticated, but
+///   what that does is not the wipe keyroost's reset stands for. Measured, it
+///   clears the four slot certificates, puts the PIN and the PUK back to
+///   their defaults (unblocking a blocked PIN), leaves every private key in
+///   place and leaves the management key as sixteen zero bytes. keyroost
+///   does not send it.
+///
+/// Not in the table, so [`FeatureGate::Unverified`]:
+/// [`PivExtension::ImportKey`] (Yubico's import was not sent to the key, and
+/// keyroost has no implementation of the card's own) and
+/// [`PivExtension::PinManagementAuth`].
+///
+/// The key has no retired slots: GENERATE in 82 and in 95 is answered `6A86`.
+/// No extension stands for that, so nothing here says it.
+const UTRUST_OPENFIPS201_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ResetGlobal,
+            PivExtension::Reset,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+            PivExtension::SetPinPukRetries,
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::SetManagementKey,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[1, 10, 6],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::GetMetadata,
+            PivExtension::Attest,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[1, 10, 6],
+            verdict: Verdict::KnownUnsupported,
+        }],
+    },
+];
+
+/// See [`YUBIKEY_FIRMWARE_VERDICTS`]'s doc — empty.
+const UTRUST_OPENFIPS201_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
+
+/// The Identiv/Hirsch uTrust FIDO2 key on OpenFIPS201's
+/// ([`OpenFips201Variant::UTrust`]) applet-axis quirks, from application
+/// version 1.10.6, the one measured (see
+/// [`UTRUST_OPENFIPS201_APPLET_VERDICTS`]'s doc for the key):
+///
+/// * [`PivQuirk::Default9bManagementKey`] — `01 02 03 04 05 06 07 08` twice,
+///   as an AES-128 key (`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`, the value
+///   already seeded for the Gov line). AES-128 mutual authentication with it
+///   succeeds on the key as delivered, the card answering the host's
+///   challenge correctly. It is not the 24-byte 3DES value the vendor's
+///   uTrust FIDO2 Technical Manual prints, which is the default of the uTrust
+///   key whose application carries no label ([`UTRUST_GENERIC_APPLET_QUIRKS`]);
+///   the vendor's uTrust Token Manager carries both.
+/// * [`PivQuirk::Dialect`]`(`[`PivDialect::OpenFips201`]`)` — how the
+///   management key is changed.
+const UTRUST_OPENFIPS201_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
+    version: &[1, 10, 6],
+    quirks: &[
+        PivQuirk::Default9bManagementKey(IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY),
+        PivQuirk::Dialect(PivDialect::OpenFips201),
+    ],
+}];
+
+/// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
+const UTRUST_OPENFIPS201_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+
 /// Identiv/Hirsch's uTrust Generic's cross-axis merge mode — see
 /// [`AxisMergeMode`]'s doc.
 const UTRUST_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
@@ -6212,6 +6405,7 @@ mod tests {
             AppletFingerprint::Token2,
             AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
             AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+            AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust),
             AppletFingerprint::Thetis,
             AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic),
             AppletFingerprint::ArekinathPivApplet(ArekinathVariant::SwissbitIShield1),
@@ -7280,6 +7474,192 @@ mod tests {
         }
     }
 
+    // --- Identiv/Hirsch uTrust FIDO2 on OpenFIPS201 ------------------------
+
+    /// The application version the measured uTrust key reports.
+    const UTRUST_OPENFIPS201_MEASURED: &[u8] = &[1, 10, 6];
+
+    #[test]
+    fn utrust_openfips201_measured_rows_hold_at_the_measured_version() {
+        let fp = AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust);
+        let v = Some(UTRUST_OPENFIPS201_MEASURED);
+        for ext in [
+            PivExtension::SetManagementKey,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+        ] {
+            assert_eq!(resolve(ext, fp, v, None), FeatureGate::Supported, "{ext:?}");
+        }
+        for ext in [
+            PivExtension::GetMetadata,
+            PivExtension::Attest,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+        ] {
+            assert_eq!(
+                resolve(ext, fp, v, None),
+                FeatureGate::Unsupported,
+                "{ext:?}"
+            );
+        }
+        // No GET METADATA, and no other channel for a slot's key status.
+        assert_eq!(
+            resolve(PivExtension::GetSlotKeyStatus, fp, v, None),
+            FeatureGate::Unsupported
+        );
+    }
+
+    #[test]
+    fn utrust_openfips201_measured_rows_claim_nothing_beyond_what_was_measured() {
+        let fp = AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust);
+        // An earlier application: what 1.10.6 supports is unverified there,
+        // what it lacks is taken to have been lacking.
+        let earlier = Some(&[1, 10, 5][..]);
+        assert_eq!(
+            resolve(PivExtension::SetManagementKey, fp, earlier, None),
+            FeatureGate::Unverified
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+                fp,
+                earlier,
+                None
+            ),
+            FeatureGate::Unverified
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+                fp,
+                earlier,
+                None
+            ),
+            FeatureGate::Unsupported
+        );
+        // A later one: what 1.10.6 supports stays supported, what it lacks
+        // is unverified (a later application may have added it).
+        let later = Some(&[1, 11][..]);
+        assert_eq!(
+            resolve(PivExtension::SetManagementKey, fp, later, None),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+                fp,
+                later,
+                None
+            ),
+            FeatureGate::Unverified
+        );
+        assert_eq!(
+            resolve(PivExtension::GetMetadata, fp, later, None),
+            FeatureGate::Unverified
+        );
+        // Never sent to the key, and in no row.
+        for v in [earlier, Some(UTRUST_OPENFIPS201_MEASURED), later] {
+            assert_eq!(
+                resolve(PivExtension::ImportKey(KeyAlg::Rsa2048), fp, v, None),
+                FeatureGate::Unverified
+            );
+            assert_eq!(
+                resolve(PivExtension::PinManagementAuth, fp, v, None),
+                FeatureGate::Unverified
+            );
+        }
+    }
+
+    #[test]
+    fn utrust_openfips201_keeps_the_generic_openfips201_standing_rows() {
+        // The rows this key resolved to while it was `OpenFips201::Generic`,
+        // at every version: keyroost's reset among them (the card's own
+        // `00 FB` is not the wipe a reset stands for, see the table's doc).
+        let fp = AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust);
+        for ext in [
+            PivExtension::ResetGlobal,
+            PivExtension::Reset,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+            PivExtension::SetPinPukRetries,
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+        ] {
+            for version in [&[0][..], UTRUST_OPENFIPS201_MEASURED, &[9, 9, 9][..]] {
+                assert_eq!(
+                    resolve(ext, fp, Some(version), None),
+                    FeatureGate::Unsupported,
+                    "{ext:?} at {version:?}"
+                );
+                assert_eq!(
+                    resolve(
+                        ext,
+                        AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+                        Some(version),
+                        None
+                    ),
+                    FeatureGate::Unsupported,
+                    "generic {ext:?} at {version:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn utrust_openfips201_quirks_start_at_the_measured_version() {
+        let fp = AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust);
+        let quirks = resolve_quirks(fp, Some(UTRUST_OPENFIPS201_MEASURED), None);
+        assert_eq!(
+            quirks,
+            BTreeSet::from([
+                PivQuirk::Default9bManagementKey(IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY),
+                PivQuirk::Dialect(PivDialect::OpenFips201),
+            ])
+        );
+        // AES-128: sixteen bytes, not the 24 of the YubiKey default the
+        // label-less uTrust key ships.
+        assert_eq!(
+            default_9b_management_key(&quirks).map(<[u8]>::len),
+            Some(16)
+        );
+        assert_eq!(PivDialect::of(&quirks), PivDialect::OpenFips201);
+        // Still there on a later application.
+        assert_eq!(resolve_quirks(fp, Some(&[1, 11]), None), quirks);
+        // Nothing is claimed of an earlier one, or of a key that reports no
+        // version: no default key to offer, and Yubico's command forms.
+        for v in [Some(&[1, 10, 5][..]), None] {
+            let quirks = resolve_quirks(fp, v, None);
+            assert!(quirks.is_empty(), "{v:?}");
+            assert_eq!(PivDialect::of(&quirks), PivDialect::YubiKey);
+        }
+        // The generic OpenFIPS201 fingerprint has neither at any version.
+        assert!(resolve_quirks(
+            AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+            Some(UTRUST_OPENFIPS201_MEASURED),
+            None
+        )
+        .is_empty());
+        // And the uTrust key with no application label keeps its own default.
+        assert_eq!(
+            default_9b_management_key(&resolve_quirks(
+                AppletFingerprint::UTrust(UTrustVariant::Generic),
+                Some(UTRUST_OPENFIPS201_MEASURED),
+                None
+            )),
+            Some(YUBIKEY_DEFAULT_MGMT_KEY)
+        );
+    }
+
     #[test]
     fn hid_crescendo_reset_unsupported_at_any_version_including_generic() {
         // Same `KnownUnsupportedSince` shape as `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s
@@ -7640,6 +8020,7 @@ mod tests {
             AppletFingerprint::Trussed(TrussedVariant::Nitrokey),
             AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
             AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+            AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust),
             AppletFingerprint::Thetis,
             AppletFingerprint::Token2,
             AppletFingerprint::UTrust(UTrustVariant::Generic),

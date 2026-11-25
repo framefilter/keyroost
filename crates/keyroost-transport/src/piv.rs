@@ -3938,16 +3938,20 @@ impl<'tx> PivSession<'tx> {
                 );
             }
         }
-        let feitian = speaks_feitian(&self.quirks());
-        // A Feitian card's own command has no touch-required form, and
-        // nothing was sent to find out what it makes of Yubico's.
-        if feitian && require_touch {
+        use keyroost_piv::compat::PivDialect;
+        let dialect = PivDialect::of(&self.quirks());
+        // Neither Feitian's command nor OpenFIPS201's has a touch-required
+        // form, and nothing was sent to find out what such a card makes of
+        // Yubico's.
+        if require_touch && matches!(dialect, PivDialect::Feitian | PivDialect::OpenFips201) {
             return Err(TransportError::PivManagementKeyTouchUnsupported);
         }
-        let apdu = Zeroizing::new(if feitian {
-            piv::set_management_key_feitian(alg, key)
-        } else {
-            piv::set_management_key(alg, key, require_touch)
+        let apdu = Zeroizing::new(match dialect {
+            PivDialect::Feitian => piv::set_management_key_feitian(alg, key),
+            PivDialect::OpenFips201 => piv::set_management_key_openfips201(alg, key),
+            // `PivDialect` is non-exhaustive: Yubico's bytes are the default,
+            // as they are for a quirk set that names no dialect.
+            _ => piv::set_management_key(alg, key, require_touch),
         });
         let (_, sw) = self.transmit_full(&apdu)?;
         ok_or_write("piv set management key", sw)
@@ -6764,6 +6768,12 @@ fn describe_apdu(apdu: &[u8]) -> String {
         Some(piv::Instruction::Verify) if apdu.len() <= 4 || apdu[4..] == [0x00] => {
             "VERIFY (retry-counter query)".to_string()
         }
+        // CHANGE REFERENCE DATA aimed at the management key (P2 `9B`) is
+        // OpenFIPS201's administrative form
+        // (`piv::set_management_key_openfips201`), not a PIN or PUK change.
+        Some(piv::Instruction::ChangeReference) if apdu.get(3) == Some(&0x9B) => {
+            "CHANGE REFERENCE DATA (management key, openfips201)".to_string()
+        }
         Some(known) => known.name().to_string(),
         // HID Crescendo's ACA (Access Control Applet) instructions — GSC-IS/
         // HID vendor extensions, not PIV at all, so none of the three is
@@ -7553,6 +7563,19 @@ mod tests {
             )),
             "SET MANAGEMENT KEY (feitian)"
         );
+        // OpenFIPS201's is a CHANGE REFERENCE DATA whose reference is the
+        // management key; the PIN's and the PUK's keep the plain name.
+        assert_eq!(
+            describe_apdu(&piv::set_management_key_openfips201(
+                piv::MgmtAlg::Aes128,
+                &[0x5A; 16]
+            )),
+            "CHANGE REFERENCE DATA (management key, openfips201)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::change_reference(0x80, b"123456", b"654321").unwrap()),
+            piv::Instruction::ChangeReference.name()
+        );
         assert_eq!(
             describe_apdu(&piv::get_slot_policy_feitian(0x9D)),
             "GET SLOT POLICY (feitian)"
@@ -7996,6 +8019,12 @@ mod tests {
             assert!(piv_cmd_sensitive(apdu));
         }
         let key = piv::set_management_key_feitian(MgmtAlg::TripleDes, &[0x5A; 24]);
+        let dump = crate::dump_cmd(&key, piv_cmd_sensitive(&key));
+        assert!(dump.contains("redacted"), "{dump}");
+        assert!(!dump.contains("5A 5A"), "{dump}");
+        // OpenFIPS201's management-key command is a CHANGE REFERENCE DATA,
+        // hidden as the PIN's own is.
+        let key = piv::set_management_key_openfips201(MgmtAlg::Aes128, &[0x5A; 16]);
         let dump = crate::dump_cmd(&key, piv_cmd_sensitive(&key));
         assert!(dump.contains("redacted"), "{dump}");
         assert!(!dump.contains("5A 5A"), "{dump}");

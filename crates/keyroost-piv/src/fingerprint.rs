@@ -1285,6 +1285,19 @@ pub enum OpenFips201Variant {
     /// Swissbit's own registered RID ([`SWISSBIT_RID`]) can also be
     /// selected on the same card.
     SwissbitIShield2,
+    /// An Identiv/Hirsch uTrust FIDO2 Security Key whose PIV application
+    /// names itself `OpenFIPS201` — recognised by its ATR identity
+    /// (`"uTrust"`) on top of the OpenFIPS201 select identity. Measured on a
+    /// uTrust FIDO2 NFC key (USB `04E6:5A11`) with firmware 3.33 printed on
+    /// it, whose PIV application answers GET VERSION with 1.10.6.
+    ///
+    /// A uTrust key whose PIV application carries no application label is
+    /// not this variant: it stays [`UTrustVariant::Generic`], which is what
+    /// the key with firmware 3.30 in
+    /// <https://github.com/framefilter/keyroost/issues/194> answers as. The
+    /// two take different management-key algorithms and hold different key
+    /// types, so they do not share rows.
+    UTrust,
 }
 
 /// Sub-fingerprint within [`AppletFingerprint::Feitian`]: the product, as the
@@ -1316,9 +1329,11 @@ pub enum FeitianModel {
 pub enum UTrustVariant {
     /// Identiv/Hirsch's general-purpose uTrust FIDO2 Security Keys —
     /// <https://www.hirschsecure.com/germany/en/products/security-keys/utrust-fido2-security-keys-nfc-plus>.
-    /// The only variant [`classify`] currently produces: every uTrust ATR
-    /// match becomes this one, since nothing yet distinguishes the Gov line
-    /// from it on the wire.
+    /// The only variant of this family [`classify`] currently produces:
+    /// every uTrust ATR match whose PIV application carries no `OpenFIPS201`
+    /// label becomes this one, since nothing yet distinguishes the Gov line
+    /// from it on the wire. A uTrust key whose application does carry that
+    /// label is [`OpenFips201Variant::UTrust`].
     Generic,
     /// Identiv/Hirsch's uTrust FIDO2 Gov Security Keys —
     /// <https://www.hirschsecure.com/germany/en/products/security-keys/utrust-fido2-gov-security-keys>.
@@ -1388,6 +1403,7 @@ impl core::fmt::Display for OpenFips201Variant {
         f.write_str(match self {
             OpenFips201Variant::Generic => "Generic",
             OpenFips201Variant::SwissbitIShield2 => "SwissbitIShield2",
+            OpenFips201Variant::UTrust => "UTrust",
         })
     }
 }
@@ -1445,6 +1461,9 @@ impl AppletFingerprint {
             AppletFingerprint::OpenFips201(OpenFips201Variant::Generic) => "Generic OpenFIPS201",
             AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2) => {
                 "Swissbit iShield 2 Series"
+            }
+            AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust) => {
+                "Identiv/Hirsch uTrust Series (OpenFIPS201)"
             }
             AppletFingerprint::Thetis => "Thetis Series",
             AppletFingerprint::Token2 => "Token2 Series",
@@ -1610,6 +1629,11 @@ pub fn classify(
     } else if open_fips_201 && swissbit_rid_selectable {
         // 2 criteria (the 1 above plus the live probe).
         AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2)
+    } else if open_fips_201 && atr == Some("utrust") {
+        // 2 criteria (the select identity plus the ATR identity). Ahead of
+        // the plain uTrust ATR match further down, which is the uTrust key
+        // whose PIV application carries no label.
+        AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust)
     } else if arekinath {
         AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic)
     } else if atr == Some("c2300") || atr == Some("c4000") || hid_crescendo_sel {
@@ -2019,6 +2043,43 @@ mod tests {
     }
 
     #[test]
+    fn classify_utrust_running_openfips201_by_label_and_atr() {
+        // The uTrust FIDO2 NFC key measured (firmware 3.33): ATR
+        // 3B 96 11 81 21 75 75 54 72 75 73 74 73, and the application label
+        // out of its SELECT answer.
+        let atr = [
+            0x3B, 0x96, 0x11, 0x81, 0x21, 0x75, 0x75, 0x54, 0x72, 0x75, 0x73, 0x74, 0x73,
+        ];
+        let identity = atr_historical_bytes(&atr).and_then(atr_identity);
+        assert_eq!(identity.as_deref(), Some("uTrust"));
+        assert_eq!(
+            classify(
+                identity.as_deref(),
+                Some("OpenFIPS201"),
+                false,
+                false,
+                false
+            ),
+            AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust)
+        );
+        // Any case, like every other criterion.
+        assert_eq!(
+            classify(Some("UTRUST"), Some("openfips201"), false, false, false),
+            AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust)
+        );
+        // The same ATR with no application label is the other uTrust applet.
+        assert_eq!(
+            classify(identity.as_deref(), None, false, false, false),
+            AppletFingerprint::UTrust(UTrustVariant::Generic)
+        );
+        // The label on another card's ATR is the generic OpenFIPS201.
+        assert_eq!(
+            classify(Some("other"), Some("OpenFIPS201"), false, false, false),
+            AppletFingerprint::OpenFips201(OpenFips201Variant::Generic)
+        );
+    }
+
+    #[test]
     fn classify_token2_either_spelling() {
         assert_eq!(
             classify(Some("TK\0PIV v1"), None, false, false, false),
@@ -2141,6 +2202,10 @@ mod tests {
             (
                 AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
                 "Swissbit iShield 2 Series",
+            ),
+            (
+                AppletFingerprint::OpenFips201(OpenFips201Variant::UTrust),
+                "Identiv/Hirsch uTrust Series (OpenFIPS201)",
             ),
             (AppletFingerprint::Thetis, "Thetis Series"),
             (AppletFingerprint::Token2, "Token2 Series"),
