@@ -324,12 +324,7 @@ pub const GLOBAL_PLATFORM_GET_CPLC: [u8; 5] = [0x80, 0xCA, 0x9F, 0x7F, 0x00];
 /// report a wrong number" discipline `decode_bcd_serial` uses.
 #[must_use]
 pub fn parse_cplc_serial(data: &[u8]) -> Option<u128> {
-    let cplc = if data.first() == Some(&0x9F) && data.get(1) == Some(&0x7F) {
-        let (len, header) = crate::read_ber_len(data.get(2..)?).ok()?;
-        data.get(2 + header..(2 + header).checked_add(len)?)?
-    } else {
-        data
-    };
+    let cplc = cplc_value(data)?;
     if cplc.len() < 18 {
         return None;
     }
@@ -352,6 +347,83 @@ pub fn parse_cplc_serial(data: &[u8]) -> Option<u128> {
         }
     }
     Some(decoded)
+}
+
+/// The CPLC structure out of a [`GLOBAL_PLATFORM_GET_CPLC`] reply: the value
+/// of a reply that starts with the tag (`9F 7F <len>`), else the reply as it
+/// is. `None` when the tag's length runs past the reply.
+fn cplc_value(data: &[u8]) -> Option<&[u8]> {
+    if data.first() == Some(&0x9F) && data.get(1) == Some(&0x7F) {
+        let (len, header) = crate::read_ber_len(data.get(2..)?).ok()?;
+        data.get(2 + header..(2 + header).checked_add(len)?)
+    } else {
+        Some(data)
+    }
+}
+
+/// Whether a card's ATR is an Identiv/Hirsch uTrust key's: its historical
+/// bytes read `uTrust`, in any case, the criterion [`classify`] names
+/// [`AppletFingerprint::UTrust`] by. A uTrust FIDO2 NFC key's ATR over USB
+/// is `3B 96 11 81 21 75 75 54 72 75 73 74 73`.
+#[must_use]
+pub fn atr_names_utrust(atr: &[u8]) -> bool {
+    atr_historical_bytes(atr)
+        .and_then(atr_identity)
+        .is_some_and(|identity| identity.eq_ignore_ascii_case("utrust"))
+}
+
+/// A uTrust FIDO2 key's serial number out of a GlobalPlatform CPLC
+/// ([`GLOBAL_PLATFORM_GET_CPLC`]) reply, read with the card manager
+/// ([`GLOBAL_PLATFORM_ISD_AID`]) selected: the four bytes of the IC Serial
+/// Number field (offset 12 of the structure [`parse_cplc_serial`]
+/// describes), each as two hex digits. This is the number Identiv's uTrust
+/// Token Manager shows as the key's serial number, and it is the last eight
+/// digits of the serial number printed on the key: measured on a uTrust
+/// FIDO2 NFC with firmware 3.33, whose label carries nine more digits in
+/// front that this read does not give. That program reads it this way for
+/// the keys it calls uTrust FIDO2 NFC and NFC+ and for GOV keys it knows by
+/// their model number; only the NFC key has been measured.
+///
+/// [`parse_cplc_serial`] is HID's rule and gives nothing here: the batch
+/// identifier of the key measured has hex digits above 9.
+///
+/// The reply is taken with or without its `9F 7F <len>` tag. `None` when it
+/// is too short to hold the field, and for a field of all zeros or all
+/// ones: a blank field would give every such key the same serial.
+#[must_use]
+pub fn parse_utrust_serial(data: &[u8]) -> Option<String> {
+    let ic_serial_number = cplc_value(data)?.get(12..16)?;
+    if ic_serial_number.iter().all(|&b| b == 0x00) || ic_serial_number.iter().all(|&b| b == 0xFF) {
+        return None;
+    }
+    Some(
+        ic_serial_number
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect(),
+    )
+}
+
+/// The read a uTrust FIDO2 key gives its firmware version to,
+/// `B1 05 42 00 00`: the one Identiv's uTrust Token Manager sends. A uTrust
+/// FIDO2 NFC answers it whichever application is selected (measured
+/// straight after connecting, with the card manager and with PIV).
+/// [`parse_utrust_firmware_version`] reads the answer.
+pub const UTRUST_GET_FIRMWARE_VERSION: [u8; 5] = [0xB1, 0x05, 0x42, 0x00, 0x00];
+
+/// A uTrust FIDO2 key's firmware version out of the answer to
+/// [`UTRUST_GET_FIRMWARE_VERSION`]: its first four bytes as text, `3.33`
+/// for the answer `33 2E 33 33`, which is the version printed on that key.
+/// `None` when the answer is shorter, or when those four bytes are not
+/// digits and dots starting with a digit, so that an answer meaning
+/// something else is not shown as a version.
+#[must_use]
+pub fn parse_utrust_firmware_version(data: &[u8]) -> Option<String> {
+    let text = data.get(..4)?;
+    if !text[0].is_ascii_digit() || !text.iter().all(|b| b.is_ascii_digit() || *b == b'.') {
+        return None;
+    }
+    Some(text.iter().map(|&b| char::from(b)).collect())
 }
 
 /// The ACA (Access Control Applet) instance AID, `A0 00 00 00 79 10 00` —
@@ -2605,6 +2677,85 @@ mod tests {
         let mut cplc = vec![0u8; 18];
         cplc[0] = 0xAB; // nibble 0xA is not a decimal digit
         assert_eq!(parse_cplc_serial(&cplc), None);
+    }
+
+    // --- Identiv uTrust FIDO2: serial number and firmware version -----------
+
+    /// The CPLC reply of a uTrust FIDO2 NFC key, as measured, with other
+    /// digits in its IC Serial Number field.
+    const UTRUST_CPLC_REPLY: &str = "9F 7F 2A 40 90 78 93 4A 4E 01 00 03 07 11 89 \
+        00 01 23 45 6A C9 40 90 11 89 40 90 11 89 4A 4E 01 00 4A 4E 45 54 4A 4E 01 00 4A 4E 45 54";
+
+    #[test]
+    fn utrust_serial_is_the_cplc_ic_serial_number_as_hex_digits() {
+        let reply = hex(UTRUST_CPLC_REPLY);
+        assert_eq!(parse_utrust_serial(&reply).as_deref(), Some("00012345"));
+        // The same without the tag in front.
+        assert_eq!(
+            parse_utrust_serial(&reply[3..]).as_deref(),
+            Some("00012345")
+        );
+        // HID's rule gives nothing for this card: its batch identifier
+        // (6A C9) is not decimal digits.
+        assert_eq!(parse_cplc_serial(&reply), None);
+        // Digits above 9 print as capitals, as Identiv's program prints them.
+        let mut cplc = vec![0u8; 42];
+        cplc[12..16].copy_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]);
+        assert_eq!(parse_utrust_serial(&cplc).as_deref(), Some("ABCDEF01"));
+    }
+
+    #[test]
+    fn utrust_serial_none_when_short_or_blank() {
+        // 15 bytes: one short of the end of the IC Serial Number field.
+        assert_eq!(parse_utrust_serial(&[0x11; 15]), None);
+        assert_eq!(parse_utrust_serial(&[]), None);
+        // A tag whose length runs past the reply.
+        assert_eq!(parse_utrust_serial(&[0x9F, 0x7F, 0x2A, 0x40, 0x90]), None);
+        // A blank field is no serial.
+        assert_eq!(parse_utrust_serial(&[0x00; 42]), None);
+        let mut ones = vec![0x11; 42];
+        ones[12..16].copy_from_slice(&[0xFF; 4]);
+        assert_eq!(parse_utrust_serial(&ones), None);
+    }
+
+    #[test]
+    fn utrust_firmware_version_is_the_answer_s_first_four_characters() {
+        assert_eq!(
+            parse_utrust_firmware_version(&hex("33 2E 33 33")).as_deref(),
+            Some("3.33")
+        );
+        assert_eq!(
+            parse_utrust_firmware_version(b"3.30").as_deref(),
+            Some("3.30")
+        );
+        // Only the first four bytes are the version.
+        assert_eq!(
+            parse_utrust_firmware_version(b"3.33\x00\x01").as_deref(),
+            Some("3.33")
+        );
+        // Too short, or not a version in text.
+        assert_eq!(parse_utrust_firmware_version(b"3.3"), None);
+        assert_eq!(parse_utrust_firmware_version(&[]), None);
+        assert_eq!(
+            parse_utrust_firmware_version(&[0x03, 0x21, 0x00, 0x00]),
+            None
+        );
+        assert_eq!(parse_utrust_firmware_version(b".333"), None);
+        assert_eq!(parse_utrust_firmware_version(b"3.3\n"), None);
+    }
+
+    #[test]
+    fn utrust_atr_is_told_by_its_historical_bytes() {
+        // A uTrust FIDO2 NFC key over USB.
+        assert!(atr_names_utrust(&hex(
+            "3B 96 11 81 21 75 75 54 72 75 73 74 73"
+        )));
+        // A YubiKey 5's ATR, a truncated one, and none.
+        assert!(!atr_names_utrust(&hex(
+            "3B FD 13 00 00 81 31 FE 15 80 73 C0 21 C0 57 59 75 62 69 4B 65 79 40"
+        )));
+        assert!(!atr_names_utrust(&hex("3B 96 11 81 21 75 75 54")));
+        assert!(!atr_names_utrust(&[]));
     }
 
     // --- ACA (Access Control Applet) XAUTH byte layer -----------------------
