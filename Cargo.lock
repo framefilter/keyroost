@@ -2032,6 +2032,7 @@ dependencies = [
  "keyroost-token2otp",
  "keyroost-token2prog",
  "keyroost-transport",
+ "keyroost-vault",
  "keyroost-winwebauthn",
  "png",
  "pollster 1.0.1",

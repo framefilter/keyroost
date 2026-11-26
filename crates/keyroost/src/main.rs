@@ -19,11 +19,13 @@ mod qrscan;
 mod screengrab;
 mod settings;
 mod ui;
+mod vault_pane;
 use ftotp_pane::FtotpState;
 use otp_pane::OtpState;
 use settings::{Settings, SidebarSetting};
 use ui::device::{self, CapState, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
 use ui::theme::{self, BtnKind, Mode, Palette};
+use vault_pane::{VaultOffer, VaultState};
 
 use eframe::egui;
 use keyroost_import::parse_otpauth;
@@ -5339,6 +5341,8 @@ struct App {
     otp: OtpState,
     /// Feitian OTP (TOTP/HOTP) view state.
     ftotp: FtotpState,
+    /// The Vault tab's state for the selected key.
+    vault: VaultState,
     /// Dark / light theme (persisted via eframe storage).
     mode: Mode,
     /// Accent index into `Palette::ACCENTS` (persisted).
@@ -7273,6 +7277,7 @@ impl App {
         out.extend(self.oath.secrets_mut());
         out.extend(self.otp.secrets_mut());
         out.extend(self.ftotp.secrets_mut());
+        out.extend(self.vault.secrets_mut());
         out.extend(self.openpgp.secrets_mut());
         out.extend(self.piv.secrets_mut());
         out.push(&mut *self.prog_seed_input);
@@ -11852,7 +11857,9 @@ impl App {
                 FidoSubview::Fingerprints if self.fido_session().is_some() => Reread::Fingerprints,
                 _ => Reread::FidoInfo,
             },
-            CapTab::Overview => Reread::FidoInfo,
+            // The key's info decides whether a vault is offered; the
+            // vault itself is read by its own Unlock.
+            CapTab::Overview | CapTab::Vault => Reread::FidoInfo,
         }
     }
 
@@ -12196,6 +12203,8 @@ impl App {
         // Replaced whole: its typed seed, shown codes and pending delete
         // confirmation all belong to the key that was selected.
         self.ftotp = FtotpState::default();
+        // So is the Vault tab's.
+        self.vault = VaultState::default();
         self.molto_reset_confirm = false;
         self.molto_delete_confirm = false;
         self.close_rename();
@@ -15194,6 +15203,7 @@ fn cap_tab_label(t: CapTab) -> &'static str {
         CapTab::Piv => "PIV",
         CapTab::Otp => "On-device OTP",
         CapTab::Ftotp => "Feitian OTP",
+        CapTab::Vault => "Vault",
     }
 }
 
@@ -19125,6 +19135,7 @@ impl App {
                                             CapTab::Piv => self.cap_piv(ui, p),
                                             CapTab::Otp => self.cap_otp(ui, p),
                                             CapTab::Ftotp => self.cap_ftotp(ui, p),
+                                            CapTab::Vault => self.cap_vault(ui, p),
                                         }
                                         // Breathing room below the last card.
                                         ui.add_space(18.0);
@@ -19617,7 +19628,15 @@ impl App {
     fn cap_tabs(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
         // A per-device remembered pick (or a device swap under an unchanged
         // selection) can be stale for this device — see `snap_cap_tab`'s doc.
-        self.cap_tab = snap_cap_tab(self.cap_tab, &dev.tabs());
+        // Unknown and NeedsAdmin place the Vault tab alike, so the Windows
+        // rights check (a device enumeration) isn't run here on every frame.
+        let offer = vault_pane::vault_offer(
+            self.security_keys.info.as_ref(),
+            self.security_keys.u2f_only,
+            false,
+        );
+        let tabs = vault_pane::with_vault_tab(dev.tabs(), offer);
+        self.cap_tab = snap_cap_tab(self.cap_tab, &tabs);
         ui.add_space(12.0);
         let mut next = None;
         // Tabs flow onto a second line when the row runs out of room, so
@@ -19625,7 +19644,7 @@ impl App {
         // The line gap leaves room for the active tab's underline.
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(20.0, 16.0);
-            for t in dev.tabs() {
+            for t in tabs {
                 let active = self.cap_tab == t;
                 let color = if active { p.txt } else { p.txt3 };
                 // A capability keyroost could not check against the device
@@ -19881,6 +19900,62 @@ impl App {
         }
     }
 
+    /// Windows without administrator rights: a FIDO key is there but its
+    /// HID interface is gated, so getInfo never loads. Always false
+    /// elsewhere.
+    fn fido_non_admin(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.security_keys.info.is_none()
+                && !keyroost_proto::devices_hidden()
+                && keyroost_winwebauthn::fido_key_present()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Whether the selected key is offered a password vault.
+    fn vault_offer(&self) -> VaultOffer {
+        vault_pane::vault_offer(
+            self.security_keys.info.as_ref(),
+            self.security_keys.u2f_only,
+            self.fido_non_admin(),
+        )
+    }
+
+    /// The Overview's "Password vault" card, under the FIDO2 card: Manage
+    /// opens the Vault tab when it is offered; a key that can't hold a
+    /// vault gets no Manage, and the line says why.
+    fn vault_overview_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let offer = self.vault_offer();
+        theme::card_frame(p).show(ui, |ui| {
+            if matches!(offer, VaultOffer::No(_)) {
+                ui.set_min_width(ui.available_width());
+                self.card_head_plain(ui, p, "Password vault", "vault");
+            } else if self.card_head(ui, p, "Password vault", "vault") {
+                self.cap_tab = CapTab::Vault;
+            }
+            ui.add_space(6.0);
+            vault_pane::experimental_note(ui, p);
+            ui.add_space(6.0);
+            if offer == VaultOffer::NeedsAdmin {
+                theme::pill(ui, "Administrator rights needed", p.warn, p.warn_soft());
+                ui.add_space(6.0);
+            }
+            ui.label(
+                egui::RichText::new(vault_pane::overview_line(offer, None))
+                    .font(theme::f_reg(13.0))
+                    .color(if offer == VaultOffer::Unknown {
+                        p.txt3
+                    } else {
+                        p.txt2
+                    }),
+            );
+        });
+    }
+
     /// Overview tab: one summary card per capability, each with a `Manage →` jump.
     /// Scrolling comes from the shared capability-pane scroller in `central`.
     fn overview(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
@@ -19916,13 +19991,7 @@ impl App {
                     // Windows non-admin: FIDO access is gated, so `info` never
                     // loads; show an admin-needed hint instead of a perpetual
                     // "Reading key…". The Manage → jump opens the full card.
-                    #[cfg(windows)]
-                    let non_admin = self.security_keys.info.is_none()
-                        && !keyroost_proto::devices_hidden()
-                        && keyroost_winwebauthn::fido_key_present();
-                    #[cfg(not(windows))]
-                    let non_admin = false;
-                    if non_admin {
+                    if self.fido_non_admin() {
                         theme::pill(ui, "Administrator rights needed", p.warn, p.warn_soft());
                         ui.add_space(6.0);
                         ui.label(
@@ -19969,6 +20038,8 @@ impl App {
                         }
                     }
                 });
+                ui.add_space(14.0);
+                self.vault_overview_card(ui, p);
                 ui.add_space(14.0);
             }
             if dev.caps.has(Caps::OATH) {
@@ -31552,6 +31623,35 @@ mod tests {
         let previous = app.selected_device.replace("serial:AAA".into());
         app.on_device_selected(previous);
         assert_eq!(app.cap_tab, CapTab::Piv);
+    }
+
+    /// The Vault tab's state belongs to the key it was read from: another
+    /// key starts with none of it.
+    #[test]
+    fn selecting_another_key_resets_the_vault_state() {
+        let mut app = App {
+            selected_device: Some("serial:AAA".into()),
+            ..Default::default()
+        };
+        app.vault.error = Some("The PIN was refused.".into());
+        app.vault.info = Some("Vault \"Personal\" deleted.".into());
+        let previous = app.selected_device.replace("serial:BBB".into());
+        app.on_device_selected(previous);
+        assert!(app.vault.error.is_none());
+        assert!(app.vault.info.is_none());
+    }
+
+    /// Vault is labeled as in the mockup, and Refresh on it reads the key's
+    /// info (what decides whether a vault is offered).
+    #[test]
+    fn the_vault_tab_is_labeled_and_refreshes_the_info() {
+        assert_eq!(cap_tab_label(CapTab::Vault), "Vault");
+        assert!(device::tab_cap(CapTab::Vault) == Some(Caps::FIDO2));
+        let app = App {
+            cap_tab: CapTab::Vault,
+            ..Default::default()
+        };
+        assert!(matches!(app.reread_choice(), Reread::FidoInfo));
     }
 
     /// A key that showed no CTAP2 interface gets the CLI's `fido info` line
