@@ -1291,6 +1291,9 @@ impl App {
                 }
                 self.vault_fix_selection();
                 self.vault.error = None;
+                // An import preview open meanwhile compares with the vault
+                // as it is now, so no tick replaces a copy saved elsewhere.
+                self.vault_import_refreshed();
             }
             Err(e @ VaultJobError::Vault(VaultKeyError::VaultGone { .. })) => {
                 let text = job_error_text(&e);
@@ -1713,18 +1716,6 @@ impl App {
             {
                 self.log(Severity::Warn, format!("Vault: {}", job_error_text(&e)));
                 self.vault_rebase_form();
-            }
-            Err(e @ VaultJobError::Vault(VaultKeyError::Conflict))
-                if matches!(kind, SaveKind::Import) =>
-            {
-                // The session holds the vault as the key does now (put back
-                // above): the preview is worked out again against it.
-                self.log(Severity::Warn, format!("Vault: {}", job_error_text(&e)));
-                self.vault.info = None;
-                self.vault_import_classify();
-                if let Some(d) = self.vault.import.as_mut() {
-                    d.notice = Some(IMPORT_CHANGED_ON_KEY.to_owned());
-                }
             }
             Err(e @ VaultJobError::Vault(VaultKeyError::Conflict))
                 if matches!(kind, SaveKind::Import) =>
@@ -3312,6 +3303,14 @@ const IMPORT_CHANGED_ON_KEY: &str = "An entry in this vault changed on the key s
                                      opened; nothing was written. The list below shows the vault \
                                      as it is now.";
 
+/// A Refresh found the import's target vault changed on the key.
+const IMPORT_REFRESHED: &str = "An entry in this vault changed on the key since the backup was \
+                                opened. The list below now compares with the vault as it is; \
+                                check the ticks before importing.";
+
+/// Open backup couldn't be queued.
+const IMPORT_OPEN_NOT_STARTED: &str = "Opening the backup couldn't start; press Open backup again.";
+
 /// Import backup… pressed while the open dialog of an earlier one is up.
 const IMPORT_PENDING: &str =
     "A backup file is already being chosen: finish or cancel that dialog first.";
@@ -3619,11 +3618,16 @@ impl App {
         let path = d.path.clone();
         let passphrase = Zeroizing::new(d.passphrase.clone());
         let for_device = self.selected_device.clone();
-        self.spawn_job(IMPORT_OPEN_LABEL, move || {
+        let queued = self.spawn_job(IMPORT_OPEN_LABEL, move || {
             let result = open_backup(&path, &passphrase);
             drop(passphrase);
             Box::new(move |app: &mut App| app.vault_apply_import_open(for_device, result))
         });
+        if !queued {
+            if let Some(d) = self.vault.import.as_mut() {
+                d.notice = Some(IMPORT_OPEN_NOT_STARTED.to_owned());
+            }
+        }
     }
 
     /// The end of Open backup. A result for another key, or one whose
@@ -3676,23 +3680,66 @@ impl App {
             })
     }
 
+    /// The preview's rows against the target as the session holds it now,
+    /// with the default ticks; `None` before the backup is opened, `Err`
+    /// when the target is no longer open.
+    fn vault_import_rows_now(&self) -> Option<Result<Vec<ImportRow>, String>> {
+        let d = self.vault.import.as_ref()?;
+        let incoming = d.incoming.as_ref()?;
+        Some(
+            self.vault_import_current(&d.target)
+                .map(|current| preview_rows(current, incoming)),
+        )
+    }
+
     /// Work the preview out again against the target as the session holds
     /// it, with the default ticks.
     fn vault_import_classify(&mut self) {
-        let Some(d) = self.vault.import.as_ref() else {
+        let Some(now) = self.vault_import_rows_now() else {
             return;
-        };
-        let Some(incoming) = d.incoming.as_ref() else {
-            return;
-        };
-        let (rows, notice) = match self.vault_import_current(&d.target) {
-            Ok(current) => (preview_rows(current, incoming), None),
-            Err(e) => (Vec::new(), Some(e)),
         };
         if let Some(d) = self.vault.import.as_mut() {
-            d.rows = rows;
-            if notice.is_some() {
-                d.notice = notice;
+            match now {
+                Ok(rows) => d.rows = rows,
+                Err(e) => {
+                    d.rows = Vec::new();
+                    d.notice = Some(e);
+                }
+            }
+        }
+    }
+
+    /// After a Refresh: rows whose comparison changed take their new plan
+    /// and default tick, and the dialog says so; the others keep the
+    /// user's ticks.
+    fn vault_import_refreshed(&mut self) {
+        let Some(now) = self.vault_import_rows_now() else {
+            return;
+        };
+        let Some(d) = self.vault.import.as_mut() else {
+            return;
+        };
+        match now {
+            Ok(rows) => {
+                let mut changed = rows.len() != d.rows.len();
+                let merged = rows
+                    .into_iter()
+                    .map(|new| match d.rows.iter().find(|r| r.index == new.index) {
+                        Some(old) if old.status == new.status => *old,
+                        _ => {
+                            changed = true;
+                            new
+                        }
+                    })
+                    .collect();
+                d.rows = merged;
+                if changed {
+                    d.notice = Some(IMPORT_REFRESHED.to_owned());
+                }
+            }
+            Err(e) => {
+                d.rows = Vec::new();
+                d.notice = Some(e);
             }
         }
     }
@@ -8634,6 +8681,48 @@ mod tests {
         let on_key = key.vault_on_key(&id).unwrap();
         assert_eq!(on_key.entries.len(), 5);
         assert_eq!(on_key.entries[0], theirs.entries[0]);
+    }
+
+    #[test]
+    fn a_refresh_under_the_preview_reclassifies_changed_rows() {
+        let mut key = FakeKey::new();
+        let mut app = app();
+        let id = opened_into(&mut app, &mut key);
+        // The user's own tick on an unchanged row survives the refresh.
+        app.vault_import_tick(1, false);
+        // Another program saves a GitHub newer than the backup's.
+        let mut theirs = key_vault();
+        theirs.entries[0].password = Zeroizing::new("gh-theirs".into());
+        theirs.entries[0].modified_minutes = 300;
+        key.put_vault(&id, &theirs);
+        // Refresh, as the job does.
+        let mut unlocked = app.vault_session().unwrap().unlocked.clone();
+        let result = run_reload(&mut key, &mut unlocked).map_err(VaultJobError::from);
+        app.vault_apply_reload(Some(KEY.into()), unlocked, result);
+        use ImportStatus::*;
+        assert_eq!(statuses(&mut app), vec![New, New, Older, Older, Same]);
+        assert_eq!(ticks(&mut app), vec![true, false, false, false, false]);
+        assert_eq!(plan_of(Older, false).0, "skip");
+        assert_eq!(
+            import_dialog(&mut app).notice.as_deref(),
+            Some(IMPORT_REFRESHED)
+        );
+        import_into(&mut app, &mut key);
+        let on_key = key.vault_on_key(&id).unwrap();
+        assert_eq!(on_key.entries[0], theirs.entries[0], "not overwritten");
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some("Imported into vault \"Personal\": 1 added, 0 replaced.")
+        );
+        // A refresh that changes nothing says nothing.
+        let mut key = FakeKey::new();
+        let mut app = super::tests::app();
+        opened_into(&mut app, &mut key);
+        let mut unlocked = app.vault_session().unwrap().unlocked.clone();
+        let result = run_reload(&mut key, &mut unlocked).map_err(VaultJobError::from);
+        app.vault_apply_reload(Some(KEY.into()), unlocked, result);
+        assert_eq!(import_dialog(&mut app).notice, None);
+        assert_eq!(ticks(&mut app), vec![true, true, true, false, false]);
     }
 
     #[test]
