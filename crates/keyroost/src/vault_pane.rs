@@ -239,8 +239,13 @@ pub(crate) fn vault_error_text(e: &VaultKeyError) -> String {
         VaultKeyError::NoVaults => "; create one with New vault",
         VaultKeyError::CreateUndone { left_over, .. } => match left_over {
             LeftOver {
-                credential: true, ..
+                credential: true,
+                data: false,
             } => "; delete the copy with no data with Delete vault\u{2026}",
+            LeftOver {
+                credential: true,
+                data: true,
+            } => "; remove both with Delete vault\u{2026}",
             LeftOver {
                 credential: false,
                 data: true,
@@ -270,10 +275,10 @@ pub(crate) fn vault_error_text(e: &VaultKeyError) -> String {
     as_sentence(&format!("{e}{hint}"))
 }
 
-/// A vault job's error as the pane shows it.
+/// A vault job's error as the pane shows it, as a sentence like the rest.
 pub(crate) fn job_error_text(e: &VaultJobError) -> String {
     match e {
-        VaultJobError::Open(s) => s.clone(),
+        VaultJobError::Open(s) => as_sentence(s),
         VaultJobError::Vault(e) => vault_error_text(e),
     }
 }
@@ -508,12 +513,7 @@ impl App {
                 self.vault_fail(&e);
                 if pin_refused && pin_from_fido {
                     // The shared PIN is wrong on the FIDO2 tab too.
-                    self.lock_session();
-                    self.security_keys.error = Some(
-                        "the key re-locked (PIN or session changed) \u{2014} \
-                         unlock again to continue."
-                            .into(),
-                    );
+                    self.relock_fido_session();
                 }
             }
         }
@@ -1157,7 +1157,11 @@ mod tests {
                 app.security_keys.session.is_none(),
                 "{code:#04x}: the FIDO2 tab's PIN is the refused one"
             );
-            assert!(app.security_keys.error.is_some(), "and it says why");
+            assert_eq!(
+                app.security_keys.error.as_deref(),
+                Some(crate::FIDO_RELOCKED),
+                "and it says why, as any re-lock does"
+            );
         }
     }
 
@@ -1172,8 +1176,8 @@ mod tests {
             Err(VaultJobError::Open("no such device".into())),
         );
         assert!(app.vault.session.is_none());
-        assert_eq!(app.vault.error.as_deref(), Some("no such device"));
-        assert!(app.log.iter().any(|l| l.text == "Vault: no such device"));
+        assert_eq!(app.vault.error.as_deref(), Some("No such device."));
+        assert!(app.log.iter().any(|l| l.text == "Vault: No such device."));
     }
 
     #[test]
@@ -1389,7 +1393,7 @@ mod tests {
             ),
             (
                 undone(true, true),
-                "; delete the copy with no data with Delete vault\u{2026}.",
+                "; remove both with Delete vault\u{2026}.",
             ),
             (
                 undone(false, true),
@@ -1440,8 +1444,10 @@ mod tests {
             "This key already holds a vault named \"Work\"."
         );
         assert_eq!(
-            job_error_text(&VaultJobError::Open("device is U2F-only".into())),
-            "device is U2F-only"
+            job_error_text(&VaultJobError::Open(
+                "device is U2F-only; CTAP2 password vaults not supported".into()
+            )),
+            "Device is U2F-only; CTAP2 password vaults not supported."
         );
         assert_eq!(
             job_error_text(&VaultJobError::Vault(VaultKeyError::NoVaults)),

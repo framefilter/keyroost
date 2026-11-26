@@ -2144,6 +2144,11 @@ fn key_firmware(
     keyroost_resolve::firmware::key_firmware(path, version, serial, reader, false)
 }
 
+/// What the FIDO2 tab says when the key refused its PIN or token and the
+/// tab locked ([`App::relock_fido_session`]).
+const FIDO_RELOCKED: &str =
+    "the key re-locked (PIN or session changed) \u{2014} unlock again to continue.";
+
 /// The permissions of the FIDO2 tab's session token: credential management,
 /// plus bio enrollment when the key supports it, so the one cached token
 /// authorizes both passkey management and fingerprint operations. Only
@@ -7271,6 +7276,14 @@ impl App {
         }
     }
 
+    /// Lock the FIDO2 tab because the key refused its PIN or token, and say
+    /// so there: [`Self::fail_session_op`], and the Vault tab's unlock when
+    /// the shared PIN was refused.
+    fn relock_fido_session(&mut self) {
+        self.lock_session();
+        self.security_keys.error = Some(FIDO_RELOCKED.into());
+    }
+
     fn lock_session(&mut self) {
         self.security_keys.session = None;
         self.security_keys.session_device = None;
@@ -7542,12 +7555,7 @@ impl App {
     fn fail_session_op(&mut self, err: &SessionOpError, context: &str) {
         self.log(Severity::Err, format!("FIDO2: {context}: {err}"));
         if err.relock {
-            self.lock_session();
-            self.security_keys.error = Some(
-                "the key re-locked (PIN or session changed) \u{2014} \
-                 unlock again to continue."
-                    .into(),
-            );
+            self.relock_fido_session();
         } else {
             self.security_keys.error = Some(format!("{context}: {err}"));
         }
