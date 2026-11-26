@@ -24,13 +24,16 @@ mod key;
 pub use key::{CtapVaultKey, VaultKey};
 
 mod ops;
-pub use ops::{matching, save, unlock, Change, OpenVault, Saved, Unlocked, VaultOnKey, VaultPick};
+pub use ops::{
+    matching, reload, save, unlock, Change, OpenVault, Saved, Unlocked, VaultOnKey, VaultPick,
+};
 
 mod lifecycle;
 pub use lifecycle::{create, delete, list_credentials, rotate, Created};
 
-#[cfg(test)]
-mod fake;
+#[cfg(any(test, feature = "vault-fake"))]
+#[doc(hidden)]
+pub mod fake;
 
 /// Which vault, as the key names it. Front ends tell vaults apart by
 /// `name`; the credential ID is carried for JSON output and for the calls

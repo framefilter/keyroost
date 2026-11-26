@@ -9,6 +9,10 @@
 //! getAssertion leaves the token only its largeBlobWrite permission (CTAP
 //! 2.1 `clearPinUvAuthTokenPermissionsExceptLbw`), and a write larger than
 //! the store is refused.
+//!
+//! Built for this crate's tests, and for a front end's tests through the
+//! `vault-fake` feature, which only a `[dev-dependencies]` entry enables.
+//! Not part of the crate's API: hidden from its docs, and free to change.
 
 use std::collections::VecDeque;
 
@@ -40,8 +44,9 @@ const STORAGE_FULL: u8 = 0x3B;
 /// The checksum trailer after a serialized largeBlob array.
 const CHECKSUM_LEN: usize = 16;
 
-/// The largeBlobKey [`UNREADABLE_ENTRY`] is sealed under.
-pub(crate) const UNREADABLE_LBK: [u8; 32] = [0x5E; 32];
+/// The largeBlobKey the damaged entry [`FakeKey::put_unreadable`] stores
+/// is sealed under.
+pub const UNREADABLE_LBK: [u8; 32] = [0x5E; 32];
 
 /// A largeBlob entry whose GCM tag verifies under [`UNREADABLE_LBK`] but
 /// whose plaintext is not DEFLATE, so it never inflates: `{1: ciphertext,
@@ -59,7 +64,7 @@ const UNREADABLE_ENTRY: &[u8] = &[
 
 /// One credential on the fake key.
 #[derive(Clone)]
-pub(crate) struct FakeCred {
+pub struct FakeCred {
     pub id: Vec<u8>,
     pub user_id: Vec<u8>,
     pub user_name: Option<String>,
@@ -69,7 +74,7 @@ pub(crate) struct FakeCred {
 
 /// A call a flow made, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Call {
+pub enum Call {
     Token { perms: u32, rp: Option<String> },
     MakeCredential,
     Assertions(Option<Vec<u8>>),
@@ -81,9 +86,9 @@ pub(crate) enum Call {
 
 /// Run once, between the `n`th `Read` (counting from 1) and whatever comes
 /// next: another writer changing the store under the flow.
-pub(crate) type Hook = Box<dyn FnOnce(&mut FakeKey)>;
+pub type Hook = Box<dyn FnOnce(&mut FakeKey)>;
 
-pub(crate) struct FakeKey {
+pub struct FakeKey {
     pub info: AuthenticatorInfo,
     pub creds: Vec<FakeCred>,
     pub log: Vec<Call>,
@@ -312,6 +317,12 @@ impl FakeKey {
         if let Some((_, perms)) = self.issued.iter_mut().find(|(t, _)| *t == token.token) {
             *perms &= LARGE_BLOB_WRITE;
         }
+    }
+}
+
+impl Default for FakeKey {
+    fn default() -> Self {
+        FakeKey::new()
     }
 }
 

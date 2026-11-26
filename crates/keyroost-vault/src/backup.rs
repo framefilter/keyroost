@@ -113,6 +113,24 @@ pub fn check_passphrase(pass: &str) -> Result<(), VaultError> {
     Ok(())
 }
 
+/// The file name a hint suggests for a backup of the vault `name`: lower
+/// case, letters and digits (any script) kept, every run of anything else
+/// one `-`, trimmed, `vault` when nothing is left, then `.t2vault`. Never a
+/// path: no separator survives, and the only dot is the extension's.
+pub fn backup_file_name(name: &str) -> String {
+    let mut stem = String::new();
+    for c in name.to_lowercase().chars() {
+        if c.is_alphanumeric() {
+            stem.push(c);
+        } else if !stem.is_empty() && !stem.ends_with('-') {
+            stem.push('-');
+        }
+    }
+    let stem = stem.trim_end_matches('-');
+    let stem = if stem.is_empty() { "vault" } else { stem };
+    format!("{stem}.t2vault")
+}
+
 pub(crate) fn export_backup_with(
     v: &Vault,
     pass: &str,
@@ -317,5 +335,29 @@ mod tests {
         assert_eq!(b[6..10], 65536u32.to_le_bytes());
         assert_eq!(import_backup(&b, BACKUP_PASS).unwrap(), sample());
         eprintln!("default_params_roundtrip took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn backup_file_name_is_plain() {
+        assert_eq!(backup_file_name("Personal"), "personal.t2vault");
+        assert_eq!(backup_file_name("Work  Mail!"), "work-mail.t2vault");
+        assert_eq!(backup_file_name("--Home/Bank--"), "home-bank.t2vault");
+        assert_eq!(backup_file_name("Café"), "café.t2vault");
+        assert_eq!(backup_file_name("Почта 2"), "почта-2.t2vault");
+        assert_eq!(backup_file_name("ééé"), "ééé.t2vault");
+        assert_eq!(backup_file_name("!!!"), "vault.t2vault");
+        // Never a path: no separator, and the only dot is the extension's.
+        for name in ["../..", "a/../b", "C:\\x", "..", ".hidden", "a.b.c"] {
+            let f = backup_file_name(name);
+            assert!(
+                !f.contains('/') && !f.contains('\\') && !f.contains(':'),
+                "{f}"
+            );
+            assert_eq!(f.matches('.').count(), 1, "{f}");
+            assert!(!f.starts_with('.') && !f.starts_with('-'), "{f}");
+        }
+        assert_eq!(backup_file_name("../.."), "vault.t2vault");
+        assert_eq!(backup_file_name("../x"), "x.t2vault");
+        assert_eq!(backup_file_name(""), "vault.t2vault");
     }
 }
