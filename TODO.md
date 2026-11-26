@@ -235,6 +235,13 @@ plan's two-key manual steps were never executed):
   and wording that says plainly the PINs go back to their defaults (user
   123456, admin 12345678).
 
+- **The app side of `fido credential compare`** — after v0.17. The CLI
+  command from [#287](https://github.com/framefilter/keyroost/pull/287)
+  lists the passkeys found on only one of two keys; the app needs the same,
+  in the same words ("key A", "key B", "Only on key A"). One placement: the
+  FIDO2 tab, when two keys are connected. dlacko, who wrote the command,
+  offered to build it.
+
 - **Require green CI on `main`** — deliberately deferred; the remaining piece
   of full branch protection. Require-PR, linear history and squash-only merges
   landed 2026-08-24 (see Standing decisions), with an admin bypass so the
