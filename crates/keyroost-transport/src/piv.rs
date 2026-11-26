@@ -4623,7 +4623,9 @@ impl<'tx> PivSession<'tx> {
     ///
     /// 1. **Full key material.** When this session already knows `slot`'s
     ///    current public key ([`Self::slot_key`]: GET METADATA, or this
-    ///    session's generate/`remember_pubkey` cache) and the certificate
+    ///    session's generate/`remember_pubkey` cache; on the Feitian ePass
+    ///    and BioPass, the slot's attestation, which is read first for a slot
+    ///    holding a generated key, about 2 s on the ePass) and the certificate
     ///    carries a different one, byte for byte — see
     ///    [`TransportError::PivImportCertificateKeyMismatch`].
     /// 2. **Algorithm only**, when step 1 couldn't run at all (`slot_key`
@@ -5065,10 +5067,13 @@ impl<'tx> PivSession<'tx> {
     /// The key a card of Feitian's dialect attests for `slot`: the algorithm
     /// and public key in the certificate [`Self::attest`] returns. Such a
     /// card has no GET METADATA, and this is the one read that gives the key
-    /// of a slot with no certificate. `None` on any other card, where the
-    /// product's rows do not list [`keyroost_piv::compat::PivExtension::Attest`]
-    /// as supported, and for a slot whose key the card does not attest
-    /// (no key, or an imported one).
+    /// of a slot with no certificate. `None` on a card that does not speak
+    /// Feitian's dialect, and where the product's rows list
+    /// [`keyroost_piv::compat::PivExtension::Attest`] as unsupported. The
+    /// request is also sent where support is unverified (the generic
+    /// Feitian row, or a version not measured), and then `None` is the
+    /// answer when the card refuses it. `None` too for a slot whose key the
+    /// card does not attest (no key, or an imported one).
     fn attested_slot_key(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
         if !speaks_feitian(&self.quirks()) {
             return None;
