@@ -76,6 +76,10 @@ pub enum FingerprintError {
     /// The key offers built-in UV but has no fingerprint enrolled
     /// (getInfo `uv: false`).
     NoneEnrolled,
+    /// The key offers built-in UV but a fingerprint token cannot carry the
+    /// permission this needs (`be` without `uvBioEnroll`, `acfg` without
+    /// `uvAcfg`); the PIN can.
+    NotForThis,
     /// No fingerprint tries are left: `status` is `Some(0x3C)` when the key
     /// said so on a token request, `None` when getUVRetries read 0.
     Blocked { status: Option<u8> },
@@ -92,6 +96,10 @@ impl std::fmt::Display for FingerprintError {
             ),
             FingerprintError::NoneEnrolled => (
                 "this key has no fingerprint enrolled; use the PIN instead",
+                None,
+            ),
+            FingerprintError::NotForThis => (
+                "this key does not allow this with a fingerprint; use the PIN instead",
                 None,
             ),
             FingerprintError::Blocked { status } => (
@@ -509,6 +517,10 @@ mod tests {
         assert_eq!(
             FingerprintError::NoneEnrolled.to_string(),
             "this key has no fingerprint enrolled; use the PIN instead"
+        );
+        assert_eq!(
+            FingerprintError::NotForThis.to_string(),
+            "this key does not allow this with a fingerprint; use the PIN instead"
         );
         assert_eq!(
             FingerprintError::Blocked { status: None }.to_string(),

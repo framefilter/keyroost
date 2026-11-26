@@ -26,10 +26,12 @@
 //! `getPinUvAuthTokenUsingUvWithPermissions` (0x06, see
 //! [`get_pin_uv_auth_token_using_uv`]) when getInfo has both `uv` and
 //! `pinUvAuthToken` true ([`built_in_uv`]), with the remaining finger tries
-//! from `getUVRetries` (0x07, [`get_uv_retries`]).
+//! from `getUVRetries` (0x07, [`get_uv_retries`]). [`get_token`] is the one
+//! call front ends use: the PIN, a fingerprint, or a fingerprint with the
+//! PIN as fallback ([`TokenSource`]), reporting which one gave the token.
 
 use crate::cbor::{self, Value};
-use crate::cmd::{fingerprint_refusal, get_info, AuthenticatorInfo, CtapError};
+use crate::cmd::{fingerprint_refusal, get_info, AuthenticatorInfo, CtapError, FingerprintError};
 use crate::hid::CTAPHID_CBOR;
 use crate::pin::{
     left16_sha256, pad_pin_to_64, EphemeralKey, PinProtocol, ProtocolV1, ProtocolV2,
@@ -353,16 +355,32 @@ pub fn get_pin_uv_auth_token(
     info: &AuthenticatorInfo,
     permissions: u32,
 ) -> Result<PinUvAuthToken, CtapError> {
-    // CTAP 2.1 requires the PIN change before either token command. Stop here
-    // so callers do not mistake the resulting 0x37 for a new-PIN policy error.
-    if info.force_pin_change == Some(true) {
-        return Err(CtapError::PinChangeRequired);
-    }
+    get_token(
+        dev,
+        info,
+        TokenSource::Pin(pin),
+        permissions,
+        None,
+        &mut || {},
+    )
+    .map(|(t, _)| t)
+}
+
+/// The PIN token with the command negotiated from getInfo: 0x09 with
+/// `permissions` and `rp_id` when the key advertises `pinUvAuthToken`,
+/// otherwise legacy 0x05, which takes neither.
+fn pin_token(
+    dev: &mut impl CtapTransport,
+    info: &AuthenticatorInfo,
+    pin: &str,
+    permissions: u32,
+    rp_id: Option<&str>,
+) -> Result<PinUvAuthToken, CtapError> {
     // We already hold `getInfo`, so negotiate the protocol straight from it
     // rather than paying for another round-trip in the helpers below.
     let chosen = select_pin_protocol(&info.pin_uv_auth_protocols);
     if info.option("pinUvAuthToken") == Some(true) {
-        token_with_permissions(dev, pin, permissions, None, chosen)
+        token_with_permissions(dev, pin, permissions, rp_id, chosen)
     } else {
         token_legacy(dev, pin, chosen)
     }
@@ -489,6 +507,130 @@ fn uv_token_extra(our_pub: Value, permissions: u32, rp_id: Option<&str>) -> Vec<
         extra.push((Value::UInt(KEY_RP_ID), Value::Text(rp.to_string())));
     }
     extra
+}
+
+/// Where [`get_token`] gets the pinUvAuthToken from.
+#[derive(Clone, Copy)]
+pub enum TokenSource<'a> {
+    /// The PIN (0x09, or legacy 0x05 on a key without `pinUvAuthToken`).
+    Pin(&'a str),
+    /// A fingerprint (0x06) only.
+    Fingerprint,
+    /// A fingerprint, and the PIN when the finger is refused or cannot be
+    /// asked; with `None`, the fingerprint error is returned instead.
+    FingerprintOrPin(Option<&'a str>),
+}
+
+// Hand-written so a PIN never reaches a log or a panic message.
+impl std::fmt::Debug for TokenSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TokenSource::Pin(_) => "Pin(<redacted>)",
+            TokenSource::Fingerprint => "Fingerprint",
+            TokenSource::FingerprintOrPin(Some(_)) => "FingerprintOrPin(Some(<redacted>))",
+            TokenSource::FingerprintOrPin(None) => "FingerprintOrPin(None)",
+        })
+    }
+}
+
+/// How a token from [`get_token`] was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verified {
+    Pin,
+    Fingerprint,
+}
+
+/// Why the user is asked for a finger: the first unlock, or again because
+/// the key dropped the token it gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerAsk {
+    Unlock,
+    Again,
+}
+
+impl FingerAsk {
+    /// The line shown while the key waits for the finger.
+    pub fn prompt(self) -> &'static str {
+        match self {
+            FingerAsk::Unlock => "Touch the fingerprint sensor\u{2026}",
+            FingerAsk::Again => {
+                "The key asked for a new unlock: touch the fingerprint sensor again\u{2026}"
+            }
+        }
+    }
+}
+
+/// Obtain a pinUvAuthToken bound to `permissions` (and `rp_id`, where the
+/// command takes one) from the PIN, a fingerprint, or a fingerprint with the
+/// PIN as fallback, and say which one gave it.
+///
+/// - `Pin`: 0x09 with the rpId, or legacy 0x05 (which ignores both
+///   `permissions` and `rp_id`) on a key without `pinUvAuthToken`.
+/// - `Fingerprint`: refused with no I/O when [`built_in_uv`] is not
+///   [`BuiltInUv::Ready`] or [`uv_grants`] does not allow `permissions`;
+///   refused without asking for the finger when getUVRetries reads 0 (a
+///   failed read is not a refusal: the token request answers for itself).
+///   Then `on_finger` runs once, right before the 0x06 request that waits
+///   for the finger.
+/// - `FingerprintOrPin(pin)`: the fingerprint; on any
+///   [`CtapError::Fingerprint`] with a PIN given, the PIN instead (without a
+///   second `on_finger`). Any other error is returned as is.
+///
+/// `forcePINChange` refuses every source with
+/// [`CtapError::PinChangeRequired`] before any I/O: CTAP 2.1 requires the
+/// PIN change before the PIN token commands, and keyroost asks for it before
+/// a fingerprint token too.
+pub fn get_token(
+    dev: &mut impl CtapTransport,
+    info: &AuthenticatorInfo,
+    source: TokenSource<'_>,
+    permissions: u32,
+    rp_id: Option<&str>,
+    on_finger: &mut dyn FnMut(),
+) -> Result<(PinUvAuthToken, Verified), CtapError> {
+    // Stop here so callers do not mistake the resulting 0x37 for a new-PIN
+    // policy error, and so no finger is asked for a token that cannot come.
+    if info.force_pin_change == Some(true) {
+        return Err(CtapError::PinChangeRequired);
+    }
+    let pin = match source {
+        TokenSource::Pin(pin) => {
+            return pin_token(dev, info, pin, permissions, rp_id).map(|t| (t, Verified::Pin))
+        }
+        TokenSource::Fingerprint => None,
+        TokenSource::FingerprintOrPin(pin) => pin,
+    };
+    match (finger_token(dev, info, permissions, rp_id, on_finger), pin) {
+        (Ok(token), _) => Ok((token, Verified::Fingerprint)),
+        (Err(CtapError::Fingerprint(_)), Some(pin)) => {
+            pin_token(dev, info, pin, permissions, rp_id).map(|t| (t, Verified::Pin))
+        }
+        (Err(error), _) => Err(error),
+    }
+}
+
+/// The fingerprint half of [`get_token`].
+fn finger_token(
+    dev: &mut impl CtapTransport,
+    info: &AuthenticatorInfo,
+    permissions: u32,
+    rp_id: Option<&str>,
+    on_finger: &mut dyn FnMut(),
+) -> Result<PinUvAuthToken, CtapError> {
+    let refuse = |why| Err(CtapError::Fingerprint(why));
+    match built_in_uv(info) {
+        BuiltInUv::Ready => {}
+        BuiltInUv::NoneEnrolled => return refuse(FingerprintError::NoneEnrolled),
+        BuiltInUv::NotOffered => return refuse(FingerprintError::NotOffered),
+    }
+    if !uv_grants(info, permissions) {
+        return refuse(FingerprintError::NotForThis);
+    }
+    if let Ok(0) = get_uv_retries(dev, info) {
+        return refuse(FingerprintError::Blocked { status: None });
+    }
+    on_finger();
+    get_pin_uv_auth_token_using_uv(dev, info, permissions, rp_id)
 }
 
 /// Decrypt the pinUvAuthToken from a 0x09 or 0x06 answer under the shared
@@ -1017,7 +1159,6 @@ mod tests {
 
     // --- Built-in user verification (fingerprint) --------------------------
 
-    use crate::cmd::FingerprintError;
     use crate::pin::EphemeralKey;
     use std::time::Duration;
 
@@ -1034,6 +1175,8 @@ mod tests {
         retries: u32,
         sub7_status: Option<u8>,
         calls: Vec<(u8, Value)>,
+        /// The decrypted pinHashEnc of every PIN token request (sub 5 or 9).
+        pin_hashes: Vec<[u8; 16]>,
         timeout: Duration,
         timeouts: Vec<Duration>,
         set_calls: Vec<Duration>,
@@ -1048,6 +1191,7 @@ mod tests {
                 retries: 5,
                 sub7_status: None,
                 calls: Vec::new(),
+                pin_hashes: Vec::new(),
                 timeout: Duration::from_secs(2),
                 timeouts: Vec::new(),
                 set_calls: Vec::new(),
@@ -1062,6 +1206,34 @@ mod tests {
             let mut resp = vec![0x00];
             resp.extend(cbor::encode(&Value::Map(map)));
             resp
+        }
+
+        /// The key's side of the agreement the request's keyAgreement and
+        /// declared protocol make.
+        fn shared(&self, req: &Value) -> Box<dyn PinProtocol> {
+            let theirs = parse_pin_response(&Value::Map(vec![(
+                Value::UInt(1),
+                req.get_uint_key(KEY_KEY_AGREEMENT).unwrap().clone(),
+            )]))
+            .unwrap()
+            .key_agreement
+            .unwrap();
+            let protocol = req.get_uint_key(KEY_PIN_PROTOCOL).unwrap().as_uint();
+            if protocol == Some(2) {
+                Box::new(ProtocolV2 {
+                    secret: self.key.shared_secret_v2(&theirs.0, &theirs.1).unwrap(),
+                })
+            } else {
+                Box::new(ProtocolV1 {
+                    secret: self.key.shared_secret_v1(&theirs.0, &theirs.1).unwrap(),
+                })
+            }
+        }
+
+        /// Answer a token request with `token` encrypted for it.
+        fn issue(&self, device: &dyn PinProtocol) -> Vec<u8> {
+            let enc = device.encrypt(&self.token).unwrap();
+            Self::reply(vec![(Value::UInt(2), Value::Bytes(enc))])
         }
     }
 
@@ -1089,25 +1261,18 @@ mod tests {
                     if let Some(status) = self.sub6_status {
                         return Ok(vec![status]);
                     }
-                    let theirs = parse_pin_response(&Value::Map(vec![(
-                        Value::UInt(1),
-                        req.get_uint_key(KEY_KEY_AGREEMENT).unwrap().clone(),
-                    )]))
-                    .unwrap()
-                    .key_agreement
-                    .unwrap();
-                    let protocol = req.get_uint_key(KEY_PIN_PROTOCOL).unwrap().as_uint();
-                    let device: Box<dyn PinProtocol> = if protocol == Some(2) {
-                        Box::new(ProtocolV2 {
-                            secret: self.key.shared_secret_v2(&theirs.0, &theirs.1).unwrap(),
-                        })
-                    } else {
-                        Box::new(ProtocolV1 {
-                            secret: self.key.shared_secret_v1(&theirs.0, &theirs.1).unwrap(),
-                        })
-                    };
-                    let enc = device.encrypt(&self.token).unwrap();
-                    Ok(Self::reply(vec![(Value::UInt(2), Value::Bytes(enc))]))
+                    let device = self.shared(&req);
+                    Ok(self.issue(device.as_ref()))
+                }
+                SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN | SUB_GET_PIN_TOKEN => {
+                    let device = self.shared(&req);
+                    let enc = req
+                        .get_uint_key(KEY_PIN_HASH_ENC)
+                        .and_then(Value::as_bytes)
+                        .unwrap();
+                    let hash = device.decrypt(enc).unwrap();
+                    self.pin_hashes.push(hash.as_slice().try_into().unwrap());
+                    Ok(self.issue(device.as_ref()))
                 }
                 SUB_GET_UV_RETRIES => match self.sub7_status {
                     Some(status) => Ok(vec![status]),
@@ -1408,5 +1573,431 @@ mod tests {
             &both,
             BIO_ENROLLMENT | AUTHENTICATOR_CONFIGURATION
         ));
+    }
+
+    // --- One token call: PIN, fingerprint, fingerprint else PIN ------------
+
+    const TEST_PIN: &str = "4711-test";
+
+    type TokenResult = Result<(PinUvAuthToken, Verified), CtapError>;
+
+    /// Run [`get_token`] and count how often it asked for the finger.
+    fn token_via(
+        dev: &mut UvDevice,
+        info: &AuthenticatorInfo,
+        source: TokenSource<'_>,
+        permissions: u32,
+        rp_id: Option<&str>,
+    ) -> (TokenResult, usize) {
+        let mut fingers = 0;
+        let result = get_token(dev, info, source, permissions, rp_id, &mut || fingers += 1);
+        (result, fingers)
+    }
+
+    fn refusal(result: TokenResult) -> CtapError {
+        match result {
+            Ok(_) => panic!("the token request must be refused"),
+            Err(error) => error,
+        }
+    }
+
+    fn info_with(opts: &[(&str, bool)]) -> AuthenticatorInfo {
+        AuthenticatorInfo {
+            options: opts.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            ..uv_info(vec![2, 1])
+        }
+    }
+
+    #[test]
+    fn pin_source_sends_0x09_with_the_rp_id() {
+        let mut dev = UvDevice::new();
+        let (result, fingers) = token_via(
+            &mut dev,
+            &uv_info(vec![2, 1]),
+            TokenSource::Pin(TEST_PIN),
+            permissions::GET_ASSERTION | permissions::LARGE_BLOB_WRITE,
+            Some("keyroost.vault"),
+        );
+        let (token, verified) = result.ok().unwrap();
+        assert_eq!(verified, Verified::Pin);
+        assert_eq!(token.token, dev.token);
+        assert_eq!(fingers, 0);
+        assert_eq!(dev.subs(), [2, 9]);
+        let req = &dev.calls[1].1;
+        assert_eq!(
+            req.get_uint_key(KEY_RP_ID).and_then(Value::as_text),
+            Some("keyroost.vault")
+        );
+        assert_eq!(
+            req.get_uint_key(KEY_PERMISSIONS).and_then(Value::as_uint),
+            Some(0x12)
+        );
+        assert_eq!(dev.pin_hashes, [left16_sha256(TEST_PIN.as_bytes())]);
+    }
+
+    #[test]
+    fn pin_source_on_a_legacy_key_uses_0x05_without_the_rp_id() {
+        let mut dev = UvDevice::new();
+        let info = AuthenticatorInfo {
+            pin_uv_auth_protocols: vec![1],
+            options: vec![("clientPin".into(), true)],
+            ..Default::default()
+        };
+        let (result, _) = token_via(
+            &mut dev,
+            &info,
+            TokenSource::Pin(TEST_PIN),
+            permissions::GET_ASSERTION,
+            Some("keyroost.vault"),
+        );
+        assert_eq!(result.ok().unwrap().1, Verified::Pin);
+        assert_eq!(dev.subs(), [2, 5]);
+        assert!(dev.calls[1].1.get_uint_key(KEY_RP_ID).is_none());
+        assert!(dev.calls[1].1.get_uint_key(KEY_PERMISSIONS).is_none());
+        assert_eq!(dev.pin_hashes, [left16_sha256(TEST_PIN.as_bytes())]);
+    }
+
+    #[test]
+    fn fingerprint_source_refuses_without_uv_and_sends_nothing() {
+        let cases = [
+            (
+                info_with(&[("uv", false), ("pinUvAuthToken", true)]),
+                FingerprintError::NoneEnrolled,
+            ),
+            (
+                info_with(&[("pinUvAuthToken", true)]),
+                FingerprintError::NotOffered,
+            ),
+            (info_with(&[("uv", true)]), FingerprintError::NotOffered),
+        ];
+        for (info, expected) in cases {
+            let mut dev = UvDevice::new();
+            let (result, fingers) = token_via(
+                &mut dev,
+                &info,
+                TokenSource::Fingerprint,
+                permissions::CREDENTIAL_MANAGEMENT,
+                None,
+            );
+            let err = refusal(result);
+            assert!(
+                matches!(err, CtapError::Fingerprint(e) if e == expected),
+                "{expected:?}: {err:?}"
+            );
+            assert!(dev.calls.is_empty());
+            assert_eq!(fingers, 0);
+        }
+    }
+
+    #[test]
+    fn fingerprint_source_checks_retries_then_asks_once() {
+        let mut dev = UvDevice::new();
+        let (result, fingers) = token_via(
+            &mut dev,
+            &uv_info(vec![2, 1]),
+            TokenSource::Fingerprint,
+            permissions::GET_ASSERTION | permissions::LARGE_BLOB_WRITE,
+            Some("keyroost.vault"),
+        );
+        let (token, verified) = result.ok().unwrap();
+        assert_eq!(verified, Verified::Fingerprint);
+        assert_eq!(token.token, dev.token);
+        assert_eq!(fingers, 1);
+        assert_eq!(dev.subs(), [7, 2, 6]);
+        let req = &dev.calls[2].1;
+        assert_eq!(
+            req.get_uint_key(KEY_PERMISSIONS).and_then(Value::as_uint),
+            Some(0x12)
+        );
+        assert_eq!(
+            req.get_uint_key(KEY_RP_ID).and_then(Value::as_text),
+            Some("keyroost.vault")
+        );
+        assert!(dev.pin_hashes.is_empty());
+    }
+
+    #[test]
+    fn zero_uv_retries_refuse_before_the_finger() {
+        let mut dev = UvDevice::new();
+        dev.retries = 0;
+        let (result, fingers) = token_via(
+            &mut dev,
+            &uv_info(vec![2]),
+            TokenSource::Fingerprint,
+            permissions::CREDENTIAL_MANAGEMENT,
+            None,
+        );
+        assert!(matches!(
+            refusal(result),
+            CtapError::Fingerprint(FingerprintError::Blocked { status: None })
+        ));
+        assert_eq!(dev.subs(), [7]);
+        assert_eq!(fingers, 0);
+    }
+
+    #[test]
+    fn a_failed_retries_read_does_not_block() {
+        let mut dev = UvDevice::new();
+        dev.sub7_status = Some(0x2B);
+        let (result, fingers) = token_via(
+            &mut dev,
+            &uv_info(vec![2]),
+            TokenSource::Fingerprint,
+            permissions::CREDENTIAL_MANAGEMENT,
+            None,
+        );
+        assert_eq!(result.ok().unwrap().1, Verified::Fingerprint);
+        assert_eq!(dev.subs(), [7, 2, 6]);
+        assert_eq!(fingers, 1);
+    }
+
+    #[test]
+    fn fingerprint_source_refuses_permissions_the_finger_cannot_grant() {
+        // F1: through 0x06, be needs uvBioEnroll and acfg needs uvAcfg; the
+        // PIN path's bioEnroll / authnrCfg are not enough.
+        for (perm, pin_option, uv_option) in [
+            (permissions::BIO_ENROLLMENT, "bioEnroll", "uvBioEnroll"),
+            (
+                permissions::AUTHENTICATOR_CONFIGURATION,
+                "authnrCfg",
+                "uvAcfg",
+            ),
+        ] {
+            let perms = permissions::CREDENTIAL_MANAGEMENT | perm;
+            let ready = [("uv", true), ("pinUvAuthToken", true)];
+            let pin_only = info_with(&[ready[0], ready[1], (pin_option, true)]);
+
+            // Fingerprint and auto without a PIN: refused, no I/O, no finger.
+            for source in [
+                TokenSource::Fingerprint,
+                TokenSource::FingerprintOrPin(None),
+            ] {
+                let mut dev = UvDevice::new();
+                let (result, fingers) = token_via(&mut dev, &pin_only, source, perms, None);
+                let err = refusal(result);
+                assert!(
+                    matches!(err, CtapError::Fingerprint(FingerprintError::NotForThis)),
+                    "{perm:#04x} {source:?}: {err:?}"
+                );
+                assert_eq!(
+                    err.to_string(),
+                    "this key does not allow this with a fingerprint; use the PIN instead"
+                );
+                assert!(dev.calls.is_empty());
+                assert_eq!(fingers, 0);
+            }
+
+            // Auto with a PIN: straight to the PIN, no finger.
+            let mut dev = UvDevice::new();
+            let (result, fingers) = token_via(
+                &mut dev,
+                &pin_only,
+                TokenSource::FingerprintOrPin(Some(TEST_PIN)),
+                perms,
+                None,
+            );
+            assert_eq!(result.ok().unwrap().1, Verified::Pin);
+            assert_eq!(dev.subs(), [2, 9]);
+            assert_eq!(fingers, 0);
+
+            // With the UV option the finger can grant it.
+            let mut dev = UvDevice::new();
+            let granted = info_with(&[ready[0], ready[1], (uv_option, true)]);
+            let (result, fingers) =
+                token_via(&mut dev, &granted, TokenSource::Fingerprint, perms, None);
+            assert_eq!(result.ok().unwrap().1, Verified::Fingerprint);
+            assert_eq!(dev.subs(), [7, 2, 6]);
+            assert_eq!(fingers, 1);
+        }
+    }
+
+    #[test]
+    fn auto_falls_back_to_the_given_pin_on_every_refusal() {
+        for code in [0x27, 0x2F, 0x30, 0x34, 0x3A, 0x3C, 0x3F, 0x40] {
+            let mut dev = UvDevice::new();
+            dev.sub6_status = Some(code);
+            let (result, fingers) = token_via(
+                &mut dev,
+                &uv_info(vec![2, 1]),
+                TokenSource::FingerprintOrPin(Some(TEST_PIN)),
+                permissions::CREDENTIAL_MANAGEMENT,
+                Some("example.com"),
+            );
+            let (token, verified) = result.ok().unwrap();
+            assert_eq!(verified, Verified::Pin, "{code:#04x}");
+            assert_eq!(token.token, dev.token);
+            assert_eq!(dev.subs(), [7, 2, 6, 2, 9], "{code:#04x}");
+            assert_eq!(fingers, 1, "{code:#04x}");
+            // The PIN request carries the same permissions and rpId.
+            let req = &dev.calls[4].1;
+            assert_eq!(
+                req.get_uint_key(KEY_RP_ID).and_then(Value::as_text),
+                Some("example.com")
+            );
+            assert_eq!(dev.pin_hashes, [left16_sha256(TEST_PIN.as_bytes())]);
+        }
+
+        // No tries left: the PIN, without asking for the finger.
+        let mut dev = UvDevice::new();
+        dev.retries = 0;
+        let (result, fingers) = token_via(
+            &mut dev,
+            &uv_info(vec![2, 1]),
+            TokenSource::FingerprintOrPin(Some(TEST_PIN)),
+            permissions::CREDENTIAL_MANAGEMENT,
+            None,
+        );
+        assert_eq!(result.ok().unwrap().1, Verified::Pin);
+        assert_eq!(dev.subs(), [7, 2, 9]);
+        assert_eq!(fingers, 0);
+    }
+
+    #[test]
+    fn auto_without_a_pin_returns_the_fingerprint_error() {
+        let mut dev = UvDevice::new();
+        dev.sub6_status = Some(0x3F);
+        let (result, fingers) = token_via(
+            &mut dev,
+            &uv_info(vec![2, 1]),
+            TokenSource::FingerprintOrPin(None),
+            permissions::CREDENTIAL_MANAGEMENT,
+            None,
+        );
+        assert!(matches!(
+            refusal(result),
+            CtapError::Fingerprint(FingerprintError::Refused(0x3F))
+        ));
+        assert_eq!(dev.subs(), [7, 2, 6]);
+        assert_eq!(fingers, 1);
+    }
+
+    #[test]
+    fn auto_on_a_key_without_uv_uses_the_pin_without_a_finger() {
+        for (info, expected) in [
+            (
+                info_with(&[("uv", false), ("pinUvAuthToken", true)]),
+                FingerprintError::NoneEnrolled,
+            ),
+            (
+                info_with(&[("pinUvAuthToken", true)]),
+                FingerprintError::NotOffered,
+            ),
+        ] {
+            let mut dev = UvDevice::new();
+            let (result, fingers) = token_via(
+                &mut dev,
+                &info,
+                TokenSource::FingerprintOrPin(Some(TEST_PIN)),
+                permissions::CREDENTIAL_MANAGEMENT,
+                None,
+            );
+            assert_eq!(result.ok().unwrap().1, Verified::Pin);
+            assert_eq!(dev.subs(), [2, 9]);
+            assert_eq!(fingers, 0);
+
+            // Without a PIN: the fingerprint error, before any I/O.
+            let mut dev = UvDevice::new();
+            let (result, fingers) = token_via(
+                &mut dev,
+                &info,
+                TokenSource::FingerprintOrPin(None),
+                permissions::CREDENTIAL_MANAGEMENT,
+                None,
+            );
+            let err = refusal(result);
+            assert!(
+                matches!(err, CtapError::Fingerprint(e) if e == expected),
+                "{err:?}"
+            );
+            assert!(dev.calls.is_empty());
+            assert_eq!(fingers, 0);
+        }
+    }
+
+    #[test]
+    fn auto_does_not_fall_back_on_other_errors() {
+        let mut dev = UvDevice::new();
+        dev.sub6_status = Some(0x2B);
+        let (result, fingers) = token_via(
+            &mut dev,
+            &uv_info(vec![2, 1]),
+            TokenSource::FingerprintOrPin(Some(TEST_PIN)),
+            permissions::CREDENTIAL_MANAGEMENT,
+            None,
+        );
+        assert!(matches!(refusal(result), CtapError::StatusCode(0x2B)));
+        assert_eq!(dev.subs(), [7, 2, 6]);
+        assert_eq!(fingers, 1);
+
+        // A PIN change the key asks for is not a finger refusal either.
+        let mut dev = UvDevice::new();
+        dev.sub6_status = Some(0x37);
+        let (result, _) = token_via(
+            &mut dev,
+            &uv_info(vec![2, 1]),
+            TokenSource::FingerprintOrPin(Some(TEST_PIN)),
+            permissions::CREDENTIAL_MANAGEMENT,
+            None,
+        );
+        assert!(matches!(refusal(result), CtapError::PinChangeRequired));
+        assert_eq!(dev.subs(), [7, 2, 6]);
+    }
+
+    #[test]
+    fn forced_pin_change_refuses_every_source_before_the_finger() {
+        let info = AuthenticatorInfo {
+            force_pin_change: Some(true),
+            ..uv_info(vec![2, 1])
+        };
+        for source in [
+            TokenSource::Pin(TEST_PIN),
+            TokenSource::Fingerprint,
+            TokenSource::FingerprintOrPin(Some(TEST_PIN)),
+            TokenSource::FingerprintOrPin(None),
+        ] {
+            let mut dev = UvDevice::new();
+            let (result, fingers) = token_via(
+                &mut dev,
+                &info,
+                source,
+                permissions::CREDENTIAL_MANAGEMENT,
+                None,
+            );
+            assert!(
+                matches!(refusal(result), CtapError::PinChangeRequired),
+                "{source:?}"
+            );
+            assert!(dev.calls.is_empty(), "{source:?}");
+            assert_eq!(fingers, 0, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn token_source_debug_hides_the_pin() {
+        let shown = [
+            format!("{:?}", TokenSource::Pin(TEST_PIN)),
+            format!("{:?}", TokenSource::FingerprintOrPin(Some(TEST_PIN))),
+        ];
+        for text in &shown {
+            assert!(!text.contains(TEST_PIN), "{text}");
+            assert!(text.contains("redacted"), "{text}");
+        }
+        assert_eq!(format!("{:?}", TokenSource::Fingerprint), "Fingerprint");
+        assert_eq!(
+            format!("{:?}", TokenSource::FingerprintOrPin(None)),
+            "FingerprintOrPin(None)"
+        );
+    }
+
+    #[test]
+    fn finger_prompts() {
+        assert_eq!(
+            FingerAsk::Unlock.prompt(),
+            "Touch the fingerprint sensor\u{2026}"
+        );
+        assert_eq!(
+            FingerAsk::Again.prompt(),
+            "The key asked for a new unlock: touch the fingerprint sensor again\u{2026}"
+        );
     }
 }
