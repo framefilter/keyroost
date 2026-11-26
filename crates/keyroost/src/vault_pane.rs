@@ -4409,7 +4409,8 @@ impl App {
 
     /// Export backup… on a vault passkey's delete question: that vault
     /// shown on the Vault tab, with its backup's save dialog; the question
-    /// waits on the FIDO2 tab. When the backup can't start (the vault
+    /// closes (nothing is deleted), so Remove asks again once the backup is
+    /// saved. When the backup can't start (the vault
     /// locked or can't be opened, or another backup's save dialog is still
     /// open), nothing changes and `Err` says why, for the question to show.
     pub(crate) fn vault_passkey_export(&mut self, credential_id: &[u8]) -> Result<(), String> {
@@ -9808,6 +9809,9 @@ mod tests {
         ]);
         app.security_keys.session = Some(session);
         app.security_keys.session_device = Some(KEY.into());
+        // The list is showing: the FIDO2 tab's Passkeys.
+        app.cap_tab = CapTab::Fido2;
+        app.security_keys.subview = crate::FidoSubview::Passkeys;
     }
 
     /// The passkey delete question's text in one frame (after the window's
@@ -9858,6 +9862,11 @@ mod tests {
             crate::passkey_label("github.com", &user(Some(""), None)),
             "github.com"
         );
+        // Text-direction and zero-width marks don't reach the screen.
+        assert_eq!(
+            crate::passkey_label("github.com", &user(Some("ali\u{202E}ce\u{200B}"), None)),
+            "github.com (ali ce )"
+        );
 
         let mut key = FakeKey::new();
         two_vaults(&mut key);
@@ -9898,6 +9907,18 @@ mod tests {
         app.selected_device = Some("serial:BBB".into());
         assert!(!passkey_question(&mut app).contains("Permanently delete"));
         assert!(app.security_keys.passkey_confirm_delete.is_none());
+        // So is one on another tab: it never floats over that tab.
+        app.selected_device = Some(KEY.into());
+        ask(&mut app);
+        app.cap_tab = CapTab::Vault;
+        assert!(!passkey_question(&mut app).contains("Permanently delete"));
+        assert!(app.security_keys.passkey_confirm_delete.is_none());
+        app.cap_tab = CapTab::Fido2;
+        ask(&mut app);
+        app.security_keys.subview = crate::FidoSubview::Settings;
+        passkey_question(&mut app);
+        assert!(app.security_keys.passkey_confirm_delete.is_none());
+        app.security_keys.subview = crate::FidoSubview::Passkeys;
         // So is one whose passkey left the list.
         app.selected_device = Some(KEY.into());
         app.ask_delete_passkey(b"gone".to_vec(), "gone.example".into(), false);
@@ -9967,14 +9988,15 @@ mod tests {
             true,
         );
         assert_eq!(answer_passkey_question(&mut app, EXPORT_BUTTON), None);
-        assert_eq!(app.cap_tab, CapTab::Overview, "no tab switch");
+        assert_eq!(app.cap_tab, CapTab::Fido2, "no tab switch");
         assert_eq!(app.vault.selected.as_deref(), Some(work.as_slice()));
         let notice = backup_pending_text(app.vault.export_for.as_ref().unwrap());
         let q = app.security_keys.passkey_confirm_delete.as_ref().unwrap();
         assert_eq!(q.notice.as_deref(), Some(notice.as_str()));
         assert!(passkey_question(&mut app).contains(&notice));
         // With nothing waiting, it goes to the Vault tab with Personal's
-        // save dialog; the question waits.
+        // save dialog, and the question closes: nothing can be deleted
+        // over the backup form without a new Remove.
         app.vault.export_for = None;
         assert_eq!(answer_passkey_question(&mut app, EXPORT_BUTTON), None);
         assert_eq!(app.cap_tab, CapTab::Vault);
@@ -9987,8 +10009,13 @@ mod tests {
             Some(personal.clone())
         );
         assert_eq!(app.file_dialog_queue.len(), 1);
-        let q = app.security_keys.passkey_confirm_delete.as_ref().unwrap();
-        assert!(q.notice.is_none());
+        assert!(app.security_keys.passkey_confirm_delete.is_none());
+        assert!(!passkey_question(&mut app).contains("Permanently delete"));
+        app.cap_tab = CapTab::Fido2;
+        assert!(
+            !passkey_question(&mut app).contains("Permanently delete"),
+            "back on the FIDO2 tab, Remove has to ask again"
+        );
         // Locked meanwhile: said, and nothing else changes.
         app.cap_tab = CapTab::Fido2;
         app.vault_lock(None);

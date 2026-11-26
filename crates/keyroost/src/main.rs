@@ -5745,6 +5745,21 @@ struct PasskeyDelete {
     notice: Option<String>,
 }
 
+/// `s` (from a key) safe to show: control, zero-width and text-direction
+/// characters ([`keyroost_keyring::is_spoofing_char`]) become spaces, as the
+/// CLI's `sanitize_terminal` does.
+fn sanitize_shown(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if keyroost_keyring::is_spoofing_char(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// A passkey as its row names it: the site, then the account (user name,
 /// else display name) when it has one.
 fn passkey_label(rp_id: &str, user: &keyroost_ctap::cred_mgmt::CredentialUser) -> String {
@@ -5754,8 +5769,8 @@ fn passkey_label(rp_id: &str, user: &keyroost_ctap::cred_mgmt::CredentialUser) -
         .filter(|n| !n.is_empty())
         .or(user.display_name.as_deref().filter(|n| !n.is_empty()));
     match account {
-        Some(a) => sanitize_title(&format!("{rp_id} ({a})")),
-        None => sanitize_title(rp_id),
+        Some(a) => sanitize_shown(&format!("{rp_id} ({a})")),
+        None => sanitize_shown(rp_id),
     }
 }
 
@@ -7435,7 +7450,7 @@ impl App {
     fn lock_session(&mut self) {
         self.security_keys.session = None;
         self.security_keys.session_device = None;
-        // A vault passkey's question is about the list that just went.
+        // A passkey's delete question is about the list that just went.
         self.security_keys.passkey_confirm_delete = None;
         wipe(&mut self.security_keys.pin_input);
     }
@@ -9602,9 +9617,10 @@ impl App {
 
     /// Modal confirmation before deleting a passkey: the Authenticator
     /// tab's question; for a password vault's passkey, also what deleting
-    /// it loses and Export backup… while that vault is unlocked. Bound to
-    /// the key it was asked on (KEY-008): another selection, or a passkey
-    /// list that no longer holds it, drops it. Returns the passkey to
+    /// it loses and Export backup… while that vault is unlocked (which
+    /// closes the question). Shown only on the FIDO2 tab's passkey list and
+    /// bound to the key it was asked on (KEY-008): another tab, another
+    /// selection, or a passkey list that no longer holds it, drops it. Returns the passkey to
     /// delete once confirmed; a click refused while a job runs keeps the
     /// question.
     fn render_passkey_delete_confirm(
@@ -9614,7 +9630,12 @@ impl App {
     ) -> Option<Vec<u8>> {
         let waiting = self.waiting_for().map(str::to_owned);
         let ask = self.security_keys.passkey_confirm_delete.clone()?;
-        let listed = completion_still_valid(Some(&ask.device), self.selected_device.as_ref())
+        // Only over the passkey list it was asked from: a question floating
+        // over another tab (the Vault tab's backup form) could delete there.
+        let showing =
+            self.cap_tab == CapTab::Fido2 && self.security_keys.subview == FidoSubview::Passkeys;
+        let listed = showing
+            && completion_still_valid(Some(&ask.device), self.selected_device.as_ref())
             && self.fido_session().is_some_and(|s| {
                 s.rps
                     .iter()
@@ -9655,9 +9676,15 @@ impl App {
                 });
             });
         if export {
-            let notice = self.vault_passkey_export(&ask.credential_id).err();
-            if let Some(q) = self.security_keys.passkey_confirm_delete.as_mut() {
-                q.notice = notice;
+            // Backing up first closes the question: nothing is deleted, and
+            // Remove asks again once the backup is saved.
+            match self.vault_passkey_export(&ask.credential_id) {
+                Ok(()) => self.security_keys.passkey_confirm_delete = None,
+                Err(why) => {
+                    if let Some(q) = self.security_keys.passkey_confirm_delete.as_mut() {
+                        q.notice = Some(why);
+                    }
+                }
             }
             None
         } else if cancel {
@@ -21474,13 +21501,20 @@ impl App {
                                                 row(
                                                     ui,
                                                     "User Name",
-                                                    c.user.name.clone().unwrap_or_default(),
+                                                    sanitize_shown(
+                                                        c.user.name.as_deref().unwrap_or_default(),
+                                                    ),
                                                     false,
                                                 );
                                                 row(
                                                     ui,
                                                     "Display Name",
-                                                    c.user.display_name.clone().unwrap_or_default(),
+                                                    sanitize_shown(
+                                                        c.user
+                                                            .display_name
+                                                            .as_deref()
+                                                            .unwrap_or_default(),
+                                                    ),
                                                     false,
                                                 );
                                                 // User ID: text if printable ASCII,
