@@ -5676,6 +5676,9 @@ enum FileTarget {
     /// "Import file…" in a key's view: the picked file joins the import
     /// queue, remembering which view asked.
     ImportCodes(import_flow::Origin),
+    /// Vault tab "Export backup…" destination: the chosen file opens the
+    /// passphrase dialog for the vault in `vault.export_for`.
+    VaultExport,
 }
 
 /// An SSH certificate extracted from a credential's largeBlob, waiting for the
@@ -5898,6 +5901,7 @@ impl App {
                             FileTarget::ImportCodes(origin) => {
                                 self.import_flow.enqueue([path], &origin);
                             }
+                            FileTarget::VaultExport => self.vault_export_chosen(path),
                         }
                     } else {
                         // Cancelled: drop whatever payload was waiting on this
@@ -5915,12 +5919,18 @@ impl App {
     }
 
     /// Drop the payload a dialog was holding when it produced no path — the
-    /// user cancelled, or the helper thread went away. Only save-certificate
-    /// dialogs park anything; without this a cancelled save would leave the
-    /// extracted certificate in the map for the rest of the session.
+    /// user cancelled, or the helper thread went away. A save-certificate
+    /// dialog parks its certificate; without this a cancelled save would
+    /// leave it in the map for the rest of the session. A vault backup's
+    /// dialog forgets which vault it was for.
     fn discard_file_target(&mut self, target: FileTarget) {
-        if let FileTarget::SshCertSave(id) = target {
-            self.security_keys.ssh_cert_pending.remove(&id);
+        match target {
+            FileTarget::SshCertSave(id) => {
+                self.security_keys.ssh_cert_pending.remove(&id);
+            }
+            // No file: no backup is waiting for one.
+            FileTarget::VaultExport => self.vault.export_for = None,
+            _ => {}
         }
     }
 }

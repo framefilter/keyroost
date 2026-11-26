@@ -8,17 +8,20 @@
 //!
 //! The words are the CLI's (`keyroostctl fido vault`), fitted to the layout.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use keyroost_ctap::large_blobs::{BlobCapacity, CredentialData};
 use keyroost_ctap::transport::CtapTransport;
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
+use keyroost_resolve::private_file::{write_private_file, OutMode};
 use keyroost_transport::vault::{
     self, Change, Created, CtapVaultKey, LeftOver, OldVault, OpenVault, Saved, Unlocked, VaultAuth,
     VaultKey, VaultKeyError, VaultOnKey, VaultRef, VaultStep,
 };
 use keyroost_vault::{
-    canon_id, generate_password, new_id, seal, user_handle, Entry, GenOptions, Vault,
+    backup_file_name, canon_id, check_passphrase, export_backup, generate_password, new_id, seal,
+    user_handle, Entry, GenOptions, Vault,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -26,7 +29,7 @@ use crate::ui::device::{CapTab, DeviceId};
 use crate::ui::theme::{self, BtnKind, Palette};
 use crate::{
     completion_still_valid, fido_unread_line, guard_secret_field, now_secs_f64, open_fido,
-    sanitize_title, wipe, App, FidoTarget, Severity, TypedSecrets,
+    sanitize_title, wipe, App, FidoTarget, FileTarget, Severity, TypedSecrets,
 };
 
 /// Where problems are reported: the CLI help's URL.
@@ -1099,6 +1102,11 @@ pub(crate) struct VaultState {
     /// The New vault box's name, while it is open. Not a secret: vault
     /// names are listed without unlocking.
     pub(crate) new_vault: Option<String>,
+    /// The vault Export backup… was pressed for, while its save dialog is
+    /// open; the chosen file opens [`Self::export`] for it.
+    pub(crate) export_for: Option<VaultRef>,
+    /// The backup's passphrase dialog; it takes the list's place while open.
+    pub(crate) export: Option<ExportDialog>,
 }
 
 impl TypedSecrets for VaultState {
@@ -1106,6 +1114,9 @@ impl TypedSecrets for VaultState {
         let mut out = vec![&mut *self.pin_input];
         if let Some(f) = self.form.as_mut() {
             out.extend(f.secrets_mut());
+        }
+        if let Some(d) = self.export.as_mut() {
+            out.extend(d.secrets_mut());
         }
         out
     }
@@ -1916,6 +1927,10 @@ impl App {
             self.render_entry_form(ui, p);
             return;
         }
+        if self.vault.export.is_some() {
+            self.render_export_dialog(ui, p);
+            return;
+        }
         self.render_vault_confirm(ui, p);
         let Some(session) = self.vault_session() else {
             return;
@@ -1949,7 +1964,7 @@ impl App {
         let mut delete: Option<String> = None;
         let mut new_chip = false;
         let mut new_row = NewVaultClicks::default();
-        let (mut rotate, mut delete_vault) = (false, false);
+        let (mut rotate, mut delete_vault, mut export) = (false, false, false);
         // The filter and name boxes edit copies while the session is
         // borrowed.
         let mut filter = std::mem::take(&mut self.vault.filter);
@@ -2068,6 +2083,8 @@ impl App {
             }
         }
 
+        // Export backup… and Rotate vault key… need a vault that opened.
+        let writable = vaults[shown].state.is_ok();
         ui.add_space(12.0);
         theme::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -2082,11 +2099,16 @@ impl App {
                     .font(theme::f_reg(12.0))
                     .color(p.txt3),
             );
+            ui.add_space(8.0);
+            if writable {
+                export = theme::button(ui, p, BtnKind::Default, EXPORT_BUTTON).clicked();
+            } else {
+                theme::button_disabled(ui, p, EXPORT_BUTTON);
+            }
         });
 
         // The shown vault as a whole. Delete vault… reaches a vault that
         // can't be opened too; Rotate needs one that opened.
-        let writable = vaults[shown].state.is_ok();
         ui.add_space(12.0);
         theme::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -2126,6 +2148,9 @@ impl App {
         }
         if delete_vault {
             self.vault_ask_delete_vault();
+        }
+        if export {
+            self.vault_export_start();
         }
         if let Some(id) = select {
             self.vault_select(id);
@@ -2641,7 +2666,8 @@ impl App {
             )
         };
         let waiting = self.waiting_for().map(str::to_owned);
-        let (mut confirm, mut cancel) = (false, false);
+        let writable = self.vault_writable();
+        let (mut confirm, mut cancel, mut export) = (false, false, false);
         ui.add_space(10.0);
         theme::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -2654,12 +2680,23 @@ impl App {
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
+                // A delete offers the backup first.
+                if !rotate {
+                    if writable {
+                        export = theme::button(ui, p, BtnKind::Default, EXPORT_BUTTON).clicked();
+                    } else {
+                        theme::button_disabled(ui, p, EXPORT_BUTTON);
+                    }
+                    ui.add_space(6.0);
+                }
                 confirm = theme::key_button(ui, p, kind, yes, waiting.as_deref()).clicked();
                 ui.add_space(6.0);
                 cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
             });
         });
-        if confirm {
+        if export {
+            self.vault_export_start();
+        } else if confirm {
             match self.vault_take_confirmed() {
                 Some(VaultConfirm::DeleteVault { vault }) => self.vault_delete_vault(vault),
                 Some(VaultConfirm::Rotate { vault }) => self.vault_rotate(vault),
@@ -2856,6 +2893,291 @@ impl App {
             self.vault_cancel_form();
         } else if save {
             self.vault_save_form();
+        }
+    }
+}
+
+/// A Repeat box that differs from the Passphrase box.
+const PASSPHRASES_DIFFER: &str = "the two passphrases don't match";
+
+/// Under the backup's passphrase boxes.
+const PASSPHRASE_NOTE: &str = "At least 10 characters. Without it, the backup can't be opened.";
+
+/// The button that backs the shown vault up to a file.
+const EXPORT_BUTTON: &str = "Export backup\u{2026}";
+
+/// The busy label while a backup is encrypted and written.
+const EXPORT_LABEL: &str = "Writing backup\u{2026}";
+
+/// The passphrase dialog of Export backup…, for the file the save dialog
+/// chose. Both boxes are secrets: Write backup, Cancel, Lock and the idle
+/// lock wipe them.
+pub(crate) struct ExportDialog {
+    /// The vault backed up, found by credential ID.
+    pub(crate) vault: VaultRef,
+    /// The file the save dialog chose (it already asked about replacing one).
+    pub(crate) path: PathBuf,
+    pub(crate) passphrase: String,
+    pub(crate) repeat: String,
+}
+
+impl TypedSecrets for ExportDialog {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        vec![&mut self.passphrase, &mut self.repeat]
+    }
+}
+
+impl Drop for ExportDialog {
+    fn drop(&mut self) {
+        self.wipe_typed();
+    }
+}
+
+/// The two passphrase boxes agree and the passphrase is one a backup takes;
+/// otherwise what to say, before anything is encrypted or written.
+pub(crate) fn check_export_passphrase(passphrase: &str, repeat: &str) -> Result<(), String> {
+    if passphrase != repeat {
+        return Err(PASSPHRASES_DIFFER.to_owned());
+    }
+    check_passphrase(passphrase).map_err(|e| e.to_string())
+}
+
+/// Encrypt `contents` under `passphrase` into a backup file at `path`; the
+/// number of entries it holds. Runs on the worker: Argon2id takes a moment.
+pub(crate) fn write_backup(
+    contents: &Vault,
+    passphrase: &str,
+    path: &Path,
+) -> Result<usize, String> {
+    let bytes = export_backup(contents, passphrase).map_err(|e| e.to_string())?;
+    write_backup_file(path, &bytes)?;
+    Ok(contents.entries.len())
+}
+
+/// Write an encrypted backup with the CLI's owner-only writer, replacing a
+/// file already there (the save dialog asked) but never writing through a
+/// link; the CLI's `cannot write FILE: ERROR` when it can't.
+fn write_backup_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_private_file(path, bytes, OutMode::Replace).map_err(|e| {
+        format!(
+            "cannot write {}: {e}",
+            sanitize_title(&path.display().to_string())
+        )
+    })
+}
+
+/// Export backup…: a passphrase-protected backup file of the shown vault,
+/// as `fido vault export` writes it. No key is used: the vault is the one
+/// the session holds.
+impl App {
+    /// Export backup…: ask where to save the shown vault's backup. Only a
+    /// vault that opened; the chosen file opens [`ExportDialog`].
+    pub(crate) fn vault_export_start(&mut self) {
+        if !self.vault_writable() {
+            return;
+        }
+        let Some(v) = self.selected_vault() else {
+            return;
+        };
+        let vault = v.vault_ref.clone();
+        let file = backup_file_name(vault.name.as_deref().unwrap_or_default());
+        self.vault.export_for = Some(vault);
+        self.spawn_file_dialog(
+            FileTarget::VaultExport,
+            true,
+            &[("Vault backup", &["t2vault"])],
+            Some(&file),
+        );
+    }
+
+    /// The save dialog chose `path`: the passphrase dialog for the vault
+    /// Export backup… was pressed for. Nothing when that is gone (a lock or
+    /// another key in the meantime rebuilt the tab's state).
+    pub(crate) fn vault_export_chosen(&mut self, path: PathBuf) {
+        let Some(vault) = self.vault.export_for.take() else {
+            return;
+        };
+        if self.vault_session().is_none() {
+            return;
+        }
+        self.vault.error = None;
+        self.vault.info = None;
+        self.vault.export = Some(ExportDialog {
+            vault,
+            path,
+            passphrase: String::new(),
+            repeat: String::new(),
+        });
+    }
+
+    /// Cancel: the dialog closes and its boxes are wiped.
+    pub(crate) fn vault_export_cancel(&mut self) {
+        self.vault.export = None;
+    }
+
+    /// The vault's contents as the session last read them, for a backup;
+    /// what to say when it is no longer there to back up.
+    fn vault_export_contents(&self, vault: &VaultRef) -> Result<Vault, String> {
+        let name = shown_name(vault.name.as_deref());
+        let v = self
+            .vault_session()
+            .and_then(|s| {
+                s.unlocked
+                    .vaults
+                    .iter()
+                    .find(|v| v.vault_ref.credential_id == vault.credential_id)
+            })
+            .ok_or_else(|| {
+                format!("Vault \"{name}\" is no longer on this key; nothing was written.")
+            })?;
+        match &v.state {
+            Ok(open) => Ok(open.contents.clone()),
+            Err(_) => Err(format!(
+                "Vault \"{name}\" can't be opened, so it can't be backed up; nothing was written."
+            )),
+        }
+    }
+
+    /// Write backup: the passphrase is checked first (a mismatch or a short
+    /// one writes nothing), then a job encrypts the vault as the session
+    /// holds it and writes the file. No key, no touch.
+    pub(crate) fn vault_export(&mut self) {
+        let Some(d) = self.vault.export.as_ref() else {
+            return;
+        };
+        if let Err(e) = check_export_passphrase(&d.passphrase, &d.repeat) {
+            self.vault.info = None;
+            self.vault.error = Some(e);
+            return;
+        }
+        let (vault, path) = (d.vault.clone(), d.path.clone());
+        let passphrase = Zeroizing::new(d.passphrase.clone());
+        let contents = match self.vault_export_contents(&vault) {
+            Ok(c) => c,
+            Err(e) => {
+                self.vault.export = None;
+                self.vault.info = None;
+                self.vault.error = Some(e);
+                return;
+            }
+        };
+        if self.refuse_if_busy() {
+            return;
+        }
+        self.vault.error = None;
+        self.vault.info = None;
+        let for_device = self.selected_device.clone();
+        self.spawn_job(EXPORT_LABEL, move || {
+            let result = write_backup(&contents, &passphrase, &path);
+            drop((contents, passphrase));
+            Box::new(move |app: &mut App| app.vault_apply_export(for_device, result))
+        });
+    }
+
+    /// The end of Write backup: written closes the dialog (wiping it) with
+    /// the CLI's line; a failure keeps it open with the reason.
+    pub(crate) fn vault_apply_export(
+        &mut self,
+        for_device: Option<DeviceId>,
+        result: Result<usize, String>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+            return;
+        }
+        match result {
+            Ok(n) => {
+                let Some(d) = self.vault.export.take() else {
+                    return;
+                };
+                let name = shown_name(d.vault.name.as_deref());
+                let file = sanitize_title(&d.path.display().to_string());
+                drop(d);
+                self.vault_done(
+                    format!(
+                        "Backup of vault \"{name}\" ({}) written to {file}.",
+                        entries(n)
+                    ),
+                    format!("backup of vault \"{name}\" written to {file}"),
+                );
+            }
+            Err(e) => {
+                self.log(Severity::Err, format!("Vault: {e}"));
+                self.vault.info = None;
+                self.vault.error = Some(e);
+            }
+        }
+    }
+
+    /// The backup's passphrase dialog: which vault, the chosen file, the
+    /// passphrase twice (masked), then Write backup / Cancel. Cancel waits
+    /// for a running write, so its end finds the dialog it reports on.
+    fn render_export_dialog(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let busy = self.busy();
+        let Some(d) = self.vault.export.as_mut() else {
+            return;
+        };
+        let (mut write, mut cancel) = (false, false);
+        const LABEL_W: f32 = 90.0;
+        theme::card_frame(p).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(format!(
+                    "Back up vault \"{}\"",
+                    shown_name(d.vault.name.as_deref())
+                ))
+                .font(theme::f_sb(14.5))
+                .color(p.txt),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(sanitize_title(&d.path.display().to_string()))
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
+            );
+            ui.add_space(8.0);
+            let secret_row = |ui: &mut egui::Ui, label: &str, text: &mut String| {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [LABEL_W, 24.0],
+                        egui::Label::new(
+                            egui::RichText::new(label)
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt2),
+                        ),
+                    );
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(text)
+                            .margin(theme::TEXT_EDIT_MARGIN)
+                            .desired_width(f32::INFINITY)
+                            .password(true),
+                    );
+                    guard_secret_field(ui.ctx(), &resp);
+                });
+            };
+            secret_row(ui, "Passphrase", &mut d.passphrase);
+            secret_row(ui, "Repeat", &mut d.repeat);
+            ui.horizontal(|ui| {
+                ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
+                ui.label(
+                    egui::RichText::new(PASSPHRASE_NOTE)
+                        .font(theme::f_reg(11.5))
+                        .color(p.txt3),
+                );
+            });
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                write = theme::button(ui, p, BtnKind::Primary, "Write backup").clicked();
+                if busy {
+                    theme::button_disabled(ui, p, "Cancel");
+                } else {
+                    cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
+                }
+            });
+        });
+        if cancel {
+            self.vault_export_cancel();
+        } else if write {
+            self.vault_export();
         }
     }
 }
@@ -6411,5 +6733,294 @@ mod tests {
         assert_eq!(chip_labels(&app)[0], "Personal \u{00B7} 2");
         assert_eq!(key.vault_on_key(&p).unwrap().entries.len(), 2);
         assert!(!app.vault.error.clone().unwrap().contains("finishes it"));
+    }
+
+    // Export backup…
+
+    const BACKUP_PASS: &str = "correct horse battery";
+
+    /// A fresh temp folder of this test run's own.
+    fn export_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "keyroost-vault-export-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The save dialog Export backup… asked for resolves to `path` (`None`:
+    /// cancelled), the way `drain_file_dialogs` receives it.
+    fn choose_file(app: &mut App, path: Option<std::path::PathBuf>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(path).unwrap();
+        app.pending_files.push((FileTarget::VaultExport, rx));
+        app.drain_file_dialogs();
+    }
+
+    /// An unlocked key with Personal (2 entries) shown, the save dialog of
+    /// Export backup… resolved to `path`.
+    fn export_dialog_for(app: &mut App, key: &mut FakeKey, path: &Path) {
+        two_vaults(key);
+        unlock_into(app, key);
+        app.vault_export_start();
+        let request = app.file_dialog_queue.pop().expect("a save dialog");
+        assert!(request.target == FileTarget::VaultExport && request.save);
+        assert_eq!(
+            request.filters,
+            vec![("Vault backup".to_owned(), vec!["t2vault".to_owned()])]
+        );
+        assert_eq!(request.default_name.as_deref(), Some("personal.t2vault"));
+        choose_file(app, Some(path.to_owned()));
+        assert!(app.vault.export_for.is_none());
+    }
+
+    fn type_passphrases(app: &mut App, passphrase: &str, repeat: &str) {
+        let d = app.vault.export.as_mut().expect("the passphrase dialog");
+        replace_text(&mut d.passphrase, passphrase);
+        replace_text(&mut d.repeat, repeat);
+    }
+
+    /// One Export backup… run the tests share (Argon2id is slow in a test
+    /// build): Personal written over an older file with looser permissions,
+    /// which the save dialog chose.
+    struct ExportRun {
+        path: std::path::PathBuf,
+        contents: Vault,
+        info: Option<String>,
+        dialog_open: bool,
+        auth_kept: bool,
+        bytes: Vec<u8>,
+        #[cfg(unix)]
+        mode: u32,
+    }
+
+    fn exported() -> &'static ExportRun {
+        static RUN: std::sync::OnceLock<ExportRun> = std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            let dir = export_dir("run");
+            let path = dir.join("personal.t2vault");
+            std::fs::write(&path, b"an older file").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            let mut key = FakeKey::new();
+            let mut app = app();
+            export_dialog_for(&mut app, &mut key, &path);
+            type_passphrases(&mut app, BACKUP_PASS, BACKUP_PASS);
+            app.vault_export();
+            let contents = app.selected_vault().unwrap().state.as_ref().unwrap();
+            let run = ExportRun {
+                contents: contents.contents.clone(),
+                info: app.vault.info.clone(),
+                dialog_open: app.vault.export.is_some(),
+                auth_kept: app.vault_session().is_some_and(|s| s.auth.is_some()),
+                bytes: std::fs::read(&path).unwrap(),
+                #[cfg(unix)]
+                mode: {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777
+                },
+                path,
+            };
+            let _ = std::fs::remove_dir_all(&dir);
+            run
+        })
+    }
+
+    #[test]
+    fn export_writes_a_backup_that_opens_with_the_passphrase() {
+        let run = exported();
+        assert_eq!(run.contents.entries.len(), 2);
+        let back = keyroost_vault::import_backup(&run.bytes, BACKUP_PASS).unwrap();
+        assert_eq!(back, run.contents);
+        assert!(keyroost_vault::import_backup(&run.bytes, "another passphrase").is_err());
+        assert_eq!(
+            run.info.as_deref(),
+            Some(
+                format!(
+                    "Backup of vault \"Personal\" (2 entries) written to {}.",
+                    run.path.display()
+                )
+                .as_str()
+            )
+        );
+        assert!(!run.dialog_open, "written closes the dialog");
+        assert!(run.auth_kept, "no key was used: the session keeps its auth");
+    }
+
+    #[test]
+    fn export_refuses_short_and_mismatched_passphrases() {
+        assert_eq!(
+            check_export_passphrase("long enough one", "long enough two"),
+            Err(PASSPHRASES_DIFFER.to_owned())
+        );
+        assert_eq!(
+            check_export_passphrase("too short", "too short"),
+            Err("use a backup passphrase of at least 10 characters".to_owned())
+        );
+        assert_eq!(check_export_passphrase("ten chars!", "ten chars!"), Ok(()));
+
+        let dir = export_dir("refuse");
+        let path = dir.join("personal.t2vault");
+        let mut key = FakeKey::new();
+        let mut app = app();
+        export_dialog_for(&mut app, &mut key, &path);
+        let text = list_text(&mut app);
+        for line in [
+            "Back up vault \"Personal\"",
+            "Passphrase",
+            "Repeat",
+            PASSPHRASE_NOTE,
+            "Write backup",
+            "Cancel",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        for (pass, repeat, said) in [
+            (BACKUP_PASS, "correct horse battery!", PASSPHRASES_DIFFER),
+            (
+                "short",
+                "short",
+                "use a backup passphrase of at least 10 characters",
+            ),
+        ] {
+            type_passphrases(&mut app, pass, repeat);
+            app.vault_export();
+            assert_eq!(app.vault.error.as_deref(), Some(said));
+            assert!(app.vault.export.is_some(), "the dialog stays");
+            assert!(!path.exists(), "nothing was written");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_dialog_wipes_on_close() {
+        let mut d = ExportDialog {
+            vault: VaultRef {
+                credential_id: vec![1],
+                name: Some("Personal".into()),
+            },
+            path: "personal.t2vault".into(),
+            passphrase: BACKUP_PASS.into(),
+            repeat: BACKUP_PASS.into(),
+        };
+        assert_eq!(d.secrets_mut().len(), 2);
+        d.wipe_typed();
+        assert!(d.passphrase.is_empty() && d.repeat.is_empty());
+        // The tab's own list carries the dialog's boxes too.
+        let mut state = VaultState {
+            export: Some(d),
+            ..Default::default()
+        };
+        assert_eq!(state.secrets_mut().len(), 3);
+
+        // Cancel closes it; so does Lock, and a cancelled save dialog
+        // forgets which vault it was for.
+        let dir = export_dir("close");
+        let path = dir.join("personal.t2vault");
+        let mut key = FakeKey::new();
+        let mut app = app();
+        export_dialog_for(&mut app, &mut key, &path);
+        type_passphrases(&mut app, BACKUP_PASS, BACKUP_PASS);
+        app.vault_export_cancel();
+        assert!(app.vault.export.is_none());
+        app.vault_export_start();
+        assert!(app.vault.export_for.is_some());
+        choose_file(&mut app, None);
+        assert!(app.vault.export_for.is_none() && app.vault.export.is_none());
+        app.vault_export_start();
+        choose_file(&mut app, Some(path.clone()));
+        type_passphrases(&mut app, BACKUP_PASS, BACKUP_PASS);
+        app.vault_lock(None);
+        assert!(app.vault.export.is_none());
+        // A save dialog still open at a lock opens nothing when it resolves.
+        unlock_into(&mut app, &mut key);
+        app.vault_export_start();
+        app.vault_lock(None);
+        assert!(app.vault.export_for.is_none());
+        choose_file(&mut app, Some(path.clone()));
+        assert!(app.vault.export.is_none());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_replaces_a_chosen_file_but_not_through_a_symlink() {
+        let run = exported();
+        assert_eq!(run.mode, 0o600, "the replaced file is owner-only");
+        assert_ne!(run.bytes, b"an older file");
+
+        let dir = export_dir("link");
+        let victim = dir.join("victim");
+        let link = dir.join("personal.t2vault");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let e = write_backup_file(&link, &run.bytes).unwrap_err();
+        assert_eq!(
+            e,
+            format!(
+                "cannot write {}: refusing to write secret output through a symlink",
+                link.display()
+            )
+        );
+        assert!(!victim.exists(), "nothing was written through the link");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // The app's end of a failed write: the dialog stays with the reason.
+        let mut key = FakeKey::new();
+        let mut app = app();
+        export_dialog_for(&mut app, &mut key, &link);
+        app.vault_apply_export(Some(KEY.into()), Err(e.clone()));
+        assert_eq!(app.vault.error.as_deref(), Some(e.as_str()));
+        assert!(app.vault.export.is_some());
+        // A result for another key is dropped.
+        app.vault_apply_export(Some("serial:BBB".into()), Ok(2));
+        assert!(app.vault.export.is_some() && app.vault.info.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_backup_is_offered_on_the_backup_card_and_before_a_delete() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let text = list_text(&mut app);
+        assert_eq!(text.matches("Export backup\u{2026}").count(), 1, "{text}");
+        app.vault_ask_delete_vault();
+        let text = list_text(&mut app);
+        assert_eq!(text.matches("Export backup\u{2026}").count(), 2, "{text}");
+        // Pressing it keeps the question for after the backup.
+        app.vault_export_start();
+        assert!(app.vault.export_for.is_some());
+        assert!(matches!(
+            app.vault.confirm,
+            Some(VaultConfirm::DeleteVault { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unavailable_vault_has_no_export() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let damaged = key.add_vault("Old", &Vault::default());
+        key.put_blob(&damaged, b"not a vault at all, just bytes");
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_select(damaged);
+        assert_eq!(
+            list_text(&mut app).matches("Export backup\u{2026}").count(),
+            1
+        );
+        assert!(!app.vault_writable());
+        app.vault_export_start();
+        assert!(app.vault.export_for.is_none() && app.file_dialog_queue.is_empty());
     }
 }

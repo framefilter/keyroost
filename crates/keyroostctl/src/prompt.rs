@@ -190,10 +190,9 @@ pub(crate) fn confirm_typed(
     }
 }
 
-/// A file that appeared at an output path after the overwrite check.
-pub(crate) const APPEARED: &str =
-    "a file appeared there while this command ran and was not replaced; \
-     pass --overwrite to replace it";
+/// The shared writer's [`OutMode`] and [`APPEARED`] (a file that appeared
+/// at an output path after the overwrite check).
+pub(crate) use keyroost_resolve::private_file::{OutMode, APPEARED};
 
 /// `write PATH: ERROR` for an output written after the card was changed.
 /// When the failure is a file that appeared mid-command ([`APPEARED`]),
@@ -212,43 +211,6 @@ pub(crate) fn write_error(
             format!("write {shown}: {e}; {note}")
         }
         _ => format!("write {shown}: {e}"),
-    }
-}
-
-/// How an output file that passed [`check_overwrite`] is written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OutMode {
-    /// Nothing was there at check time: create it, and fail rather than
-    /// replace a file that appeared while the command waited on the key.
-    New,
-    /// Something was there and replacing it was agreed (`--overwrite` or a
-    /// "yes" at the terminal).
-    Replace,
-}
-
-impl OutMode {
-    /// Open `path` for writing in this mode. `New` reports a file that
-    /// appeared since the check as an error naming --overwrite.
-    pub(crate) fn open(self, path: &std::path::Path) -> std::io::Result<std::fs::File> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true);
-        match self {
-            OutMode::New => opts.create_new(true),
-            OutMode::Replace => opts.create(true).truncate(true),
-        };
-        opts.open(path).map_err(|e| {
-            if self == OutMode::New && e.kind() == std::io::ErrorKind::AlreadyExists {
-                std::io::Error::new(std::io::ErrorKind::AlreadyExists, APPEARED)
-            } else {
-                e
-            }
-        })
-    }
-
-    /// Write `data` to `path` in this mode.
-    pub(crate) fn write(self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        self.open(path)?.write_all(data)
     }
 }
 
