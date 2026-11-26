@@ -2272,10 +2272,20 @@ impl<'tx> PivSession<'tx> {
         // resolvable without at least one live probe, so there's no way to
         // skip it generally — HidCrescendo is the sole identity that answers
         // a plain SELECT/ATR alone and never needs this extension).
-        let version = if matches!(id, fingerprint::AppletFingerprint::HidCrescendo(_)) {
-            None
-        } else {
-            self.version()
+        //
+        // A Feitian product with rows of its own is asked its PIV application
+        // version instead, with the command Feitian's client reads it with:
+        // those rows are keyed on it. Yubico's GET VERSION is not sent to
+        // such a key, neither measured product answering it with a version
+        // (`9000` and no data, `6A86`). A Feitian key of any other product is
+        // read as before.
+        let version = match id {
+            fingerprint::AppletFingerprint::HidCrescendo(_) => None,
+            fingerprint::AppletFingerprint::Feitian(
+                fingerprint::FeitianModel::EPassFidoNfcPlus
+                | fingerprint::FeitianModel::BioPassFidoPro,
+            ) => self.feitian_application_version(),
+            _ => self.version(),
         };
         // No generic name fallback here — an undiscovered name stays empty,
         // per `PivStatus::applet_name`'s doc; `id`/its `Display`/
@@ -2796,6 +2806,21 @@ impl<'tx> PivSession<'tx> {
         (sw == piv::SW_OK && !data.is_empty()).then_some(data)
     }
 
+    /// A Feitian key's PIV application version
+    /// ([`keyroost_piv::fingerprint::FEITIAN_APPLICATION_VERSION`], sent with
+    /// PIV selected): the two bytes Feitian publishes as the product's PIV
+    /// number. `None` if the command errors, the card answers a non-`9000`
+    /// status, or the answer is not one
+    /// [`keyroost_piv::fingerprint::feitian_application_version`] reads.
+    fn feitian_application_version(&mut self) -> Option<Vec<u8>> {
+        use keyroost_piv::fingerprint::{feitian_application_version, FEITIAN_APPLICATION_VERSION};
+        let (data, sw) = self.transmit_full(&FEITIAN_APPLICATION_VERSION).ok()?;
+        if sw != piv::SW_OK {
+            return None;
+        }
+        feitian_application_version(&data).map(|version| version.to_vec())
+    }
+
     /// Yubico GET SERIAL; `None` if unsupported (older firmware / non-Yubico).
     /// Widened to `u128` — see [`keyroost_piv::parse_serial`] for why the
     /// reply isn't always the standard 4-byte `u32`. Called at most once per
@@ -3194,9 +3219,18 @@ impl<'tx> PivSession<'tx> {
     /// previous confirmation — is still right, so that case falls back to
     /// whatever's already cached instead of erasing it: a metadata-less
     /// card's silence is *expected*, not a "this key is gone" signal.
+    ///
+    /// A card of Feitian's dialect, which has no GET METADATA, is asked to
+    /// attest the slot's key instead (`Self::attested_slot_key`): a key
+    /// generated on it in an earlier session, with no certificate yet, is
+    /// then known here without the caller supplying it.
     fn confirmed_slot_key(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
         let key_ref = slot.key_ref();
-        match self.resolve_slot_from_device(slot).0 {
+        let live = match self.resolve_slot_from_device(slot).0 {
+            Some(kv) => Some(kv),
+            None => self.attested_slot_key(slot),
+        };
+        match live {
             Some(kv) => {
                 self.state.pubkey_cache.remember(key_ref, Some(kv.clone()));
                 Some(kv)
@@ -4589,7 +4623,9 @@ impl<'tx> PivSession<'tx> {
     ///
     /// 1. **Full key material.** When this session already knows `slot`'s
     ///    current public key ([`Self::slot_key`]: GET METADATA, or this
-    ///    session's generate/`remember_pubkey` cache) and the certificate
+    ///    session's generate/`remember_pubkey` cache; on the Feitian ePass
+    ///    and BioPass, the slot's attestation, which is read first for a slot
+    ///    holding a generated key, about 2 s on the ePass) and the certificate
     ///    carries a different one, byte for byte — see
     ///    [`TransportError::PivImportCertificateKeyMismatch`].
     /// 2. **Algorithm only**, when step 1 couldn't run at all (`slot_key`
@@ -5002,6 +5038,11 @@ impl<'tx> PivSession<'tx> {
     /// synthetic `SW = 6D 00` this returns without any card I/O matches
     /// exactly what a real unsupported-instruction refusal looks like, so
     /// every caller of `attest` sees the same error shape either way.
+    ///
+    /// A card of Feitian's dialect is sent its own form
+    /// ([`keyroost_piv::attest_feitian`]). Its certificate carries no
+    /// extension, and a slot with no key or with an imported one is refused
+    /// (`6F00` or `6984`, by product).
     pub fn attest(&mut self, slot: Slot) -> Result<Vec<u8>, TransportError> {
         if !self.internal_read_allowed(keyroost_piv::compat::PivExtension::Attest, "ATTEST") {
             // `6D 00` (instruction not supported) is exactly what this
@@ -5013,9 +5054,32 @@ impl<'tx> PivSession<'tx> {
                 sw2: 0x00,
             });
         }
-        let (data, sw) = self.transmit_full(&piv::attest(slot.key_ref()))?;
+        let apdu = if speaks_feitian(&self.quirks()) {
+            piv::attest_feitian(slot.key_ref())
+        } else {
+            piv::attest(slot.key_ref())
+        };
+        let (data, sw) = self.transmit_full(&apdu)?;
         ok_or_write("piv attest", sw)?;
         Ok(data)
+    }
+
+    /// The key a card of Feitian's dialect attests for `slot`: the algorithm
+    /// and public key in the certificate [`Self::attest`] returns. Such a
+    /// card has no GET METADATA, and this is the one read that gives the key
+    /// of a slot with no certificate. `None` on a card that does not speak
+    /// Feitian's dialect, and where the product's rows list
+    /// [`keyroost_piv::compat::PivExtension::Attest`] as unsupported. The
+    /// request is also sent where support is unverified (the generic
+    /// Feitian row, or a version not measured), and then `None` is the
+    /// answer when the card refuses it. `None` too for a slot whose key the
+    /// card does not attest (no key, or an imported one).
+    fn attested_slot_key(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
+        if !speaks_feitian(&self.quirks()) {
+            return None;
+        }
+        let cert = self.attest(slot).ok()?;
+        piv::x509_parse::parse_certificate_public_key(&cert).ok()
     }
 
     /// Whether using `slot`'s private key (sign, decrypt, key agreement,
@@ -6722,6 +6786,9 @@ fn describe_apdu(apdu: &[u8]) -> String {
     if apdu == keyroost_piv::fingerprint::FEITIAN_DEVICE_INFO {
         return "DEVICE INFO (feitian)".to_string();
     }
+    if apdu == keyroost_piv::fingerprint::FEITIAN_APPLICATION_VERSION {
+        return "APPLICATION VERSION (feitian)".to_string();
+    }
     match piv::Instruction::from_code(ins) {
         // A SELECT's data field is the raw AID/RID itself (no `5C` wrapper,
         // unlike GET DATA / PUT DATA below) — name it whenever it's an AID
@@ -6758,6 +6825,11 @@ fn describe_apdu(apdu: &[u8]) -> String {
         // (`piv::set_pin_retries_feitian`); Yubico's import always has data.
         Some(piv::Instruction::ImportKey) if apdu.len() <= 4 => {
             "SET PIN RETRIES (feitian)".to_string()
+        }
+        // 0xFB with a slot in P1 is a Feitian card's ATTEST
+        // (`piv::attest_feitian`); Yubico's reset has none there.
+        Some(piv::Instruction::Reset) if apdu.get(2).is_some_and(|p1| *p1 != 0x00) => {
+            "ATTEST (feitian)".to_string()
         }
         // A bodyless VERIFY (`00 20 00 80`, no Lc, or with an Lc of zero)
         // queries the PIN retry counter rather than presenting a PIN.
@@ -7594,13 +7666,21 @@ mod tests {
             }
         }
         // 6984 is read that way on such a card only: not on the ePass FIDO NFC
-        // Plus, which takes the same reset instruction, and not on a
-        // YubiKey.
+        // Plus at the PIV application version it was measured at (9166),
+        // which takes the same reset instruction, and not on a YubiKey.
         let epass = resolve_quirks(
+            AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
+            Some(&[0x91, 0x66]),
+            None,
+        );
+        // An ePass FIDO NFC Plus whose version was not read is not known to
+        // answer as that one did, so it is read either way too.
+        let unread = resolve_quirks(
             AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus),
             None,
             None,
         );
+        assert!(reset_not_allowed(0x6984, &unread));
         let yubikey = resolve_quirks(AppletFingerprint::YubiKey, Some(&[5, 7, 4]), None);
         for quirks in [&epass, &yubikey] {
             for sw in [0x6982, 0x6983, 0x6985] {
@@ -7623,9 +7703,11 @@ mod tests {
             None,
             None,
         );
+        // The ePass FIDO NFC Plus at the PIV application version it was
+        // measured at (9166) took the import in one extended-length APDU.
         let other = resolve_quirks(
             AppletFingerprint::Feitian(keyroost_piv::fingerprint::FeitianModel::EPassFidoNfcPlus),
-            None,
+            Some(&[0x91, 0x66]),
             None,
         );
         assert!(import_link(link, &needs).chain_upfront.is_some());
@@ -7714,6 +7796,29 @@ mod tests {
         assert_eq!(
             reset_command(&BTreeSet::new()),
             vec![0x00, 0xFB, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn describe_apdu_names_feitians_version_read_and_attest() {
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::FEITIAN_APPLICATION_VERSION),
+            "APPLICATION VERSION (feitian)"
+        );
+        // The instruction byte is Yubico's reset's; a slot in P1 tells the
+        // two apart.
+        assert_eq!(
+            describe_apdu(&piv::attest_feitian(Slot::Authentication.key_ref())),
+            "ATTEST (feitian)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::attest_feitian(Slot::KeyManagement.key_ref())),
+            "ATTEST (feitian)"
+        );
+        assert_eq!(describe_apdu(&piv::reset()), "RESET (yubico extension)");
+        assert_eq!(
+            describe_apdu(&piv::attest(Slot::Authentication.key_ref())),
+            "ATTEST (yubico extension)"
         );
     }
 

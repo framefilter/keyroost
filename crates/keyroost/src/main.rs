@@ -26076,7 +26076,12 @@ impl App {
                     // own dotted field) when it equals the applet version, so
                     // the common case where a token doesn't distinguish the
                     // two axes doesn't show the same number twice.
-                    let applet_ver = st.version.as_deref().map(keyroost_piv::format_version_bytes);
+                    let applet_ver = st.version.as_deref().map(|version| {
+                        keyroost_piv::fingerprint::format_applet_version(
+                            st.applet_fingerprint,
+                            version,
+                        )
+                    });
                     let fw_ver = st
                         .version_firmware
                         .as_deref()

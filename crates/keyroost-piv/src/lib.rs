@@ -2190,9 +2190,15 @@ pub fn get_slot_policy_feitian(key_ref: u8) -> Vec<u8> {
 
 /// The PIN and touch policy in the answer to [`get_slot_policy_feitian`]:
 /// three bytes, the second the PIN policy ([`PinPolicy::from_id`]) and the
-/// third the touch policy in Feitian's values ([`PolicyTags::Feitian`]). The
-/// first byte is not understood and is ignored. `None` for any other shape or
-/// value, and for a PIN policy of 0.
+/// third the touch policy in Feitian's values ([`PolicyTags::Feitian`]).
+/// `None` for any other shape or value, and for a PIN policy of 0.
+///
+/// The first byte is not read. Feitian describes it as a state for its own
+/// Windows minidriver, which goes by it to ask for the PIN or for a
+/// fingerprint: `03` touch only, `04` PIN and touch, `00` otherwise. The six
+/// answers measured on an ePass FIDO NFC Plus fit that: `00` with touch
+/// "never" under each PIN policy, `03` with PIN "never" and touch "always" or
+/// "cached", `04` with PIN "always" and touch "always".
 ///
 /// The card answers for a slot with no key too, with what a key generated
 /// there without policy tags would get (measured: once and never for 9A, 9D
@@ -2244,6 +2250,32 @@ pub fn reset_feitian() -> Vec<u8> {
 #[must_use]
 pub fn attest(key_ref: u8) -> Vec<u8> {
     build_apdu_get(0x00, Instruction::Attest.code(), key_ref, 0x00, 0x00)
+}
+
+/// Feitian's ATTEST: `00 FB <key_ref> 00 00`, a certificate for the key
+/// generated in `key_ref`'s slot. The instruction byte is the one Yubico's
+/// reset has; that reset has no slot in `P1`. No PIN and no management key.
+/// (Feitian names the command; the rest is measured.)
+///
+/// Measured on an ePass FIDO NFC Plus and a BioPass FIDO Pro, 2026-11-24.
+/// For a key generated in the slot the card answers `9000` and an X.509
+/// certificate that holds the slot's public key. Its signature verifies
+/// under the key of the certificate in the `5F FF 01` object, whose subject
+/// is the returned certificate's issuer; that object holds the bare
+/// certificate, with no `70` tag around it. Each call makes a new
+/// certificate, in about two seconds on the ePass FIDO NFC Plus and under a
+/// tenth of one on the BioPass FIDO Pro. A slot with no key and a slot with
+/// an imported key are answered `6F00` on the ePass FIDO NFC Plus and `6984`
+/// on the BioPass FIDO Pro, and Yubico's `F9` is answered `6D00` on both.
+///
+/// The certificate carries no extension: a slot's policy is read with
+/// [`get_slot_policy_feitian`], not from here. The ePass FIDO NFC Plus
+/// writes the length of the certificate's signature in the long form (`03 82
+/// 00 47`): [`x509_parse::parse_certificate_public_key`] reads the
+/// certificate all the same, and a parser that takes only DER does not.
+#[must_use]
+pub fn attest_feitian(key_ref: u8) -> Vec<u8> {
+    vec![0x00, Instruction::Reset.code(), key_ref, 0x00, 0x00]
 }
 
 /// Yubico extension: DELETE a slot's private key by issuing MOVE KEY with the
@@ -3441,6 +3473,15 @@ mod tests {
         // chained via GET RESPONSE for the certificate's full length).
         assert_eq!(attest(0x9A), vec![0x00, 0xF9, 0x9A, 0x00, 0x00]);
         assert_eq!(attest(0x9C), vec![0x00, 0xF9, 0x9C, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn attest_feitian_apdu_bytes() {
+        // The bytes sent to both keys. The instruction is Yubico's reset's,
+        // which has no slot in P1 and no Le.
+        assert_eq!(attest_feitian(0x9A), vec![0x00, 0xFB, 0x9A, 0x00, 0x00]);
+        assert_eq!(attest_feitian(0x9D), vec![0x00, 0xFB, 0x9D, 0x00, 0x00]);
+        assert_ne!(attest_feitian(0x9A), reset());
     }
 
     #[test]
