@@ -192,7 +192,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         "vault" => &Help {
             title: "Password vault",
             body: "Passwords kept in an encrypted vault on this key, opened with the key's PIN and a touch. If the key is lost or reset, the vault goes with it, so keep a backup file. Refresh reads the vault again without a touch; vaults made elsewhere appear after Lock and Unlock.",
-            slug: "",
+            slug: "/vault",
         },
         "large_blobs" => &Help {
             title: "Large blob storage",

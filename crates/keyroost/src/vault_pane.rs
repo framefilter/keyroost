@@ -4736,6 +4736,7 @@ mod tests {
         let h = crate::ui::help::help("vault").expect("a vault help topic");
         assert_eq!(h.title, "Password vault");
         assert!(h.body.contains("keep a backup file"), "{}", h.body);
+        assert_eq!(h.slug, "/vault");
     }
 
     // ----- unlock, lock, Refresh -----

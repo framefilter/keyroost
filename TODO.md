@@ -104,7 +104,9 @@ items marked *(no hardware)* need a device the maintainer does not have.
   `--reveal`), on a Token2 PIN+ (the fresh-token retry) and another key
   with a large-blob store besides the YubiKey, and in the app's
   Vault tab, and user reports have had a release to come in; then drop
-  "(experimental)" from the `fido vault` help, the README and the app.
+  "(experimental)" from the `fido vault` help, the README, `docs/vault.html`,
+  and the app's Vault tab and Overview card
+  (`vault_pane::experimental_note`).
 
 - **Lift the "experimental" label on the Token2 PIN+ OATH and OpenPGP
   applets.** PIV is exercised on a PIN+ Dual Ace R3.4 since #251; verify
