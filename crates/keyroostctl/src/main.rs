@@ -3058,7 +3058,9 @@ enum FidoCredentialCmd {
     /// With exactly two FIDO keys connected the keys need no naming; with
     /// more, name them with --a/--b or pick at the terminal.
     ///
-    /// Matches on relying-party ID and user handle.
+    /// Matches on relying-party ID and user handle; a keyroost password vault
+    /// matches on its vault name instead, since each key's copy has its own
+    /// user handle.
     ///
     /// PINs from stdin come one per line, key A's first. With no PIN flag,
     /// the terminal asks for each key; an empty answer for key B reuses key
@@ -16332,13 +16334,49 @@ struct CompareCred {
     user_display_name: Option<String>,
 }
 
+/// The relying party keyroost's password vault credentials live under
+/// (`keyroost_vault::RP_ID`). keyroostctl doesn't depend on keyroost-vault,
+/// so the value is repeated here rather than adding that edge for one string.
+const VAULT_RP_ID: &str = "fido2-vault.token2";
+
 /// The identity two credentials match on: the relying party plus the RP's
 /// own user handle. The handle (not the login string) is what the RP keeps
 /// stable when an account is registered on a second key.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct CompareKey<'a> {
     rp_id: &'a str,
-    user_id: &'a [u8],
+    user: CompareUser<'a>,
+}
+
+/// Who a credential belongs to within its relying party.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum CompareUser<'a> {
+    /// The RP's user handle: the WebAuthn account identity.
+    Handle(&'a [u8]),
+    /// A vault's name. Each vault credential's handle is `0x01`, 8 random
+    /// bytes, then the name, so the same vault created on two keys never
+    /// shares a handle; the name is what the two copies have in common.
+    VaultName(String),
+}
+
+impl CompareCred {
+    fn compare_key(&self) -> CompareKey<'_> {
+        let vault_name = (self.rp_id == VAULT_RP_ID)
+            .then(|| {
+                // The name the handle carries, else the user name, as
+                // keyroost's vault code reads it.
+                keyroost_ctap::get_assertion::vault_name_from_user_id(&self.user_id)
+                    .or_else(|| self.user_name.clone())
+            })
+            .flatten();
+        CompareKey {
+            rp_id: &self.rp_id,
+            user: match vault_name {
+                Some(name) => CompareUser::VaultName(name),
+                None => CompareUser::Handle(&self.user_id),
+            },
+        }
+    }
 }
 
 /// Split `a` and `b` into (only on A, only on B, on both), each sorted by
@@ -16356,11 +16394,7 @@ fn compare_creds<'a>(
     fn first_by_key<'c>(creds: &'c [CompareCred]) -> HashMap<CompareKey<'c>, &'c CompareCred> {
         let mut map = HashMap::new();
         for c in creds {
-            map.entry(CompareKey {
-                rp_id: &c.rp_id,
-                user_id: &c.user_id,
-            })
-            .or_insert(c);
+            map.entry(c.compare_key()).or_insert(c);
         }
         map
     }
@@ -16377,8 +16411,8 @@ fn compare_creds<'a>(
     }
     let a_map = first_by_key(a);
     let b_map = first_by_key(b);
-    let a_keys: HashSet<CompareKey<'_>> = a_map.keys().copied().collect();
-    let b_keys: HashSet<CompareKey<'_>> = b_map.keys().copied().collect();
+    let a_keys: HashSet<CompareKey<'_>> = a_map.keys().cloned().collect();
+    let b_keys: HashSet<CompareKey<'_>> = b_map.keys().cloned().collect();
     let mut only_a: Vec<&CompareCred> = a_keys.difference(&b_keys).map(|k| a_map[k]).collect();
     let mut only_b: Vec<&CompareCred> = b_keys.difference(&a_keys).map(|k| b_map[k]).collect();
     let mut on_both: Vec<&CompareCred> = a_keys.intersection(&b_keys).map(|k| a_map[k]).collect();
@@ -20896,6 +20930,56 @@ mod cli_tests {
         assert_eq!(only_b, vec![&b[1]]);
         // The A side is shown for a shared identity.
         assert_eq!(on_both, vec![&a[0]]);
+    }
+
+    /// A vault credential's user handle: `0x01`, 8 random bytes, the name.
+    fn vault_handle(random: u8, name: &str) -> Vec<u8> {
+        let mut h = vec![0x01];
+        h.extend_from_slice(&[random; 8]);
+        h.extend_from_slice(name.as_bytes());
+        h
+    }
+
+    #[test]
+    fn credential_compare_matches_vaults_by_name() {
+        // The same vault on both keys: different random handle bytes, same
+        // name, so it is on both.
+        let a = vec![compare_cred(
+            VAULT_RP_ID,
+            &vault_handle(0x11, "Mail"),
+            Some("Mail"),
+        )];
+        let b = vec![compare_cred(
+            VAULT_RP_ID,
+            &vault_handle(0x22, "Mail"),
+            Some("Mail"),
+        )];
+        let (only_a, only_b, on_both) = compare_creds(&a, &b);
+        assert!(only_a.is_empty() && only_b.is_empty());
+        assert_eq!(on_both, vec![&a[0]]);
+        // Different names are different vaults: one only on each side.
+        let b = vec![compare_cred(
+            VAULT_RP_ID,
+            &vault_handle(0x22, "Bank"),
+            Some("Bank"),
+        )];
+        let (only_a, only_b, on_both) = compare_creds(&a, &b);
+        assert_eq!(only_a, vec![&a[0]]);
+        assert_eq!(only_b, vec![&b[0]]);
+        assert!(on_both.is_empty());
+        // Any other relying party still matches on the handle alone.
+        let a = vec![compare_cred(
+            "example.com",
+            &vault_handle(0x11, "x"),
+            Some("x"),
+        )];
+        let b = vec![compare_cred(
+            "example.com",
+            &vault_handle(0x22, "x"),
+            Some("x"),
+        )];
+        let (only_a, only_b, on_both) = compare_creds(&a, &b);
+        assert_eq!((only_a.len(), only_b.len(), on_both.len()), (1, 1, 0));
     }
 
     #[test]
