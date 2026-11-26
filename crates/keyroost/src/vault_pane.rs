@@ -417,8 +417,9 @@ fn as_sentence(text: &str) -> String {
     s
 }
 
-/// A vault error as the pane shows it: the error's own words, with the
-/// app's place to fix it where the CLI names a command.
+/// A delete whose entry is no longer in the vault.
+const ENTRY_NOT_IN_VAULT: &str = "This entry is no longer in the vault; nothing was deleted.";
+
 /// A delete refused because the entry changed on the key.
 const DELETE_CHANGED_ON_KEY: &str = "This entry changed on the key since the vault was opened; \
                                      nothing was deleted. Check it and delete again.";
@@ -433,6 +434,8 @@ fn delete_entry_question(title: &str, vault: &str, key: &str) -> String {
     )
 }
 
+/// A vault error as the pane shows it: the error's own words, with the
+/// app's place to fix it where the CLI names a command.
 pub(crate) fn vault_error_text(e: &VaultKeyError) -> String {
     let hint = match e {
         VaultKeyError::PinNotSet => "; set one on the FIDO2 tab",
@@ -1295,21 +1298,31 @@ impl App {
     /// refused. Refused while a job runs; the question stays for the next
     /// try.
     pub(crate) fn vault_confirm_delete_entry(&mut self) {
+        if let Some((vault, kind, change)) = self.vault_take_delete() {
+            self.vault_start_save(vault, kind, change);
+        }
+    }
+
+    /// The confirmed delete's change, with the confirmation taken. `None`
+    /// while a job runs (the question stays) or when the entry is no longer
+    /// in the vault (said plainly; nothing is written).
+    pub(crate) fn vault_take_delete(&mut self) -> Option<(VaultRef, SaveKind, Change)> {
         let Some(VaultConfirm::DeleteEntry { vault, entry_id }) = self.vault.confirm.as_ref()
         else {
-            return;
+            return None;
         };
         let (vault, entry_id) = (vault.clone(), entry_id.clone());
         if self.refuse_if_busy() {
-            return;
+            return None;
         }
         self.vault.confirm = None;
-        let before = self.vault_entry(&vault, &entry_id);
-        let Some(before) = before else {
-            return;
+        let Some(before) = self.vault_entry(&vault, &entry_id) else {
+            self.vault.info = None;
+            self.vault.error = Some(ENTRY_NOT_IN_VAULT.to_owned());
+            return None;
         };
         let title = Zeroizing::new(before.title.clone());
-        self.vault_start_save(vault, SaveKind::Delete { title }, Change::Delete { before });
+        Some((vault, SaveKind::Delete { title }, Change::Delete { before }))
     }
 
     /// Entry `id` of `vault` as the session holds it.
@@ -4417,20 +4430,69 @@ mod tests {
 
     // ----- delete an entry -----
 
+    /// Ask, confirm (the real confirm logic), then run the job against
+    /// `key` and land it as the apply does.
     fn delete_by_id(app: &mut App, key: &mut FakeKey, id: &str) {
         app.vault_ask_delete_entry(id);
-        let Some(VaultConfirm::DeleteEntry { vault, entry_id }) = app.vault.confirm.take() else {
-            panic!("a delete was asked");
-        };
-        let before = app.vault_entry(&vault, &entry_id).unwrap();
-        save_into(
-            app,
-            key,
-            vault,
-            SaveKind::Delete {
-                title: Zeroizing::new(before.title.clone()),
-            },
-            Change::Delete { before },
+        let (vault, kind, change) = app.vault_take_delete().expect("a confirmed delete");
+        assert!(app.vault.confirm.is_none());
+        save_into(app, key, vault, kind, change);
+    }
+
+    #[test]
+    fn the_question_stays_while_another_job_runs() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let id = session_entry(&app, "Bank").id.clone();
+        app.vault_ask_delete_entry(&id);
+        app.busy_jobs = 1;
+        app.busy_label = Some("Reading\u{2026}".into());
+        assert!(app.vault_take_delete().is_none());
+        assert!(matches!(
+            app.vault.confirm,
+            Some(VaultConfirm::DeleteEntry { .. })
+        ));
+        app.busy_jobs = 0;
+        assert!(app.vault_take_delete().is_some());
+    }
+
+    #[test]
+    fn an_entry_gone_before_confirm_writes_nothing() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let id = session_entry(&app, "Bank").id.clone();
+        app.vault_ask_delete_entry(&id);
+        // A Refresh (or another writer) took it out of the session.
+        {
+            let s = app.vault_session_mut().unwrap();
+            let v = s
+                .unlocked
+                .vaults
+                .iter_mut()
+                .find(|v| v.vault_ref.credential_id == p)
+                .unwrap();
+            v.state
+                .as_mut()
+                .unwrap()
+                .contents
+                .entries
+                .retain(|e| e.id != id);
+        }
+        let stored = key.stored().to_vec();
+        assert!(app.vault_take_delete().is_none());
+        assert!(app.vault.confirm.is_none());
+        assert_eq!(
+            app.vault.error.as_deref(),
+            Some("This entry is no longer in the vault; nothing was deleted.")
+        );
+        assert_eq!(key.stored(), &stored[..]);
+        assert!(
+            app.vault_session().unwrap().auth.is_some(),
+            "auth untouched"
         );
     }
 
