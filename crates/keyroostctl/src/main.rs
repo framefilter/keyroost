@@ -16452,45 +16452,33 @@ fn fmt_compare_cred(c: &CompareCred) -> String {
 /// for a malformed `rpIdHash` (which `fido credential list` reports as
 /// "credentials unavailable"): their credentials can't be listed, so the
 /// comparison carries the count instead of reading as complete.
-/// Like [`with_credential_manager`] but on an already-resolved path, so two
-/// keys can be read without the single-key selection memo.
 fn read_compare_side(
     hid_path: &std::path::Path,
     pin: &str,
 ) -> Result<(Vec<CompareCred>, usize), Box<dyn std::error::Error>> {
-    let (mut dev, init) = open_ctap_hid(hid_path)?;
-    if !init.supports_cbor() {
-        return Err("device is U2F-only; CTAP2 credential management not supported".into());
-    }
-    let info = keyroost_ctap::get_info(&mut dev)?;
-    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
-        &mut dev,
-        pin,
-        &info,
-        keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
-    )?;
-    let mut mgr = keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
-    let mut out = Vec::new();
-    let mut unavailable = 0;
-    for rp in mgr.list_relying_parties()? {
-        let creds = match rp.rp_id_hash {
-            Some(hash) => mgr.list_credentials(&hash)?,
-            None => {
-                unavailable += 1;
-                Vec::new()
+    with_credential_manager_at(hid_path, pin, |mgr| {
+        let mut out = Vec::new();
+        let mut unavailable = 0;
+        for rp in mgr.list_relying_parties()? {
+            let creds = match rp.rp_id_hash {
+                Some(hash) => mgr.list_credentials(&hash)?,
+                None => {
+                    unavailable += 1;
+                    Vec::new()
+                }
+            };
+            for c in creds {
+                out.push(CompareCred {
+                    rp_id: rp.id.clone(),
+                    rp_name: rp.name.clone().filter(|n| !n.is_empty()),
+                    user_id: c.user.id.clone(),
+                    user_name: c.user.name.clone(),
+                    user_display_name: c.user.display_name.clone(),
+                });
             }
-        };
-        for c in creds {
-            out.push(CompareCred {
-                rp_id: rp.id.clone(),
-                rp_name: rp.name.clone().filter(|n| !n.is_empty()),
-                user_id: c.user.id.clone(),
-                user_name: c.user.name.clone(),
-                user_display_name: c.user.display_name.clone(),
-            });
         }
-    }
-    Ok((out, unavailable))
+        Ok((out, unavailable))
+    })
 }
 
 /// One side of the unreadable-RP note: `None` when the side read clean, else
@@ -17064,7 +17052,23 @@ where
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
     let path = crate::target::fido_path(path)?;
-    let (mut dev, init) = open_ctap_hid(&path)?;
+    with_credential_manager_at(&path, pin, f)
+}
+
+/// [`with_credential_manager`] on an already-resolved HID path, returning
+/// what the closure returns: `fido credential compare` reads two keys
+/// without the single-key selection.
+fn with_credential_manager_at<T, F>(
+    path: &std::path::Path,
+    pin: &str,
+    f: F,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: for<'a> FnOnce(
+        &mut keyroost_ctap::cred_mgmt::CredentialManager<'a, keyroost_ctap::CtapHidDevice>,
+    ) -> Result<T, Box<dyn std::error::Error>>,
+{
+    let (mut dev, init) = open_ctap_hid(path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 credential management not supported".into());
     }

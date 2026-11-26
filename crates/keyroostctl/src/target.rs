@@ -489,6 +489,9 @@ fn resolve_compare_side_explicit(
             .map(|t| t.device.clone())
             .map_err(rewrite)
         }
+        // An undetected --a-path/--b-path is refused, unlike single-key
+        // --path's stand-in row: a two-key command fails closed rather than
+        // read a device the scan can't identify or tell apart from the other.
         Err(e) => Err(rewrite(e)),
     }
 }
