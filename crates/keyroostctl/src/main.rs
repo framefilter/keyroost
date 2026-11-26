@@ -16721,13 +16721,10 @@ fn run_fido_creds_compare(args: FidoCredCompareArgs<'_>) -> Result<(), Box<dyn s
                 );
             }
         } else if unavailable.is_empty() {
-            outln!(
-                "Both keys hold the same {} passkey credential(s).",
-                on_both.len()
-            );
+            outln!("Both keys hold the same {} credential(s).", on_both.len());
         } else {
             outln!(
-                "Both keys hold the same {} readable passkey credential(s); {} unavailable, comparison incomplete.",
+                "Both keys hold the same {} readable credential(s); {} unavailable, comparison incomplete.",
                 on_both.len(),
                 unavailable.join(" and ")
             );
