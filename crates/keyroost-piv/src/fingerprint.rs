@@ -105,9 +105,10 @@ pub const FEITIAN_APPLICATION_VERSION: [u8; 11] = [
 /// ePass FIDO NFC Plus answered `91 66`, listed as PIV 9166. A BioPass FIDO
 /// Pro answered `47 17`; the list gives that product no PIV number of its
 /// own, and the two bytes are the first two of its COS version, 4.7.17.
-/// Feitian says the numbers of one product order by size, a later version
-/// having the larger number, and that the numbers of two products do not
-/// compare. A byte slice of the two orders the same way.
+/// Feitian told a contributor (November 2026) that the numbers of one
+/// product order by size, a later version having the larger number, and
+/// that the numbers of two products do not compare. A byte slice of the two
+/// orders the same way.
 #[must_use]
 pub fn feitian_application_version(answer: &[u8]) -> Option<[u8; 2]> {
     if answer.len() < 16 {
@@ -1933,8 +1934,9 @@ mod tests {
             FEITIAN_APPLICATION_VERSION,
             hex("80 E2 80 00 05 DF FF 02 80 01 00")[..]
         );
-        // One product's numbers order as byte slices the way Feitian says
-        // they do: its list has PIV 8063 and PIV 9166 under the same name.
+        // One product's numbers order as byte slices the way Feitian told a
+        // contributor they do (November 2026): its products page lists PIV
+        // 8063 (K9) and PIV 9166 (K9D) under the same ePass name.
         assert!([0x80u8, 0x63][..] < [0x91u8, 0x66][..]);
     }
 

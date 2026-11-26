@@ -196,16 +196,18 @@ command Feitian's client shows each application's version with. *(Client.)*
 *(Measured, Key A and one Key B, 2026-11-23; the other Key B answered the
 same sixteen bytes with PIV selected.)* The version is bytes 8 and 9,
 where the client reads it: `91 66` and `91 26` are the PIV 9166 and OTP 9126
-of Feitian's product list. Key A's `47 17` are the first digits of its COS
+of Feitian's product list (<https://fido.ftsafe.com/products/>: the ePass
+FIDO NFC Plus K9D, COS 1.826, lists PIV 9166 and OTP 9126; the K9, COS 3.3.01,
+lists PIV 8063). Key A's `47 17` are the first digits of its COS
 version; the list gives that product no number for PIV. The other bytes are
 not read. The OTP applet's SELECT answer carries a version of another kind
 under tag `59` (1.0.2 on the same Key B).
 
-Feitian says the numbers of one product order by size, a later version
-having the larger number, and that the numbers of two products do not
-compare. It also says that a change to an application, to the COS or to the
-hardware can each change what PIV does, and that it keeps no list of the
-differences between versions to publish. *(Feitian, 2026-11-24.)*
+Feitian told a contributor (November 2026) that the numbers of one product
+order by size, a later version having the larger number, and that the
+numbers of two products do not compare. It also said that a change to an
+application, to the COS or to the hardware can each change what PIV does,
+and that it keeps no list of the differences between versions to publish.
 
 keyroost reads this version for PIV only, on the two products it has PIV
 rows for, and shows it as the PIV applet's version, the digits as Feitian

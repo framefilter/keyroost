@@ -3286,32 +3286,34 @@ const FEITIAN_BIOPASS_PRO_PIV_VERSION: &[u8] = &[0x47, 0x17];
 /// `Verdict::KnownSupported`, through Feitian's own instruction byte — see
 /// [`PivDialect::Feitian`] for the hardware observation (an ePass FIDO NFC
 /// Plus, USB `096E:0853`). The row sits at the universal `[]` sentinel, for
-/// every version of the product: Feitian names `00 FC 00 00 00` as its PIV
-/// reset, and Feitian's own client software sends it to every key it
-/// manages. The deliberate PIN/PUK burn this verdict allows is still
+/// every version of the product: `00 FC 00 00 00` is the PIV reset, and
+/// Feitian's own client software sends it to every key it manages. The deliberate PIN/PUK burn this verdict allows is still
 /// only reached after the card itself has answered the bare reset with one
 /// of the "not allowed yet" status words
 /// (`keyroost_transport::PivSession::force_reset`), so a Feitian card that
 /// does not know the instruction is not burned.
 ///
 /// **Every other row sits at the PIV application version it was measured
-/// at**, [`FEITIAN_EPASS_NFC_PLUS_PIV_VERSION`]. Feitian says that a later
-/// version of one product has the larger number, and that a change to the
-/// PIV application, to the COS or to the hardware can each change what PIV
-/// does. So a key of this product with an earlier version, or one whose
+/// at**, [`FEITIAN_EPASS_NFC_PLUS_PIV_VERSION`]. Feitian told a
+/// contributor (November 2026) that a later version of one product has the
+/// larger number, and that a change to the PIV application, to the COS or to
+/// the hardware can each change what PIV does. Its products page
+/// (<https://fido.ftsafe.com/products/>) lists the PIV numbers: 9166 for the
+/// ePass FIDO NFC Plus K9D and 8063 for the K9, two model codes under one
+/// name. So a key of this product with an earlier version, or one whose
 /// version could not be read, is not taken to do what this one did: what was
 /// seen to work is unverified there, and the card answers for itself. It is
 /// still sent Feitian's instructions ([`FEITIAN_EPASS_NFC_PLUS_APPLET_QUIRKS`]).
-/// The COS version is not part of the key. Feitian says a change to the COS
-/// alone can change PIV too, and nothing measured tells two such keys apart
+/// The COS version is not part of the key. Feitian told a contributor a
+/// change to the COS alone can change PIV too, and nothing measured tells two such keys apart
 /// yet; a difference found between two would be the reason to add it.
 ///
 /// The [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`]/
 /// [`PivExtension::GetMetadata`] rows below are hardware-observed
 /// `Verdict::KnownUnsupported`: none of Yubico's vendor-extension APDUs
 /// these three represent are accepted. The ePass FIDO NFC Plus answers each
-/// `6D00`, and Feitian says its PIV application has no command to delete a
-/// slot's key or to read a slot's key information.
+/// `6D00`: it has no command, as far as measured, to delete a slot's key or
+/// to read a slot's key information. Feitian does not document one.
 /// [`PivExtension::PinManagementAuth`] joins the same row on the same live
 /// unit: PIN VERIFY doesn't unlock the standard
 /// [`crate::OBJECT_PIN_PROTECTED_DATA`] object the indirect mechanism reads.
