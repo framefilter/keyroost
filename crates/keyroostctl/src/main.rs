@@ -2917,7 +2917,7 @@ enum FidoCmd {
         #[command(subcommand)]
         cmd: FidoPinCmd,
     },
-    /// List, inspect or delete the credentials (passkeys and security-key sign-ins) on the key.
+    /// List, inspect, compare or delete the credentials (passkeys and security-key sign-ins) on the key.
     Credential {
         #[command(subcommand)]
         cmd: FidoCredentialCmd,
@@ -3049,12 +3049,20 @@ enum FidoCredentialCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Compare the resident credentials on two keys.
+    /// Compare the resident credentials (passkeys) on two keys.
+    ///
+    /// Only credentials stored on the key (passkeys) can be compared;
+    /// security-key sign-ins kept on the website's side can't be listed by
+    /// any tool.
     ///
     /// With exactly two FIDO keys connected the keys need no naming; with
     /// more, name them with --a/--b or pick at the terminal.
     ///
     /// Matches on relying-party ID and user handle.
+    ///
+    /// PINs from stdin come one per line, key A's first. With no PIN flag,
+    /// the terminal asks for each key; an empty answer for key B reuses key
+    /// A's PIN.
     Compare {
         /// Key A to compare, by friendly name, serial, or `list` number
         /// (prefix name:, serial: or list: to force which); omit both
@@ -3072,23 +3080,21 @@ enum FidoCredentialCmd {
         /// USB HID device path of key B, instead of --b.
         #[arg(long = "b-path", value_name = "PATH", conflicts_with = "b")]
         b_path: Option<std::path::PathBuf>,
-        /// The PIN both keys share: env:NAME reads that environment variable,
-        /// stdin reads one line (first line, or second when --a-pin stdin is
-        /// also given; hidden when typed at a terminal). Key B reuses it
-        /// unless --b-pin is also given. With neither this nor the per-key
-        /// flags, a terminal asks. It asks for each key (an empty second
-        /// answer reuses the first).
+        /// The PIN for each key without its own --a-pin or --b-pin: env:NAME
+        /// reads that environment variable, stdin reads one line (first line,
+        /// or second line after --a-pin stdin; hidden when typed at a
+        /// terminal). With no PIN flag, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         /// The PIN for key A: env:NAME reads that environment variable,
         /// stdin reads one line (first line; hidden when typed at a
-        /// terminal). With neither, a terminal asks.
+        /// terminal). With neither this nor --pin, a terminal asks.
         #[arg(long = "a-pin", value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         a_pin: Option<SecretSource>,
         /// The PIN for key B: env:NAME reads that environment variable,
-        /// stdin reads one line (second line when --a-pin stdin or --pin
-        /// stdin is also given; hidden when typed at a terminal). With
-        /// neither, a terminal asks.
+        /// stdin reads one line (second line when key A's PIN comes from
+        /// stdin too; hidden when typed at a terminal). With neither this nor
+        /// --pin, a terminal asks.
         #[arg(long = "b-pin", value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         b_pin: Option<SecretSource>,
     },
@@ -16410,8 +16416,8 @@ fn fmt_compare_cred(c: &CompareCred) -> String {
 /// Read every resident credential on the key at `hid_path` for the comparison.
 /// Returns the readable credentials plus the count of relying parties skipped
 /// for a malformed `rpIdHash` (which `fido credential list` reports as
-/// "credentials unavailable"): their credentials can't be listed, so the comparison
-/// carries the count instead of claiming two keys are in sync.
+/// "credentials unavailable"): their credentials can't be listed, so the
+/// comparison carries the count instead of reading as complete.
 /// Like [`with_credential_manager`] but on an already-resolved path, so two
 /// keys can be read without the single-key selection memo.
 fn read_compare_side(
@@ -16654,8 +16660,8 @@ fn run_fido_creds_compare(args: FidoCredCompareArgs<'_>) -> Result<(), Box<dyn s
     // Relying parties with a malformed rpIdHash can't be listed, so the
     // comparison is partial — say so loudly, on stderr so it also reaches
     // --json users without breaking the output schema (as the OATH listing
-    // does for undecodable entries). An invisible entry must never read as
-    // "in sync".
+    // does for undecodable entries). An invisible entry must never let the
+    // summary read as complete.
     let unavailable = unavailable_parts(unavail_a, unavail_b);
     if !unavailable.is_empty() {
         crate::output::warn(&format!(
@@ -16693,12 +16699,12 @@ fn run_fido_creds_compare(args: FidoCredCompareArgs<'_>) -> Result<(), Box<dyn s
             }
         } else if unavailable.is_empty() {
             outln!(
-                "Both keys hold the same {} account(s); in sync.",
+                "Both keys hold the same {} passkey credential(s).",
                 on_both.len()
             );
         } else {
             outln!(
-                "Both keys hold the same {} readable account(s); {} unavailable, comparison incomplete.",
+                "Both keys hold the same {} readable passkey credential(s); {} unavailable, comparison incomplete.",
                 on_both.len(),
                 unavailable.join(" and ")
             );
@@ -16719,14 +16725,14 @@ fn run_fido_creds_compare(args: FidoCredCompareArgs<'_>) -> Result<(), Box<dyn s
     }
     if unavailable.is_empty() {
         outln!(
-            "Key A holds {} credential(s), key B holds {}; {} account(s) on both.",
+            "Key A holds {} credential(s), key B holds {}; {} credential(s) on both.",
             creds_a.len(),
             creds_b.len(),
             on_both.len()
         );
     } else {
         outln!(
-            "Key A holds {} credential(s), key B holds {}; {} account(s) on both, {} unavailable.",
+            "Key A holds {} credential(s), key B holds {}; {} credential(s) on both, {} unavailable.",
             creds_a.len(),
             creds_b.len(),
             on_both.len(),

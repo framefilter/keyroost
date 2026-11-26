@@ -461,9 +461,9 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl fido pin min-length</code></td><td>Raise the minimum PIN length</td></tr>
       <tr><td><code>keyroostctl fido pin min-length set</code></td><td>Raise the minimum PIN length. One-way: asks first (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl fido pin force-change</code></td><td>Force a PIN change on next use, without changing the minimum length</td></tr>
-      <tr><td><code>keyroostctl fido credential</code></td><td>List, inspect or delete the credentials (passkeys and security-key sign-ins) on the key</td></tr>
+      <tr><td><code>keyroostctl fido credential</code></td><td>List, inspect, compare or delete the credentials (passkeys and security-key sign-ins) on the key</td></tr>
       <tr><td><code>keyroostctl fido credential list</code></td><td>List every resident credential on the authenticator, grouped by RP</td></tr>
-      <tr><td><code>keyroostctl fido credential compare</code></td><td>Compare the resident credentials on two keys</td></tr>
+      <tr><td><code>keyroostctl fido credential compare</code></td><td>Compare the resident credentials (passkeys) on two keys</td></tr>
       <tr><td><code>keyroostctl fido credential delete</code></td><td>Delete one credential (passkey or security-key sign-in) by its hex credential ID. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
       <tr><td><code>keyroostctl fido credential status</code></td><td>Show how many passkeys the key holds and how many more fit. Needs the PIN</td></tr>
       <tr><td><code>keyroostctl fido fingerprint</code></td><td>List, add, rename or delete enrolled fingerprints</td></tr>

@@ -649,9 +649,21 @@ pub(crate) fn select_fido_pair(
     for d in [&mut a, &mut b] {
         keyroost_resolve::add_fido_models(std::slice::from_mut(d), debug_on());
     }
-    errln!("{}", announce_line(&a, Need::FidoHid));
-    errln!("{}", announce_line(&b, Need::FidoHid));
+    errln!("{}", announce_side(&a, "key A"));
+    errln!("{}", announce_side(&b, "key B"));
     Ok((a, b))
+}
+
+/// The announce line for one side of a two-key command, naming the side
+/// (`→ key A: Model · serial X · path`): the result headings say "key A" and
+/// "key B", and with two keys compared as-is the order alone would not tell
+/// the user which key is which.
+fn announce_side(d: &Device, side: &str) -> String {
+    let line = announce_line(d, Need::FidoHid);
+    match line.strip_prefix("\u{2192} ") {
+        Some(rest) => format!("\u{2192} {side}: {rest}"),
+        None => format!("{side}: {line}"),
+    }
 }
 
 /// The HID path of the selected FIDO key.
@@ -1490,6 +1502,17 @@ mod tests {
         assert!(e.starts_with("key A: "), "{e}");
         assert!(e.contains("--a/--b"), "{e}");
         assert!(!e.contains("--device"), "{e}");
+    }
+
+    #[test]
+    fn compare_announce_lines_name_each_side() {
+        let devices = two_fido_keys();
+        let a = announce_side(&devices[0], "key A");
+        let b = announce_side(&devices[1], "key B");
+        assert!(a.starts_with("\u{2192} key A: "), "{a}");
+        assert!(b.starts_with("\u{2192} key B: "), "{b}");
+        assert!(a.contains(&devices[0].serial), "{a}");
+        assert!(b.contains(&devices[1].serial), "{b}");
     }
 
     #[test]
