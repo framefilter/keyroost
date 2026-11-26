@@ -209,14 +209,14 @@ pub(crate) fn new_name_refusal(name: &str, taken: &[Option<String>]) -> Option<V
 
 /// What one more entry takes on the key, for the space line's "room for
 /// about N more entries": one fixed size, so the number only falls as the
-/// store fills and only rises as it empties. Measured by sealing typical
-/// logins (a 20-character generated password, a site, user name and URL
-/// not already in the vault, no notes): the first entries of a vault add
-/// about 55 to 105 bytes each (the ID and password don't compress), later
-/// ones less as the compression finds repeats. 80 bytes covers the early
-/// ones, so the line promises a little less room than there is rather
-/// than more.
-pub(crate) const TYPICAL_ENTRY_BYTES: u64 = 80;
+/// store fills and only rises as it empties. Measured by sealing 40
+/// typical logins with `keyroost_vault::seal` (site, user name and URL, a
+/// generated password, no notes): after the first entry, each adds about
+/// 45 bytes with 20-character passwords and up to about 57 with
+/// 32-character ones and distinct user names (the ID and password don't
+/// compress). 60 bytes sits just above that, so the line promises a
+/// little less room than there is rather than more.
+pub(crate) const TYPICAL_ENTRY_BYTES: u64 = 60;
 
 /// `bytes` in KB with one decimal, a trailing `.0` dropped: `1.3`, `4`.
 pub(crate) fn kb(bytes: u64) -> String {
@@ -225,7 +225,7 @@ pub(crate) fn kb(bytes: u64) -> String {
 }
 
 /// How full the key's store is, in plain numbers: `1.3 of 4 KB used · room
-/// for about 34 more entries` (free bytes ÷ [`TYPICAL_ENTRY_BYTES`]), or
+/// for about 45 more entries` (free bytes ÷ [`TYPICAL_ENTRY_BYTES`]), or
 /// `· full` when not one more fits.
 pub(crate) fn space_line(cap: &BlobCapacity) -> String {
     let used = format!("{} of {} KB used", kb(cap.used_bytes), kb(cap.max_bytes));
@@ -6088,11 +6088,11 @@ mod tests {
         assert_eq!(kb(1331), "1.3");
         assert_eq!(kb(4096), "4");
         assert_eq!(kb(0), "0");
-        // 2725 free at 80 bytes an entry: room for 34.
-        assert_eq!(TYPICAL_ENTRY_BYTES, 80);
+        // 2725 free at 60 bytes an entry: room for 45.
+        assert_eq!(TYPICAL_ENTRY_BYTES, 60);
         assert_eq!(
             space_line(&cap(1371, 4096)),
-            "1.3 of 4 KB used \u{00B7} room for about 34 more entries"
+            "1.3 of 4 KB used \u{00B7} room for about 45 more entries"
         );
         assert_eq!(
             space_line(&cap(4000, 4096)),
