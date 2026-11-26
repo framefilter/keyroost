@@ -251,18 +251,32 @@ fn contains_folded(hay: &str, needle: &[char]) -> bool {
 /// Whether entry `e` matches the filter: its title, username or URL holds
 /// `filter`, ignoring case. Never its notes or password, which the list
 /// doesn't show. An empty filter matches every entry.
+/// The list lower-cases the filter once ([`shown_rows`]); this one-entry
+/// form is for tests.
+#[cfg(test)]
 pub(crate) fn matches_filter(e: &Entry, filter: &str) -> bool {
-    let needle: Vec<char> = fold(filter.trim()).collect();
+    matches_needle(e, &needle(filter))
+}
+
+/// The filter lower-cased once, for [`matches_needle`].
+fn needle(filter: &str) -> Vec<char> {
+    fold(filter.trim()).collect()
+}
+
+/// Whether entry `e` matches the filter, already lower-cased ([`needle`]):
+/// its title, username or URL holds it. Never its notes or password.
+fn matches_needle(e: &Entry, needle: &[char]) -> bool {
     [&e.title, &e.username, &e.url]
         .iter()
-        .any(|f| contains_folded(f, &needle))
+        .any(|f| contains_folded(f, needle))
 }
 
 /// The entries of `v` the list shows for `filter`, as indices into
 /// `v.entries`: sorted by title, then username, ignoring case.
 pub(crate) fn shown_rows(v: &Vault, filter: &str) -> Vec<usize> {
+    let needle = needle(filter);
     let mut rows: Vec<usize> = (0..v.entries.len())
-        .filter(|&i| matches_filter(&v.entries[i], filter))
+        .filter(|&i| matches_needle(&v.entries[i], &needle))
         .collect();
     rows.sort_by(|&a, &b| {
         let (a, b) = (&v.entries[a], &v.entries[b]);
@@ -754,6 +768,7 @@ impl App {
                     s.entry_bytes = entry_bytes_estimate(&unlocked.vaults);
                     s.unlocked = unlocked;
                 }
+                self.vault_fix_selection();
                 self.vault.error = None;
             }
             Err(e @ VaultJobError::Vault(VaultKeyError::VaultGone { .. })) => {
@@ -784,6 +799,36 @@ impl App {
     pub(crate) fn selected_vault(&self) -> Option<&VaultOnKey> {
         let vaults = &self.vault_session()?.unlocked.vaults;
         selected_index(vaults, self.vault.selected.as_deref()).map(|i| &vaults[i])
+    }
+
+    /// A selected vault no longer listed (deleted or replaced): back to the
+    /// first vault, with nothing of the old one left open or shown.
+    pub(crate) fn vault_fix_selection(&mut self) {
+        let Some(id) = self.vault.selected.as_deref() else {
+            return;
+        };
+        let listed = self.vault_session().is_some_and(|s| {
+            s.unlocked
+                .vaults
+                .iter()
+                .any(|v| v.vault_ref.credential_id == id)
+        });
+        if !listed {
+            self.vault.selected = None;
+            self.vault.open_entry = None;
+            self.vault.revealed = None;
+        }
+    }
+
+    /// Copy entry `id`'s username or password from the shown vault: the
+    /// concealed copy, marked as the vault's so Lock clears it, and the
+    /// button's "Copied" flash. Nothing for an empty value.
+    pub(crate) fn vault_copy(&mut self, ctx: &egui::Context, id: &str, what: CopyWhat, now: f64) {
+        if let Some(mut text) = self.vault_copy_text(id, what) {
+            let text = std::mem::take(&mut *text);
+            self.copy_secret_from(ctx, text, true);
+            self.vault.copied = Some((what.flash_key(id), now + COPIED_FLASH_SECS));
+        }
     }
 
     /// Show vault `id` (its credential ID): the opened entry closes and a
@@ -1001,6 +1046,7 @@ impl App {
     /// filter, a row per entry with its copy buttons (the opened one with its
     /// password behind Show, its URL and notes), then the Backup card.
     fn render_vault_list(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        self.vault_fix_selection();
         let Some(session) = self.vault_session() else {
             return;
         };
@@ -1148,11 +1194,7 @@ impl App {
             self.vault.revealed = r;
         }
         if let Some((id, what)) = copy {
-            if let Some(mut text) = self.vault_copy_text(&id, what) {
-                let text = std::mem::take(&mut *text);
-                self.copy_secret_from(ui.ctx(), text, true);
-                self.vault.copied = Some((what.flash_key(&id), now + COPIED_FLASH_SECS));
-            }
+            self.vault_copy(ui.ctx(), &id, what, now);
         }
         if let Some((_, t)) = &self.vault.copied {
             ui.ctx()
@@ -1332,10 +1374,15 @@ fn opened_entry(ui: &mut egui::Ui, p: &Palette, e: &Entry, showing: bool) -> Opt
                     value(ui, "");
                 } else {
                     if showing {
-                        ui.label(
-                            egui::RichText::new(e.password.as_str())
-                                .font(theme::f_mono(13.0))
-                                .color(p.txt),
+                        // Not selectable: Ctrl+C would skip the concealed
+                        // copy and its 45 s clear.
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(e.password.as_str())
+                                    .font(theme::f_mono(13.0))
+                                    .color(p.txt),
+                            )
+                            .selectable(false),
                         );
                     } else {
                         ui.label(
@@ -2437,7 +2484,10 @@ mod tests {
             .vaults
             .remove(0);
         assert_eq!(name(&app).as_deref(), Some("Work"));
-        // Work itself gone: the first vault.
+        // Work itself gone: the first vault, with nothing of Work left
+        // open or shown.
+        app.vault.open_entry = Some("w1".into());
+        app.vault.revealed = Some("w1".into());
         app.vault
             .session
             .as_mut()
@@ -2446,6 +2496,20 @@ mod tests {
             .vaults
             .remove(0);
         assert_eq!(name(&app).as_deref(), Some("Home"));
+        app.vault_fix_selection();
+        assert_eq!(app.vault.selected, None);
+        assert_eq!(app.vault.open_entry, None);
+        assert_eq!(app.vault.revealed, None);
+        // A listed selection is kept as it is.
+        let home = app.vault_session().unwrap().unlocked.vaults[0]
+            .vault_ref
+            .credential_id
+            .clone();
+        app.vault_select(home.clone());
+        app.vault.open_entry = Some("h1".into());
+        app.vault_fix_selection();
+        assert_eq!(app.vault.selected, Some(home));
+        assert_eq!(app.vault.open_entry.as_deref(), Some("h1"));
     }
 
     #[test]
@@ -2535,6 +2599,27 @@ mod tests {
         assert_eq!(c.text.as_str(), "x");
         assert!(c.from_vault);
         assert!(!clipboard_clear_for("x".to_owned(), 0.0, false).from_vault);
+    }
+
+    #[test]
+    fn a_vault_copy_is_marked_as_the_vaults() {
+        // No clipboard handle in a test: the copy takes egui's path.
+        let mut key = FakeKey::new();
+        let (_, a, _) = two_githubs(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let ctx = egui::Context::default();
+        app.vault_copy(&ctx, &a, CopyWhat::Password, 100.0);
+        let c = app.clipboard_clear_at.as_ref().expect("a clear scheduled");
+        assert!(c.from_vault, "Lock clears it");
+        assert_eq!(c.text.as_str(), "pw-a");
+        assert_eq!(
+            app.vault.copied,
+            Some((format!("{a}:p"), 100.0 + COPIED_FLASH_SECS))
+        );
+        assert!(app.secret_clipboard.is_none(), "no real clipboard opened");
+        app.vault_lock(None);
+        assert!(app.clipboard_clear_at.is_none());
     }
 
     #[test]

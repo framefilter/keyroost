@@ -209,6 +209,9 @@ fn copy_concealed(slot: &mut Option<arboard::Clipboard>, text: &str) -> bool {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         return false;
     }
+    // Tests never open the real clipboard: with no handle, the copy takes
+    // egui's path, which only records it in the frame's output.
+    #[cfg(not(test))]
     if slot.is_none() {
         *slot = arboard::Clipboard::new().ok();
     }
