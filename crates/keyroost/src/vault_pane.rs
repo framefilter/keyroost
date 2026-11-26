@@ -57,8 +57,9 @@ pub(crate) fn vault_offer(
         Ok(()) => VaultOffer::Ready,
         Err(VaultKeyError::PinNotSet) => VaultOffer::NeedsPin,
         Err(VaultKeyError::Unsupported(what)) => VaultOffer::No(what),
-        // `check_support` answers with the two above only.
-        Err(_) => VaultOffer::Unknown,
+        // `check_support` answers with the two above today. A refusal it
+        // adds later is still a refusal: never a key left on "Reading key…".
+        Err(_) => VaultOffer::No("everything a vault needs"),
     }
 }
 
@@ -127,10 +128,16 @@ fn sentence(s: &str) -> String {
 }
 
 /// The Overview card's line: why there is no vault, or what is in it.
-/// `vaults` is the unlocked list, `None` while locked.
-pub(crate) fn overview_line(offer: VaultOffer, vaults: Option<&[VaultOnKey]>) -> String {
+/// `read_failed` is whether the key's getInfo read failed (the FIDO2 tab's
+/// "Couldn't read this key."); `vaults` is the unlocked list, `None` while
+/// locked.
+pub(crate) fn overview_line(
+    offer: VaultOffer,
+    read_failed: bool,
+    vaults: Option<&[VaultOnKey]>,
+) -> String {
     match offer {
-        VaultOffer::Unknown => fido_unread_line(false, false).to_owned(),
+        VaultOffer::Unknown => fido_unread_line(false, read_failed).to_owned(),
         VaultOffer::NeedsAdmin => "Open the FIDO2 tab to manage this key via Windows settings \
                                    or restart as administrator."
             .to_owned(),
@@ -215,13 +222,17 @@ impl App {
                 ui.add_space(6.0);
             }
             ui.label(
-                egui::RichText::new(overview_line(offer, None))
-                    .font(theme::f_reg(13.0))
-                    .color(if offer == VaultOffer::Unknown {
-                        p.txt3
-                    } else {
-                        p.txt2
-                    }),
+                egui::RichText::new(overview_line(
+                    offer,
+                    self.security_keys.error.is_some(),
+                    None,
+                ))
+                .font(theme::f_reg(13.0))
+                .color(if offer == VaultOffer::Unknown {
+                    p.txt3
+                } else {
+                    p.txt2
+                }),
             );
             if matches!(offer, VaultOffer::NeedsAdmin | VaultOffer::NeedsPin) {
                 ui.add_space(8.0);
@@ -364,28 +375,33 @@ mod tests {
     #[test]
     fn overview_line_says_why() {
         assert_eq!(
-            overview_line(VaultOffer::Unknown, None),
+            overview_line(VaultOffer::Unknown, false, None),
             "Reading key\u{2026}"
         );
+        // A failed read isn't left on "Reading key…".
         assert_eq!(
-            overview_line(VaultOffer::NeedsAdmin, None),
+            overview_line(VaultOffer::Unknown, true, None),
+            "Couldn't read this key."
+        );
+        assert_eq!(
+            overview_line(VaultOffer::NeedsAdmin, false, None),
             "Open the FIDO2 tab to manage this key via Windows settings or restart as \
              administrator."
         );
         assert_eq!(
-            overview_line(VaultOffer::No("largeBlobKey"), None),
+            overview_line(VaultOffer::No("largeBlobKey"), false, None),
             "This key cannot hold a password vault: it does not support largeBlobKey."
         );
         assert_eq!(
-            overview_line(VaultOffer::NeedsPin, None),
+            overview_line(VaultOffer::NeedsPin, false, None),
             "A password vault needs a FIDO2 PIN; set one on the FIDO2 tab."
         );
         assert_eq!(
-            overview_line(VaultOffer::Ready, None),
+            overview_line(VaultOffer::Ready, false, None),
             "Passwords in an encrypted vault on this key, opened with the PIN and a touch."
         );
         assert_eq!(
-            overview_line(VaultOffer::Ready, Some(&[])),
+            overview_line(VaultOffer::Ready, false, Some(&[])),
             "No vaults on this key yet."
         );
         let mut key = FakeKey::new();
@@ -398,7 +414,7 @@ mod tests {
         key.add_vault("Work", &Vault::default());
         let vaults = unlocked(&mut key);
         assert_eq!(
-            overview_line(VaultOffer::Ready, Some(&vaults)),
+            overview_line(VaultOffer::Ready, false, Some(&vaults)),
             "Personal \u{00B7} 2, Work \u{00B7} 0"
         );
     }

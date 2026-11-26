@@ -19918,18 +19918,24 @@ impl App {
 
     /// Whether the selected key is offered a password vault.
     fn vault_offer(&self) -> VaultOffer {
+        self.vault_offer_with(self.fido_non_admin())
+    }
+
+    /// [`Self::vault_offer`] with the Windows rights check already made.
+    fn vault_offer_with(&self, non_admin: bool) -> VaultOffer {
         vault_pane::vault_offer(
             self.security_keys.info.as_ref(),
             self.security_keys.u2f_only,
-            self.fido_non_admin(),
+            non_admin,
         )
     }
 
     /// The Overview's "Password vault" card, under the FIDO2 card: Manage
     /// opens the Vault tab when it is offered; a key that can't hold a
-    /// vault gets no Manage, and the line says why.
-    fn vault_overview_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let offer = self.vault_offer();
+    /// vault gets no Manage, and the line says why. `non_admin` is the
+    /// Overview's own [`Self::fido_non_admin`].
+    fn vault_overview_card(&mut self, ui: &mut egui::Ui, p: &Palette, non_admin: bool) {
+        let offer = self.vault_offer_with(non_admin);
         theme::card_frame(p).show(ui, |ui| {
             if matches!(offer, VaultOffer::No(_)) {
                 ui.set_min_width(ui.available_width());
@@ -19945,7 +19951,9 @@ impl App {
                 ui.add_space(6.0);
             }
             ui.label(
-                egui::RichText::new(vault_pane::overview_line(offer, None))
+                // A failed read says "Reading key…" here, as the FIDO2
+                // card above it does.
+                egui::RichText::new(vault_pane::overview_line(offer, false, None))
                     .font(theme::f_reg(13.0))
                     .color(if offer == VaultOffer::Unknown {
                         p.txt3
@@ -19960,6 +19968,8 @@ impl App {
     /// Scrolling comes from the shared capability-pane scroller in `central`.
     fn overview(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
         let waiting = self.waiting_for().map(str::to_owned);
+        // Once per frame: on Windows it enumerates HID devices.
+        let non_admin = self.fido_non_admin();
         ui.vertical(|ui| {
             self.mds_card(ui, p, dev);
             if dev.caps.has(Caps::U2F_ONLY) {
@@ -19991,7 +20001,7 @@ impl App {
                     // Windows non-admin: FIDO access is gated, so `info` never
                     // loads; show an admin-needed hint instead of a perpetual
                     // "Reading key…". The Manage → jump opens the full card.
-                    if self.fido_non_admin() {
+                    if non_admin {
                         theme::pill(ui, "Administrator rights needed", p.warn, p.warn_soft());
                         ui.add_space(6.0);
                         ui.label(
@@ -20039,7 +20049,7 @@ impl App {
                     }
                 });
                 ui.add_space(14.0);
-                self.vault_overview_card(ui, p);
+                self.vault_overview_card(ui, p, non_admin);
                 ui.add_space(14.0);
             }
             if dev.caps.has(Caps::OATH) {
@@ -20432,15 +20442,9 @@ impl App {
         // link to Windows' settings and an elevate button, instead of the normal
         // — and here non-functional — management UI.
         #[cfg(windows)]
-        {
-            let no_access = self.security_keys.info.is_none();
-            if no_access
-                && !keyroost_proto::devices_hidden()
-                && keyroost_winwebauthn::fido_key_present()
-            {
-                self.fido2_non_admin_card(ui, p);
-                return;
-            }
+        if self.fido_non_admin() {
+            self.fido2_non_admin_card(ui, p);
+            return;
         }
 
         let pin = pin_support(self.security_keys.info.as_ref());
