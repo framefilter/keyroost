@@ -169,6 +169,9 @@ jobs:
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/SHA256SUMS"
           sha_linux="$(grep 'linux-x86_64' SHA256SUMS | cut -d' ' -f1)"
           sha_udev="$(sha256sum udev/70-keyroost-fido.rules | cut -d' ' -f1)"
+          sha_desktop="$(sha256sum packaging/flatpak/io.github.framefilter.keyroost.desktop | cut -d' ' -f1)"
+          sha_icon_svg="$(sha256sum packaging/icons/hicolor/scalable/apps/io.github.framefilter.keyroost.svg | cut -d' ' -f1)"
+          sha_icon_png="$(sha256sum packaging/icons/hicolor/256x256/apps/io.github.framefilter.keyroost.png | cut -d' ' -f1)"
 
           mkdir -p ~/.ssh
           printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
@@ -199,6 +202,9 @@ jobs:
             sed -e "s/@VERSION@/${version}/g" \
                 -e "s/@SHA_LINUX@/${sha_linux}/g" \
                 -e "s/@SHA_UDEV@/${sha_udev}/g" \
+                -e "s/@SHA_DESKTOP@/${sha_desktop}/g" \
+                -e "s/@SHA_ICON_SVG@/${sha_icon_svg}/g" \
+                -e "s/@SHA_ICON_PNG@/${sha_icon_png}/g" \
                 "packaging/aur/${t}.template" > "aur-repo/${t}"
           done
           cd aur-repo

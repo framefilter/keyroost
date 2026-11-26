@@ -342,6 +342,16 @@ fn pcsc_note(debug: bool, body: &str) {
     crate::trace::line(debug, || format_line(Dir::Note, &otp_label("PCSC"), body));
 }
 
+/// Whether a re-SELECT after a card reset worked. `61xx` is a successful
+/// SELECT with an answer waiting (a contact card answers its SELECT that way);
+/// the answer itself isn't needed.
+fn reselect_answer(sw: u16) -> Result<(), OtpError> {
+    if sw >> 8 == 0x61 {
+        return Ok(());
+    }
+    OtpError::check(sw)
+}
+
 /// Record one debug-trace line: to stderr when `debug` is on, and to an
 /// active GUI capture (see `crate::trace`) either way. Every byte dump
 /// in this module — both transports, both directions — must go through here
@@ -992,6 +1002,31 @@ impl PcScOtpTransport {
         Ok(())
     }
 
+    /// Reconnect to the same card with a reset, then re-SELECT the applet we
+    /// were on: the reset clears the selection, and without it the next
+    /// command would reach the card's default applet.
+    fn reset_and_reselect(&mut self) -> Result<(), OtpTransportError> {
+        self.card.reconnect(
+            pcsc::ShareMode::Shared,
+            pcsc::Protocols::ANY,
+            pcsc::Disposition::ResetCard,
+        )?;
+        if self.current_aid.is_empty() {
+            return Ok(());
+        }
+        let sel = t2::build_select(&self.current_aid);
+        let mut sbuf = [0u8; 256];
+        let sresp = self.card.transmit(&sel, &mut sbuf)?;
+        if sresp.len() < 2 {
+            return Err(OtpTransportError::EmptyResponse);
+        }
+        let ssw = ((sresp[sresp.len() - 2] as u16) << 8) | sresp[sresp.len() - 1] as u16;
+        // A failed re-SELECT means the next command would hit the wrong
+        // applet; surface that rather than send blind.
+        reselect_answer(ssw)?;
+        Ok(())
+    }
+
     fn raw_transmit(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), OtpTransportError> {
         // Keyed off the original command: a `61xx` GET-RESPONSE continuation
         // resends a different header into `to_send`, but the secret verdict must
@@ -1038,34 +1073,13 @@ impl PcScOtpTransport {
                         self.debug,
                         "transient card error; reconnecting and retrying",
                     );
-                    // Re-establish the link to the same card.
-                    self.card.reconnect(
-                        pcsc::ShareMode::Shared,
-                        pcsc::Protocols::ANY,
-                        pcsc::Disposition::ResetCard,
-                    )?;
-                    // A `ResetCard` reconnect resets the card: it clears the
-                    // applet selection made at open AND discards any in-flight
-                    // `61xx` GET-RESPONSE chain. So we must (a) re-SELECT the
-                    // applet we were on — otherwise the resend targets the
-                    // default applet and fails — and (b) throw away everything
+                    // A `ResetCard` reconnect also discards any in-flight
+                    // `61xx` GET-RESPONSE chain, so throw away everything
                     // accumulated so far and restart from the *original* APDU.
                     // Resending a bare GET RESPONSE (or appending fresh bytes to
                     // a half-filled `acc`) against a freshly reset card would
                     // corrupt the reassembly.
-                    if !self.current_aid.is_empty() {
-                        let sel = t2::build_select(&self.current_aid);
-                        let mut sbuf = [0u8; 256];
-                        let sresp = self.card.transmit(&sel, &mut sbuf)?;
-                        if sresp.len() < 2 {
-                            return Err(OtpTransportError::EmptyResponse);
-                        }
-                        let ssw =
-                            ((sresp[sresp.len() - 2] as u16) << 8) | sresp[sresp.len() - 1] as u16;
-                        // A failed re-SELECT means the resend would hit the
-                        // wrong applet; surface that rather than send blind.
-                        OtpError::check(ssw)?;
-                    }
+                    self.reset_and_reselect()?;
                     acc.clear();
                     chunks = 0;
                     to_send = apdu.to_vec();
@@ -1080,6 +1094,16 @@ impl PcScOtpTransport {
                             &format!("PC/SC error: {e}"),
                         )
                     });
+                    // A failed exchange can leave the card mute: a contact
+                    // card answered every command after it with "non-existent
+                    // transaction" (re #155). Callers that read something
+                    // best-effort carry on after this error, so reset the card
+                    // and re-select the applet for the next command. This
+                    // command is not retried; its error is the answer.
+                    pcsc_note(self.debug, "resetting the card after the failed exchange");
+                    if let Err(re) = self.reset_and_reselect() {
+                        pcsc_note(self.debug, &format!("card reset failed ({re})"));
+                    }
                     return Err(OtpTransportError::Pcsc(e));
                 }
             };
@@ -2483,6 +2507,20 @@ mod ctap_reply_tests {
         );
         // Any other refusal declines without asking.
         assert!(!probe_answered(0x6D00, || panic!("no flag read on 6D00")));
+    }
+}
+
+#[cfg(test)]
+mod reselect_tests {
+    use super::reselect_answer;
+
+    #[test]
+    fn a_select_with_an_answer_waiting_counts_as_selected() {
+        // A Token2 contact card answers the OTP applet's SELECT with 61 04.
+        assert!(reselect_answer(0x6104).is_ok());
+        assert!(reselect_answer(0x9000).is_ok());
+        assert!(reselect_answer(0x6A82).is_err());
+        assert!(reselect_answer(0x6D00).is_err());
     }
 }
 
