@@ -348,6 +348,70 @@ pub fn feitian_cos_version(reader: &str, debug: bool) -> Option<String> {
     keyroost_feitianotp::parse_device_cos(&data).map(keyroost_feitianotp::cos_version_text)
 }
 
+/// The firmware version of the Identiv/Hirsch uTrust FIDO2 key on `reader`,
+/// as the key gives it
+/// ([`keyroost_piv::fingerprint::parse_utrust_firmware_version`]): the
+/// version printed on the key, where its CTAPHID INIT bytes are another
+/// number (0.0.1 on a key with firmware 3.33). `None` if the reader can't be
+/// opened, its card's ATR names no uTrust key
+/// ([`keyroost_piv::fingerprint::atr_names_utrust`]), or the key doesn't
+/// answer with a version.
+///
+/// The read ([`keyroost_piv::fingerprint::UTRUST_GET_FIRMWARE_VERSION`]) is
+/// not in Identiv/Hirsch's documentation; it was found in Identiv/Hirsch's
+/// uTrust Token Manager (Windows).
+///
+/// No application is selected for it: the key answers the read whichever
+/// one is selected, and that one stays selected.
+pub fn utrust_firmware_version(reader: &str, debug: bool) -> Option<String> {
+    use keyroost_piv::fingerprint::{parse_utrust_firmware_version, UTRUST_GET_FIRMWARE_VERSION};
+    if keyroost_proto::is_molto2_reader(reader) {
+        return None;
+    }
+    let shown = keyroost_proto::trace::reader_name(reader);
+    let ctx = crate::establish_context().ok()?;
+    let name = std::ffi::CString::new(reader).ok()?;
+    let card = match crate::connect_shared(&ctx, &name) {
+        Ok(c) => c,
+        Err(e) => {
+            trace::line(debug, || {
+                format_line(
+                    Dir::Note,
+                    "identity",
+                    &format!("{shown} connect failed: {e}"),
+                )
+            });
+            return None;
+        }
+    };
+    let out = (|| -> Option<String> {
+        if !crate::card_is_utrust(&card) {
+            return None;
+        }
+        let command = UTRUST_GET_FIRMWARE_VERSION;
+        trace::line(debug, || {
+            format_line(Dir::Sent, "identity", &format!("{shown} {}", hex(&command)))
+        });
+        let (data, sw) =
+            crate::exchange_apdu(&card, &command, 0x61, || vec![0x00, 0xC0, 0x00, 0x00, 0x00])
+                .ok()?;
+        trace::line(debug, || {
+            format_line(
+                Dir::Received,
+                "identity",
+                &format!("{shown} {} {sw:04X}", hex(&data)),
+            )
+        });
+        if sw != 0x9000 {
+            return None;
+        }
+        parse_utrust_firmware_version(&data)
+    })();
+    // LeaveCard: never reset a card another session may hold.
+    let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

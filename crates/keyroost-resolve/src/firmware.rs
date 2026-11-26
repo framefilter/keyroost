@@ -24,6 +24,14 @@
 //!   the three bytes read, `47.17.00` for that key, where Feitian writes
 //!   4.7.17. When that read gives nothing (no reader for the key here, or
 //!   a key that doesn't answer it), the INIT bytes are shown as they are.
+//! * Identiv/Hirsch (uTrust FIDO2): bytes that are not the version printed
+//!   on the key (`0.0.1` on a uTrust FIDO2 NFC with firmware 3.33). The key
+//!   gives that version over its smart-card reader
+//!   (`keyroost_transport::identity::utrust_firmware_version`), to a
+//!   command that is not in Identiv/Hirsch's documentation: it was found
+//!   in Identiv/Hirsch's uTrust Token Manager (Windows). It is shown as
+//!   read, `3.33`. When that read gives nothing, the INIT bytes are shown
+//!   as they are.
 //!
 //! [`key_firmware`] applies these rules for one key; the CLI's `fido info`
 //! and the app's key header both show what it returns.
@@ -40,13 +48,19 @@ const TOKEN2_VID: u16 = keyroost_proto::USB_VID;
 /// Feitian's USB vendor ID.
 const FEITIAN_VID: u16 = 0x096e;
 
+/// Identiv's USB vendor ID, which uTrust FIDO2 keys carry under both the
+/// Identiv and the Hirsch name.
+const IDENTIV_VID: u16 = 0x04e6;
+
 /// The firmware to show for the FIDO key at HID `path`, whose CTAPHID INIT
 /// reported `version`: the INIT version read the vendor's way
 /// ([`init_firmware`]); for a Token2, the release its serial names (the
 /// row's `serial` when the scan read it, else read over USB); for a
 /// Feitian key, the COS version it reports over `reader`, else its INIT
-/// bytes as they are; when INIT says
-/// 0.0.0 (a Nitrokey 3), what the admin application reports over `reader`.
+/// bytes as they are; for an Identiv/Hirsch uTrust FIDO2 key, the firmware
+/// version it gives over `reader`, else its INIT bytes as they are; when
+/// INIT says 0.0.0 (a Nitrokey 3), what the admin application reports over
+/// `reader`.
 /// `None` when the key doesn't say, or isn't found by `path`.
 ///
 /// May ask the key (the Token2 serial, the admin application), so run it
@@ -80,17 +94,24 @@ pub fn key_firmware(
     }
     if vendor_id == FEITIAN_VID {
         let cos = reader.and_then(|r| keyroost_transport::identity::feitian_cos_version(r, debug));
-        return feitian_firmware(cos, version);
+        return read_or_init_bytes(cos, version);
+    }
+    if vendor_id == IDENTIV_VID {
+        let read =
+            reader.and_then(|r| keyroost_transport::identity::utrust_firmware_version(r, debug));
+        return read_or_init_bytes(read, version);
     }
     reader.and_then(|r| keyroost_transport::identity::trussed_admin_firmware(r, debug))
 }
 
-/// A Feitian key's firmware: the COS version it reported (`cos`) when the
-/// read gave one; else its CTAPHID INIT bytes as they are, which is what
-/// keyroost showed before it read the COS version. `None` when neither
-/// says anything (INIT 0.0.0).
-fn feitian_firmware(cos: Option<String>, version: (u8, u8, u8)) -> Option<String> {
-    cos.or_else(|| {
+/// The firmware of a key whose vendor states a version its CTAPHID INIT
+/// bytes are not (a Feitian key's COS version, a uTrust FIDO2 key's
+/// firmware version): the version the key gave over its reader (`read`)
+/// when that read gave one; else its INIT bytes as they are, which is what
+/// keyroost showed before it read that version. `None` when neither says
+/// anything (INIT 0.0.0).
+fn read_or_init_bytes(read: Option<String>, version: (u8, u8, u8)) -> Option<String> {
+    read.or_else(|| {
         let (major, minor, build) = version;
         (version != (0, 0, 0)).then(|| format!("{major}.{minor}.{build}"))
     })
@@ -98,11 +119,11 @@ fn feitian_firmware(cos: Option<String>, version: (u8, u8, u8)) -> Option<String
 
 /// The firmware a key's CTAPHID INIT version bytes state, read the way
 /// its vendor writes them; `None` when they don't state it (a Token2's, a
-/// Feitian key's, or all zeros, as on a Nitrokey 3), so the caller asks the
-/// key another way.
+/// Feitian key's, an Identiv key's, or all zeros, as on a Nitrokey 3), so
+/// the caller asks the key another way.
 pub fn init_firmware(vendor_id: u16, product_id: u16, version: (u8, u8, u8)) -> Option<String> {
     let (major, minor, build) = version;
-    if vendor_id == TOKEN2_VID || vendor_id == FEITIAN_VID || version == (0, 0, 0) {
+    if matches!(vendor_id, TOKEN2_VID | FEITIAN_VID | IDENTIV_VID) || version == (0, 0, 0) {
         return None;
     }
     if (vendor_id, product_id) == (SOLOKEYS_VID, SOLO2_PID) {
@@ -237,6 +258,9 @@ mod tests {
         // A Feitian key's INIT bytes are not its COS version (a BioPass FIDO
         // Pro: INIT 1.0.1, COS 4.7.17), so they are not shown.
         assert_eq!(init_firmware(0x096e, 0x086a, (1, 0, 1)), None);
+        // Nor are a uTrust FIDO2 key's the version printed on it (INIT
+        // 0.0.1 on a key with firmware 3.33).
+        assert_eq!(init_firmware(0x04e6, 0x5a11, (0, 0, 1)), None);
         assert_eq!(init_firmware(0x20a0, 0x42b2, (0, 0, 0)), None);
     }
 
@@ -245,11 +269,28 @@ mod tests {
     #[test]
     fn a_feitian_key_shows_its_cos_version_else_its_init_bytes() {
         assert_eq!(
-            feitian_firmware(Some("47.17.00".into()), (1, 0, 1)).as_deref(),
+            read_or_init_bytes(Some("47.17.00".into()), (1, 0, 1)).as_deref(),
             Some("47.17.00")
         );
-        assert_eq!(feitian_firmware(None, (1, 0, 1)).as_deref(), Some("1.0.1"));
-        assert_eq!(feitian_firmware(None, (0, 0, 0)), None);
+        assert_eq!(
+            read_or_init_bytes(None, (1, 0, 1)).as_deref(),
+            Some("1.0.1")
+        );
+        assert_eq!(read_or_init_bytes(None, (0, 0, 0)), None);
+    }
+
+    /// The same for a uTrust FIDO2 key: the version it gives over its
+    /// reader, else the INIT bytes keyroost showed before.
+    #[test]
+    fn a_utrust_key_shows_the_version_it_gives_else_its_init_bytes() {
+        assert_eq!(
+            read_or_init_bytes(Some("3.33".into()), (0, 0, 1)).as_deref(),
+            Some("3.33")
+        );
+        assert_eq!(
+            read_or_init_bytes(None, (0, 0, 1)).as_deref(),
+            Some("0.0.1")
+        );
     }
 
     #[test]

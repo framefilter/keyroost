@@ -1503,6 +1503,78 @@ fn probe_note(body: &str) {
     keyroost_proto::trace::emit(probe_trace_on(), || format_line(Dir::Note, "probe", body));
 }
 
+/// [`probe_note`] when `trace` is on, else nothing.
+fn probe_note_if(trace: bool) -> impl Fn(&str) {
+    move |body| {
+        if trace {
+            probe_note(body);
+        }
+    }
+}
+
+/// Whether the card on `card` is an Identiv/Hirsch uTrust key by its ATR
+/// ([`keyroost_piv::fingerprint::atr_names_utrust`]). Nothing is sent to
+/// the card for it, and the reader's name plays no part: the keys are sold
+/// under both company names.
+pub(crate) fn card_is_utrust(card: &Card) -> bool {
+    let mut names = [0u8; 256];
+    let mut atr = [0u8; pcsc::MAX_ATR_SIZE];
+    card.status2(&mut names, &mut atr)
+        .is_ok_and(|status| keyroost_piv::fingerprint::atr_names_utrust(status.atr()))
+}
+
+/// The serial number of the uTrust FIDO2 key on `card`, read from the key
+/// itself: the card manager's CPLC data
+/// ([`keyroost_piv::fingerprint::parse_utrust_serial`]). The card manager
+/// is selected and asked, both GlobalPlatform's own commands, as
+/// Identiv/Hirsch's uTrust FIDO2 Technical Manual describes; it stays
+/// selected.
+///
+/// The reader's own serial number (PC/SC's `VENDOR_IFD_SERIAL_NO`) is never
+/// taken for it: on a separate reader (a contactless one, say) that is the
+/// reader's serial, and every uTrust key placed on it would get the same.
+///
+/// `None` when the read gives no serial.
+fn read_utrust_serial(card: &Card, trace: bool) -> Option<String> {
+    use keyroost_piv::fingerprint;
+    let note = probe_note_if(trace);
+    let select = keyroost_piv::select_by_aid(&fingerprint::GLOBAL_PLATFORM_ISD_AID);
+    match transmit_apdu(card, &select) {
+        Ok((_, s1, s2)) if sw_ok(s1, s2) => {}
+        Ok((_, s1, s2)) => {
+            note(&format!(
+                "utrust card manager select -> {s1:02X}{s2:02X}: serial not asked"
+            ));
+            return None;
+        }
+        Err(e) => {
+            note(&format!("utrust card manager select -> error: {e}"));
+            return None;
+        }
+    }
+    let answer = exchange_apdu(card, &fingerprint::GLOBAL_PLATFORM_GET_CPLC, 0x61, || {
+        vec![0x00, 0xC0, 0x00, 0x00, 0x00]
+    });
+    let (data, sw) = match answer {
+        Ok(answer) => answer,
+        Err(e) => {
+            note(&format!("utrust serial (cplc) -> error: {e}"));
+            return None;
+        }
+    };
+    let serial = (sw == 0x9000)
+        .then(|| fingerprint::parse_utrust_serial(&data))
+        .flatten();
+    note(&match &serial {
+        Some(sn) => format!("utrust serial (cplc) -> {:?}", abbreviate(sn)),
+        None => format!(
+            "utrust serial (cplc) -> {sw:04X}, {} byte(s): not used",
+            data.len()
+        ),
+    });
+    serial
+}
+
 /// A transmit that failed below the card (PC/SC itself: Windows' "access is
 /// denied" on a FIDO applet, a removed card) gets an answer line in the
 /// trace, so a request is never left without one.
@@ -2087,6 +2159,13 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                     }
                     probe.serial = serial;
                 }
+            }
+            // An Identiv/Hirsch uTrust FIDO2 key's serial, from its card
+            // manager's CPLC data. The key measured has no USB serial
+            // string, no OATH or OpenPGP applet and a PIV applet that gives
+            // no serial, so without this it has none.
+            if probe.serial.is_none() && card_is_utrust(&card) {
+                probe.serial = read_utrust_serial(&card, trace);
             }
             // OpenPGP present: read the AID once. Capture the manufacturer ID
             // (card-content vendor signal, #83) always; use the embedded

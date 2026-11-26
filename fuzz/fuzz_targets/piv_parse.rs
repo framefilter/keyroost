@@ -50,4 +50,9 @@ fuzz_target!(|data: &[u8]| {
     let _ = keyroost_piv::parse_slot_policy_feitian(data);
     // And the reply to its application-version read.
     let _ = keyroost_piv::fingerprint::feitian_application_version(data);
+    // Identiv uTrust FIDO2 replies (#271): the ATR that names the key, the
+    // CPLC reply its serial number is in, and its firmware version.
+    let _ = keyroost_piv::fingerprint::atr_names_utrust(data);
+    let _ = keyroost_piv::fingerprint::parse_utrust_serial(data);
+    let _ = keyroost_piv::fingerprint::parse_utrust_firmware_version(data);
 });
