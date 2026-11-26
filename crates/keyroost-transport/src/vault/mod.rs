@@ -375,7 +375,9 @@ enum Method {
     Pin(Zeroizing<String>),
     /// A fingerprint, asking through `ask` before each finger. With a
     /// `fallback` PIN, the first fingerprint error turns the method into
-    /// `Pin(fallback)` for the rest of the flow.
+    /// `Pin(fallback)` for the life of this `VaultAuth`: every later token
+    /// it obtains, in this flow and any later one, comes from the PIN. A new
+    /// `VaultAuth` tries the finger again.
     Fingerprint {
         fallback: Option<Zeroizing<String>>,
         ask: Box<dyn FnMut(FingerAsk) + Send>,
@@ -411,8 +413,9 @@ impl VaultAuth {
 
     /// A fingerprint, and the PIN when one is given and the finger is
     /// refused or cannot be asked (no fingerprint on the key, no tries
-    /// left): from then on every token in this flow comes from the PIN.
-    /// With no PIN, the same as [`fingerprint`](Self::fingerprint).
+    /// left): from then on every token this `VaultAuth` obtains comes from
+    /// the PIN; a new one tries the finger again. With no PIN, the same as
+    /// [`fingerprint`](Self::fingerprint).
     pub fn auto(pin: Option<Zeroizing<String>>, ask: Box<dyn FnMut(FingerAsk) + Send>) -> Self {
         VaultAuth::with(Method::Fingerprint { fallback: pin, ask })
     }
@@ -485,16 +488,18 @@ impl VaultAuth {
     }
 
     /// Turn a fingerprint method with a fallback PIN into the PIN method for
-    /// the rest of the flow, and return that PIN; `None` when there is no
-    /// PIN to fall back to.
+    /// the life of this `VaultAuth`, and return that PIN. `None` when there
+    /// is no PIN to fall back to, and always for the PIN method: a PIN that
+    /// was just sent is never sent again as a fallback.
     fn fall_back_to_pin(&mut self) -> Option<&Zeroizing<String>> {
-        if let Method::Fingerprint { fallback, .. } = &mut self.method {
-            let pin = fallback.take()?;
-            self.method = Method::Pin(pin);
-        }
+        let Method::Fingerprint { fallback, .. } = &mut self.method else {
+            return None;
+        };
+        let pin = fallback.take()?;
+        self.method = Method::Pin(pin);
         match &self.method {
             Method::Pin(pin) => Some(pin),
-            Method::Fingerprint { .. } => None,
+            Method::Fingerprint { .. } => unreachable!("just set to the PIN"),
         }
     }
 
@@ -623,6 +628,8 @@ mod tests {
     };
     use keyroost_ctap::client_pin::{PinUvAuthToken, Verified};
     use keyroost_ctap::get_assertion::Assertion;
+    use keyroost_ctap::large_blobs::LargeBlobArray;
+    use keyroost_ctap::FingerprintError;
     use keyroost_vault::{open, user_handle, Entry, Vault, RP_ID};
     use std::error::Error as _;
 
@@ -852,6 +859,105 @@ mod tests {
         let shown = format!("{:?}", VaultAuth::auto(None, ask));
         assert!(shown.contains("\"fingerprint\""), "{shown}");
         assert!(format!("{:?}", pin()).contains("\"pin <redacted>\""));
+    }
+
+    /// A key whose PIN token request answers with a fingerprint error.
+    struct FingerErrOnPin(FakeKey);
+
+    impl VaultKey for FingerErrOnPin {
+        fn info(&self) -> &AuthenticatorInfo {
+            self.0.info()
+        }
+        fn pin_token(
+            &mut self,
+            pin: &str,
+            permissions: u32,
+            rp_id: Option<&str>,
+        ) -> Result<PinUvAuthToken, CtapError> {
+            self.0.pin_token(pin, permissions, rp_id)?;
+            Err(CtapError::Fingerprint(FingerprintError::Refused(0x3F)))
+        }
+        fn uv_token(
+            &mut self,
+            permissions: u32,
+            rp_id: Option<&str>,
+            on_finger: &mut dyn FnMut(),
+        ) -> Result<PinUvAuthToken, CtapError> {
+            self.0.uv_token(permissions, rp_id, on_finger)
+        }
+        fn make_credential(
+            &mut self,
+            token: &PinUvAuthToken,
+            user_id: &[u8],
+            name: &str,
+        ) -> Result<keyroost_ctap::make_credential::MadeCredential, CtapError> {
+            self.0.make_credential(token, user_id, name)
+        }
+        fn assertions(
+            &mut self,
+            token: &PinUvAuthToken,
+            allow: Option<&[u8]>,
+        ) -> Result<Vec<Assertion>, CtapError> {
+            self.0.assertions(token, allow)
+        }
+        fn credentials(
+            &mut self,
+            token: &PinUvAuthToken,
+        ) -> Result<Vec<VaultCredential>, CtapError> {
+            self.0.credentials(token)
+        }
+        fn delete_credential(
+            &mut self,
+            token: &PinUvAuthToken,
+            credential_id: &[u8],
+        ) -> Result<(), CtapError> {
+            self.0.delete_credential(token, credential_id)
+        }
+        fn read_blobs(&mut self) -> Result<LargeBlobArray, CtapError> {
+            self.0.read_blobs()
+        }
+        fn write_blobs(
+            &mut self,
+            token: &PinUvAuthToken,
+            serialized: &[u8],
+        ) -> Result<(), CtapError> {
+            self.0.write_blobs(token, serialized)
+        }
+    }
+
+    #[test]
+    fn a_pin_is_never_sent_twice_as_its_own_fallback() {
+        let pin_requests = |key: &FingerErrOnPin| {
+            key.0
+                .log
+                .iter()
+                .filter(|c| matches!(c, Call::Token { .. }))
+                .count()
+        };
+        let is_finger_err = |r: &Result<_, VaultKeyError>| {
+            matches!(r, Err(VaultKeyError::Ctap(CtapError::Fingerprint(_))))
+        };
+
+        // The PIN method: one request, its error returned as is.
+        let mut key = FingerErrOnPin(FakeKey::new());
+        let mut auth = pin();
+        let r = auth.fresh_token(&mut key, LBW, None).map(drop);
+        assert!(is_finger_err(&r), "{r:?}");
+        assert_eq!(pin_requests(&key), 1);
+        assert!(auth.current_for(LBW).is_none());
+
+        // auto: the refused finger falls back once; the fallback's own
+        // fingerprint error is not a reason to send the PIN again.
+        let mut key = FingerErrOnPin(FakeKey::with_fingerprint());
+        key.0.uv_refusals.push_back(0x3F);
+        let (_, ask) = super::fake::asks();
+        let mut auth = VaultAuth::auto(Some(Zeroizing::new(FakeKey::PIN.to_owned())), ask);
+        let r = auth.fresh_token(&mut key, LBW, None).map(drop);
+        assert!(is_finger_err(&r), "{r:?}");
+        assert_eq!(pin_requests(&key), 1);
+        let r = auth.fresh_token(&mut key, LBW, None).map(drop);
+        assert!(is_finger_err(&r), "{r:?}");
+        assert_eq!(pin_requests(&key), 2, "one PIN request per token asked for");
     }
 
     #[test]
