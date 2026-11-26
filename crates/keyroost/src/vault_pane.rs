@@ -9277,13 +9277,13 @@ mod tests {
         assert!(app.vault_session().unwrap().auth.is_some());
 
         // A file that isn't there says so in the CLI's words.
+        // The OS words for a missing file differ by platform, so take them
+        // from the OS itself.
         let gone = dir.join("gone.t2vault");
+        let os_text = std::fs::read(&gone).unwrap_err().to_string();
         assert_eq!(
             open_backup(&gone, IMPORT_PASS).unwrap_err(),
-            format!(
-                "cannot read {}: No such file or directory (os error 2)",
-                gone.display()
-            )
+            format!("cannot read {}: {os_text}", gone.display())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
