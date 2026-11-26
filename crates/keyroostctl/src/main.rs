@@ -11075,10 +11075,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             .as_deref()
                             .map(keyroost_piv::format_version_bytes);
                         emit_json(&json_out::PivStatusJson {
-                            version: status
-                                .version
-                                .as_deref()
-                                .map(keyroost_piv::format_version_bytes),
+                            version: status.version.as_deref().map(|version| {
+                                keyroost_piv::fingerprint::format_applet_version(
+                                    status.applet_fingerprint,
+                                    version,
+                                )
+                            }),
                             serial: status.serial.map(keyroost_piv::format_serial_short),
                             pin_retries: status.pin_retries,
                             pin_verified: status.pin_verified,
@@ -11134,7 +11136,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let version_str = status
                         .version
                         .as_deref()
-                        .map(keyroost_piv::format_version_bytes)
+                        .map(|version| {
+                            keyroost_piv::fingerprint::format_applet_version(
+                                status.applet_fingerprint,
+                                version,
+                            )
+                        })
                         .unwrap_or_else(|| "(unavailable)".to_string());
                     // `version_firmware` is the token's own firmware (read through a
                     // fingerprint-specific probe only some tokens answer — currently

@@ -154,7 +154,7 @@ Client.)*
 
 | Tag | Key A | Key B | What |
 |---|---|---|---|
-| `81` | `04 08` | `02 02` | The second byte is the product: Feitian's client names `08` "BioPass FIDO Pro" and `02` "ePass FIDO-NFC Plus". *(Client.)* |
+| `81` | `04 08` | `02 02` | The last byte is the product: Feitian's clients name `08` "BioPass FIDO Pro" and `02` "ePass FIDO-NFC Plus". They read a value of three bytes too, with one more byte in front and the product still last; no key was seen to answer that way. *(Client.)* |
 | `82` | nine ASCII digits | nine ASCII digits | The serial that the serial read above gives. |
 | `84` | `47 17 00` | `07 04 00` | Also each key's USB release number. Feitian's client shows the first two bytes as the COS version. *(Client.)* |
 | `92` | `47 17 00` | `01 08 26` | The COS version Feitian publishes for the product: 4.7.17 for the BioPass FIDO Pro, 1.826 for the ePass FIDO NFC Plus. |
@@ -177,6 +177,44 @@ each: `47.17.00` and `01.08.26`. Feitian groups those digits differently for
 the two products, so keyroost does not regroup them. It does not show a
 Feitian key's CTAPHID INIT version bytes (`1.0.1` on Key A), which are
 neither value. With no smart-card reader for the key, no firmware is shown.
+
+## An application's version
+
+```
+80 E2 80 00 05 DF FF 02 80 01 00
+```
+
+Sent after a SELECT, this answers for the application selected. It is the
+command Feitian's client shows each application's version with. *(Client.)*
+
+| Key | Selected | Answer |
+|---|---|---|
+| A | PIV | `00 00 00 01 14 00 33 20 47 17 18 01 09 11 00 00` |
+| B | PIV | `00 00 00 01 00 00 00 00 91 66 25 02 25 14 16 00` |
+| B | OTP | `00 00 00 01 14 00 00 00 91 26 25 01 17 11 14 13` |
+
+*(Measured, Key A and one Key B, 2026-11-23; the other Key B answered the
+same sixteen bytes with PIV selected.)* The version is bytes 8 and 9,
+where the client reads it: `91 66` and `91 26` are the PIV 9166 and OTP 9126
+of Feitian's product list (<https://fido.ftsafe.com/products/>: the ePass
+FIDO NFC Plus K9D, COS 1.826, lists PIV 9166 and OTP 9126; the K9, COS 3.3.01,
+lists PIV 8063). Key A's `47 17` are the first digits of its COS
+version; the list gives that product no number for PIV. The other bytes are
+not read. The OTP applet's SELECT answer carries a version of another kind
+under tag `59` (1.0.2 on the same Key B).
+
+Feitian told a contributor (November 2026) that the numbers of one product
+order by size, a later version having the larger number, and that the
+numbers of two products do not compare. It also said that a change to an
+application, to the COS or to the hardware can each change what PIV does,
+and that it keeps no list of the differences between versions to publish.
+
+keyroost reads this version for PIV only, on the two products it has PIV
+rows for, and shows it as the PIV applet's version, the digits as Feitian
+writes them (`9166`). What it knows a product's PIV to do is recorded at the
+version it was measured at: a key of the product with an earlier version, or
+one whose version could not be read, is sent Feitian's commands and not
+assumed to take all of them.
 
 ## Slots
 

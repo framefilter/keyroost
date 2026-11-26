@@ -108,15 +108,23 @@ impl fmt::Display for ImportRefusal {
                 if let Some(alg) = alg {
                     write!(f, "{} ", alg.label())?;
                 }
-                let what = match floor.axis {
-                    compat::VersionAxis::Firmware => "firmware",
-                    compat::VersionAxis::Applet => "PIV applet",
+                let (what, version) = match floor.axis {
+                    compat::VersionAxis::Firmware => (
+                        "firmware",
+                        keyroost_piv::format_version_bytes(floor.version),
+                    ),
+                    compat::VersionAxis::Applet => (
+                        "PIV applet",
+                        keyroost_piv::fingerprint::format_applet_version(
+                            *fingerprint,
+                            floor.version,
+                        ),
+                    ),
                 };
                 write!(
                     f,
-                    "keys needs {} {what} {} or later.",
+                    "keys needs {} {what} {version} or later.",
                     product_name(*fingerprint),
-                    keyroost_piv::format_version_bytes(floor.version)
                 )
             }
             Self::KeyTypeNotSupported(alg) => {

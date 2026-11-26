@@ -54,9 +54,15 @@ pub const FEITIAN_OTP_AID: [u8; 9] = [0xD1, 0x56, 0x00, 0x01, 0x32, 0x83, 0x26, 
 /// client reads them. (Hardware-observed on two keys, 2026-11-22 and 23.)
 pub const FEITIAN_DEVICE_INFO: [u8; 5] = [0x80, 0xE3, 0xEE, 0x80, 0x00];
 
-/// The product byte in an answer to [`FEITIAN_DEVICE_INFO`]: the second
-/// byte under tag `81`. `None` when the answer does not start `80`, has no
-/// such tag, or ends inside a TLV before it.
+/// The product byte in an answer to [`FEITIAN_DEVICE_INFO`]: the last byte
+/// under tag `81` when it holds two bytes or three. `None` when the answer
+/// does not start `80`, has no such tag, holds another number of bytes under
+/// it, or ends inside a TLV before it.
+///
+/// Both measured keys answer two bytes, the second being the product. Both of
+/// Feitian's clients read a longer value with the product in its third byte,
+/// a byte coming in front of the two (their tables call the three `AA`, `BB`
+/// and `CC`); no key was seen to answer that way. *(Client.)*
 #[must_use]
 pub fn feitian_product(device_info: &[u8]) -> Option<u8> {
     let mut rest = match device_info {
@@ -66,11 +72,63 @@ pub fn feitian_product(device_info: &[u8]) -> Option<u8> {
     while let [tag, len, tail @ ..] = rest {
         let value = tail.get(..usize::from(*len))?;
         if *tag == 0x81 {
-            return value.get(1).copied();
+            return match value {
+                [_, product] | [_, _, product] => Some(*product),
+                _ => None,
+            };
         }
         rest = &tail[value.len()..];
     }
     None
+}
+
+/// Feitian's read of the selected application's version,
+/// `80 E2 80 00 05 DF FF 02 80 01 00`: the command Feitian's own client shows
+/// each application's version with. Sent with PIV selected it answers for the
+/// PIV application. Read the answer with [`feitian_application_version`].
+///
+/// Measured on two keys, 2026-11-23: each answered `9000` and sixteen bytes.
+/// With another application selected the same key answers that application's
+/// own number (an ePass FIDO NFC Plus: `91 26` with its OTP application
+/// selected).
+pub const FEITIAN_APPLICATION_VERSION: [u8; 11] = [
+    0x80, 0xE2, 0x80, 0x00, 0x05, 0xDF, 0xFF, 0x02, 0x80, 0x01, 0x00,
+];
+
+/// The version in an answer to [`FEITIAN_APPLICATION_VERSION`]: bytes 8 and
+/// 9 of an answer of sixteen bytes or more, which is where Feitian's client
+/// reads it. `None` for a shorter answer: the client has a rule for one, and
+/// no key was seen to give one, so it is not guessed at here.
+///
+/// The two bytes are the digits Feitian publishes
+/// (<https://fido.ftsafe.com/products/>, under "COS/Applet version"): an
+/// ePass FIDO NFC Plus answered `91 66`, listed as PIV 9166. A BioPass FIDO
+/// Pro answered `47 17`; the list gives that product no PIV number of its
+/// own, and the two bytes are the first two of its COS version, 4.7.17.
+/// Feitian told a contributor (November 2026) that the numbers of one
+/// product order by size, a later version having the larger number, and
+/// that the numbers of two products do not compare. A byte slice of the two
+/// orders the same way.
+#[must_use]
+pub fn feitian_application_version(answer: &[u8]) -> Option<[u8; 2]> {
+    if answer.len() < 16 {
+        return None;
+    }
+    Some([answer[8], answer[9]])
+}
+
+/// An applet version as keyroost shows it for `fingerprint`. A Feitian
+/// product read with [`FEITIAN_APPLICATION_VERSION`] is shown the way Feitian
+/// writes it, the four digits run together (`9166`); every other version is
+/// [`crate::format_version_bytes`]'s.
+#[must_use]
+pub fn format_applet_version(fingerprint: AppletFingerprint, version: &[u8]) -> String {
+    match fingerprint {
+        AppletFingerprint::Feitian(
+            FeitianModel::EPassFidoNfcPlus | FeitianModel::BioPassFidoPro,
+        ) => version.iter().map(|b| format!("{b:02X}")).collect(),
+        _ => crate::format_version_bytes(version),
+    }
 }
 
 /// The [`FeitianModel`] a key's answer to [`FEITIAN_DEVICE_INFO`] names:
@@ -1857,6 +1915,50 @@ mod tests {
     }
 
     #[test]
+    fn feitian_application_version_is_bytes_eight_and_nine() {
+        // Hardware-observed, 2026-11-23, PIV selected: an ePass FIDO NFC Plus
+        // and a BioPass FIDO Pro.
+        let epass = hex("00 00 00 01 00 00 00 00 91 66 25 02 25 14 16 00");
+        let biopass = hex("00 00 00 01 14 00 33 20 47 17 18 01 09 11 00 00");
+        assert_eq!(feitian_application_version(&epass), Some([0x91, 0x66]));
+        assert_eq!(feitian_application_version(&biopass), Some([0x47, 0x17]));
+        // Constructed: a longer answer is read at the same place, a shorter
+        // one not at all.
+        let mut longer = epass.clone();
+        longer.push(0xAA);
+        assert_eq!(feitian_application_version(&longer), Some([0x91, 0x66]));
+        assert_eq!(feitian_application_version(&epass[..15]), None);
+        assert_eq!(feitian_application_version(&hex("91 66")), None);
+        assert_eq!(feitian_application_version(&[]), None);
+        assert_eq!(
+            FEITIAN_APPLICATION_VERSION,
+            hex("80 E2 80 00 05 DF FF 02 80 01 00")[..]
+        );
+        // One product's numbers order as byte slices the way Feitian told a
+        // contributor they do (November 2026): its products page lists PIV
+        // 8063 (K9) and PIV 9166 (K9D) under the same ePass name.
+        assert!([0x80u8, 0x63][..] < [0x91u8, 0x66][..]);
+    }
+
+    #[test]
+    fn a_feitian_products_version_is_shown_as_feitian_writes_it() {
+        let epass = AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus);
+        let biopass = AppletFingerprint::Feitian(FeitianModel::BioPassFidoPro);
+        assert_eq!(format_applet_version(epass, &[0x91, 0x66]), "9166");
+        assert_eq!(format_applet_version(biopass, &[0x47, 0x17]), "4717");
+        // Any other fingerprint, a Feitian key of an unmeasured product among
+        // them (its version is Yubico's GET VERSION answer), is unchanged.
+        assert_eq!(
+            format_applet_version(AppletFingerprint::Feitian(FeitianModel::Generic), &[0]),
+            "0"
+        );
+        assert_eq!(
+            format_applet_version(AppletFingerprint::YubiKey, &[5, 7, 1]),
+            "5.7.1"
+        );
+    }
+
+    #[test]
     fn feitian_model_is_the_product_the_key_reports() {
         // Hardware-observed, 2026-11-22 and 23: the device information of an
         // ePass FIDO NFC Plus (USB 096E:0853) and of a BioPass FIDO Pro (USB
@@ -1884,10 +1986,20 @@ mod tests {
             feitian_model(&hex("80 04 81 02 00 05")),
             FeitianModel::Generic
         );
+        // Constructed, as Feitian's clients read it: with three bytes under
+        // the tag the product is the third, and the second is not taken for
+        // it.
+        assert_eq!(feitian_product(&hex("80 05 81 03 05 02 08")), Some(0x08));
+        assert_eq!(
+            feitian_model(&hex("80 05 81 03 05 02 08")),
+            FeitianModel::BioPassFidoPro
+        );
+        assert_eq!(feitian_product(&hex("80 05 81 03 05 02 01")), Some(0x01));
         for answer in [
             "80 03 86 01 70",
             "80 03 81 01 02",
             "80 04 81 02 02",
+            "80 06 81 04 00 05 02 08",
             "81 02 02 02",
             "80",
             "",
