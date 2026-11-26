@@ -1397,6 +1397,11 @@ impl App {
         self.vault_idle_lock();
         // A focused box keeps egui's undo history of what was typed.
         self.drop_text_focus = true;
+        self.vault_idle_log(limit);
+    }
+
+    /// The log line of a vault idle lock after `limit`, its own deadline.
+    pub(crate) fn vault_idle_log(&mut self, limit: std::time::Duration) {
         self.log(
             Severity::Info,
             format!(
@@ -5486,6 +5491,45 @@ mod tests {
         app.busy_jobs = 0;
         assert_eq!(app.idle_lock_tick(t0 + 40 * MIN, false), None);
         assert!(app.vault.session.is_none());
+    }
+
+    #[test]
+    fn a_job_past_both_deadlines_logs_the_vaults_lock_too() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.security_keys.session = Some(fido_session("123456"));
+        app.security_keys.session_device = Some(KEY.into());
+        let mut form = EntryForm::for_add(shown_ref(&app));
+        form.title.push_str("Mail");
+        app.vault.form = Some(form);
+
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.busy_jobs = 1;
+        let late = t0 + crate::VAULT_EDIT_IDLE_LOCK_AFTER + MIN;
+        app.idle_lock_tick(late, false);
+        assert!(app.vault.session.is_some() && app.security_keys.session.is_some());
+        app.busy_jobs = 0;
+        assert_eq!(app.idle_lock_tick(late, false), None);
+
+        assert!(app.security_keys.session.is_none());
+        assert_eq!(app.security_keys.error, Some(crate::idle_locked_msg()));
+        assert!(app.vault.session.is_none() && app.vault.form.is_none());
+        assert_eq!(
+            app.vault.error,
+            Some(crate::idle_locked_msg_for(
+                crate::VAULT_EDIT_IDLE_LOCK_AFTER
+            ))
+        );
+        let texts: Vec<&str> = app.log.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"Locked after 5 minutes of inactivity."));
+        assert!(
+            texts.contains(&"Vault: Locked after 15 minutes of inactivity."),
+            "the log matches the Vault tab"
+        );
+        assert_eq!(idle_lines(&app), 2);
     }
 
     #[test]

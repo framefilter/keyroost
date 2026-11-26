@@ -7435,8 +7435,11 @@ impl App {
     /// key: PINs, PUKs, passwords, passphrases, management keys, seeds and
     /// otpauth:// URIs, in every pane and dialog, from each state's
     /// [`TypedSecrets`] list; the vault's ([`vault_pane::VaultState`])
-    /// appended when `vault` is set. The idle lock wipes them all, so a form
-    /// left half-filled doesn't keep its secret.
+    /// appended when `vault` is set. The idle lock wipes the list outside
+    /// the vault through it, so a form left half-filled doesn't keep its
+    /// secret; an unlocked vault is wiped by [`Self::vault_lock`] rebuilding
+    /// its state, and only a PIN typed into a locked Vault tab through the
+    /// vault's own list.
     ///
     /// Left out on purpose: the Molto2 customer key. Empty there means the
     /// factory default key, so wiping it would quietly switch the next
@@ -7494,7 +7497,14 @@ impl App {
             let outside_due = idle >= IDLE_LOCK_AFTER && self.holds_secrets_outside_vault();
             let vault_due = idle >= self.vault_idle_limit() && self.vault_holds_secrets();
             if outside_due || (vault_due && !self.vault_form_dirty()) {
+                // A job that held off both deadlines can leave a dirty form
+                // past its own: the vault then locks here, after 15 minutes,
+                // and the log says so as the Vault tab does.
+                let vault_extended = vault_due && self.vault_form_dirty();
                 self.idle_lock(vault_due);
+                if vault_extended {
+                    self.vault_idle_log(VAULT_EDIT_IDLE_LOCK_AFTER);
+                }
             } else if vault_due {
                 self.vault_idle_lock_alone();
             }
