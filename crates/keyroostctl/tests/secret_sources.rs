@@ -475,11 +475,11 @@ const LITERAL_CASES: &[&[&str]] = &[
     ],
     &["otp", "import", "--in", "f", "--file-password=S3CRETVALUE"],
     &["fido", "pin", "change", "--pin", "default"],
-    &["fido", "credential", "diff", "--pin", "S3CRETVALUE"],
+    &["fido", "credential", "compare", "--pin", "S3CRETVALUE"],
     &[
         "fido",
         "credential",
-        "diff",
+        "compare",
         "--a",
         "A",
         "--b",
@@ -490,7 +490,7 @@ const LITERAL_CASES: &[&[&str]] = &[
     &[
         "fido",
         "credential",
-        "diff",
+        "compare",
         "--a",
         "A",
         "--b",

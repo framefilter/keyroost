@@ -561,7 +561,7 @@ pub(crate) struct FidoCredentialJson {
     pub algorithm_name: Option<&'static str>,
 }
 
-/// `keyroostctl fido --json credential diff` — resident credentials on two
+/// `keyroostctl fido --json credential compare` — resident credentials on two
 /// keys compared by (relying-party ID, user handle). Credential IDs always
 /// differ between keys, so they are not part of the comparison and not shown.
 /// The groups hold distinct identities; `a_total`/`b_total` are the readable
@@ -570,9 +570,9 @@ pub(crate) struct FidoCredentialJson {
 /// neither compared nor counted in the totals; per-side RP counts go in
 /// `a_unavailable_rps`/`b_unavailable_rps`.
 #[derive(Serialize)]
-pub(crate) struct FidoCredDiffJson {
-    pub only_on_a: Vec<FidoCredDiffEntryJson>,
-    pub only_on_b: Vec<FidoCredDiffEntryJson>,
+pub(crate) struct FidoCredCompareJson {
+    pub only_on_a: Vec<FidoCredCompareEntryJson>,
+    pub only_on_b: Vec<FidoCredCompareEntryJson>,
     pub a_total: usize,
     pub b_total: usize,
     /// Relying parties skipped on each key (malformed `rpIdHash`, as
@@ -581,9 +581,9 @@ pub(crate) struct FidoCredDiffJson {
     pub b_unavailable_rps: usize,
 }
 
-/// One resident credential in the `credential diff` output.
+/// One resident credential in the `credential compare` output.
 #[derive(Serialize)]
-pub(crate) struct FidoCredDiffEntryJson {
+pub(crate) struct FidoCredCompareEntryJson {
     pub rp_id: String,
     pub rp_name: Option<String>,
     /// The user handle, rendered as UTF-8 (lossy), as the human prints it.
@@ -1405,16 +1405,16 @@ mod tests {
     }
 
     #[test]
-    fn creds_diff_shape() {
-        let v = to_v(&FidoCredDiffJson {
-            only_on_a: vec![FidoCredDiffEntryJson {
+    fn creds_compare_shape() {
+        let v = to_v(&FidoCredCompareJson {
+            only_on_a: vec![FidoCredCompareEntryJson {
                 rp_id: "example.com".into(),
                 rp_name: Some("Example".into()),
                 user_id: "u".into(),
                 user_name: Some("n".into()),
                 user_display_name: None,
             }],
-            only_on_b: vec![FidoCredDiffEntryJson {
+            only_on_b: vec![FidoCredCompareEntryJson {
                 rp_id: "other.example".into(),
                 rp_name: None,
                 user_id: "v".into(),

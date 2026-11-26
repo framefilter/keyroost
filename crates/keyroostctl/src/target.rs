@@ -459,10 +459,10 @@ fn same_pair_check(a: Device, b: Device) -> Result<(Device, Device), Box<dyn Err
     Ok((a, b))
 }
 
-/// Resolve one explicit diff side with no picker: an exact value must match
+/// Resolve one explicit compare side with no picker: an exact value must match
 /// exactly, like `--device`. Errors name the flag passed (`--a`/`--b`), not
 /// the global `--device` the resolver message is written for.
-fn resolve_diff_side_explicit(
+fn resolve_compare_side_explicit(
     devices: &[Device],
     sel: &Selector<'_>,
     flag: &str,
@@ -504,7 +504,7 @@ fn fido_candidates(devices: &[Device], exclude: Option<&Device>) -> Vec<usize> {
 
 /// Pick one row of `idxs` at the terminal for `side` (`key A`/`key B`), or
 /// refuse with the standard list-the-keys error when not interactive.
-fn pick_diff_side(
+fn pick_compare_side(
     devices: &[Device],
     idxs: &[usize],
     picker: &mut dyn Picker,
@@ -539,13 +539,13 @@ fn pick_diff_side(
     Ok(devices[i].clone())
 }
 
-/// Pair `devices` (one enumerated scan) with the two diff selectors.
+/// Pair `devices` (one enumerated scan) with the two compare selectors.
 /// Explicit sides must match exactly; an unnamed side is the only remaining
 /// FIDO row, or picked at the terminal; with neither side named, exactly two
 /// connected keys are compared as-is. Takes the picker for the ambiguous
 /// cases; an explicit side naming a Molto2 serial re-enumerates admitting any
 /// key for the fallback refusal.
-fn resolve_diff_pair(
+fn resolve_compare_pair(
     devices: &[Device],
     sel_a: &Selector<'_>,
     sel_b: &Selector<'_>,
@@ -555,8 +555,8 @@ fn resolve_diff_pair(
     let exp_a = explicit(sel_a);
     let exp_b = explicit(sel_b);
     if exp_a && exp_b {
-        let a = resolve_diff_side_explicit(devices, sel_a, "--a", "key A")?;
-        let b = resolve_diff_side_explicit(devices, sel_b, "--b", "key B")?;
+        let a = resolve_compare_side_explicit(devices, sel_a, "--a", "key A")?;
+        let b = resolve_compare_side_explicit(devices, sel_b, "--b", "key B")?;
         return same_pair_check(a, b);
     }
     if exp_a || exp_b {
@@ -567,7 +567,7 @@ fn resolve_diff_pair(
         } else {
             (sel_b, "--b", "key B", "key A", false)
         };
-        let named = resolve_diff_side_explicit(devices, sel_named, flag_n, side_n)?;
+        let named = resolve_compare_side_explicit(devices, sel_named, flag_n, side_n)?;
         let rest = fido_candidates(devices, Some(&named));
         let other = match rest.as_slice() {
             [] => {
@@ -577,7 +577,7 @@ fn resolve_diff_pair(
                 .into());
             }
             [i] => devices[*i].clone(),
-            _ => pick_diff_side(devices, &rest, picker, side_o)?,
+            _ => pick_compare_side(devices, &rest, picker, side_o)?,
         };
         let (a, b) = if named_first {
             (named, other)
@@ -600,15 +600,15 @@ fn resolve_diff_pair(
         .into()),
         [first, second] => same_pair_check(devices[*first].clone(), devices[*second].clone()),
         _ => {
-            let a = pick_diff_side(devices, &all, picker, "key A")?;
+            let a = pick_compare_side(devices, &all, picker, "key A")?;
             let rest = fido_candidates(devices, Some(&a));
-            let b = pick_diff_side(devices, &rest, picker, "key B")?;
+            let b = pick_compare_side(devices, &rest, picker, "key B")?;
             same_pair_check(a, b)
         }
     }
 }
 
-/// Select the two FIDO-over-USB keys `fido credential diff` compares:
+/// Select the two FIDO-over-USB keys `fido credential compare` compares:
 /// explicit `--a`/`--b` sides must match exactly, otherwise two connected
 /// keys are compared as-is and more are picked at the terminal. Prints one
 /// announce line per key, like `select`, with the same bootloader/admin hints.
@@ -636,14 +636,15 @@ pub(crate) fn select_fido_pair(
     {
         keyroost_resolve::add_key_names(&mut devices, debug_on());
     }
-    let (mut a, mut b) = resolve_diff_pair(&devices, &sel_a, &sel_b, &mut picker).map_err(|e| {
-        let bl = keyroost_hid::bootloader_device_present().map(|b| b.to_string());
-        add_admin_hint(
-            add_bootloader_hint(e, bl.as_deref()),
-            Need::FidoHid,
-            crate::admin_only_fido_key_present,
-        )
-    })?;
+    let (mut a, mut b) =
+        resolve_compare_pair(&devices, &sel_a, &sel_b, &mut picker).map_err(|e| {
+            let bl = keyroost_hid::bootloader_device_present().map(|b| b.to_string());
+            add_admin_hint(
+                add_bootloader_hint(e, bl.as_deref()),
+                Need::FidoHid,
+                crate::admin_only_fido_key_present,
+            )
+        })?;
     // Name the chosen rows by model, as `select_from` does for its one row.
     for d in [&mut a, &mut b] {
         keyroost_resolve::add_fido_models(std::slice::from_mut(d), debug_on());
@@ -1269,7 +1270,7 @@ mod tests {
         assert!(!hinted(other, Need::FidoHid, true).contains("administrator"));
     }
 
-    /// A scripted picker for the diff pair tests: answers are indices into
+    /// A scripted picker for the compare pair tests: answers are indices into
     /// each `pick` call's choices, in order.
     struct FakePicker {
         interactive: bool,
@@ -1318,16 +1319,16 @@ mod tests {
         b: Selector<'_>,
         picker: &mut dyn Picker,
     ) -> String {
-        match resolve_diff_pair(devices, &a, &b, picker) {
+        match resolve_compare_pair(devices, &a, &b, picker) {
             Ok(_) => panic!("expected the pair to be refused"),
             Err(e) => e.to_string(),
         }
     }
 
     #[test]
-    fn diff_pair_explicit_sides_resolve_in_ab_order() {
+    fn compare_pair_explicit_sides_resolve_in_ab_order() {
         let devices = two_fido_keys();
-        let (a, b) = resolve_diff_pair(
+        let (a, b) = resolve_compare_pair(
             &devices,
             &side(Some("ABCDEF01"), None),
             &side(Some("12345678"), None),
@@ -1339,7 +1340,7 @@ mod tests {
             ("ABCDEF01", "12345678")
         );
         // ... and by HID path.
-        let (a, b) = resolve_diff_pair(
+        let (a, b) = resolve_compare_pair(
             &devices,
             &side(None, Some(Path::new("/dev/hidraw2"))),
             &side(None, Some(Path::new("/dev/hidraw1"))),
@@ -1353,9 +1354,9 @@ mod tests {
     }
 
     #[test]
-    fn diff_pair_auto_picks_exactly_two_in_list_order() {
+    fn compare_pair_auto_picks_exactly_two_in_list_order() {
         let devices = two_fido_keys();
-        let (a, b) = resolve_diff_pair(
+        let (a, b) = resolve_compare_pair(
             &devices,
             &side(None, None),
             &side(None, None),
@@ -1368,9 +1369,9 @@ mod tests {
     }
 
     #[test]
-    fn diff_pair_one_named_side_auto_picks_the_other() {
+    fn compare_pair_one_named_side_auto_picks_the_other() {
         let devices = two_fido_keys();
-        let (a, b) = resolve_diff_pair(
+        let (a, b) = resolve_compare_pair(
             &devices,
             &side(Some("ABCDEF01"), None),
             &side(None, None),
@@ -1381,7 +1382,7 @@ mod tests {
             (a.serial.as_str(), b.serial.as_str()),
             ("ABCDEF01", "12345678")
         );
-        let (a, b) = resolve_diff_pair(
+        let (a, b) = resolve_compare_pair(
             &devices,
             &side(None, None),
             &side(Some("12345678"), None),
@@ -1395,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_pair_refuses_the_same_key_twice() {
+    fn compare_pair_refuses_the_same_key_twice() {
         let devices = two_fido_keys();
         let e = pair_err(
             &devices,
@@ -1415,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_pair_alias_rows_count_as_the_same_key() {
+    fn compare_pair_alias_rows_count_as_the_same_key() {
         let mut devices = two_fido_keys();
         // Same physical key under a second id (e.g. friendly name vs
         // serial): the HID path is what ties the rows together.
@@ -1433,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_pair_errors_name_the_side_flag() {
+    fn compare_pair_errors_name_the_side_flag() {
         let devices = two_fido_keys();
         let e = pair_err(
             &devices,
@@ -1447,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_pair_picks_both_sides_at_the_terminal() {
+    fn compare_pair_picks_both_sides_at_the_terminal() {
         let mut devices = two_fido_keys();
         let mut third = dev(None, "ZZZZ9999");
         third.id = "serial:ZZZZ9999".into();
@@ -1458,7 +1459,8 @@ mod tests {
         // List order by serial: 12345678, ABCDEF01, ZZZZ9999.
         let mut picker = FakePicker::answering(&[2, 0]);
         let (a, b) =
-            resolve_diff_pair(&devices, &side(None, None), &side(None, None), &mut picker).unwrap();
+            resolve_compare_pair(&devices, &side(None, None), &side(None, None), &mut picker)
+                .unwrap();
         assert_eq!(a.serial, "ZZZZ9999");
         assert_eq!(b.serial, "12345678");
         assert_eq!(
@@ -1471,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_pair_refuses_without_a_terminal_when_ambiguous() {
+    fn compare_pair_refuses_without_a_terminal_when_ambiguous() {
         let mut devices = two_fido_keys();
         let mut third = dev(None, "ZZZZ9999");
         third.id = "serial:ZZZZ9999".into();
@@ -1491,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_pair_needs_two_connected_keys() {
+    fn compare_pair_needs_two_connected_keys() {
         let one = vec![two_fido_keys()[0].clone()];
         let e = pair_err(&one, side(None, None), side(None, None), &mut NoPicker);
         assert!(e.contains("only one key"), "{e}");

@@ -552,7 +552,7 @@ impl<I: SecretIo> Secrets<I> {
     }
 
     /// Read a PIN at a caller-worded hidden prompt, where an empty line
-    /// means `fallback` when one is given (`fido credential diff`: the
+    /// means `fallback` when one is given (`fido credential compare`: the
     /// second key's prompt offers ENTER for the same PIN as the first key).
     /// Only the interactive case reaches here — flag and piped-stdin
     /// sources are read with `read`.
@@ -999,7 +999,7 @@ mod tests {
 
     #[test]
     fn fallback_prompt_accepts_empty_as_the_first_pin() {
-        // The diff's second-key prompt: ENTER reuses the first key's PIN.
+        // `credential compare`'s second-key prompt: ENTER reuses the first key's PIN.
         let mut s = sec(FakeIo::terminal().typing(&[""]));
         let first = Zeroizing::new("1234".to_string());
         assert_eq!(
