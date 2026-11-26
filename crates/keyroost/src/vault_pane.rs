@@ -962,10 +962,6 @@ impl EntryForm {
 
     /// Whether any field differs from where the form started: empty for an
     /// add, the entry as read for an edit.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the idle lock reads it (not yet wired)")
-    )]
     pub(crate) fn is_dirty(&self) -> bool {
         let start: [&str; 5] = match &self.editing {
             Some(e) => [&e.title, &e.username, &e.password, &e.url, &e.notes],
@@ -1113,17 +1109,49 @@ pub(crate) struct VaultState {
 
 impl TypedSecrets for VaultState {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
-        let mut out = vec![&mut *self.pin_input];
-        if let Some(f) = self.form.as_mut() {
+        // Every field named, so a new one has to be classified here.
+        let Self {
+            error: _,
+            info: _,
+            session: _,
+            pin_input,
+            progress: _,
+            selected: _,
+            // What the list is filtered by: titles, usernames and URLs the
+            // unlocked list shows anyway.
+            filter: _,
+            open_entry: _,
+            revealed: _,
+            copied: _,
+            form,
+            gen: _,
+            gen_open: _,
+            confirm: _,
+            new_vault: _,
+            export_for: _,
+            export,
+            import_asked: _,
+            import,
+        } = self;
+        let mut out = vec![&mut **pin_input];
+        if let Some(f) = form.as_mut() {
             out.extend(f.secrets_mut());
         }
-        if let Some(d) = self.export.as_mut() {
+        if let Some(d) = export.as_mut() {
             out.extend(d.secrets_mut());
         }
-        if let Some(d) = self.import.as_mut() {
+        if let Some(d) = import.as_mut() {
             out.extend(d.secrets_mut());
         }
         out
+    }
+}
+
+impl VaultState {
+    /// The import preview holds a backup's entries, opened with its
+    /// passphrase.
+    pub(crate) fn holds_opened(&self) -> bool {
+        self.import.as_ref().is_some_and(|d| d.incoming.is_some())
     }
 }
 
@@ -1319,6 +1347,63 @@ impl App {
             gen,
             ..Default::default()
         };
+    }
+
+    /// The add / edit entry form holds unsaved changes: the one thing that
+    /// keeps the vault open past [`crate::IDLE_LOCK_AFTER`].
+    pub(crate) fn vault_form_dirty(&self) -> bool {
+        self.vault.form.as_ref().is_some_and(EntryForm::is_dirty)
+    }
+
+    /// How long the vault waits without input before the idle lock takes
+    /// it: [`crate::VAULT_EDIT_IDLE_LOCK_AFTER`] while its form holds
+    /// unsaved changes, else the app's [`crate::IDLE_LOCK_AFTER`].
+    pub(crate) fn vault_idle_limit(&self) -> std::time::Duration {
+        if self.vault_form_dirty() {
+            crate::VAULT_EDIT_IDLE_LOCK_AFTER
+        } else {
+            crate::IDLE_LOCK_AFTER
+        }
+    }
+
+    /// The Vault tab holds something the idle lock clears: the unlocked
+    /// vaults, a typed secret, or a backup opened for import.
+    pub(crate) fn vault_holds_secrets(&mut self) -> bool {
+        self.vault.session.is_some()
+            || self.vault.holds_opened()
+            || self.vault.secrets_mut().iter().any(|s| !s.is_empty())
+    }
+
+    /// The idle lock's part in the vault, after [`Self::vault_idle_limit`]
+    /// without input: an unlocked vault locks ([`Self::vault_lock`], which
+    /// also wipes its forms and clears a vault copy still on the clipboard)
+    /// and says why; a PIN typed into a locked tab is only wiped, as the
+    /// FIDO2 tab's is.
+    pub(crate) fn vault_idle_lock(&mut self) {
+        let v = &self.vault;
+        if v.session.is_some() || v.form.is_some() || v.export.is_some() || v.import.is_some() {
+            let limit = self.vault_idle_limit();
+            self.vault_lock(Some(crate::idle_locked_msg_for(limit)));
+        } else {
+            self.vault.wipe_typed();
+        }
+    }
+
+    /// The vault alone reaches [`crate::VAULT_EDIT_IDLE_LOCK_AFTER`]: the
+    /// rest of the app locked at [`crate::IDLE_LOCK_AFTER`], while the form
+    /// held unsaved changes. Now the vault locks too, and the log says so.
+    pub(crate) fn vault_idle_lock_alone(&mut self) {
+        let limit = self.vault_idle_limit();
+        self.vault_idle_lock();
+        // A focused box keeps egui's undo history of what was typed.
+        self.drop_text_focus = true;
+        self.log(
+            Severity::Info,
+            format!(
+                "Vault: Locked after {} of inactivity.",
+                crate::span_words(limit)
+            ),
+        );
     }
 
     /// The vault the list shows: the selected one, else the first.
@@ -3003,7 +3088,13 @@ pub(crate) struct ExportDialog {
 
 impl TypedSecrets for ExportDialog {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
-        vec![&mut self.passphrase, &mut self.repeat]
+        let Self {
+            vault: _,
+            path: _,
+            passphrase,
+            repeat,
+        } = self;
+        vec![passphrase, repeat]
     }
 }
 
@@ -3521,7 +3612,17 @@ impl ImportDialog {
 
 impl TypedSecrets for ImportDialog {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
-        vec![&mut self.passphrase]
+        let Self {
+            path: _,
+            passphrase,
+            target: _,
+            new_name: _,
+            // The opened entries wipe themselves when the dialog drops.
+            incoming: _,
+            rows: _,
+            notice: _,
+        } = self;
+        vec![passphrase]
     }
 }
 
@@ -5168,6 +5269,374 @@ mod tests {
         assert!(!app.holds_unlocked_secrets());
         app.idle_lock_tick(t0 + crate::IDLE_LOCK_AFTER * 2, false);
         assert_eq!(app.log.len(), lines, "nothing left to lock, nothing logged");
+    }
+
+    // ----- the idle lock: the vault's scoped extension and its secrets -----
+
+    const MIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// How many activity-log lines say the idle lock fired.
+    fn idle_lines(app: &App) -> usize {
+        app.log
+            .iter()
+            .filter(|l| l.text.contains("of inactivity"))
+            .count()
+    }
+
+    fn export_dialog(vault: VaultRef) -> ExportDialog {
+        ExportDialog {
+            vault,
+            path: "personal.t2vault".into(),
+            passphrase: "correct horse".into(),
+            repeat: "correct horse".into(),
+        }
+    }
+
+    #[test]
+    fn idle_lock_locks_the_vault_and_wipes_its_forms() {
+        let mut key = FakeKey::new();
+        let mut app = super::tests::app();
+        opened_into(&mut app, &mut key);
+        import_dialog(&mut app).passphrase.push_str(IMPORT_PASS);
+        let vault = shown_ref(&app);
+        app.vault.form = Some(EntryForm::for_add(vault.clone()));
+        app.vault.export = Some(export_dialog(vault));
+        *app.security_keys.pin_input = "fido-pin".into();
+        app.clipboard_clear_at = Some(clipboard_clear_for("hunter22".into(), 0.0, true));
+        assert!(!app.vault_form_dirty(), "an untouched form");
+
+        let t0 = std::time::Instant::now();
+        assert_eq!(app.idle_lock_tick(t0, false), Some(crate::IDLE_LOCK_AFTER));
+        assert_eq!(
+            app.idle_lock_tick(t0 + crate::IDLE_LOCK_AFTER - MIN, false),
+            Some(MIN)
+        );
+        assert!(app.vault.session.is_some(), "not yet");
+        assert_eq!(app.idle_lock_tick(t0 + crate::IDLE_LOCK_AFTER, false), None);
+
+        assert!(app.vault.session.is_none());
+        assert!(app.vault.form.is_none());
+        assert!(app.vault.export.is_none());
+        assert!(
+            app.vault.import.is_none(),
+            "the preview goes with its entries"
+        );
+        assert!(app.typed_secrets().iter().all(|s| s.is_empty()));
+        assert!(app.security_keys.pin_input.is_empty());
+        assert!(app.clipboard_clear_at.is_none(), "a vault copy is cleared");
+        assert_eq!(
+            app.vault.error.as_deref(),
+            Some(crate::idle_locked_msg().as_str())
+        );
+        assert_eq!(idle_lines(&app), 1);
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.text == "Locked after 5 minutes of inactivity."));
+        assert!(app.drop_text_focus);
+        assert!(!app.holds_unlocked_secrets());
+    }
+
+    #[test]
+    fn a_dirty_vault_form_keeps_only_the_vault_open() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.security_keys.session = Some(fido_session("123456"));
+        app.security_keys.session_device = Some(KEY.into());
+        app.oath.loaded = true;
+        app.oath.creds = vec![crate::OathRow::new(
+            "Example:alice".into(),
+            Some("123456".into()),
+            false,
+        )];
+        let mut form = EntryForm::for_add(shown_ref(&app));
+        form.title.push_str("Mail");
+        form.password.push_str("half-typed");
+        form.notes.push_str("a note");
+        app.vault.form = Some(form);
+        assert!(app.vault_form_dirty());
+
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            app.idle_lock_tick(t0, false),
+            Some(crate::IDLE_LOCK_AFTER),
+            "the nearest deadline is the rest of the app's"
+        );
+        assert_eq!(
+            app.idle_lock_tick(t0 + crate::IDLE_LOCK_AFTER, false),
+            Some(crate::VAULT_EDIT_IDLE_LOCK_AFTER - crate::IDLE_LOCK_AFTER)
+        );
+        // Everything outside the vault locked as today.
+        assert!(app.security_keys.session.is_none());
+        assert_eq!(app.security_keys.error, Some(crate::idle_locked_msg()));
+        assert!(app.oath.creds.is_empty());
+        assert_eq!(app.oath.notice, Some(crate::idle_hidden_msg()));
+        assert!(!app.holds_secrets_outside_vault());
+        // The vault and its form stay.
+        assert!(app.vault.session.is_some());
+        let form = app.vault.form.as_ref().expect("the form stays");
+        assert_eq!(form.password, "half-typed");
+        assert_eq!(form.notes, "a note");
+        assert!(app.vault.error.is_none());
+        assert_eq!(idle_lines(&app), 1);
+
+        // No second lock, no log line, in between.
+        assert_eq!(app.idle_lock_tick(t0 + 10 * MIN, false), Some(5 * MIN));
+        let almost = t0 + crate::VAULT_EDIT_IDLE_LOCK_AFTER - std::time::Duration::from_secs(1);
+        assert_eq!(
+            app.idle_lock_tick(almost, false),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert!(app.vault.session.is_some());
+        assert_eq!(idle_lines(&app), 1);
+
+        assert_eq!(
+            app.idle_lock_tick(t0 + crate::VAULT_EDIT_IDLE_LOCK_AFTER, false),
+            None
+        );
+        assert!(app.vault.session.is_none());
+        assert!(app.vault.form.is_none(), "the form is wiped");
+        let msg = app.vault.error.clone().expect("the tab says why");
+        assert_eq!(
+            msg,
+            crate::idle_locked_msg_for(crate::VAULT_EDIT_IDLE_LOCK_AFTER)
+        );
+        assert!(msg.contains("15 minutes"), "{msg}");
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.text == "Vault: Locked after 15 minutes of inactivity."));
+        assert_eq!(idle_lines(&app), 2);
+        assert!(app.typed_secrets().iter().all(|s| s.is_empty()));
+        assert!(!app.holds_unlocked_secrets());
+
+        assert_eq!(
+            app.idle_lock_tick(t0 + crate::VAULT_EDIT_IDLE_LOCK_AFTER * 2, false),
+            None
+        );
+        assert_eq!(idle_lines(&app), 2, "nothing left to lock");
+    }
+
+    #[test]
+    fn an_untouched_form_does_not_extend_the_lock() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let e = session_entry(&app, "GitHub");
+        let mut form = EntryForm::for_edit(shown_ref(&app), &e);
+        // Typed over and typed back: as read, so nothing unsaved.
+        form.title.push('x');
+        form.title.pop();
+        app.vault.form = Some(form);
+        assert!(!app.vault_form_dirty());
+
+        let t0 = std::time::Instant::now();
+        assert_eq!(app.idle_lock_tick(t0, false), Some(crate::IDLE_LOCK_AFTER));
+        assert_eq!(app.idle_lock_tick(t0 + crate::IDLE_LOCK_AFTER, false), None);
+        assert!(app.vault.session.is_none());
+        assert!(app.vault.form.is_none());
+        assert_eq!(
+            app.vault.error.as_deref(),
+            Some(crate::idle_locked_msg().as_str())
+        );
+    }
+
+    #[test]
+    fn typing_restarts_both_clocks() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.security_keys.session = Some(fido_session("123456"));
+        app.security_keys.session_device = Some(KEY.into());
+        let mut form = EntryForm::for_add(shown_ref(&app));
+        form.title.push_str("Mail");
+        app.vault.form = Some(form);
+
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        assert_eq!(
+            app.idle_lock_tick(t0 + 4 * MIN, true),
+            Some(crate::IDLE_LOCK_AFTER)
+        );
+        assert_eq!(app.idle_lock_tick(t0 + 8 * MIN, false), Some(MIN));
+        assert!(app.security_keys.session.is_some(), "input restarted it");
+        // 5 minutes after the input: the FIDO2 tab locks; the vault has 10
+        // more.
+        assert_eq!(app.idle_lock_tick(t0 + 9 * MIN, false), Some(10 * MIN));
+        assert!(app.security_keys.session.is_none());
+        assert!(app.vault.session.is_some());
+        // Typing in the form restarts the vault's 15 minutes.
+        assert_eq!(
+            app.idle_lock_tick(t0 + 18 * MIN, true),
+            Some(crate::VAULT_EDIT_IDLE_LOCK_AFTER)
+        );
+        assert_eq!(app.idle_lock_tick(t0 + 32 * MIN, false), Some(MIN));
+        assert!(app.vault.session.is_some());
+        // A running operation postpones the lock, as for every other pane.
+        app.busy_jobs = 1;
+        assert_eq!(
+            app.idle_lock_tick(t0 + 40 * MIN, false),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert!(app.vault.session.is_some(), "never mid-operation");
+        app.busy_jobs = 0;
+        assert_eq!(app.idle_lock_tick(t0 + 40 * MIN, false), None);
+        assert!(app.vault.session.is_none());
+    }
+
+    #[test]
+    fn the_existing_idle_messages_are_unchanged() {
+        assert_eq!(crate::VAULT_EDIT_IDLE_LOCK_AFTER.as_secs(), 15 * 60);
+        assert_eq!(crate::idle_lock_span(), "5 minutes");
+        assert_eq!(crate::span_words(crate::IDLE_LOCK_AFTER), "5 minutes");
+        assert_eq!(crate::span_words(MIN), "1 minute");
+        assert_eq!(
+            crate::span_words(std::time::Duration::from_secs(75)),
+            "75 seconds"
+        );
+        assert_eq!(
+            crate::span_words(crate::VAULT_EDIT_IDLE_LOCK_AFTER),
+            "15 minutes"
+        );
+        assert_eq!(
+            crate::idle_locked_msg(),
+            "Locked after 5 minutes of inactivity \u{2014} unlock again to continue."
+        );
+        assert_eq!(
+            crate::idle_locked_msg(),
+            crate::idle_locked_msg_for(crate::IDLE_LOCK_AFTER)
+        );
+        assert_eq!(
+            crate::idle_locked_msg_for(crate::VAULT_EDIT_IDLE_LOCK_AFTER),
+            "Locked after 15 minutes of inactivity \u{2014} unlock again to continue."
+        );
+        assert_eq!(
+            crate::idle_hidden_msg(),
+            "Codes hidden after 5 minutes of inactivity."
+        );
+        assert_eq!(
+            crate::idle_closed_msg(),
+            "Closed after 5 minutes of inactivity."
+        );
+    }
+
+    #[test]
+    fn vault_state_lists_every_secret_field() {
+        let mut key = FakeKey::new();
+        let mut app = super::tests::app();
+        opened_into(&mut app, &mut key);
+        let vault = shown_ref(&app);
+        *app.vault.pin_input = "1234".into();
+        let mut form = EntryForm::for_add(vault.clone());
+        for s in [
+            &mut form.title,
+            &mut form.username,
+            &mut form.password,
+            &mut form.url,
+            &mut form.notes,
+        ] {
+            s.push_str("typed");
+        }
+        app.vault.form = Some(form);
+        app.vault.export = Some(export_dialog(vault));
+        import_dialog(&mut app).passphrase.push_str(IMPORT_PASS);
+        // Not secrets: the filter and a new vault's name.
+        app.vault.filter = "git".into();
+        app.vault.new_vault = Some("Work".into());
+
+        assert_eq!(app.vault.secrets_mut().len(), 1 + 5 + 2 + 1);
+        assert_eq!(
+            app.typed_secrets().len(),
+            app.typed_secrets_outside_vault().len() + 9,
+            "the app's list is the outside list plus the vault's"
+        );
+        assert!(!app.typed_secrets_outside_vault().is_empty());
+        app.vault.wipe_typed();
+        assert!(app.vault.pin_input.is_empty());
+        let f = app.vault.form.as_ref().unwrap();
+        for s in [&f.title, &f.username, &f.password, &f.url, &f.notes] {
+            assert!(s.is_empty());
+        }
+        let d = app.vault.export.as_ref().unwrap();
+        assert!(d.passphrase.is_empty() && d.repeat.is_empty());
+        assert!(app.vault.import.as_ref().unwrap().passphrase.is_empty());
+        assert_eq!(app.vault.filter, "git");
+        assert_eq!(app.vault.new_vault.as_deref(), Some("Work"));
+        assert!(app.typed_secrets().iter().all(|s| s.is_empty()));
+    }
+
+    #[test]
+    fn vault_lock_rebuilds_the_state() {
+        let mut key = FakeKey::new();
+        let mut app = super::tests::app();
+        let id = opened_into(&mut app, &mut key);
+        let vault = shown_ref(&app);
+        app.vault.info = Some("Entry \"x\" added.".into());
+        *app.vault.pin_input = "1234".into();
+        app.vault.selected = Some(id);
+        app.vault.filter = "git".into();
+        app.vault.open_entry = Some("ghghghgh".into());
+        app.vault.revealed = Some("ghghghgh".into());
+        app.vault.copied = Some(("ghghghgh:p".into(), 1.0));
+        app.vault.form = Some(EntryForm::for_add(vault.clone()));
+        app.vault.gen.length = 32;
+        app.vault.gen_open = true;
+        app.vault.confirm = Some(VaultConfirm::Rotate {
+            vault: vault.clone(),
+        });
+        app.vault.new_vault = Some("Work".into());
+        app.vault.export_for = Some(vault.clone());
+        app.vault.export = Some(export_dialog(vault));
+        app.vault.import_asked = true;
+        let cell = app.vault.progress.clone();
+
+        app.vault_lock(Some("Locked.".into()));
+
+        // Destructured, so a new field has to say what a lock does to it.
+        let VaultState {
+            error,
+            info,
+            session,
+            pin_input,
+            progress,
+            selected,
+            filter,
+            open_entry,
+            revealed,
+            copied,
+            form,
+            gen,
+            gen_open,
+            confirm,
+            new_vault,
+            export_for,
+            export,
+            import_asked,
+            import,
+        } = &app.vault;
+        assert_eq!(error.as_deref(), Some("Locked."));
+        assert!(info.is_none());
+        assert!(session.is_none());
+        assert!(pin_input.is_empty());
+        assert!(Arc::ptr_eq(progress, &cell), "kept: a running job's prompt");
+        assert!(selected.is_none());
+        assert!(filter.is_empty());
+        assert!(open_entry.is_none());
+        assert!(revealed.is_none());
+        assert!(copied.is_none());
+        assert!(form.is_none());
+        assert_eq!(gen.length, 32, "kept: the generator's settings");
+        assert!(!gen_open);
+        assert!(confirm.is_none());
+        assert!(new_vault.is_none());
+        assert!(export_for.is_none());
+        assert!(export.is_none());
+        assert!(!import_asked);
+        assert!(import.is_none());
     }
 
     // ----- the list: space, rows, copy, Show -----

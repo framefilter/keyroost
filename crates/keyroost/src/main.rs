@@ -85,16 +85,23 @@ fn clear_if_still_held(
     }
 }
 
-/// How long the app keeps an unlocked FIDO session, a retained OATH password
-/// or OTP PIN, and displayed codes without a click, key press or scroll
-/// before locking them (see `App::idle_lock`). The lock messages below take
-/// their wording from it, so they can't name a different duration.
+/// How long the app keeps an unlocked FIDO session, an unlocked vault, a
+/// retained OATH password or OTP PIN, and displayed codes without a click,
+/// key press or scroll before locking them (see `App::idle_lock`). The lock
+/// messages below take their wording from it, so they can't name a
+/// different duration.
 const IDLE_LOCK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-/// [`IDLE_LOCK_AFTER`] in words: "5 minutes", "1 minute", or "75 seconds"
-/// when it isn't a whole number of minutes.
-fn idle_lock_span() -> String {
-    let secs = IDLE_LOCK_AFTER.as_secs();
+/// How long the vault alone stays unlocked without input while its add /
+/// edit entry form holds unsaved changes, so a half-typed entry isn't lost
+/// to the 5-minute lock. Everything outside the vault still locks after
+/// [`IDLE_LOCK_AFTER`].
+const VAULT_EDIT_IDLE_LOCK_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// `d` in words: "5 minutes", "1 minute", or "75 seconds" when it isn't a
+/// whole number of minutes.
+fn span_words(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
     let (n, unit) = if secs.is_multiple_of(60) {
         (secs / 60, "minute")
     } else {
@@ -103,12 +110,23 @@ fn idle_lock_span() -> String {
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
+/// [`IDLE_LOCK_AFTER`] in words ([`span_words`]).
+fn idle_lock_span() -> String {
+    span_words(IDLE_LOCK_AFTER)
+}
+
 /// Shown where the idle lock dropped something the user has to unlock again:
 /// the FIDO session, a password-protected OATH applet, the OTP PIN.
 fn idle_locked_msg() -> String {
+    idle_locked_msg_for(IDLE_LOCK_AFTER)
+}
+
+/// [`idle_locked_msg`] for a lock after `d`: the vault's, which waits
+/// [`VAULT_EDIT_IDLE_LOCK_AFTER`] while its form holds unsaved changes.
+fn idle_locked_msg_for(d: std::time::Duration) -> String {
     format!(
         "Locked after {} of inactivity \u{2014} unlock again to continue.",
-        idle_lock_span()
+        span_words(d)
     )
 }
 
@@ -2154,7 +2172,7 @@ fn wipe(s: &mut String) {
 /// A form or pane state that holds secrets typed or pasted into it: PINs,
 /// PUKs, passwords, passphrases, management keys, seeds. `secrets_mut` is the
 /// one list of those fields. The state's own wipe (on drop, on close) and the
-/// idle lock ([`App::typed_secrets`]) both use it, so a field can't be wiped
+/// idle lock ([`App::typed_secrets_with`]) both use it, so a field can't be wiped
 /// in one place and missed in the other. A small form names every field
 /// there, secret or not, so a field added to it doesn't compile until
 /// someone says which it is.
@@ -7351,15 +7369,23 @@ impl App {
     }
 
     /// Whether the app holds anything [`Self::idle_lock`] would clear: an
-    /// unlocked FIDO session (with its PIN), a typed secret not yet sent to a
-    /// key ([`Self::typed_secrets`]), a retained OATH password or OTP PIN, or
-    /// displayed OATH / OTP codes. `&mut` only because the typed-secret list
-    /// is one list, shared with the wipe.
+    /// unlocked FIDO session (with its PIN), an unlocked vault, a typed
+    /// secret not yet sent to a key ([`Self::typed_secrets_with`]), a retained
+    /// OATH password or OTP PIN, or displayed OATH / OTP codes. `&mut` only
+    /// because the typed-secret list is one list, shared with the wipe.
     fn holds_unlocked_secrets(&mut self) -> bool {
+        self.holds_secrets_outside_vault() || self.vault_holds_secrets()
+    }
+
+    /// [`Self::holds_unlocked_secrets`] outside the Vault tab: what locks
+    /// after [`IDLE_LOCK_AFTER`] whatever the vault's form holds.
+    fn holds_secrets_outside_vault(&mut self) -> bool {
         self.security_keys.session.is_some()
-            || self.vault.session.is_some()
-            || self.typed_secrets().iter().any(|s| !s.is_empty())
-            || self.holds_opened_secrets()
+            || self
+                .typed_secrets_outside_vault()
+                .iter()
+                .any(|s| !s.is_empty())
+            || self.holds_opened_secrets_outside_vault()
             || self.oath.unlocked_password.is_some()
             || self.oath.creds.iter().any(|r| r.code.is_some())
             || self.otp.pin.is_some()
@@ -7372,7 +7398,14 @@ impl App {
     /// file read for import (seeds, decrypted or not), an OpenPGP key set
     /// made or read from a backup, the key from a .p12 file, or the entries
     /// of a vault backup opened for import.
+    #[cfg(test)]
     fn holds_opened_secrets(&self) -> bool {
+        self.holds_opened_secrets_outside_vault() || self.vault.holds_opened()
+    }
+
+    /// `holds_opened_secrets` without the vault's import preview (that one
+    /// is [`vault_pane::VaultState::holds_opened`]).
+    fn holds_opened_secrets_outside_vault(&self) -> bool {
         self.import_flow
             .dialog
             .as_ref()
@@ -7380,23 +7413,35 @@ impl App {
             || self.openpgp.created.is_some()
             || self.openpgp.restore_loaded.is_some()
             || self.piv.key_import.contents.is_some()
-            || self
-                .vault
-                .import
-                .as_ref()
-                .is_some_and(|d| d.incoming.is_some())
+    }
+
+    /// Every typed secret, the vault's included: what the tests check the
+    /// idle lock against. The lock itself takes the list in two parts
+    /// ([`Self::typed_secrets_outside_vault`] and the vault's own), since a
+    /// vault form with unsaved changes may outlast the rest.
+    #[cfg(test)]
+    fn typed_secrets(&mut self) -> Vec<&mut String> {
+        self.typed_secrets_with(true)
+    }
+
+    /// The typed secrets outside the Vault tab, which the idle lock wipes
+    /// after [`IDLE_LOCK_AFTER`] even while the vault's form keeps the vault
+    /// open longer.
+    fn typed_secrets_outside_vault(&mut self) -> Vec<&mut String> {
+        self.typed_secrets_with(false)
     }
 
     /// Every field holding a secret typed or pasted and not yet sent to a
     /// key: PINs, PUKs, passwords, passphrases, management keys, seeds and
     /// otpauth:// URIs, in every pane and dialog, from each state's
-    /// [`TypedSecrets`] list. The idle lock wipes them all, so a form left
-    /// half-filled doesn't keep its secret.
+    /// [`TypedSecrets`] list; the vault's ([`vault_pane::VaultState`])
+    /// appended when `vault` is set. The idle lock wipes them all, so a form
+    /// left half-filled doesn't keep its secret.
     ///
     /// Left out on purpose: the Molto2 customer key. Empty there means the
     /// factory default key, so wiping it would quietly switch the next
     /// sign-in to the default key.
-    fn typed_secrets(&mut self) -> Vec<&mut String> {
+    fn typed_secrets_with(&mut self, vault: bool) -> Vec<&mut String> {
         // Each state's own list (TypedSecrets), the one its wipe uses too;
         // only the few boxes kept on `App` itself are named here.
         let mut out = self.security_keys.secrets_mut();
@@ -7405,7 +7450,6 @@ impl App {
         out.extend(self.oath.secrets_mut());
         out.extend(self.otp.secrets_mut());
         out.extend(self.ftotp.secrets_mut());
-        out.extend(self.vault.secrets_mut());
         out.extend(self.openpgp.secrets_mut());
         out.extend(self.piv.secrets_mut());
         out.push(&mut *self.prog_seed_input);
@@ -7413,6 +7457,9 @@ impl App {
         out.extend(self.import_dialog.secrets_mut());
         if let Some(d) = self.import_flow.dialog.as_mut() {
             out.extend(d.secrets_mut());
+        }
+        if vault {
+            out.extend(self.vault.secrets_mut());
         }
         out
     }
@@ -7426,23 +7473,33 @@ impl App {
     /// under it, but doesn't restart the clock: the panes' own periodic
     /// refreshes would otherwise keep the codes up for good. Returns how long
     /// until the next check is due, or `None` when nothing is held.
+    ///
+    /// Everything locks after [`IDLE_LOCK_AFTER`], except the vault while its
+    /// add / edit form holds unsaved changes: the vault alone then waits up
+    /// to [`VAULT_EDIT_IDLE_LOCK_AFTER`] from the same last input. A lock
+    /// fires only while what it locks is held, so none repeats per frame.
     fn idle_lock_tick(
         &mut self,
         now: std::time::Instant,
         user_input: bool,
     ) -> Option<std::time::Duration> {
         let operating = self.busy() || self.import_busy() || self.reset_arm.is_some();
-        let held = self.holds_unlocked_secrets();
         // Judge the time idle before this frame's input counts. Where the
         // platform stops drawing a minimized window, the timer's frame never
         // comes; the first frame back can carry the click that restored the
         // window, and counting that first would restart the clock and show
         // the secrets again.
         let idle = self.last_activity.map(|t| now.saturating_duration_since(t));
-        if held && !operating && idle.is_some_and(|d| d >= IDLE_LOCK_AFTER) {
-            self.idle_lock();
-            return None;
+        if let (false, Some(idle)) = (operating, idle) {
+            let outside_due = idle >= IDLE_LOCK_AFTER && self.holds_secrets_outside_vault();
+            let vault_due = idle >= self.vault_idle_limit() && self.vault_holds_secrets();
+            if outside_due || (vault_due && !self.vault_form_dirty()) {
+                self.idle_lock(vault_due);
+            } else if vault_due {
+                self.vault_idle_lock_alone();
+            }
         }
+        let held = self.holds_unlocked_secrets();
         // While nothing is held the clock follows the frame, so it starts
         // when something is unlocked rather than at the last click before.
         if user_input || !held || idle.is_none() {
@@ -7451,8 +7508,15 @@ impl App {
         if !held {
             return None;
         }
+        // The nearest deadline: the app's while anything outside the vault
+        // is held, else the vault's own.
+        let limit = if self.holds_secrets_outside_vault() {
+            IDLE_LOCK_AFTER
+        } else {
+            self.vault_idle_limit()
+        };
         let idle = now.saturating_duration_since(self.last_activity.unwrap_or(now));
-        let due = IDLE_LOCK_AFTER.saturating_sub(idle);
+        let due = limit.saturating_sub(idle);
         // Past due but postponed by an operation: check again shortly rather
         // than asking for a repaint loop.
         Some(if operating {
@@ -7462,20 +7526,22 @@ impl App {
         })
     }
 
-    /// Lock what [`Self::holds_unlocked_secrets`] reports, after
+    /// Lock what [`Self::holds_secrets_outside_vault`] reports, after
     /// [`IDLE_LOCK_AFTER`] without input: the FIDO session through the same
-    /// path as the Lock button, every typed secret ([`Self::typed_secrets`];
-    /// the change-PIN form also closes), the retained OATH password and OTP
-    /// PIN (a protected applet goes back to its unlock prompt, as after a
-    /// rejected password), and every displayed code. Local only — no device
-    /// I/O.
-    fn idle_lock(&mut self) {
+    /// path as the Lock button, every typed secret
+    /// ([`Self::typed_secrets_outside_vault`]; the change-PIN form also
+    /// closes), the retained OATH password and OTP PIN (a protected applet
+    /// goes back to its unlock prompt, as after a rejected password), and
+    /// every displayed code. With `include_vault`, the vault too
+    /// ([`Self::vault_idle_lock`]); without, a vault whose form holds unsaved
+    /// changes stays open. Local only — no device I/O.
+    fn idle_lock(&mut self, include_vault: bool) {
         if self.security_keys.session.is_some() {
             self.lock_session();
             self.security_keys.error = Some(idle_locked_msg());
         }
-        if self.vault.session.is_some() {
-            self.vault_lock(Some(idle_locked_msg()));
+        if include_vault {
+            self.vault_idle_lock();
         }
         if self.security_keys.change_pin.has_pin_input() {
             // Replacing the form wipes its PINs (ChangePinDialog's Drop).
@@ -7514,7 +7580,7 @@ impl App {
             self.piv.notice = Some(idle_closed_msg());
         }
         // Every other typed secret: the boxes empty, their forms stay open.
-        for secret in self.typed_secrets() {
+        for secret in self.typed_secrets_outside_vault() {
             wipe(secret);
         }
         // A box that still has keyboard focus keeps egui's undo history,
@@ -17465,8 +17531,10 @@ impl eframe::App for App {
         }
 
         // Inactivity lock: after IDLE_LOCK_AFTER without input, drop the
-        // unlocked FIDO session, retained OATH password / OTP PIN, shown
-        // codes and typed secrets. The timer wakes the frame loop even when nothing else draws.
+        // unlocked FIDO session, the vault, retained OATH password / OTP PIN,
+        // shown codes and typed secrets; a vault form with unsaved changes
+        // keeps the vault alone open up to VAULT_EDIT_IDLE_LOCK_AFTER. The
+        // timer wakes the frame loop even when nothing else draws.
         let user_input = ctx.input(|i| i.events.iter().any(is_user_activity));
         self.user_acted = ctx.input(|i| {
             i.pointer.any_click()
