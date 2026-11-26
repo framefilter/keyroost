@@ -636,3 +636,94 @@ fn every_secret_flag_has_a_literal_case() {
         );
     }
 }
+
+/// The paths of the FIDO commands that take the FIDO PIN through `--pin` or
+/// `--a-pin` (all but setting and changing the PIN itself), with the extra
+/// args of each path's first row.
+fn fido_pin_commands() -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for line in TABLE
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+    {
+        let cols: Vec<&str> = line.split('\t').filter(|c| !c.is_empty()).collect();
+        let path = cols[0];
+        let secrets = cols[cols.len() - 2];
+        let fido = path.starts_with("fido ") || path.starts_with("name ");
+        let takes_pin = secrets.split(' ').any(|s| s == "pin" || s == "a-pin");
+        // The vault commands take --unlock in their own change.
+        let excluded =
+            ["fido pin set", "fido pin change"].contains(&path) || path.starts_with("fido vault");
+        if !fido || !takes_pin || excluded || out.iter().any(|(p, _)| p == path) {
+            continue;
+        }
+        let extra = if cols.len() == 4 {
+            cols[1].split(' ').map(str::to_owned).collect()
+        } else {
+            Vec::new()
+        };
+        out.push((path.to_owned(), extra));
+    }
+    out
+}
+
+#[test]
+fn every_fido_pin_command_offers_unlock() {
+    let commands = fido_pin_commands();
+    assert_eq!(commands.len(), 21, "{commands:?}");
+    for (path, _) in &commands {
+        let mut args: Vec<&str> = path.split(' ').collect();
+        args.push("--help");
+        let out = common::keyroostctl().args(&args).output().unwrap();
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{path}: {help}");
+        assert!(help.contains("--unlock"), "{path}: {help}");
+        assert!(
+            help.contains("fingerprint unlock is experimental"),
+            "{path}: {help}"
+        );
+    }
+}
+
+#[test]
+fn fingerprint_with_any_pin_flag_is_a_usage_error() {
+    for (path, extra) in fido_pin_commands() {
+        let flags: &[&str] = if path == "fido credential compare" {
+            &["--pin", "--a-pin", "--b-pin"]
+        } else {
+            &["--pin"]
+        };
+        for flag in flags {
+            let mut args: Vec<&str> = path.split(' ').collect();
+            args.extend(extra.iter().map(String::as_str));
+            args.extend(["--unlock", "fingerprint", flag, "env:X"]);
+            let (code, err) = run(&args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(
+                err.contains(&format!("takes no PIN; drop {flag},")),
+                "{args:?}: {err}"
+            );
+            assert!(
+                !err.contains('\u{2192}'),
+                "{args:?}: a key was selected: {err}"
+            );
+        }
+    }
+}
+
+/// A fingerprint unlock needs no PIN source: without a terminal it gets as
+/// far as looking for the key instead of refusing for want of a PIN.
+#[test]
+fn fingerprint_needs_no_pin_source_without_a_terminal() {
+    for args in [
+        &["fido", "credential", "list", "--unlock", "fingerprint"][..],
+        &["fido", "credential", "compare", "--unlock", "fingerprint"],
+        &["fido", "credential", "compare", "--unlock", "auto"],
+        &["fido", "blob", "clear", "--yes", "--unlock", "fingerprint"],
+    ] {
+        let (code, err) = run(args);
+        assert_ne!(code, 0, "{args:?}: {err}");
+        assert!(!err.contains(" given: pass "), "{args:?}: {err}");
+        assert!(err.contains("no key with FIDO2"), "{args:?}: {err}");
+    }
+}

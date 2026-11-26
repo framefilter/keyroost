@@ -466,7 +466,7 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl fido credential list</code></td><td>List every resident credential on the authenticator, grouped by RP</td></tr>
       <tr><td><code>keyroostctl fido credential compare</code></td><td>Compare the resident credentials (passkeys) on two keys</td></tr>
       <tr><td><code>keyroostctl fido credential delete</code></td><td>Delete one credential (passkey or security-key sign-in) by its hex credential ID. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
-      <tr><td><code>keyroostctl fido credential status</code></td><td>Show how many passkeys the key holds and how many more fit. Needs the PIN</td></tr>
+      <tr><td><code>keyroostctl fido credential status</code></td><td>Show how many passkeys the key holds and how many more fit. Needs the PIN or a fingerprint</td></tr>
       <tr><td><code>keyroostctl fido fingerprint</code></td><td>List, add, rename or delete enrolled fingerprints</td></tr>
       <tr><td><code>keyroostctl fido fingerprint list</code></td><td>List enrolled fingerprints (template id + name)</td></tr>
       <tr><td><code>keyroostctl fido fingerprint add</code></td><td>Enroll a new fingerprint. Touch the sensor repeatedly when prompted until capture completes</td></tr>

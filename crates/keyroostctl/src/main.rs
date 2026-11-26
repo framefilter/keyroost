@@ -2082,7 +2082,8 @@ enum NameCmd {
     /// is unless --store says otherwise.
     ///
     /// A name stored on the key travels with it and is visible to anyone who
-    /// has the key; changing or replacing it needs the FIDO PIN.
+    /// has the key; changing or replacing it needs the FIDO PIN or a
+    /// fingerprint.
     ///
     /// A name stored on the key is kept in the key's shared large-blob store
     /// without belonging to a passkey, so a browser may clear it when the
@@ -2093,18 +2094,20 @@ enum NameCmd {
         /// characters are rejected.
         name: String,
         /// Where to keep the name: `local` (this computer; the default for an
-        /// unnamed key) or `key` (on the key; needs the FIDO PIN; visible to
-        /// anyone who has the key).
+        /// unnamed key) or `key` (on the key; needs the FIDO PIN or a
+        /// fingerprint; visible to anyone who has the key).
         #[arg(long, value_enum, value_name = "WHERE")]
         store: Option<StoreArg>,
         /// Replace a name stored on the key without asking (required when not
         /// run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
         /// The FIDO PIN, for a name stored on the key: env:NAME reads that
         /// environment variable, stdin reads one line (hidden when typed at a
         /// terminal). With neither, a terminal asks when the name goes on the
-        /// key.
+        /// key (`--unlock pin` only).
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
@@ -2115,7 +2118,8 @@ enum NameCmd {
     /// Remove a name wherever it is stored: NAME, or the key selected with -d.
     ///
     /// Removing a name stored on the key needs the key connected and the FIDO
-    /// PIN; a name only on this computer is removed without either.
+    /// PIN or a fingerprint; a name only on this computer is removed without
+    /// either.
     Clear {
         /// The name to remove (omit it to clear the key selected with -d).
         #[arg(conflicts_with_all = ["path", "reader"])]
@@ -2124,10 +2128,12 @@ enum NameCmd {
         /// run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
         /// The FIDO PIN, for a name stored on the key: env:NAME reads that
         /// environment variable, stdin reads one line (hidden when typed at a
         /// terminal). With neither, a terminal asks when the name is on the
-        /// key.
+        /// key (`--unlock pin` only).
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
@@ -3025,10 +3031,9 @@ enum FidoPinCmd {
     },
     /// Force a PIN change on next use, without changing the minimum length.
     ForceChange {
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3053,10 +3058,9 @@ enum FidoMinLengthCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3069,10 +3073,9 @@ enum FidoMinLengthCmd {
 enum FidoCredentialCmd {
     /// List every resident credential on the authenticator, grouped by RP.
     List {
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3093,6 +3096,10 @@ enum FidoCredentialCmd {
     /// PINs from stdin come one per line, key A's first. With no PIN flag,
     /// the terminal asks for each key; an empty answer for key B reuses key
     /// A's PIN.
+    ///
+    /// With --unlock fingerprint each key asks for its own fingerprint touch;
+    /// --unlock auto uses each key's fingerprint, else that key's PIN from
+    /// --a-pin, --b-pin or --pin.
     Compare {
         /// Key A to compare, by friendly name, serial, or `list` number
         /// (prefix name:, serial: or list: to force which); omit both
@@ -3110,21 +3117,24 @@ enum FidoCredentialCmd {
         /// USB HID device path of key B, instead of --b.
         #[arg(long = "b-path", value_name = "PATH", conflicts_with = "b")]
         b_path: Option<std::path::PathBuf>,
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
         /// The PIN for each key without its own --a-pin or --b-pin: env:NAME
         /// reads that environment variable, stdin reads one line (first line,
         /// or second line after --a-pin stdin; hidden when typed at a
-        /// terminal). With no PIN flag, a terminal asks.
+        /// terminal). With no PIN flag, a terminal asks (`--unlock pin` only).
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         /// The PIN for key A: env:NAME reads that environment variable,
         /// stdin reads one line (first line; hidden when typed at a
-        /// terminal). With neither this nor --pin, a terminal asks.
+        /// terminal). With neither this nor --pin, a terminal asks (`--unlock
+        /// pin` only).
         #[arg(long = "a-pin", value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         a_pin: Option<SecretSource>,
         /// The PIN for key B: env:NAME reads that environment variable,
         /// stdin reads one line (second line when key A's PIN comes from
         /// stdin too; hidden when typed at a terminal). With neither this nor
-        /// --pin, a terminal asks.
+        /// --pin, a terminal asks (`--unlock pin` only).
         #[arg(long = "b-pin", value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         b_pin: Option<SecretSource>,
     },
@@ -3135,10 +3145,9 @@ enum FidoCredentialCmd {
         /// Credential ID to delete, in hex (see `fido credential list`).
         #[arg(value_name = "ID", value_parser = parse_hex_arg)]
         id: String,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3147,12 +3156,11 @@ enum FidoCredentialCmd {
         yes: bool,
     },
     /// Show how many passkeys the key holds and how many more fit. Needs the
-    /// PIN.
+    /// PIN or a fingerprint.
     Status {
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3164,10 +3172,9 @@ enum FidoCredentialCmd {
 enum FidoFingerprintCmd {
     /// List enrolled fingerprints (template id + name).
     List {
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3179,10 +3186,9 @@ enum FidoFingerprintCmd {
         /// (put `--` before a name that starts with `-`).
         #[arg(value_name = "NAME")]
         name: Option<String>,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3196,10 +3202,9 @@ enum FidoFingerprintCmd {
         /// New friendly name (put `--` before a name that starts with `-`).
         #[arg(value_name = "NAME")]
         name: String,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3210,10 +3215,9 @@ enum FidoFingerprintCmd {
         /// Fingerprint template ID, in hex (see `fido fingerprint list`).
         #[arg(value_name = "ID", value_parser = parse_hex_arg)]
         id: String,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3243,20 +3247,18 @@ enum FidoConfigCmd {
 enum FidoToggleCmd {
     /// Turn on "always require user verification" (alwaysUv). Does nothing if it is already on.
     Enable {
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Turn off "always require user verification" (alwaysUv). Does nothing if it is already off.
     Disable {
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3273,10 +3275,9 @@ enum FidoAttestationCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3287,17 +3288,16 @@ enum FidoAttestationCmd {
 ///
 /// A FIDO SSH key may stash its OpenSSH certificate in the FIDO2 large-blob
 /// store, keyed by the credential's per-credential largeBlobKey. These commands
-/// enumerate those credentials (needs a PIN for credential management) and pull
+/// enumerate those credentials (needs the PIN or a fingerprint for credential management) and pull
 /// the certificate back out as an `id-cert.pub` file usable by `ssh`.
 #[derive(Subcommand)]
 enum SshCertCmd {
     /// List resident SSH credentials (ssh:* RP IDs) and whether each has a
     /// certificate stored in its largeBlob.
     List {
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3315,10 +3315,9 @@ enum SshCertCmd {
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3332,7 +3331,7 @@ enum SshCertCmd {
 /// cannot read. The key's own name (`keyroostctl name set NAME --store key`)
 /// is an entry of kind `key name`; change it with `name set`, not here.
 /// Reads need no PIN (the store is world-readable); writes pull a
-/// `largeBlobWrite` token from your PIN. Every write re-reads the live array
+/// `largeBlobWrite` token from your PIN or a fingerprint. Every write re-reads the live array
 /// first so existing RP entries are never clobbered by stale state.
 #[derive(Subcommand)]
 enum LargeBlobCmd {
@@ -3362,10 +3361,9 @@ enum LargeBlobCmd {
         /// The note text to store (plain UTF-8). Visible in argv to other
         /// local processes — never a secret.
         text: String,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3382,10 +3380,9 @@ enum LargeBlobCmd {
         index: usize,
         /// The new note text (plain UTF-8). Visible in argv to other processes.
         text: String,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3401,10 +3398,9 @@ enum LargeBlobCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3438,10 +3434,9 @@ enum LargeBlobCmd {
         /// clear everything else.
         #[arg(long)]
         keep_name: bool,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = Unlock::Pin, help = FIDO_UNLOCK_HELP)]
+        unlock: Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -3817,14 +3812,11 @@ impl Unlock {
 }
 
 /// The help of `--unlock` on the FIDO commands that take a PIN.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the FIDO commands take --unlock in the next change"
-    )
-)]
 const FIDO_UNLOCK_HELP: &str = "How to unlock the key: with the PIN (the default), a fingerprint touch, or the fingerprint with the PIN as fallback (fingerprint unlock is experimental)";
+
+/// The help of `--pin` on the FIDO commands that take `--unlock`. No final
+/// period, like every help clap takes from a doc comment.
+const FIDO_PIN_HELP: &str = "The PIN: env:NAME reads that environment variable, stdin reads one line (hidden when typed at a terminal). With neither, a terminal asks (`--unlock pin` only)";
 
 /// Transport selector for the `otp` command group.
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -13918,6 +13910,7 @@ fn run_name(cmd: &NameCmd) -> Result<(), Box<dyn std::error::Error>> {
             name,
             store,
             yes,
+            unlock,
             pin,
             path,
             reader,
@@ -13925,6 +13918,7 @@ fn run_name(cmd: &NameCmd) -> Result<(), Box<dyn std::error::Error>> {
             name,
             *store,
             *yes,
+            *unlock,
             pin.as_ref(),
             path.as_deref(),
             reader.as_deref(),
@@ -13932,12 +13926,14 @@ fn run_name(cmd: &NameCmd) -> Result<(), Box<dyn std::error::Error>> {
         NameCmd::Clear {
             name,
             yes,
+            unlock,
             pin,
             path,
             reader,
         } => name_clear(
             name.as_deref(),
             *yes,
+            *unlock,
             pin.as_ref(),
             path.as_deref(),
             reader.as_deref(),
@@ -14081,16 +14077,18 @@ fn plan_key_label(
 /// key is replaced or removed), read the FIDO PIN, re-find the key if the
 /// person was kept waiting, then write only over the array the plan was
 /// made from. Returns how full the large-blob store is after the write.
+#[allow(clippy::too_many_arguments)]
 fn apply_key_label(
     sec: &mut Secrets,
     src: Source<'_>,
+    unlock: Unlock,
     yes: bool,
     dev: &keyroost_resolve::Device,
     plan: &keyroost_ctap::device_label::LabelPlan,
     question: Option<&str>,
     v: &str,
 ) -> Result<keyroost_ctap::large_blobs::BlobCapacity, Box<dyn std::error::Error>> {
-    check_fido_unlock(sec, Unlock::Pin, src)?;
+    check_fido_unlock(sec, unlock, src)?;
     let unlock = confirm_then_read_unlock(
         &mut crate::prompt::RealTerm,
         sec,
@@ -14099,8 +14097,9 @@ fn apply_key_label(
         &crate::prompt::key_label(dev),
         Some(dev),
         src,
-        Unlock::Pin,
+        unlock,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+        None,
     )?;
     let path = crate::target::hid_path_of(dev)?;
     let (mut h, _) = open_ctap_hid(&path)?;
@@ -14125,6 +14124,7 @@ fn name_set(
     name: &str,
     store: Option<StoreArg>,
     yes: bool,
+    unlock: Unlock,
     pin: Option<&SecretSource>,
     path: Option<&Path>,
     reader: Option<&str>,
@@ -14134,7 +14134,7 @@ fn name_set(
     let mut sec = Secrets::real();
     let src = Source::from_flag(pin);
     if pin.is_some() {
-        sec.check(&FIDO_PIN, src)?;
+        check_fido_unlock(&sec, unlock, src)?;
     }
     let dev = crate::target::select(Need::Nameable, reader, path)?;
     nameable(&dev)?;
@@ -14169,7 +14169,16 @@ fn name_set(
                     sanitize_terminal(old)
                 )
             });
-            let cap = apply_key_label(&mut sec, src, yes, &dev, &plan, question.as_deref(), &v)?;
+            let cap = apply_key_label(
+                &mut sec,
+                src,
+                unlock,
+                yes,
+                &dev,
+                &plan,
+                question.as_deref(),
+                &v,
+            )?;
             // Re-read keys.json: another keyroost run (or the app) may have
             // saved to it while the PIN prompt and the write ran.
             let saved = Keyring::load_default().and_then(|mut k| {
@@ -14228,6 +14237,7 @@ fn name_set_local(
 fn name_clear(
     name: Option<&str>,
     yes: bool,
+    unlock: Unlock,
     pin: Option<&SecretSource>,
     path: Option<&Path>,
     reader: Option<&str>,
@@ -14235,11 +14245,11 @@ fn name_clear(
     let mut sec = Secrets::real();
     let src = Source::from_flag(pin);
     if pin.is_some() {
-        sec.check(&FIDO_PIN, src)?;
+        check_fido_unlock(&sec, unlock, src)?;
     }
     match name {
-        Some(n) => name_clear_by_name(&mut sec, src, yes, n),
-        None => name_clear_selected(&mut sec, src, yes, path, reader),
+        Some(n) => name_clear_by_name(&mut sec, src, unlock, yes, n),
+        None => name_clear_selected(&mut sec, src, unlock, yes, path, reader),
     }
 }
 
@@ -14247,6 +14257,7 @@ fn name_clear(
 fn clear_key_label(
     sec: &mut Secrets,
     src: Source<'_>,
+    unlock: Unlock,
     yes: bool,
     dev: &keyroost_resolve::Device,
     label: &str,
@@ -14260,7 +14271,7 @@ fn clear_key_label(
         "remove the name '{}' stored on the key",
         sanitize_terminal(label)
     );
-    apply_key_label(sec, src, yes, dev, &plan, Some(&question), &v).map(|_| ())
+    apply_key_label(sec, src, unlock, yes, dev, &plan, Some(&question), &v).map(|_| ())
 }
 
 /// The note for a key whose own name couldn't be read just now: its local
@@ -14275,6 +14286,7 @@ fn unread_name_note(dev: &keyroost_resolve::Device) -> Option<&'static str> {
 fn name_clear_by_name(
     sec: &mut Secrets,
     src: Source<'_>,
+    unlock: Unlock,
     yes: bool,
     name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -14301,7 +14313,7 @@ fn name_clear_by_name(
             Some(d) => match &d.naming.on_key {
                 KeyLabel::Present(l) if l == name => {
                     errln!("{}", crate::target::announce_line(d, Need::FidoHid));
-                    clear_key_label(sec, src, yes, d, name)?;
+                    clear_key_label(sec, src, unlock, yes, d, name)?;
                 }
                 _ => note = unread_name_note(d),
             },
@@ -14326,6 +14338,7 @@ fn name_clear_by_name(
 fn name_clear_selected(
     sec: &mut Secrets,
     src: Source<'_>,
+    unlock: Unlock,
     yes: bool,
     path: Option<&Path>,
     reader: Option<&str>,
@@ -14335,7 +14348,7 @@ fn name_clear_selected(
     nameable(&dev)?;
     let mut cleared_on_key = false;
     if let (Some(NameSource::Key), Some(label)) = (dev.naming.source, &dev.naming.plain) {
-        clear_key_label(sec, src, yes, &dev, label)?;
+        clear_key_label(sec, src, unlock, yes, &dev, label)?;
         cleared_on_key = true;
     }
     let mut keyring = Keyring::load_default()?;
@@ -14729,18 +14742,24 @@ fn fingerprint_check(
     }
 }
 
-/// [`fingerprint_check`] on `dev`, read over USB before any question or
-/// PIN, for a fingerprint-only unlock (`src` is the PIN flag: `auto` with
-/// one given is not fingerprint-only). The PIN path does no I/O here. A
-/// U2F-only key passes: the command's own open says what it can't do.
+/// [`fingerprint_check`] on `dev` before any question or PIN, for a
+/// fingerprint-only unlock (`src` is the PIN flag: `auto` with one given is
+/// not fingerprint-only). `known` is the getInfo the command already read
+/// before asking anything; without it, getInfo is read over USB here. The
+/// PIN path does no I/O here. A U2F-only key passes: the command's own open
+/// says what it can't do.
 fn refuse_fingerprint_early(
     dev: &keyroost_resolve::Device,
     unlock: Unlock,
     src: Source<'_>,
     permissions: u32,
+    known: Option<&keyroost_ctap::AuthenticatorInfo>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !unlock.finger_only(src.given()) {
         return Ok(());
+    }
+    if let Some(info) = known {
+        return Ok(fingerprint_check(info, unlock, src.given(), permissions)?);
     }
     let (mut hid, init) = open_ctap_hid(&crate::target::hid_path_of(dev)?)?;
     if !init.supports_cbor() {
@@ -14780,7 +14799,7 @@ fn fido_unlock_with<I: crate::secrets::SecretIo>(
     permissions: u32,
 ) -> Result<FidoUnlock, Box<dyn std::error::Error>> {
     let src = Source::from_flag(flag);
-    refuse_fingerprint_early(dev, unlock, src, permissions)?;
+    refuse_fingerprint_early(dev, unlock, src, permissions, None)?;
     let unlock = read_fido_unlock(sec, unlock, src)?;
     fido_reverify_if_prompted(sec, dev)?;
     Ok(unlock)
@@ -14808,6 +14827,19 @@ fn fido_token<D: keyroost_ctap::transport::CtapTransport>(
     permissions: u32,
     finger: &str,
 ) -> Result<keyroost_ctap::client_pin::PinUvAuthToken, keyroost_ctap::CtapError> {
+    fido_token_said(dev, info, unlock, permissions, finger, &UNLOCKED_WITH_SAID)
+}
+
+/// [`fido_token`] with the "said once" flag given: `fido credential
+/// compare` says it once per key, right after that key's prompt.
+fn fido_token_said<D: keyroost_ctap::transport::CtapTransport>(
+    dev: &mut D,
+    info: &keyroost_ctap::AuthenticatorInfo,
+    unlock: &FidoUnlock,
+    permissions: u32,
+    finger: &str,
+    said: &std::sync::atomic::AtomicBool,
+) -> Result<keyroost_ctap::client_pin::PinUvAuthToken, keyroost_ctap::CtapError> {
     let (token, verified) = keyroost_ctap::client_pin::get_token(
         dev,
         info,
@@ -14817,7 +14849,7 @@ fn fido_token<D: keyroost_ctap::transport::CtapTransport>(
         &mut || crate::prompt::touch(finger),
     )?;
     if matches!(unlock, FidoUnlock::Auto(_))
-        && !UNLOCKED_WITH_SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && !said.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
         errln!("{}", unlocked_with_line(verified));
     }
@@ -14942,13 +14974,14 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
                     length,
                     force_change,
                     yes,
+                    unlock,
                     pin,
                     path,
                 },
         } => {
             let mut sec = Secrets::real();
             let src = Source::from_flag(pin.as_ref());
-            check_fido_unlock(&sec, Unlock::Pin, src)?;
+            check_fido_unlock(&sec, *unlock, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let info = fido_info_before_pin(&dev)?;
             if let Some(refusal) = config_unsupported(&info, ConfigSetting::MinPinLength) {
@@ -14962,8 +14995,9 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
                 &crate::prompt::key_label(&dev),
                 Some(&dev),
                 src,
-                Unlock::Pin,
+                *unlock,
                 keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
+                Some(&info),
             )?;
             let length = *length;
             let force_change = *force_change;
@@ -14981,18 +15015,24 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             })?;
             Ok(())
         }
-        FidoPinCmd::ForceChange { pin, path } => {
+        FidoPinCmd::ForceChange { unlock, pin, path } => {
             // As `fido_pin`, with the support check between the source check
             // (a missing source is refused before any device I/O) and the PIN.
             let mut sec = Secrets::real();
             let src = Source::from_flag(pin.as_ref());
-            check_fido_unlock(&sec, Unlock::Pin, src)?;
+            check_fido_unlock(&sec, *unlock, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let info = fido_info_before_pin(&dev)?;
             if let Some(refusal) = config_unsupported(&info, ConfigSetting::MinPinLength) {
                 return Err(refusal.into());
             }
-            let unlock = read_fido_unlock(&mut sec, Unlock::Pin, src)?;
+            fingerprint_check(
+                &info,
+                *unlock,
+                src.given(),
+                keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
+            )?;
+            let unlock = read_fido_unlock(&mut sec, *unlock, src)?;
             fido_reverify_if_prompted(&sec, &dev)?;
             with_configurator(path.as_deref(), &unlock, |cfg, _info| {
                 cfg.force_pin_change()?;
@@ -15006,37 +15046,50 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_fido_credentials(cmd: &FidoCredentialCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        FidoCredentialCmd::List { pin, path } => {
+        FidoCredentialCmd::List { unlock, pin, path } => {
             let unlock = fido_unlock(
                 path.as_deref(),
-                Unlock::Pin,
+                *unlock,
                 pin.as_ref(),
                 keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
             )?;
             run_fido_creds_list(path.as_deref(), &unlock)?;
             Ok(())
         }
-        FidoCredentialCmd::Delete { id, pin, path, yes } => {
+        FidoCredentialCmd::Delete {
+            id,
+            unlock,
+            pin,
+            path,
+            yes,
+        } => {
             let cred_id_bytes =
                 hex_decode(id).map_err(|e| format!("the credential ID is not valid hex: {}", e))?;
             let mut sec = Secrets::real();
             let src = Source::from_flag(pin.as_ref());
-            check_fido_unlock(&sec, Unlock::Pin, src)?;
+            check_fido_unlock(&sec, *unlock, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
+            refuse_fingerprint_early(
+                &dev,
+                *unlock,
+                src,
+                keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
+                None,
+            )?;
             let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("delete FIDO credential {}", hex_short(&cred_id_bytes)),
             )?;
-            let unlock = read_fido_unlock(&mut sec, Unlock::Pin, src)?;
+            let unlock = read_fido_unlock(&mut sec, *unlock, src)?;
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             run_fido_creds_delete(path.as_deref(), &unlock, &cred_id_bytes)?;
             Ok(())
         }
-        FidoCredentialCmd::Status { pin, path } => {
+        FidoCredentialCmd::Status { unlock, pin, path } => {
             let unlock = fido_unlock(
                 path.as_deref(),
-                Unlock::Pin,
+                *unlock,
                 pin.as_ref(),
                 keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
             )?;
@@ -15048,6 +15101,7 @@ fn run_fido_credentials(cmd: &FidoCredentialCmd) -> Result<(), Box<dyn std::erro
             a_path,
             b,
             b_path,
+            unlock,
             pin,
             a_pin,
             b_pin,
@@ -15059,27 +15113,32 @@ fn run_fido_credentials(cmd: &FidoCredentialCmd) -> Result<(), Box<dyn std::erro
             pin: pin.as_ref(),
             a_pin: a_pin.as_ref(),
             b_pin: b_pin.as_ref(),
-            unlock: Unlock::Pin,
+            unlock: *unlock,
         }),
     }
 }
 
 fn run_fido_fingerprints(cmd: &FidoFingerprintCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        FidoFingerprintCmd::List { pin, path } => {
+        FidoFingerprintCmd::List { unlock, pin, path } => {
             let unlock = fido_unlock(
                 path.as_deref(),
-                Unlock::Pin,
+                *unlock,
                 pin.as_ref(),
                 keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
             )?;
             run_fido_fingerprint_list(path.as_deref(), &unlock)?;
             Ok(())
         }
-        FidoFingerprintCmd::Add { name, pin, path } => {
+        FidoFingerprintCmd::Add {
+            name,
+            unlock,
+            pin,
+            path,
+        } => {
             let unlock = fido_unlock(
                 path.as_deref(),
-                Unlock::Pin,
+                *unlock,
                 pin.as_ref(),
                 keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
             )?;
@@ -15089,6 +15148,7 @@ fn run_fido_fingerprints(cmd: &FidoFingerprintCmd) -> Result<(), Box<dyn std::er
         FidoFingerprintCmd::Rename {
             id,
             name,
+            unlock,
             pin,
             path,
         } => {
@@ -15096,26 +15156,39 @@ fn run_fido_fingerprints(cmd: &FidoFingerprintCmd) -> Result<(), Box<dyn std::er
                 hex_decode(id).map_err(|e| format!("the template ID is not valid hex: {}", e))?;
             let unlock = fido_unlock(
                 path.as_deref(),
-                Unlock::Pin,
+                *unlock,
                 pin.as_ref(),
                 keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
             )?;
             run_fido_fingerprint_rename(path.as_deref(), &unlock, &id, name)?;
             Ok(())
         }
-        FidoFingerprintCmd::Delete { id, pin, path, yes } => {
+        FidoFingerprintCmd::Delete {
+            id,
+            unlock,
+            pin,
+            path,
+            yes,
+        } => {
             let id =
                 hex_decode(id).map_err(|e| format!("the template ID is not valid hex: {}", e))?;
             let mut sec = Secrets::real();
             let src = Source::from_flag(pin.as_ref());
-            check_fido_unlock(&sec, Unlock::Pin, src)?;
+            check_fido_unlock(&sec, *unlock, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
+            refuse_fingerprint_early(
+                &dev,
+                *unlock,
+                src,
+                keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
+                None,
+            )?;
             let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("delete fingerprint template {}", hex_short(&id)),
             )?;
-            let unlock = read_fido_unlock(&mut sec, Unlock::Pin, src)?;
+            let unlock = read_fido_unlock(&mut sec, *unlock, src)?;
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             run_fido_fingerprint_delete(path.as_deref(), &unlock, &id)?;
             Ok(())
@@ -15163,11 +15236,12 @@ fn always_uv_pre_pin_step(
 fn run_fido_always_uv(
     want_on: bool,
     path: Option<&std::path::Path>,
+    unlock: Unlock,
     pin: Option<&SecretSource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut sec = Secrets::real();
     let src = Source::from_flag(pin);
-    check_fido_unlock(&sec, Unlock::Pin, src)?;
+    check_fido_unlock(&sec, unlock, src)?;
     let dev = crate::target::select_fido(path)?;
     let word = if want_on { "on" } else { "off" };
     // Read the state first (no PIN needed), so a key already in the
@@ -15180,7 +15254,13 @@ fn run_fido_always_uv(
         already();
         return Ok(());
     }
-    let unlock = read_fido_unlock(&mut sec, Unlock::Pin, src)?;
+    fingerprint_check(
+        &current,
+        unlock,
+        src.given(),
+        keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
+    )?;
+    let unlock = read_fido_unlock(&mut sec, unlock, src)?;
     fido_reverify_if_prompted(&sec, &dev)?;
     with_configurator(path, &unlock, |cfg, info| {
         // Checked again on this handle: the key may have changed since the first read.
@@ -15243,17 +15323,23 @@ enum ConfigSetting {
 fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         FidoConfigCmd::AlwaysUv {
-            cmd: FidoToggleCmd::Enable { pin, path },
-        } => run_fido_always_uv(true, path.as_deref(), pin.as_ref()),
+            cmd: FidoToggleCmd::Enable { unlock, pin, path },
+        } => run_fido_always_uv(true, path.as_deref(), *unlock, pin.as_ref()),
         FidoConfigCmd::AlwaysUv {
-            cmd: FidoToggleCmd::Disable { pin, path },
-        } => run_fido_always_uv(false, path.as_deref(), pin.as_ref()),
+            cmd: FidoToggleCmd::Disable { unlock, pin, path },
+        } => run_fido_always_uv(false, path.as_deref(), *unlock, pin.as_ref()),
         FidoConfigCmd::Attestation {
-            cmd: FidoAttestationCmd::Enable { yes, pin, path },
+            cmd:
+                FidoAttestationCmd::Enable {
+                    yes,
+                    unlock,
+                    pin,
+                    path,
+                },
         } => {
             let mut sec = Secrets::real();
             let src = Source::from_flag(pin.as_ref());
-            check_fido_unlock(&sec, Unlock::Pin, src)?;
+            check_fido_unlock(&sec, *unlock, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let info = fido_info_before_pin(&dev)?;
             if let Some(refusal) = config_unsupported(&info, ConfigSetting::EnterpriseAttestation) {
@@ -15267,8 +15353,9 @@ fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>
                 &crate::prompt::key_label(&dev),
                 Some(&dev),
                 src,
-                Unlock::Pin,
+                *unlock,
                 keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
+                Some(&info),
             )?;
             with_configurator(path.as_deref(), &unlock, |cfg, _info| {
                 cfg.enable_enterprise_attestation()?;
@@ -15284,10 +15371,15 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
     match cmd {
         LargeBlobCmd::List { path } => run_fido_large_blob_list(path.as_deref()),
         LargeBlobCmd::Show { index, path } => run_fido_large_blob_get(path.as_deref(), *index),
-        LargeBlobCmd::Add { text, pin, path } => {
+        LargeBlobCmd::Add {
+            text,
+            unlock,
+            pin,
+            path,
+        } => {
             let unlock = fido_unlock(
                 path.as_deref(),
-                Unlock::Pin,
+                *unlock,
                 pin.as_ref(),
                 keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
             )?;
@@ -15296,6 +15388,7 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
         LargeBlobCmd::Edit {
             index,
             text,
+            unlock,
             pin,
             path,
         } => {
@@ -15303,24 +15396,32 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             // the name entry refused before the PIN is read.
             let mut sec = Secrets::real();
             let src = Source::from_flag(pin.as_ref());
-            check_fido_unlock(&sec, Unlock::Pin, src)?;
-            let (dev, _, current) = open_and_read_large_blobs(path.as_deref())?;
+            check_fido_unlock(&sec, *unlock, src)?;
+            let (dev, info, current) = open_and_read_large_blobs(path.as_deref())?;
             if let Some(refusal) = large_blob_edit_refusal(&current, *index) {
                 return Err(refusal.into());
             }
             drop(dev); // not held while the PIN is typed
             let key = crate::target::select_fido(path.as_deref())?;
-            let unlock = read_fido_unlock(&mut sec, Unlock::Pin, src)?;
+            fingerprint_check(
+                &info,
+                *unlock,
+                src.given(),
+                keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+            )?;
+            let unlock = read_fido_unlock(&mut sec, *unlock, src)?;
             fido_reverify_if_prompted(&sec, &key)?;
             run_fido_large_blob_edit(path.as_deref(), &unlock, *index, text)
         }
         LargeBlobCmd::Delete {
             index,
             yes,
+            unlock,
             pin,
             path,
         } => run_fido_large_blob_delete(
             path.as_deref(),
+            *unlock,
             Source::from_flag(pin.as_ref()),
             *index,
             *yes,
@@ -15337,10 +15438,12 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
         LargeBlobCmd::Clear {
             yes,
             keep_name,
+            unlock,
             pin,
             path,
         } => run_fido_large_blob_clear(
             path.as_deref(),
+            *unlock,
             Source::from_flag(pin.as_ref()),
             *yes,
             *keep_name,
@@ -15351,10 +15454,10 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
 /// Dispatch for `fido ssh` — list SSH credentials or export a cert.
 fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        SshCertCmd::List { pin, path } => {
+        SshCertCmd::List { unlock, pin, path } => {
             let unlock = fido_unlock(
                 path.as_deref(),
-                Unlock::Pin,
+                *unlock,
                 pin.as_ref(),
                 keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
             )?;
@@ -15365,6 +15468,7 @@ fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>>
             id,
             out,
             overwrite,
+            unlock,
             pin,
             path,
         } => {
@@ -15373,7 +15477,7 @@ fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>>
             let [out_mode] = crate::prompt::check_overwrites([out.as_deref()], *overwrite)?;
             let unlock = fido_unlock(
                 path.as_deref(),
-                Unlock::Pin,
+                *unlock,
                 pin.as_ref(),
                 keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
             )?;
@@ -15934,13 +16038,14 @@ fn run_fido_large_blob_edit(
 
 fn run_fido_large_blob_delete(
     path: Option<&std::path::Path>,
+    unlock: Unlock,
     src: Source<'_>,
     index: usize,
     yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut sec = Secrets::real();
-    check_fido_unlock(&sec, Unlock::Pin, src)?;
-    let (dev, _info, current) = open_and_read_large_blobs(path)?;
+    check_fido_unlock(&sec, unlock, src)?;
+    let (dev, info, current) = open_and_read_large_blobs(path)?;
     let entry = current
         .entry(index)
         .ok_or_else(|| large_blob_bad_index(index, current.len()))?;
@@ -15967,8 +16072,9 @@ fn run_fido_large_blob_delete(
         &crate::prompt::key_label(&key),
         Some(&key),
         src,
-        Unlock::Pin,
+        unlock,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+        Some(&info),
     )?;
     let (mut dev, info, again) = open_and_read_large_blobs(path)?;
     if !large_blob_unchanged(&current, &again) {
@@ -15996,15 +16102,16 @@ fn run_fido_large_blob_delete(
 
 fn run_fido_large_blob_clear(
     path: Option<&std::path::Path>,
+    unlock: Unlock,
     src: Source<'_>,
     yes: bool,
     keep_name: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use keyroost_ctap::large_blobs::EntryKind;
     let mut sec = Secrets::real();
-    check_fido_unlock(&sec, Unlock::Pin, src)?;
+    check_fido_unlock(&sec, unlock, src)?;
     // Read first so we can report exactly what will be wiped.
-    let (dev, _info, current) = open_and_read_large_blobs(path)?;
+    let (dev, info, current) = open_and_read_large_blobs(path)?;
     let name = current.label().map(|(_, l)| sanitize_terminal(&l.label));
     let keep = keep_name && name.is_some();
     if keep_name && !keep {
@@ -16059,8 +16166,9 @@ fn run_fido_large_blob_clear(
         &crate::prompt::key_label(&key),
         Some(&key),
         src,
-        Unlock::Pin,
+        unlock,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+        Some(&info),
     )?;
     let (mut dev, info, again) = open_and_read_large_blobs(path)?;
     if !large_blob_unchanged(&current, &again) {
@@ -16693,8 +16801,13 @@ fn fmt_compare_cred(c: &CompareCred) -> String {
 fn read_compare_side(
     hid_path: &std::path::Path,
     unlock: &FidoUnlock,
+    label: &str,
 ) -> Result<(Vec<CompareCred>, usize), Box<dyn std::error::Error>> {
-    with_credential_manager_at(hid_path, unlock, |mgr| {
+    // Each key asks for its own finger by name, and under `auto` says how
+    // it was unlocked right after.
+    let finger = format!("Touch the fingerprint sensor on {label}\u{2026}");
+    let said = std::sync::atomic::AtomicBool::new(false);
+    with_credential_manager_at(hid_path, unlock, &finger, &said, |mgr| {
         let mut out = Vec::new();
         let mut unavailable = 0;
         for rp in mgr.list_relying_parties()? {
@@ -16952,11 +17065,22 @@ fn run_fido_creds_compare(args: FidoCredCompareArgs<'_>) -> Result<(), Box<dyn s
     )?;
     check_compare_unlocks(&sec, unlock, pin, a_pin, b_pin)?;
     let (dev_a, dev_b) = crate::target::select_fido_pair(a, a_path, b, b_path)?;
+    // A fingerprint a key can't give is refused before any PIN is read.
+    for (dev, own, side) in [(&dev_a, a_pin, "A"), (&dev_b, b_pin, "B")] {
+        refuse_fingerprint_early(
+            dev,
+            unlock,
+            Source::from_flag(own.or(pin)),
+            keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
+            None,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("key {side}: {e}").into() })?;
+    }
     // Both sides share one prompt/line when neither per-key flag is given;
     // otherwise each side reads its own source (key A first, then key B).
     let label_a = crate::prompt::key_label(&dev_a);
     let label_b = crate::prompt::key_label(&dev_b);
-    let (pin_a, pin_b) =
+    let (unlock_a, unlock_b) =
         read_compare_unlocks(&mut sec, unlock, pin, a_pin, b_pin, &label_a, &label_b)?;
     // A typed PIN left a gap in which either key could have been swapped.
     if sec.prompted() {
@@ -16967,9 +17091,9 @@ fn run_fido_creds_compare(args: FidoCredCompareArgs<'_>) -> Result<(), Box<dyn s
     }
     let path_a = crate::target::hid_path_of(&dev_a)?;
     let path_b = crate::target::hid_path_of(&dev_b)?;
-    let (creds_a, unavail_a) = read_compare_side(&path_a, &pin_a)
+    let (creds_a, unavail_a) = read_compare_side(&path_a, &unlock_a, &label_a)
         .map_err(|e| -> Box<dyn std::error::Error> { format!("key A: {e}").into() })?;
-    let (creds_b, unavail_b) = read_compare_side(&path_b, &pin_b)
+    let (creds_b, unavail_b) = read_compare_side(&path_b, &unlock_b, &label_b)
         .map_err(|e| -> Box<dyn std::error::Error> { format!("key B: {e}").into() })?;
     let (only_a, only_b, on_both) = compare_creds(&creds_a, &creds_b);
     // Relying parties with a malformed rpIdHash can't be listed, so the
@@ -17346,7 +17470,13 @@ where
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
     let path = crate::target::fido_path(path)?;
-    with_credential_manager_at(&path, unlock, f)
+    with_credential_manager_at(
+        &path,
+        unlock,
+        FingerAsk::Unlock.prompt(),
+        &UNLOCKED_WITH_SAID,
+        f,
+    )
 }
 
 /// [`with_credential_manager`] on an already-resolved HID path, returning
@@ -17355,6 +17485,8 @@ where
 fn with_credential_manager_at<T, F>(
     path: &std::path::Path,
     unlock: &FidoUnlock,
+    finger: &str,
+    said: &std::sync::atomic::AtomicBool,
     f: F,
 ) -> Result<T, Box<dyn std::error::Error>>
 where
@@ -17367,12 +17499,13 @@ where
         return Err("device is U2F-only; CTAP2 credential management not supported".into());
     }
     let info = keyroost_ctap::get_info(&mut dev)?;
-    let token = fido_token(
+    let token = fido_token_said(
         &mut dev,
         &info,
         unlock,
         keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
-        FingerAsk::Unlock.prompt(),
+        finger,
+        said,
     )?;
     let mut mgr = keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
     f(&mut mgr)
@@ -17461,8 +17594,10 @@ where
 /// Ask first, then read the PIN: a refusal or a "no" never consumes a PIN
 /// source (the FIDO one-way settings and the large-blob wipes). Before the
 /// question, a fingerprint `reopened` can't give for `permissions` is
-/// refused ([`refuse_fingerprint_early`]), so nobody answers a question for
-/// an unlock that cannot come. `reopened` is the key a command reopens
+/// refused ([`refuse_fingerprint_early`], from `known` when the command
+/// already read getInfo), so nobody answers a question for an unlock that
+/// cannot come; with `reopened` and `known` both `None` (tests) that check
+/// is skipped. `reopened` is the key a command reopens
 /// after this returns; when the question was shown or the PIN was typed at
 /// the hidden prompt, it is re-found ([`crate::target::reverify`]) only
 /// after the PIN has been read — immediately before the reopen, not while
@@ -17479,6 +17614,7 @@ fn confirm_then_read_unlock<I: crate::secrets::SecretIo>(
     src: Source<'_>,
     unlock: Unlock,
     permissions: u32,
+    known: Option<&keyroost_ctap::AuthenticatorInfo>,
 ) -> Result<FidoUnlock, Box<dyn std::error::Error>> {
     confirm_then_read_unlock_ordered(
         term,
@@ -17488,9 +17624,10 @@ fn confirm_then_read_unlock<I: crate::secrets::SecretIo>(
         key,
         src,
         unlock,
-        || match reopened {
-            Some(dev) => refuse_fingerprint_early(dev, unlock, src, permissions),
-            None => Ok(()),
+        || match (reopened, known) {
+            (Some(dev), _) => refuse_fingerprint_early(dev, unlock, src, permissions, known),
+            (None, Some(info)) => Ok(fingerprint_check(info, unlock, src.given(), permissions)?),
+            (None, None) => Ok(()),
         },
         |waited| {
             if waited {
@@ -21001,6 +21138,7 @@ mod cli_tests {
             unset,
             Unlock::Pin,
             keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -21016,11 +21154,74 @@ mod cli_tests {
             unset,
             Unlock::Pin,
             keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
+            None,
         )
         .unwrap_err()
         .to_string();
         assert!(!e.contains("KR_UNSET"), "{e}");
         assert!(e.contains("--pin"), "{e}");
+    }
+
+    #[test]
+    fn a_known_getinfo_refuses_a_fingerprint_before_the_question() {
+        // The settings commands read getInfo before asking anything; that
+        // info decides a fingerprint refusal (no second read), and it comes
+        // ahead of the question: without a terminal the question would
+        // otherwise be the refusal ("add --yes").
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
+        struct NoTty;
+        impl crate::prompt::Term for NoTty {
+            fn present(&self) -> bool {
+                false
+            }
+            fn say(&mut self, _: &str) {}
+            fn ask(&mut self, _: &str) -> std::io::Result<String> {
+                unreachable!("never asks without a terminal")
+            }
+        }
+        let info = |opts: &[(&str, bool)]| keyroost_ctap::AuthenticatorInfo {
+            options: opts.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            ..Default::default()
+        };
+        let acfg = keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION;
+        let ask = |unlock, known: &keyroost_ctap::AuthenticatorInfo| {
+            let mut sec = Secrets::new(FakeIo::default());
+            confirm_then_read_unlock(
+                &mut NoTty,
+                &mut sec,
+                false,
+                "enable enterprise attestation (only a reset turns it off)",
+                "k",
+                None,
+                Source::NONE,
+                unlock,
+                acfg,
+                Some(known),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        let no_uv = info(&[("pinUvAuthToken", true), ("authnrCfg", true)]);
+        assert_eq!(
+            ask(Unlock::Fingerprint, &no_uv),
+            "this key does not offer fingerprint unlock; use the PIN instead"
+        );
+        // A finger that can't carry `acfg` on this key (F1).
+        let bio = info(&[("pinUvAuthToken", true), ("uv", true), ("authnrCfg", true)]);
+        assert_eq!(
+            ask(Unlock::Auto, &bio),
+            "this key does not allow this with a fingerprint; use the PIN instead"
+        );
+        // The PIN goes on to the question.
+        assert!(ask(Unlock::Pin, &no_uv).ends_with("add --yes"));
+        let granted = info(&[
+            ("pinUvAuthToken", true),
+            ("uv", true),
+            ("authnrCfg", true),
+            ("uvAcfg", true),
+        ]);
+        assert!(ask(Unlock::Fingerprint, &granted).ends_with("add --yes"));
     }
 
     /// A terminal that answers "y" to every question.
@@ -24462,6 +24663,80 @@ mod cli_tests {
             unlock_conflict(&matches(&["keyroostctl", "piv", "info"])),
             None
         );
+        // The real FIDO commands, through the full parse `run` does.
+        for (args, want) in [
+            (
+                &[
+                    "keyroostctl",
+                    "fido",
+                    "credential",
+                    "list",
+                    "--unlock",
+                    "fingerprint",
+                    "--pin",
+                    "env:X",
+                ][..],
+                Some("--pin"),
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "fido",
+                    "credential",
+                    "compare",
+                    "--unlock",
+                    "fingerprint",
+                    "--b-pin",
+                    "stdin",
+                ],
+                Some("--b-pin"),
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "name",
+                    "set",
+                    "x",
+                    "--unlock",
+                    "fingerprint",
+                    "--pin",
+                    "env:X",
+                ],
+                Some("--pin"),
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "fido",
+                    "blob",
+                    "clear",
+                    "--unlock",
+                    "auto",
+                    "--pin",
+                    "stdin",
+                ],
+                None,
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "fido",
+                    "ssh",
+                    "list",
+                    "--unlock",
+                    "fingerprint",
+                ],
+                None,
+            ),
+        ] {
+            assert_eq!(
+                unlock_conflict(&matches(args)),
+                want.map(|f| format!(
+                    "`--unlock fingerprint` takes no PIN; drop {f}, or use --unlock auto for a PIN fallback"
+                )),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
@@ -26725,9 +27000,13 @@ mod cli_tests {
                 // the secret; elsewhere the help says when it asks, or that
                 // it never does.
                 let required = needed[path.as_str()].iter().any(|n| n == long);
-                // (clap drops the help's final period.)
-                let asks_always =
-                    help.ends_with("a terminal asks") || help.contains("a terminal asks.");
+                // (clap drops the help's final period.) On a command with
+                // `--unlock`, the PIN is needed every run only under its
+                // default `pin`, and the help says so in the same words.
+                let has_unlock = cmd.get_arguments().any(|a| a.get_id() == "unlock");
+                let asks_always = help.ends_with("a terminal asks")
+                    || help.contains("a terminal asks.")
+                    || (has_unlock && help.ends_with("a terminal asks (`--unlock pin` only)"));
                 assert_eq!(asks_always, required, "{path} --{long}: {help}");
             }
             // Two stdin sources that can be combined: each states its line,
