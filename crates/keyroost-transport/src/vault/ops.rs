@@ -262,21 +262,21 @@ pub fn reload(key: &mut impl VaultKey, unlocked: &mut Unlocked) -> Result<(), Va
 /// The current token serves when it allows credential management (a listing
 /// just made took one); otherwise a fresh one, with largeBlobWrite too as
 /// [`list_credentials`](super::list_credentials) takes it. A held token the
-/// key dropped or let expire gets one fresh token and one more try.
+/// key dropped or let expire gets one renewed token (a finger is asked for
+/// again, saying why) and one more try.
 fn has_vault_credential(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
 ) -> Result<bool, VaultKeyError> {
-    if let Some(token) = auth.current_for(CREDENTIAL_MANAGEMENT).cloned() {
-        match key.credentials(&token) {
+    let perms = CREDENTIAL_MANAGEMENT | LARGE_BLOB_WRITE;
+    let token = match auth.current_for(CREDENTIAL_MANAGEMENT).cloned() {
+        None => auth.fresh_token(key, perms, None)?.clone(),
+        Some(token) => match key.credentials(&token) {
             Ok(creds) => return Ok(!creds.is_empty()),
-            Err(e) if stale_token(&e) => {}
+            Err(e) if stale_token(&e) => auth.renewed_token(key, perms, None)?.clone(),
             Err(e) => return Err(e.into()),
-        }
-    }
-    let token = auth
-        .fresh_token(key, CREDENTIAL_MANAGEMENT | LARGE_BLOB_WRITE, None)?
-        .clone();
+        },
+    };
     Ok(!key.credentials(&token)?.is_empty())
 }
 
@@ -452,7 +452,8 @@ pub(super) fn check_fits(
 ///
 /// A key can drop a token between unlock and write, or let it expire while
 /// a question waits: on the first `PIN_AUTH_INVALID` or `PIN_TOKEN_EXPIRED`
-/// a fresh token is taken and the array is read, built and written once
+/// a renewed token is taken (a finger is asked for again, saying why) and
+/// the array is read, built and written once
 /// more. A second refusal, or any other error, is returned.
 pub(crate) fn write_array(
     key: &mut impl VaultKey,
@@ -477,7 +478,7 @@ pub(crate) fn write_array(
             Ok(()) => return Ok(next),
             Err(e) if stale_token(&e) && !retried => {
                 retried = true;
-                token = auth.fresh_token(key, LARGE_BLOB_WRITE, None)?.clone();
+                token = auth.renewed_token(key, LARGE_BLOB_WRITE, None)?.clone();
             }
             Err(e) => return Err(e.into()),
         }
@@ -1979,5 +1980,285 @@ mod tests {
         fn send<T: Send>() {}
         send::<Change>();
         send::<Saved>();
+    }
+
+    // ----- fingerprint -----
+
+    use super::super::fake::asks;
+    use keyroost_ctap::client_pin::{FingerAsk, Verified};
+    use keyroost_ctap::FingerprintError;
+
+    fn no_pin_token(key: &FakeKey) -> bool {
+        key.log.iter().all(|c| !matches!(c, Call::Token { .. }))
+    }
+
+    #[test]
+    fn a_fingerprint_unlock_takes_uv_tokens_only_and_opens_the_vaults() {
+        let mut key = FakeKey::with_fingerprint();
+        let personal = Vault {
+            entries: vec![entry("GitHub"), entry("Mail")],
+        };
+        key.add_vault("Personal", &personal);
+        key.add_vault("Work", &Vault::default());
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+
+        let (r, steps) = run(&mut key, &mut auth);
+        let u = r.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(steps, vec![VaultStep::UnlockTouch]);
+        assert!(no_pin_token(&key), "{:?}", key.log);
+        assert_eq!(
+            key.log,
+            vec![
+                Call::UvToken {
+                    perms: CM | LBW,
+                    rp: None
+                },
+                Call::Credentials,
+                Call::UvToken {
+                    perms: GA | LBW,
+                    rp: Some(RP_ID.into())
+                },
+                Call::Assertions(None),
+                Call::Read,
+            ]
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [FingerAsk::Unlock, FingerAsk::Unlock]
+        );
+        assert_eq!(key.fingers, 2);
+        // The same hmac-secret whichever way the token came, so the vault
+        // a PIN unlock sealed opens.
+        assert_eq!(opened(&u.vaults[0]).contents, personal);
+        assert_eq!(opened(&u.vaults[1]).contents, Vault::default());
+        assert_eq!(auth.verified(), Some(Verified::Fingerprint));
+    }
+
+    #[test]
+    fn a_key_that_drops_the_token_asks_the_finger_again_and_says_why() {
+        let mut key = FakeKey::with_fingerprint();
+        key.drops_token_after_presence = true;
+        let id = key.add_vault("Personal", &Vault::default());
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        let mut u = unlock(&mut key, &mut auth, &mut |_| {}).unwrap_or_else(|e| panic!("{e}"));
+        let mut open = u.vaults.remove(0).state.unwrap_or_else(|p| panic!("{p}"));
+        let from = key.log.len();
+
+        let a = entry("GitHub");
+        let (r, steps) = save_with(&mut key, &mut auth, &mut open, &Change::Add(a.clone()));
+        r.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            key.log[from..],
+            [
+                Call::Read,
+                Call::Write,
+                Call::UvToken {
+                    perms: LBW,
+                    rp: None
+                },
+                Call::Read,
+                Call::Write,
+            ]
+        );
+        assert_eq!(steps, vec![VaultStep::Write, VaultStep::Write]);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [FingerAsk::Unlock, FingerAsk::Unlock, FingerAsk::Again]
+        );
+        assert!(no_pin_token(&key));
+        assert_eq!(key.vault_on_key(&id), Some(Vault { entries: vec![a] }));
+        assert_eq!(auth.verified(), Some(Verified::Fingerprint));
+    }
+
+    #[test]
+    fn a_stale_listing_token_asks_the_finger_again() {
+        let mut key = FakeKey::with_fingerprint();
+        key.add_vault("Personal", &Vault::default());
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        auth.fresh_token(&mut key, CM, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Another token from elsewhere invalidates the one held.
+        key.pin_token(FakeKey::PIN, LBW, None).unwrap();
+        key.log.clear();
+        run(&mut key, &mut auth).0.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            key.log[..2],
+            [
+                Call::Credentials,
+                Call::UvToken {
+                    perms: CM | LBW,
+                    rp: None
+                }
+            ]
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [FingerAsk::Unlock, FingerAsk::Again, FingerAsk::Unlock]
+        );
+    }
+
+    #[test]
+    fn auto_uses_the_pin_on_a_key_without_a_fingerprint() {
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &Vault::default());
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::auto(Some(Zeroizing::new(FakeKey::PIN.to_owned())), ask);
+        let (r, _) = run(&mut key, &mut auth);
+        r.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            key.log.iter().all(|c| !matches!(c, Call::UvToken { .. })),
+            "{:?}",
+            key.log
+        );
+        assert_eq!(
+            key.log
+                .iter()
+                .filter(|c| matches!(c, Call::Token { .. }))
+                .count(),
+            2
+        );
+        assert!(asked.lock().unwrap().is_empty());
+        assert_eq!(key.fingers, 0);
+        assert_eq!(auth.verified(), Some(Verified::Pin));
+    }
+
+    #[test]
+    fn auto_falls_back_to_the_pin_after_a_refusal_and_keeps_it() {
+        let mut key = FakeKey::with_fingerprint();
+        key.add_vault("Personal", &Vault::default());
+        key.uv_refusals.push_back(0x3F);
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::auto(Some(Zeroizing::new(FakeKey::PIN.to_owned())), ask);
+        let mut u = unlock(&mut key, &mut auth, &mut |_| {}).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            key.log[..3],
+            [
+                Call::UvToken {
+                    perms: CM | LBW,
+                    rp: None
+                },
+                Call::Token {
+                    perms: CM | LBW,
+                    rp: None
+                },
+                Call::Credentials,
+            ]
+        );
+        assert_eq!(key.uv_retries, 4);
+        assert_eq!(auth.verified(), Some(Verified::Pin));
+        // Every later token, in this flow and the next, comes from the PIN.
+        let mut open = u.vaults.remove(0).state.unwrap_or_else(|p| panic!("{p}"));
+        key.write_refusals.push_back(0x33);
+        saved(&mut key, &mut auth, &mut open, &Change::Add(entry("A")));
+        let uv = key
+            .log
+            .iter()
+            .filter(|c| matches!(c, Call::UvToken { .. }))
+            .count();
+        assert_eq!(uv, 1, "{:?}", key.log);
+        assert_eq!(
+            key.log
+                .iter()
+                .filter(|c| matches!(c, Call::Token { .. }))
+                .count(),
+            3,
+            "credential management, the touch, the renewed write token"
+        );
+        assert_eq!(*asked.lock().unwrap(), [FingerAsk::Unlock]);
+        assert_eq!(auth.verified(), Some(Verified::Pin));
+    }
+
+    #[test]
+    fn a_refused_fingerprint_without_a_pin_says_use_the_pin() {
+        let mut key = FakeKey::with_fingerprint();
+        key.add_vault("Personal", &Vault::default());
+        key.uv_refusals.push_back(0x3F);
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        let (r, steps) = run(&mut key, &mut auth);
+        let Err(err) = r else { panic!("refused") };
+        assert!(
+            matches!(
+                err,
+                VaultKeyError::Ctap(CtapError::Fingerprint(FingerprintError::Refused(0x3F)))
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("use the PIN instead"), "{err}");
+        assert!(steps.is_empty());
+        assert!(no_pin_token(&key));
+        assert_eq!(*asked.lock().unwrap(), [FingerAsk::Unlock]);
+        assert_eq!(auth.verified(), None);
+        assert!(auth.current_for(CM).is_none());
+    }
+
+    #[test]
+    fn auto_without_a_pin_on_a_key_without_a_fingerprint_is_the_fingerprint_error() {
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &Vault::default());
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::auto(None, ask);
+        let Err(err) = run(&mut key, &mut auth).0 else {
+            panic!("refused")
+        };
+        assert!(
+            matches!(
+                err,
+                VaultKeyError::Ctap(CtapError::Fingerprint(FingerprintError::NotOffered))
+            ),
+            "{err:?}"
+        );
+        assert!(key.log.is_empty(), "{:?}", key.log);
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn zero_retries_refuse_before_any_finger() {
+        let mut key = FakeKey::with_fingerprint();
+        key.add_vault("Personal", &Vault::default());
+        key.uv_retries = 0;
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        let Err(err) = run(&mut key, &mut auth).0 else {
+            panic!("refused")
+        };
+        assert!(
+            matches!(
+                err,
+                VaultKeyError::Ctap(CtapError::Fingerprint(FingerprintError::Blocked {
+                    status: None
+                }))
+            ),
+            "{err:?}"
+        );
+        assert!(asked.lock().unwrap().is_empty());
+        assert_eq!(key.fingers, 0);
+        assert!(no_pin_token(&key));
+    }
+
+    #[test]
+    fn the_last_refusal_blocks_the_next_ask() {
+        let mut key = FakeKey::with_fingerprint();
+        key.add_vault("Personal", &Vault::default());
+        key.uv_retries = 1;
+        key.uv_refusals.push_back(0x3F);
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        assert!(run(&mut key, &mut auth).0.is_err());
+        assert_eq!(key.uv_retries, 0);
+        let Err(err) = run(&mut key, &mut auth).0 else {
+            panic!("blocked")
+        };
+        assert!(
+            matches!(
+                err,
+                VaultKeyError::Ctap(CtapError::Fingerprint(FingerprintError::Blocked { .. }))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(*asked.lock().unwrap(), [FingerAsk::Unlock]);
     }
 }

@@ -8,23 +8,26 @@
 //! the permission a call needs, a successful makeCredential or
 //! getAssertion leaves the token only its largeBlobWrite permission (CTAP
 //! 2.1 `clearPinUvAuthTokenPermissionsExceptLbw`), and a write larger than
-//! the store is refused.
+//! the store is refused. A key made [`FakeKey::with_fingerprint`] also gives
+//! tokens for a finger, with scripted refusals and tries left, and can drop
+//! a token entirely after a touch, as some keys do.
 //!
 //! Built for this crate's tests, and for a front end's tests through the
 //! `vault-fake` feature, which only a `[dev-dependencies]` entry enables.
 //! Not part of the crate's API: hidden from its docs, and free to change.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use keyroost_ctap::client_pin::permissions::{
     CREDENTIAL_MANAGEMENT, GET_ASSERTION, LARGE_BLOB_WRITE, MAKE_CREDENTIAL,
 };
-use keyroost_ctap::client_pin::PinUvAuthToken;
+use keyroost_ctap::client_pin::{built_in_uv, uv_grants, BuiltInUv, FingerAsk, PinUvAuthToken};
 use keyroost_ctap::device_label::DeviceLabel;
 use keyroost_ctap::get_assertion::Assertion;
 use keyroost_ctap::large_blobs::{empty_array_serialized, LargeBlobArray};
 use keyroost_ctap::make_credential::MadeCredential;
-use keyroost_ctap::{AuthenticatorInfo, CtapError};
+use keyroost_ctap::{AuthenticatorInfo, CtapError, FingerprintError};
 use keyroost_vault::{open, seal, user_handle, Vault};
 use zeroize::Zeroizing;
 
@@ -40,7 +43,13 @@ const NOT_ALLOWED: u8 = 0x30;
 /// `CTAP2_ERR_NO_CREDENTIALS`.
 const NO_CREDENTIALS: u8 = 0x2E;
 /// `CTAP2_ERR_LARGE_BLOB_STORAGE_FULL`.
-const STORAGE_FULL: u8 = 0x3B;
+const STORAGE_FULL: u8 = 0x18;
+/// `CTAP2_ERR_UV_INVALID`: the finger was not recognized; one try spent.
+const UV_INVALID: u8 = 0x3F;
+/// `CTAP2_ERR_UV_BLOCKED`.
+const UV_BLOCKED: u8 = 0x3C;
+/// The fingerprint tries a fresh key has.
+const UV_TRIES: u32 = 5;
 /// The checksum trailer after a serialized largeBlob array.
 const CHECKSUM_LEN: usize = 16;
 
@@ -75,7 +84,17 @@ pub struct FakeCred {
 /// A call a flow made, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
-    Token { perms: u32, rp: Option<String> },
+    /// A PIN token request.
+    Token {
+        perms: u32,
+        rp: Option<String>,
+    },
+    /// A fingerprint token request that reached the key (getInfo allowed
+    /// it).
+    UvToken {
+        perms: u32,
+        rp: Option<String>,
+    },
     MakeCredential,
     Assertions(Option<Vec<u8>>),
     Credentials,
@@ -116,6 +135,19 @@ pub struct FakeKey {
     pub credmgmt_without_lbk: bool,
     /// Every credential delete fails (`NOT_ALLOWED`).
     pub delete_fails: bool,
+    /// Fingerprint tries left (getUVRetries). At 0 a fingerprint token is
+    /// refused as blocked before the finger is asked for.
+    pub uv_retries: u32,
+    /// Status codes the next fingerprint token requests answer, one per
+    /// request, after the finger was asked for. `0x3F` (not recognized)
+    /// spends one of [`uv_retries`](Self::uv_retries).
+    pub uv_refusals: VecDeque<u8>,
+    /// A makeCredential or getAssertion leaves its token no permission at
+    /// all, not even largeBlobWrite: a key that drops the token after a
+    /// touch.
+    pub drops_token_after_presence: bool,
+    /// How many times a finger was asked for.
+    pub fingers: usize,
     /// The serialized array with its checksum.
     stored: Vec<u8>,
     /// Every token issued: its bytes and permissions.
@@ -169,6 +201,10 @@ impl FakeKey {
             mc_without_lbk: false,
             credmgmt_without_lbk: false,
             delete_fails: false,
+            uv_retries: UV_TRIES,
+            uv_refusals: VecDeque::new(),
+            drops_token_after_presence: false,
+            fingers: 0,
             stored: empty_array_serialized(),
             issued: Vec::new(),
             current: None,
@@ -176,6 +212,16 @@ impl FakeKey {
             writes: 0,
             next: 0,
         }
+    }
+
+    /// A key with a fingerprint enrolled: getInfo `uv` and `bioEnroll` are
+    /// true, so built-in UV is ready.
+    pub fn with_fingerprint() -> Self {
+        let mut key = FakeKey::new();
+        key.info
+            .options
+            .extend([("uv".to_owned(), true), ("bioEnroll".to_owned(), true)]);
+        key
     }
 
     /// Set the store's size (`maxSerializedLargeBlobArray`).
@@ -312,10 +358,28 @@ impl FakeKey {
 
     /// CTAP 2.1 `clearPinUvAuthTokenPermissionsExceptLbw`: after a
     /// makeCredential or getAssertion with user presence, `token` keeps only
-    /// its largeBlobWrite permission.
+    /// its largeBlobWrite permission, or none with
+    /// [`drops_token_after_presence`](Self::drops_token_after_presence).
     fn keep_only_lbw(&mut self, token: &PinUvAuthToken) {
+        let keep = if self.drops_token_after_presence {
+            0
+        } else {
+            LARGE_BLOB_WRITE
+        };
         if let Some((_, perms)) = self.issued.iter_mut().find(|(t, _)| *t == token.token) {
-            *perms &= LARGE_BLOB_WRITE;
+            *perms &= keep;
+        }
+    }
+
+    /// Issue a new token with `permissions`; it invalidates the old one.
+    fn issue(&mut self, permissions: u32) -> PinUvAuthToken {
+        let mut bytes = vec![0x70; 32];
+        bytes[0] = self.issued.len() as u8;
+        self.issued.push((bytes.clone(), permissions));
+        self.current = Some(bytes.clone());
+        PinUvAuthToken {
+            protocol: 2,
+            token: bytes,
         }
     }
 }
@@ -344,14 +408,50 @@ impl VaultKey for FakeKey {
         if pin != Self::PIN {
             return Err(CtapError::StatusCode(PIN_INVALID));
         }
-        let mut bytes = vec![0x70; 32];
-        bytes[0] = self.issued.len() as u8;
-        self.issued.push((bytes.clone(), permissions));
-        self.current = Some(bytes.clone());
-        Ok(PinUvAuthToken {
-            protocol: 2,
-            token: bytes,
-        })
+        Ok(self.issue(permissions))
+    }
+
+    /// The rules `get_token` follows for a fingerprint: what getInfo rules
+    /// out is refused with no exchange (no [`Call::UvToken`]); no tries
+    /// left is refused before the finger; then the finger is asked for and
+    /// a scripted refusal, if any, answers.
+    fn uv_token(
+        &mut self,
+        permissions: u32,
+        rp_id: Option<&str>,
+        on_finger: &mut dyn FnMut(),
+    ) -> Result<PinUvAuthToken, CtapError> {
+        let refuse = |why| Err(CtapError::Fingerprint(why));
+        match built_in_uv(&self.info) {
+            BuiltInUv::Ready => {}
+            BuiltInUv::NoneEnrolled => return refuse(FingerprintError::NoneEnrolled),
+            BuiltInUv::NotOffered => return refuse(FingerprintError::NotOffered),
+        }
+        if !uv_grants(&self.info, permissions) {
+            return refuse(FingerprintError::NotForThis);
+        }
+        self.log.push(Call::UvToken {
+            perms: permissions,
+            rp: rp_id.map(str::to_owned),
+        });
+        if self.uv_retries == 0 {
+            return refuse(FingerprintError::Blocked { status: None });
+        }
+        on_finger();
+        self.fingers += 1;
+        if let Some(code) = self.uv_refusals.pop_front() {
+            if code == UV_INVALID {
+                self.uv_retries -= 1;
+            }
+            return match code {
+                UV_BLOCKED => refuse(FingerprintError::Blocked { status: Some(code) }),
+                0x27 | 0x2F | 0x30 | 0x34 | 0x3A | UV_INVALID | 0x40 => {
+                    refuse(FingerprintError::Refused(code))
+                }
+                _ => Err(CtapError::StatusCode(code)),
+            };
+        }
+        Ok(self.issue(permissions))
     }
 
     fn make_credential(
@@ -492,6 +592,18 @@ impl VaultKey for FakeKey {
         }
         Ok(())
     }
+}
+
+/// A finger-ask callback for `VaultAuth::fingerprint` / `VaultAuth::auto`
+/// that records every ask, and the record to check.
+#[allow(clippy::type_complexity)]
+pub fn asks() -> (Arc<Mutex<Vec<FingerAsk>>>, Box<dyn FnMut(FingerAsk) + Send>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&asked);
+    (
+        asked,
+        Box::new(move |why| record.lock().expect("not poisoned").push(why)),
+    )
 }
 
 #[cfg(test)]
@@ -730,6 +842,113 @@ mod tests {
         ));
         assert_eq!(key.array().len(), 1);
         key.write_blobs(&t, &note).unwrap();
+    }
+
+    fn finger(key: &mut FakeKey, perms: u32) -> Result<PinUvAuthToken, CtapError> {
+        key.uv_token(perms, None, &mut || {})
+    }
+
+    #[test]
+    fn a_finger_token_follows_getinfo_and_the_tries_left() {
+        use keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT;
+        // No fingerprint: refused with no exchange and no finger.
+        let mut key = FakeKey::new();
+        assert!(matches!(
+            finger(&mut key, LARGE_BLOB_WRITE),
+            Err(CtapError::Fingerprint(FingerprintError::NotOffered))
+        ));
+        key.info.options.push(("uv".into(), false));
+        assert!(matches!(
+            finger(&mut key, LARGE_BLOB_WRITE),
+            Err(CtapError::Fingerprint(FingerprintError::NoneEnrolled))
+        ));
+        assert!(key.log.is_empty());
+        assert_eq!(key.fingers, 0);
+
+        let mut key = FakeKey::with_fingerprint();
+        assert!(matches!(
+            finger(&mut key, BIO_ENROLLMENT),
+            Err(CtapError::Fingerprint(FingerprintError::NotForThis))
+        ));
+        assert!(key.log.is_empty());
+
+        key.uv_retries = 2;
+        key.uv_refusals.extend([0x2F, UV_INVALID, UV_INVALID, 0x2F]);
+        assert!(matches!(
+            finger(&mut key, LARGE_BLOB_WRITE),
+            Err(CtapError::Fingerprint(FingerprintError::Refused(0x2F)))
+        ));
+        assert_eq!(key.uv_retries, 2, "a timeout spends no try");
+        for left in [1, 0] {
+            assert!(matches!(
+                finger(&mut key, LARGE_BLOB_WRITE),
+                Err(CtapError::Fingerprint(FingerprintError::Refused(
+                    UV_INVALID
+                )))
+            ));
+            assert_eq!(key.uv_retries, left);
+        }
+        let mut asked = false;
+        assert!(matches!(
+            key.uv_token(LARGE_BLOB_WRITE, None, &mut || asked = true),
+            Err(CtapError::Fingerprint(FingerprintError::Blocked {
+                status: None
+            }))
+        ));
+        assert!(!asked, "no finger once no try is left");
+        assert_eq!(key.fingers, 3);
+        assert_eq!(key.uv_refusals.len(), 1, "the blocked request popped none");
+
+        key.uv_retries = 5;
+        key.uv_refusals = [UV_BLOCKED, 0x37].into();
+        assert!(matches!(
+            finger(&mut key, LARGE_BLOB_WRITE),
+            Err(CtapError::Fingerprint(FingerprintError::Blocked {
+                status: Some(UV_BLOCKED)
+            }))
+        ));
+        assert!(matches!(
+            finger(&mut key, LARGE_BLOB_WRITE),
+            Err(CtapError::StatusCode(0x37))
+        ));
+
+        let t = key
+            .uv_token(CREDENTIAL_MANAGEMENT, Some("example.com"), &mut || {})
+            .unwrap();
+        assert_eq!(
+            key.log.last(),
+            Some(&Call::UvToken {
+                perms: CREDENTIAL_MANAGEMENT,
+                rp: Some("example.com".into())
+            })
+        );
+        assert!(key.credentials(&t).is_ok());
+    }
+
+    #[test]
+    fn a_dropping_key_leaves_the_token_nothing_after_a_touch() {
+        let mut key = FakeKey::with_fingerprint();
+        key.drops_token_after_presence = true;
+        key.add_vault("Personal", &Vault::default());
+        let t = finger(&mut key, GET_ASSERTION | LARGE_BLOB_WRITE).unwrap();
+        assert_eq!(key.assertions(&t, None).unwrap().len(), 1);
+        assert_eq!(key.perms_of(&t), 0);
+        let bytes = key.stored().to_vec();
+        assert!(matches!(
+            key.write_blobs(&t, &bytes),
+            Err(CtapError::StatusCode(PIN_AUTH_INVALID))
+        ));
+    }
+
+    #[test]
+    fn asks_records_every_ask() {
+        let (asked, mut ask) = asks();
+        ask(FingerAsk::Unlock);
+        ask(FingerAsk::Again);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [FingerAsk::Unlock, FingerAsk::Again]
+        );
     }
 
     #[test]

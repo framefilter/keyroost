@@ -1,7 +1,9 @@
 //! The seam between the vault flows and a key: [`VaultKey`], and
 //! [`CtapVaultKey`], the real key over CTAP.
 
-use keyroost_ctap::client_pin::{get_pin_uv_auth_token_with_permissions, PinUvAuthToken};
+use keyroost_ctap::client_pin::{
+    get_pin_uv_auth_token_with_permissions, get_token, PinUvAuthToken, TokenSource,
+};
 use keyroost_ctap::cred_mgmt::CredentialManager;
 use keyroost_ctap::get_assertion::{get_assertions, Assertion, GetAssertionRequest};
 use keyroost_ctap::hmac_secret::{self, prf_salt};
@@ -26,6 +28,19 @@ pub trait VaultKey {
         pin: &str,
         permissions: u32,
         rp_id: Option<&str>,
+    ) -> Result<PinUvAuthToken, CtapError>;
+
+    /// A pinUvAuthToken from a fingerprint (CTAP 2.1 built-in user
+    /// verification) with `permissions`, bound to `rp_id` when given.
+    /// Refused with [`CtapError::Fingerprint`] and no finger asked when the
+    /// key cannot give one (no fingerprint, a permission a finger cannot
+    /// grant, no tries left); otherwise `on_finger` runs once, right before
+    /// the key waits for the finger.
+    fn uv_token(
+        &mut self,
+        permissions: u32,
+        rp_id: Option<&str>,
+        on_finger: &mut dyn FnMut(),
     ) -> Result<PinUvAuthToken, CtapError>;
 
     /// Make a discoverable vault credential (waits for a touch).
@@ -112,6 +127,23 @@ impl<T: CtapTransport> VaultKey for CtapVaultKey<T> {
         rp_id: Option<&str>,
     ) -> Result<PinUvAuthToken, CtapError> {
         get_pin_uv_auth_token_with_permissions(&mut self.dev, pin, permissions, rp_id)
+    }
+
+    fn uv_token(
+        &mut self,
+        permissions: u32,
+        rp_id: Option<&str>,
+        on_finger: &mut dyn FnMut(),
+    ) -> Result<PinUvAuthToken, CtapError> {
+        get_token(
+            &mut self.dev,
+            &self.info,
+            TokenSource::Fingerprint,
+            permissions,
+            rp_id,
+            on_finger,
+        )
+        .map(|(token, _)| token)
     }
 
     fn make_credential(

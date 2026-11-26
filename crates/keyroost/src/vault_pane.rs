@@ -7559,6 +7559,20 @@ mod tests {
         ) -> Result<Token, CtapError> {
             self.key.pin_token(pin, permissions, rp_id)
         }
+        fn uv_token(
+            &mut self,
+            permissions: u32,
+            rp_id: Option<&str>,
+            on_finger: &mut dyn FnMut(),
+        ) -> Result<Token, CtapError> {
+            // The key waits for the finger once `on_finger` has run, so the
+            // banner shown then is the one this finger touch sees.
+            let (at_touch, banner) = (&mut self.at_touch, &self.banner);
+            self.key.uv_token(permissions, rp_id, &mut || {
+                on_finger();
+                at_touch.push(shown(banner));
+            })
+        }
         fn make_credential(
             &mut self,
             token: &Token,

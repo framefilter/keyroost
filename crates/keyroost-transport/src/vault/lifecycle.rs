@@ -260,8 +260,8 @@ fn remove_data(
 }
 
 /// Delete credential `id` with the current token when it allows credential
-/// management, else a fresh one; once more with a fresh token when the key
-/// dropped it or let it expire.
+/// management, else a fresh one; once more with a renewed token when the
+/// key dropped it or let it expire.
 fn delete_credential(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
@@ -273,7 +273,7 @@ fn delete_credential(
     };
     match key.delete_credential(&token, id) {
         Err(e) if stale_token(&e) => {
-            let token = auth.fresh_token(key, CREDENTIAL_MANAGEMENT, None)?;
+            let token = auth.renewed_token(key, CREDENTIAL_MANAGEMENT, None)?;
             Ok(key.delete_credential(token, id)?)
         }
         r => Ok(r?),
@@ -1068,6 +1068,42 @@ mod tests {
         );
         assert_eq!(key.array().len(), 0);
         assert_eq!(key.creds.len(), 1);
+    }
+
+    #[test]
+    fn a_fingerprint_delete_asks_again_on_a_stale_token() {
+        use super::super::fake::asks;
+        use keyroost_ctap::client_pin::FingerAsk;
+        let mut key = FakeKey::with_fingerprint();
+        let p = key.add_vault("Personal", &Vault::default());
+        key.delete_refusals.extend([0x33]);
+        let (asked, ask) = asks();
+        let (r, _) = run_delete(&mut key, &mut VaultAuth::fingerprint(ask), "Personal");
+        r.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            key.log,
+            vec![
+                Call::UvToken {
+                    perms: CM | LBW,
+                    rp: None
+                },
+                Call::Credentials,
+                Call::Read,
+                Call::Read,
+                Call::Write,
+                Call::Delete(p.clone()),
+                Call::UvToken {
+                    perms: CM,
+                    rp: None
+                },
+                Call::Delete(p),
+            ]
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [FingerAsk::Unlock, FingerAsk::Again]
+        );
+        assert!(key.creds.is_empty());
     }
 
     #[test]
