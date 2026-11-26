@@ -257,6 +257,16 @@ pub(crate) const SECRET_FLAGS: &[SecretFlag] = &[
         default_ok: false,
     },
     SecretFlag {
+        long: "a-pin",
+        what: "the PIN",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "b-pin",
+        what: "the PIN",
+        default_ok: false,
+    },
+    SecretFlag {
         long: "puk",
         what: "the PUK",
         default_ok: false,
@@ -541,30 +551,52 @@ impl<I: SecretIo> Secrets<I> {
         Ok(first)
     }
 
+    /// Read a PIN at a caller-worded hidden prompt, where an empty line
+    /// means `fallback` when one is given (`fido credential compare`: the
+    /// second key's prompt offers ENTER for the same PIN as the first key).
+    /// Only the interactive case reaches here — flag and piped-stdin
+    /// sources are read with `read`.
+    pub(crate) fn read_with_fallback(
+        &mut self,
+        spec: &Spec,
+        prompt: &str,
+        fallback: Option<&Zeroizing<String>>,
+    ) -> Result<Zeroizing<String>, String> {
+        let typed = self.hidden_text(spec, prompt)?;
+        match (typed.is_empty(), fallback) {
+            (true, Some(first)) => Ok(first.clone()),
+            _ => finish(spec, typed, Origin::Prompt),
+        }
+    }
+
     fn hidden(&mut self, spec: &Spec, repeat: bool) -> Result<Zeroizing<String>, String> {
+        self.hidden_text(spec, &spec.prompt_text(repeat))
+    }
+
+    /// `hidden` with the prompt text given directly, for callers that name
+    /// the key in the question.
+    fn hidden_text(&mut self, spec: &Spec, prompt: &str) -> Result<Zeroizing<String>, String> {
         self.prompted = true;
-        self.io
-            .read_hidden(&spec.prompt_text(repeat))
-            .map_err(|e| match e.kind() {
-                // rpassword turns off ISIG, so Ctrl-C arrives as a plain byte
-                // and it raises SIGINT itself before returning — that kills
-                // the process outright (and the terminal's echo may stay
-                // off unless the shell restores it), so on Unix `Interrupted`
-                // here is never actually reached from a live Ctrl-C; only
-                // Ctrl-D (UnexpectedEof) reaches this branch. On Windows
-                // rpassword calls GenerateConsoleCtrlEvent, which is
-                // asynchronous: `Interrupted` can come back and this message
-                // may print before the Ctrl-C handler ends the process —
-                // the same outcome, nothing changed.
-                ErrorKind::Interrupted | ErrorKind::UnexpectedEof => {
-                    "canceled; nothing was changed".to_string()
-                }
-                _ => format!(
-                    "could not read the {} at a hidden prompt ({e}); pass {} instead",
-                    spec.label,
-                    spec.sources_hint()
-                ),
-            })
+        self.io.read_hidden(prompt).map_err(|e| match e.kind() {
+            // rpassword turns off ISIG, so Ctrl-C arrives as a plain byte
+            // and it raises SIGINT itself before returning — that kills
+            // the process outright (and the terminal's echo may stay
+            // off unless the shell restores it), so on Unix `Interrupted`
+            // here is never actually reached from a live Ctrl-C; only
+            // Ctrl-D (UnexpectedEof) reaches this branch. On Windows
+            // rpassword calls GenerateConsoleCtrlEvent, which is
+            // asynchronous: `Interrupted` can come back and this message
+            // may print before the Ctrl-C handler ends the process —
+            // the same outcome, nothing changed.
+            ErrorKind::Interrupted | ErrorKind::UnexpectedEof => {
+                "canceled; nothing was changed".to_string()
+            }
+            _ => format!(
+                "could not read the {} at a hidden prompt ({e}); pass {} instead",
+                spec.label,
+                spec.sources_hint()
+            ),
+        })
     }
 }
 
@@ -963,6 +995,33 @@ mod tests {
         let io = FakeIo::piped(&[]).var("KR_EMPTY", "");
         let s = sec(io);
         assert!(s.check(&PW, Source::env("KR_EMPTY")).is_ok());
+    }
+
+    #[test]
+    fn fallback_prompt_accepts_empty_as_the_first_pin() {
+        // `credential compare`'s second-key prompt: ENTER reuses the first key's PIN.
+        let mut s = sec(FakeIo::terminal().typing(&[""]));
+        let first = Zeroizing::new("1234".to_string());
+        assert_eq!(
+            &*s.read_with_fallback(&PIN, "PIN for key B: ", Some(&first))
+                .unwrap(),
+            "1234"
+        );
+        assert!(s.prompted());
+        assert_eq!(s.io.prompts, vec!["PIN for key B: ".to_string()]);
+        // A typed answer is used as-is.
+        let mut s = sec(FakeIo::terminal().typing(&["4321"]));
+        assert_eq!(
+            &*s.read_with_fallback(&PIN, "PIN for key B: ", Some(&first))
+                .unwrap(),
+            "4321"
+        );
+        // Without a fallback an empty line is refused like any prompt.
+        let mut s = sec(FakeIo::terminal().typing(&[""]));
+        assert_eq!(
+            s.read_with_fallback(&PIN, "PIN: ", None).unwrap_err(),
+            "no PIN entered; nothing was changed"
+        );
     }
 
     #[test]

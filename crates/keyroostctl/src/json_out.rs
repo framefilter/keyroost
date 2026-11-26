@@ -561,6 +561,40 @@ pub(crate) struct FidoCredentialJson {
     pub algorithm_name: Option<&'static str>,
 }
 
+/// `keyroostctl fido --json credential compare` — resident credentials on two
+/// keys compared by (relying-party ID, user handle). Credential IDs always
+/// differ between keys, so they are not part of the comparison and not shown.
+/// The three groups hold distinct identities (`on_both` shows key A's entry);
+/// `total_a`/`total_b` are the readable entry counts, as `fido credential
+/// list` counts them. Relying parties whose `rpIdHash` came back malformed
+/// can't be listed, so their credentials are neither compared nor counted in
+/// the totals; per-side counts go in `unavailable_relying_parties_a`/`_b`.
+/// The side is a suffix, as OpenPGP's `_sig`/`_dec`/`_aut` fields are.
+#[derive(Serialize)]
+pub(crate) struct FidoCredCompareJson {
+    pub only_on_a: Vec<FidoCredCompareEntryJson>,
+    pub only_on_b: Vec<FidoCredCompareEntryJson>,
+    pub on_both: Vec<FidoCredCompareEntryJson>,
+    pub total_a: usize,
+    pub total_b: usize,
+    /// Relying parties skipped on each key (malformed `rpIdHash`, as
+    /// `fido credential list` reports them).
+    pub unavailable_relying_parties_a: usize,
+    pub unavailable_relying_parties_b: usize,
+}
+
+/// One resident credential in the `credential compare` output.
+#[derive(Serialize)]
+pub(crate) struct FidoCredCompareEntryJson {
+    pub rp_id: String,
+    pub rp_name: Option<String>,
+    /// The user handle as lowercase hex: most handles are random bytes, and
+    /// a lossy UTF-8 rendering could make two different handles look alike.
+    pub user_id: String,
+    pub user_name: Option<String>,
+    pub user_display_name: Option<String>,
+}
+
 /// `keyroostctl fido ssh --json list` — one entry per resident SSH credential
 /// (an `ssh:*` relying party), as the text form prints one line each.
 #[derive(Serialize)]
@@ -1368,6 +1402,50 @@ mod tests {
                     ("user_display_name", "string|null"),
                     ("algorithm", "number|null"),
                     ("algorithm_name", "string|null"),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn creds_compare_shape() {
+        let entry = |rp: &str, user_id: &str| FidoCredCompareEntryJson {
+            rp_id: rp.into(),
+            rp_name: Some("Example".into()),
+            user_id: user_id.into(),
+            user_name: Some("n".into()),
+            user_display_name: None,
+        };
+        let v = to_v(&FidoCredCompareJson {
+            only_on_a: vec![entry("example.com", "75")],
+            only_on_b: vec![entry("other.example", "76")],
+            on_both: vec![entry("both.example", "77")],
+            total_a: 2,
+            total_b: 2,
+            unavailable_relying_parties_a: 1,
+            unavailable_relying_parties_b: 0,
+        });
+        assert_shape(
+            &v,
+            &[
+                ("only_on_a", "array"),
+                ("only_on_b", "array"),
+                ("on_both", "array"),
+                ("total_a", "number"),
+                ("total_b", "number"),
+                ("unavailable_relying_parties_a", "number"),
+                ("unavailable_relying_parties_b", "number"),
+            ],
+        );
+        for group in ["only_on_a", "only_on_b", "on_both"] {
+            assert_shape(
+                &v[group][0],
+                &[
+                    ("rp_id", "string"),
+                    ("rp_name", "string|null"),
+                    ("user_id", "string"),
+                    ("user_name", "string|null"),
+                    ("user_display_name", "string|null"),
                 ],
             );
         }

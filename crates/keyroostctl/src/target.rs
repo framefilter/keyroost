@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use keyroost_resolve::{
-    endpoint, resolve_target_reading, Caps, Device, DeviceKind, EnumerateOptions, Need, Picker,
-    SelectError, Selector,
+    endpoint, list_number, resolve_target, resolve_target_reading, row_label,
+    selection_needs_key_names, Caps, Choice, Device, DeviceKind, EnumerateOptions, Need, NoPicker,
+    Picker, SelectError, Selector,
 };
 
 use crate::prompt::{RealTerm, TermPicker};
@@ -441,6 +442,231 @@ pub(crate) fn select_fido_any(
         let bl = keyroost_hid::bootloader_device_present().map(|b| b.to_string());
         add_bootloader_hint(e, bl.as_deref())
     })
+}
+
+/// Two rows naming the same physical key: the same resolver id, or the same
+/// USB HID path. Used both to refuse `--a`/`--b` naming one key and to
+/// exclude the named side from the auto-pick candidates.
+fn same_physical(a: &Device, b: &Device) -> bool {
+    a.id == b.id || (a.hid_path.is_some() && a.hid_path == b.hid_path)
+}
+
+/// Refuse a pair naming the same physical key twice.
+fn same_pair_check(a: Device, b: Device) -> Result<(Device, Device), Box<dyn Error>> {
+    if same_physical(&a, &b) {
+        return Err("--a and --b name the same key; pass two different keys".into());
+    }
+    Ok((a, b))
+}
+
+/// Resolve one explicit compare side with no picker: an exact value must match
+/// exactly, like `--device`. Errors name the flag passed (`--a`/`--b`), not
+/// the global `--device` the resolver message is written for.
+fn resolve_compare_side_explicit(
+    devices: &[Device],
+    sel: &Selector<'_>,
+    flag: &str,
+    side: &str,
+) -> Result<Device, Box<dyn Error>> {
+    let rewrite = |e: SelectError| -> Box<dyn Error> {
+        format!("{side}: {}", e.to_string().replace("--device", flag)).into()
+    };
+    match resolve_target(devices, sel, Need::FidoHid, &mut NoPicker) {
+        Ok(t) => Ok(t.device.clone()),
+        // A Molto2 named by serial matches no FIDO row: rescan admitting any
+        // key (which reads its serial) so the refusal says the key can't do
+        // this, not that nothing matches — the same fallback `select` uses.
+        Err(SelectError::NotFound { .. }) if sel.device.is_some() => {
+            let mut any = enumerate_for(Need::Any)?;
+            keyroost_resolve::add_key_names(&mut any, debug_on());
+            resolve_target_reading(
+                &any,
+                sel,
+                Need::FidoHid,
+                &mut NoPicker,
+                &mut molto_card_serial,
+            )
+            .map(|t| t.device.clone())
+            .map_err(rewrite)
+        }
+        // An undetected --a-path/--b-path is refused, unlike single-key
+        // --path's stand-in row: a two-key command fails closed rather than
+        // read a device the scan can't identify or tell apart from the other.
+        Err(e) => Err(rewrite(e)),
+    }
+}
+
+/// The FIDO-over-USB rows of `devices` in `list` order, without `exclude`.
+fn fido_candidates(devices: &[Device], exclude: Option<&Device>) -> Vec<usize> {
+    keyroost_resolve::list_order(devices)
+        .into_iter()
+        .filter(|&i| Need::FidoHid.admits(&devices[i]))
+        .filter(|&i| exclude.is_none_or(|x| !same_physical(&devices[i], x)))
+        .collect()
+}
+
+/// Pick one row of `idxs` at the terminal for `side` (`key A`/`key B`), or
+/// refuse with the standard list-the-keys error when not interactive.
+fn pick_compare_side(
+    devices: &[Device],
+    idxs: &[usize],
+    picker: &mut dyn Picker,
+    side: &str,
+) -> Result<Device, Box<dyn Error>> {
+    if !picker.interactive() {
+        // The standard refusal over the whole scan: it lists every candidate
+        // with the selector value that names it.
+        return resolve_target(devices, &Selector::default(), Need::FidoHid, &mut NoPicker)
+            .map(|t| t.device.clone())
+            .map_err(|e| {
+                format!("{side}: {}", e.to_string().replace("--device", "--a/--b")).into()
+            });
+    }
+    let choices: Vec<Choice> = idxs
+        .iter()
+        .map(|&i| Choice {
+            number: list_number(devices, i).unwrap_or(0),
+            label: row_label(&devices[i]),
+            endpoint: endpoint(&devices[i], Need::FidoHid),
+        })
+        .collect();
+    let k = picker
+        .pick(
+            &format!("Select {side} ({} connected keys qualify):", idxs.len()),
+            &choices,
+        )
+        .map_err(|e| -> Box<dyn Error> { format!("{side}: {e}").into() })?;
+    let i = *idxs.get(k).ok_or_else(|| -> Box<dyn Error> {
+        format!("{side}: choice {k} is out of range").into()
+    })?;
+    Ok(devices[i].clone())
+}
+
+/// Pair `devices` (one enumerated scan) with the two compare selectors.
+/// Explicit sides must match exactly; an unnamed side is the only remaining
+/// FIDO row, or picked at the terminal; with neither side named, exactly two
+/// connected keys are compared as-is. Takes the picker for the ambiguous
+/// cases; an explicit side naming a Molto2 serial re-enumerates admitting any
+/// key for the fallback refusal.
+fn resolve_compare_pair(
+    devices: &[Device],
+    sel_a: &Selector<'_>,
+    sel_b: &Selector<'_>,
+    picker: &mut dyn Picker,
+) -> Result<(Device, Device), Box<dyn Error>> {
+    let explicit = |s: &Selector<'_>| s.device.is_some() || s.path.is_some();
+    let exp_a = explicit(sel_a);
+    let exp_b = explicit(sel_b);
+    if exp_a && exp_b {
+        let a = resolve_compare_side_explicit(devices, sel_a, "--a", "key A")?;
+        let b = resolve_compare_side_explicit(devices, sel_b, "--b", "key B")?;
+        return same_pair_check(a, b);
+    }
+    if exp_a || exp_b {
+        // One side named: the other is the only remaining FIDO row, if there
+        // is exactly one, else picked at the terminal.
+        let (sel_named, flag_n, side_n, side_o, named_first) = if exp_a {
+            (sel_a, "--a", "key A", "key B", true)
+        } else {
+            (sel_b, "--b", "key B", "key A", false)
+        };
+        let named = resolve_compare_side_explicit(devices, sel_named, flag_n, side_n)?;
+        let rest = fido_candidates(devices, Some(&named));
+        let other = match rest.as_slice() {
+            [] => {
+                return Err(format!(
+                    "only one key with FIDO2 over USB is connected; connect a second key for {side_o}"
+                )
+                .into());
+            }
+            [i] => devices[*i].clone(),
+            _ => pick_compare_side(devices, &rest, picker, side_o)?,
+        };
+        let (a, b) = if named_first {
+            (named, other)
+        } else {
+            (other, named)
+        };
+        return same_pair_check(a, b);
+    }
+    let all = fido_candidates(devices, None);
+    match all.as_slice() {
+        [] => {
+            let e = resolve_target(devices, &Selector::default(), Need::FidoHid, &mut NoPicker)
+                .expect_err("no FIDO row, so no row can be picked");
+            Err(e.into())
+        }
+        [i] => Err(format!(
+            "only one key with FIDO2 over USB is connected ({}); connect a second key to compare",
+            row_label(&devices[*i])
+        )
+        .into()),
+        [first, second] => same_pair_check(devices[*first].clone(), devices[*second].clone()),
+        _ => {
+            let a = pick_compare_side(devices, &all, picker, "key A")?;
+            let rest = fido_candidates(devices, Some(&a));
+            let b = pick_compare_side(devices, &rest, picker, "key B")?;
+            same_pair_check(a, b)
+        }
+    }
+}
+
+/// Select the two FIDO-over-USB keys `fido credential compare` compares:
+/// explicit `--a`/`--b` sides must match exactly, otherwise two connected
+/// keys are compared as-is and more are picked at the terminal. Prints one
+/// announce line per key, like `select`, with the same bootloader/admin hints.
+pub(crate) fn select_fido_pair(
+    a_device: Option<&str>,
+    a_path: Option<&Path>,
+    b_device: Option<&str>,
+    b_path: Option<&Path>,
+) -> Result<(Device, Device), Box<dyn Error>> {
+    let sel_a = Selector {
+        device: a_device,
+        reader: None,
+        path: a_path,
+    };
+    let sel_b = Selector {
+        device: b_device,
+        reader: None,
+        path: b_path,
+    };
+    let mut term = RealTerm;
+    let mut picker = TermPicker::new(&mut term);
+    let mut devices = enumerate_for(Need::FidoHid)?;
+    if selection_needs_key_names(&devices, &sel_a, Need::FidoHid)
+        || selection_needs_key_names(&devices, &sel_b, Need::FidoHid)
+    {
+        keyroost_resolve::add_key_names(&mut devices, debug_on());
+    }
+    let (mut a, mut b) =
+        resolve_compare_pair(&devices, &sel_a, &sel_b, &mut picker).map_err(|e| {
+            let bl = keyroost_hid::bootloader_device_present().map(|b| b.to_string());
+            add_admin_hint(
+                add_bootloader_hint(e, bl.as_deref()),
+                Need::FidoHid,
+                crate::admin_only_fido_key_present,
+            )
+        })?;
+    // Name the chosen rows by model, as `select_from` does for its one row.
+    for d in [&mut a, &mut b] {
+        keyroost_resolve::add_fido_models(std::slice::from_mut(d), debug_on());
+    }
+    errln!("{}", announce_side(&a, "key A"));
+    errln!("{}", announce_side(&b, "key B"));
+    Ok((a, b))
+}
+
+/// The announce line for one side of a two-key command, naming the side
+/// (`→ key A: Model · serial X · path`): the result headings say "key A" and
+/// "key B", and with two keys compared as-is the order alone would not tell
+/// the user which key is which.
+fn announce_side(d: &Device, side: &str) -> String {
+    let line = announce_line(d, Need::FidoHid);
+    match line.strip_prefix("\u{2192} ") {
+        Some(rest) => format!("\u{2192} {side}: {rest}"),
+        None => format!("{side}: {line}"),
+    }
 }
 
 /// The HID path of the selected FIDO key.
@@ -1057,5 +1283,256 @@ mod tests {
         // Nor does an error that isn't about finding no key.
         let other: Box<dyn std::error::Error> = Box::new(SelectError::Conflict);
         assert!(!hinted(other, Need::FidoHid, true).contains("administrator"));
+    }
+
+    /// A scripted picker for the compare pair tests: answers are indices into
+    /// each `pick` call's choices, in order.
+    struct FakePicker {
+        interactive: bool,
+        answers: std::collections::VecDeque<usize>,
+        headings: Vec<String>,
+    }
+    impl FakePicker {
+        fn answering(answers: &[usize]) -> Self {
+            FakePicker {
+                interactive: true,
+                answers: answers.iter().copied().collect(),
+                headings: Vec::new(),
+            }
+        }
+        fn refusing() -> Self {
+            FakePicker {
+                interactive: false,
+                answers: Default::default(),
+                headings: Vec::new(),
+            }
+        }
+    }
+    impl Picker for FakePicker {
+        fn interactive(&self) -> bool {
+            self.interactive
+        }
+        fn pick(&mut self, heading: &str, _choices: &[Choice]) -> Result<usize, String> {
+            self.headings.push(heading.to_string());
+            self.answers
+                .pop_front()
+                .ok_or_else(|| "no more answers".to_string())
+        }
+    }
+
+    fn side<'a>(device: Option<&'a str>, path: Option<&'a Path>) -> Selector<'a> {
+        Selector {
+            device,
+            reader: None,
+            path,
+        }
+    }
+
+    fn pair_err(
+        devices: &[Device],
+        a: Selector<'_>,
+        b: Selector<'_>,
+        picker: &mut dyn Picker,
+    ) -> String {
+        match resolve_compare_pair(devices, &a, &b, picker) {
+            Ok(_) => panic!("expected the pair to be refused"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn compare_pair_explicit_sides_resolve_in_ab_order() {
+        let devices = two_fido_keys();
+        let (a, b) = resolve_compare_pair(
+            &devices,
+            &side(Some("ABCDEF01"), None),
+            &side(Some("12345678"), None),
+            &mut NoPicker,
+        )
+        .unwrap();
+        assert_eq!(
+            (a.serial.as_str(), b.serial.as_str()),
+            ("ABCDEF01", "12345678")
+        );
+        // ... and by HID path.
+        let (a, b) = resolve_compare_pair(
+            &devices,
+            &side(None, Some(Path::new("/dev/hidraw2"))),
+            &side(None, Some(Path::new("/dev/hidraw1"))),
+            &mut NoPicker,
+        )
+        .unwrap();
+        assert_eq!(
+            (a.serial.as_str(), b.serial.as_str()),
+            ("ABCDEF01", "12345678")
+        );
+    }
+
+    #[test]
+    fn compare_pair_auto_picks_exactly_two_in_list_order() {
+        let devices = two_fido_keys();
+        let (a, b) = resolve_compare_pair(
+            &devices,
+            &side(None, None),
+            &side(None, None),
+            &mut NoPicker,
+        )
+        .unwrap();
+        // List order sorts by serial: 12345678 before ABCDEF01.
+        assert_eq!(a.serial, "12345678");
+        assert_eq!(b.serial, "ABCDEF01");
+    }
+
+    #[test]
+    fn compare_pair_one_named_side_auto_picks_the_other() {
+        let devices = two_fido_keys();
+        let (a, b) = resolve_compare_pair(
+            &devices,
+            &side(Some("ABCDEF01"), None),
+            &side(None, None),
+            &mut NoPicker,
+        )
+        .unwrap();
+        assert_eq!(
+            (a.serial.as_str(), b.serial.as_str()),
+            ("ABCDEF01", "12345678")
+        );
+        let (a, b) = resolve_compare_pair(
+            &devices,
+            &side(None, None),
+            &side(Some("12345678"), None),
+            &mut NoPicker,
+        )
+        .unwrap();
+        assert_eq!(
+            (a.serial.as_str(), b.serial.as_str()),
+            ("ABCDEF01", "12345678")
+        );
+    }
+
+    #[test]
+    fn compare_pair_refuses_the_same_key_twice() {
+        let devices = two_fido_keys();
+        let e = pair_err(
+            &devices,
+            side(Some("12345678"), None),
+            side(Some("12345678"), None),
+            &mut NoPicker,
+        );
+        assert!(e.contains("same key"), "{e}");
+        // ... however the row is named twice.
+        let e = pair_err(
+            &devices,
+            side(Some("12345678"), None),
+            side(None, Some(Path::new("/dev/hidraw1"))),
+            &mut NoPicker,
+        );
+        assert!(e.contains("same key"), "{e}");
+    }
+
+    #[test]
+    fn compare_pair_alias_rows_count_as_the_same_key() {
+        let mut devices = two_fido_keys();
+        // Same physical key under a second id (e.g. friendly name vs
+        // serial): the HID path is what ties the rows together.
+        let mut alias = devices[0].clone();
+        alias.id = "name:My Key".into();
+        devices.push(alias.clone());
+        assert!(same_physical(&devices[0], &alias));
+        // The auto-pick exclusion drops both rows, leaving only the other key.
+        assert_eq!(fido_candidates(&devices, Some(&devices[0])).len(), 1);
+        // And pairing the two spellings is refused like any same-key pair.
+        match same_pair_check(devices[0].clone(), alias) {
+            Ok(_) => panic!("expected the alias pair to be refused"),
+            Err(e) => assert!(e.to_string().contains("same key"), "{e}"),
+        }
+    }
+
+    #[test]
+    fn compare_pair_errors_name_the_side_flag() {
+        let devices = two_fido_keys();
+        let e = pair_err(
+            &devices,
+            side(Some("nope"), None),
+            side(None, None),
+            &mut NoPicker,
+        );
+        assert!(e.starts_with("key A: "), "{e}");
+        assert!(e.contains("--a nope"), "{e}");
+        assert!(!e.contains("--device"), "{e}");
+    }
+
+    #[test]
+    fn compare_pair_picks_both_sides_at_the_terminal() {
+        let mut devices = two_fido_keys();
+        let mut third = dev(None, "ZZZZ9999");
+        third.id = "serial:ZZZZ9999".into();
+        third.caps = Caps::FIDO2;
+        third.reader = None;
+        third.hid_path = Some("/dev/hidraw3".into());
+        devices.push(third);
+        // List order by serial: 12345678, ABCDEF01, ZZZZ9999.
+        let mut picker = FakePicker::answering(&[2, 0]);
+        let (a, b) =
+            resolve_compare_pair(&devices, &side(None, None), &side(None, None), &mut picker)
+                .unwrap();
+        assert_eq!(a.serial, "ZZZZ9999");
+        assert_eq!(b.serial, "12345678");
+        assert_eq!(
+            picker.headings,
+            vec![
+                "Select key A (3 connected keys qualify):",
+                "Select key B (2 connected keys qualify):",
+            ]
+        );
+    }
+
+    #[test]
+    fn compare_pair_refuses_without_a_terminal_when_ambiguous() {
+        let mut devices = two_fido_keys();
+        let mut third = dev(None, "ZZZZ9999");
+        third.id = "serial:ZZZZ9999".into();
+        third.caps = Caps::FIDO2;
+        third.reader = None;
+        third.hid_path = Some("/dev/hidraw3".into());
+        devices.push(third);
+        let e = pair_err(
+            &devices,
+            side(None, None),
+            side(None, None),
+            &mut FakePicker::refusing(),
+        );
+        assert!(e.starts_with("key A: "), "{e}");
+        assert!(e.contains("--a/--b"), "{e}");
+        assert!(!e.contains("--device"), "{e}");
+    }
+
+    #[test]
+    fn compare_announce_lines_name_each_side() {
+        let devices = two_fido_keys();
+        let a = announce_side(&devices[0], "key A");
+        let b = announce_side(&devices[1], "key B");
+        assert!(a.starts_with("\u{2192} key A: "), "{a}");
+        assert!(b.starts_with("\u{2192} key B: "), "{b}");
+        assert!(a.contains(&devices[0].serial), "{a}");
+        assert!(b.contains(&devices[1].serial), "{b}");
+    }
+
+    #[test]
+    fn compare_pair_needs_two_connected_keys() {
+        let one = vec![two_fido_keys()[0].clone()];
+        let e = pair_err(&one, side(None, None), side(None, None), &mut NoPicker);
+        assert!(e.contains("only one key"), "{e}");
+        // One named side with nothing else connected names its missing half.
+        let e = pair_err(
+            &one,
+            side(Some("12345678"), None),
+            side(None, None),
+            &mut NoPicker,
+        );
+        assert!(e.contains("key B"), "{e}");
+        // None connected: the standard no-candidates refusal.
+        let e = pair_err(&[], side(None, None), side(None, None), &mut NoPicker);
+        assert!(e.contains("FIDO2 over USB"), "{e}");
     }
 }
