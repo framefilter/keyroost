@@ -21,7 +21,7 @@ use keyroost_transport::vault::{
 };
 use keyroost_vault::{
     backup_file_name, canon_id, check_passphrase, classify, export_backup, generate_password,
-    import_backup, new_id, seal, user_handle, Entry, GenOptions, ImportStatus, Vault,
+    import_backup, new_id, Entry, GenOptions, ImportStatus, Vault, VaultError, MAX_NAME_BYTES,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -194,37 +194,29 @@ pub(crate) fn overview_line(
     }
 }
 
-/// What one entry adds to a sealed vault when nothing is known yet: a short
-/// login with no notes, rounded up.
-pub(crate) const DEFAULT_ENTRY_BYTES: usize = 80;
-
-/// About how many bytes one entry takes on the key, from the open vaults:
-/// what their entries add to a sealed empty vault, per entry, sealed under a
-/// stand-in secret (the size doesn't depend on it). At least 1;
-/// [`DEFAULT_ENTRY_BYTES`] with no entries to go by. Seals every open vault,
-/// so it runs when the contents change, never while drawing.
-pub(crate) fn entry_bytes_estimate(vaults: &[VaultOnKey]) -> usize {
-    let secret = [0x5a_u8; 32];
-    let Ok(empty) = seal(&Vault::default(), &secret).map(|b| b.len()) else {
-        return DEFAULT_ENTRY_BYTES;
-    };
-    let mut grown = 0usize;
-    let mut count = 0usize;
-    for open in vaults.iter().filter_map(|v| v.state.as_ref().ok()) {
-        let n = open.contents.entries.len();
-        if n == 0 {
-            continue;
-        }
-        let Ok(sealed) = seal(&open.contents, &secret) else {
-            return DEFAULT_ENTRY_BYTES;
-        };
-        grown += sealed.len().saturating_sub(empty);
-        count += n;
+/// Why a new vault can't be named `name` (already trimmed): the format's
+/// length limit, or one of the vaults named `taken` has it. `None` when it
+/// can. No key and no randomness: cheap enough to ask every frame.
+pub(crate) fn new_name_refusal(name: &str, taken: &[Option<String>]) -> Option<VaultKeyError> {
+    if name.is_empty() || name.len() > MAX_NAME_BYTES {
+        return Some(VaultKeyError::Vault(VaultError::NameLength));
     }
-    grown
-        .checked_div(count)
-        .map_or(DEFAULT_ENTRY_BYTES, |n| n.max(1))
+    taken
+        .iter()
+        .any(|t| t.as_deref() == Some(name))
+        .then(|| VaultKeyError::DuplicateName(name.to_owned()))
 }
+
+/// What one more entry takes on the key, for the space line's "room for
+/// about N more entries": one fixed size, so the number only falls as the
+/// store fills and only rises as it empties. Measured by sealing typical
+/// logins (a 20-character generated password, a site, user name and URL
+/// not already in the vault, no notes): the first entries of a vault add
+/// about 55 to 105 bytes each (the ID and password don't compress), later
+/// ones less as the compression finds repeats. 80 bytes covers the early
+/// ones, so the line promises a little less room than there is rather
+/// than more.
+pub(crate) const TYPICAL_ENTRY_BYTES: u64 = 80;
 
 /// `bytes` in KB with one decimal, a trailing `.0` dropped: `1.3`, `4`.
 pub(crate) fn kb(bytes: u64) -> String {
@@ -233,10 +225,11 @@ pub(crate) fn kb(bytes: u64) -> String {
 }
 
 /// How full the key's store is, in plain numbers: `1.3 of 4 KB used · room
-/// for about 75 more entries`, or `· full` when not one more fits.
-pub(crate) fn space_line(cap: &BlobCapacity, entry_bytes: usize) -> String {
+/// for about 34 more entries` (free bytes ÷ [`TYPICAL_ENTRY_BYTES`]), or
+/// `· full` when not one more fits.
+pub(crate) fn space_line(cap: &BlobCapacity) -> String {
     let used = format!("{} of {} KB used", kb(cap.used_bytes), kb(cap.max_bytes));
-    let n = cap.free_bytes / entry_bytes.max(1) as u64;
+    let n = cap.free_bytes / TYPICAL_ENTRY_BYTES;
     match n {
         0 => format!("{used} \u{00B7} full"),
         1 => format!("{used} \u{00B7} room for about 1 more entry"),
@@ -393,7 +386,8 @@ pub(crate) fn experimental_note(ui: &mut egui::Ui, p: &Palette) {
                     .color(p.txt3),
             )
         };
-        ui.add(text("Experimental: please "));
+        // The pill says "Experimental": the sentence starts after it.
+        ui.add(text("Please "));
         ui.hyperlink_to(
             egui::RichText::new("report problems").font(theme::f_reg(11.5)),
             ISSUES_URL,
@@ -1107,10 +1101,6 @@ pub(crate) struct VaultSession {
     /// The PIN came from the FIDO2 tab's session, so a refusal of it
     /// locks that tab too.
     pub(crate) pin_from_fido: bool,
-    /// About how many bytes one more entry takes ([`entry_bytes_estimate`]),
-    /// for the space line. Set whenever the contents change, never while
-    /// drawing.
-    pub(crate) entry_bytes: usize,
 }
 
 impl VaultSession {
@@ -1168,6 +1158,9 @@ pub(crate) struct VaultState {
     pub(crate) gen_open: bool,
     /// The action waiting for its confirmation card.
     pub(crate) confirm: Option<VaultConfirm>,
+    /// That card was just asked for: it scrolls into view once (the
+    /// vault's questions sit far from the buttons that ask them).
+    pub(crate) scroll_to_confirm: bool,
     /// The New vault box's name, while it is open. Not a secret: vault
     /// names are listed without unlocking.
     pub(crate) new_vault: Option<String>,
@@ -1204,6 +1197,7 @@ impl TypedSecrets for VaultState {
             gen: _,
             gen_open: _,
             confirm: _,
+            scroll_to_confirm: _,
             new_vault: _,
             export_for: _,
             export,
@@ -1352,13 +1346,11 @@ impl App {
         match result {
             Ok(unlocked) => {
                 self.vault.error = None;
-                let entry_bytes = entry_bytes_estimate(&unlocked.vaults);
                 self.vault.session = Some(VaultSession {
                     device,
                     auth: Some(auth),
                     unlocked,
                     pin_from_fido,
-                    entry_bytes,
                 });
                 self.refresh_storage_vault_labels();
                 // One PIN entry serves both tabs: the FIDO2 tab unlocks with
@@ -1425,7 +1417,6 @@ impl App {
         match result {
             Ok(()) => {
                 if let Some(s) = self.vault_session_mut() {
-                    s.entry_bytes = entry_bytes_estimate(&unlocked.vaults);
                     s.unlocked = unlocked;
                 }
                 self.refresh_storage_vault_labels();
@@ -1697,6 +1688,7 @@ impl App {
             vault,
             entry_id: id.to_owned(),
         });
+        self.vault.scroll_to_confirm = true;
     }
 
     /// The confirmed delete: the entry as the session holds it goes through
@@ -1727,8 +1719,21 @@ impl App {
             self.vault.error = Some(ENTRY_NOT_IN_VAULT.to_owned());
             return None;
         };
-        let title = Zeroizing::new(before.title.clone());
+        let title = self.vault_entry_name(&vault, &before);
         Some((vault, SaveKind::Delete { title }, Change::Delete { before }))
+    }
+
+    /// Entry `e` of `vault` as a question or a result line names it
+    /// ([`entry_shown_name`]): with its username (and host) when another
+    /// entry shares its title.
+    fn vault_entry_name(&self, vault: &VaultRef, e: &Entry) -> Zeroizing<String> {
+        match self
+            .session_vault(&vault.credential_id)
+            .and_then(|v| v.state.as_ref().ok())
+        {
+            Some(open) => entry_shown_name(&open.contents, e),
+            None => Zeroizing::new(e.title.clone()),
+        }
     }
 
     /// Entry `id` of `vault` as the session holds it.
@@ -1821,7 +1826,6 @@ impl App {
         if let Some(v) = s.vault_mut(&id) {
             v.state = Ok(open);
         }
-        s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
         self.refresh_storage_vault_labels();
     }
 
@@ -2219,7 +2223,7 @@ impl App {
             space_bar(ui, p, cap);
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(space_line(cap, session.entry_bytes))
+                egui::RichText::new(space_line(cap))
                     .font(theme::f_reg(11.5))
                     .color(p.txt3),
             );
@@ -2466,24 +2470,31 @@ impl App {
     /// format takes it and no vault on the key has it; otherwise `None`
     /// with the reason in the pane.
     fn vault_check_new_name(&mut self, typed: &str) -> Option<String> {
+        self.vault_session()?;
         let name = typed.trim().to_owned();
-        let taken = self
-            .vault_session()?
-            .unlocked
-            .vaults
-            .iter()
-            .any(|v| v.vault_ref.name.as_deref() == Some(name.as_str()));
-        let refused = match user_handle(&name) {
-            Err(e) => Some(VaultKeyError::Vault(e)),
-            Ok(_) if taken => Some(VaultKeyError::DuplicateName(name.clone())),
-            Ok(_) => None,
-        };
-        if let Some(e) = refused {
+        if let Some(e) = self.vault_new_name_refusal(&name) {
             self.vault.info = None;
             self.vault.error = Some(vault_error_text(&e));
             return None;
         }
         Some(name)
+    }
+
+    /// The names of the session's vaults, for [`new_name_refusal`].
+    fn vault_names(&self) -> Vec<Option<String>> {
+        self.vault_session().map_or_else(Vec::new, |s| {
+            s.unlocked
+                .vaults
+                .iter()
+                .map(|v| v.vault_ref.name.clone())
+                .collect()
+        })
+    }
+
+    /// Why a new vault can't be named `name` (already trimmed), against the
+    /// session's vaults ([`new_name_refusal`]).
+    pub(crate) fn vault_new_name_refusal(&self, name: &str) -> Option<VaultKeyError> {
+        new_name_refusal(name, &self.vault_names())
     }
 
     /// Create vault: an empty vault of the typed name on the selected key,
@@ -2565,7 +2576,6 @@ impl App {
                 state: Ok(open),
             });
             s.unlocked.capacity = capacity;
-            s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
         }
         self.refresh_storage_vault_labels();
         self.vault_select(id);
@@ -2591,6 +2601,7 @@ impl App {
         };
         let vault = v.vault_ref.clone();
         self.vault.confirm = Some(VaultConfirm::DeleteVault { vault });
+        self.vault.scroll_to_confirm = true;
     }
 
     /// Ask before rotating the shown vault's key; only a vault that opened.
@@ -2603,6 +2614,7 @@ impl App {
         };
         let vault = v.vault_ref.clone();
         self.vault.confirm = Some(VaultConfirm::Rotate { vault });
+        self.vault.scroll_to_confirm = true;
     }
 
     /// The waiting Delete vault or Rotate, taken once its Yes can run.
@@ -2682,7 +2694,6 @@ impl App {
                         open.stored = false;
                     }
                     s.unlocked.capacity = capacity;
-                    s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
                 }
                 self.refresh_storage_vault_labels();
                 self.vault.open_entry = None;
@@ -2696,7 +2707,6 @@ impl App {
                 .vaults
                 .retain(|v| v.vault_ref.credential_id != vault.credential_id);
             s.unlocked.capacity = capacity;
-            s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
         }
         self.refresh_storage_vault_labels();
         self.vault_fix_selection();
@@ -2798,7 +2808,6 @@ impl App {
                 None => s.unlocked.vaults.push(new),
             }
             s.unlocked.capacity = capacity;
-            s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
         }
         self.refresh_storage_vault_labels();
         if was_shown {
@@ -2827,7 +2836,6 @@ impl App {
                 let text = format!("{text} {ROTATE_AGAIN}");
                 self.log(Severity::Warn, format!("Vault: {text}"));
                 if let Some(s) = self.vault_session_mut() {
-                    s.entry_bytes = entry_bytes_estimate(&unlocked.vaults);
                     s.unlocked = unlocked;
                 }
                 self.refresh_storage_vault_labels();
@@ -2919,7 +2927,7 @@ impl App {
         let writable = self.vault_writable();
         let (mut confirm, mut cancel, mut export) = (false, false, false);
         ui.add_space(10.0);
-        theme::card_frame(p).show(ui, |ui| {
+        let card = theme::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.colored_label(color, question);
             ui.add_space(4.0);
@@ -2944,6 +2952,10 @@ impl App {
                 cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
             });
         });
+        // Asked just now: bring it into view (it may sit below the fold).
+        if std::mem::take(&mut self.vault.scroll_to_confirm) {
+            card.response.scroll_to_me(Some(egui::Align::Center));
+        }
         if export {
             self.vault_export_start();
         } else if confirm {
@@ -2971,12 +2983,12 @@ impl App {
             return;
         };
         let key = self.vault_key_title();
-        let question =
-            delete_entry_question(&entry.title, &shown_name(vault.name.as_deref()), &key);
+        let name = self.vault_entry_name(&vault, &entry);
+        let question = delete_entry_question(&name, &shown_name(vault.name.as_deref()), &key);
         let waiting = self.waiting_for().map(str::to_owned);
         let mut confirm = false;
         let mut cancel = false;
-        theme::card_frame(p).show(ui, |ui| {
+        let card = theme::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.colored_label(p.err, question);
             ui.add_space(4.0);
@@ -2997,6 +3009,10 @@ impl App {
                 }
             });
         });
+        // Asked just now: bring it into view (it may sit below the fold).
+        if std::mem::take(&mut self.vault.scroll_to_confirm) {
+            card.response.scroll_to_me(Some(egui::Align::Center));
+        }
         ui.add_space(10.0);
         if confirm {
             self.vault_confirm_delete_entry();
@@ -3129,7 +3145,7 @@ impl App {
                 ui.colored_label(p.warn, notice);
             }
             ui.add_space(8.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            right_row(ui, 32.0, |ui| {
                 save = theme::key_button(ui, p, BtnKind::Primary, "Save", waiting.as_deref())
                     .clicked();
                 if busy {
@@ -3498,7 +3514,7 @@ impl App {
                 );
             });
             ui.add_space(8.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            right_row(ui, 32.0, |ui| {
                 write = theme::button(ui, p, BtnKind::Primary, "Write backup").clicked();
                 if busy {
                     theme::button_disabled(ui, p, "Cancel");
@@ -3519,6 +3535,9 @@ impl App {
 fn imported_line(vault: &str, added: usize, replaced: usize) -> String {
     format!("Imported into vault \"{vault}\": {added} added, {replaced} replaced.")
 }
+
+/// Under the button of an import into a new vault before it has a name.
+const IMPORT_NAME_NEEDED: &str = "Type a name for the new vault.";
 
 /// The button that imports a backup file.
 const IMPORT_BUTTON: &str = "Import backup\u{2026}";
@@ -3673,6 +3692,29 @@ fn import_row_name(e: &Entry) -> Zeroizing<String> {
         push_flat(&mut s, host);
     }
     s
+}
+
+/// Entry `e` of `v` named so it can't be taken for another: its title when
+/// no other entry has it, else with its username, and its host too when
+/// that still leaves two alike (the row's words). Wiped: the username is
+/// private.
+fn entry_shown_name(v: &Vault, e: &Entry) -> Zeroizing<String> {
+    let alike = |same: &dyn Fn(&Entry) -> bool| v.entries.iter().filter(|o| same(o)).count() > 1;
+    if !alike(&|o| o.title == e.title) {
+        let mut s = Zeroizing::new(String::with_capacity(e.title.len()));
+        push_flat(&mut s, &e.title);
+        return s;
+    }
+    if !e.username.trim().is_empty() && !alike(&|o| o.title == e.title && o.username == e.username)
+    {
+        let mut s = Zeroizing::new(String::with_capacity(e.title.len() + e.username.len() + 3));
+        push_flat(&mut s, &e.title);
+        s.push_str(" (");
+        push_flat(&mut s, &e.username);
+        s.push(')');
+        return s;
+    }
+    import_row_name(e)
 }
 
 /// A file's name as the preview names it.
@@ -4108,6 +4150,7 @@ impl App {
             .as_ref()
             .and_then(|d| self.vault_import_current(&d.target).ok().flatten())
             .map_or(0, |v| v.entries.len());
+        let taken_names = self.vault_names();
         let Some(d) = self.vault.import.as_mut() else {
             return;
         };
@@ -4156,7 +4199,7 @@ impl App {
                 }
                 ui.add_space(8.0);
                 let can_open = !busy && !d.passphrase.is_empty();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                right_row(ui, 32.0, |ui| {
                     if can_open {
                         open |= theme::button(ui, p, BtnKind::Primary, "Open backup").clicked();
                     } else {
@@ -4211,13 +4254,22 @@ impl App {
             });
             ui.add_space(8.0);
 
-            let vault_name = match &d.target {
-                ImportTarget::Existing(v) => shown_name(v.name.as_deref()),
-                ImportTarget::New => shown_name(Some(d.new_name.trim())),
+            // A new vault's name, once it is one New vault would take.
+            let new_name = d.new_name.trim();
+            let refusal = match &d.target {
+                ImportTarget::Existing(_) => None,
+                ImportTarget::New => new_name_refusal(new_name, &taken_names),
+            };
+            let for_vault = match &d.target {
+                ImportTarget::Existing(v) => format!("vault \"{}\"", shown_name(v.name.as_deref())),
+                ImportTarget::New if refusal.is_none() => {
+                    format!("new vault \"{}\"", sanitize_title(new_name))
+                }
+                ImportTarget::New => "a new vault".to_owned(),
             };
             ui.label(
                 egui::RichText::new(format!(
-                    "{} in {} for vault \"{vault_name}\":",
+                    "{} in {} for {for_vault}:",
                     entries(incoming.entries.len()),
                     file_label(&d.path)
                 ))
@@ -4225,45 +4277,56 @@ impl App {
                 .color(p.txt),
             );
             ui.add_space(6.0);
-            egui::Grid::new("vault-import-rows")
-                .num_columns(4)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    for (i, r) in d.rows.iter().enumerate() {
-                        let Some(e) = incoming.entries.get(r.index) else {
-                            continue;
-                        };
-                        if has_box(r.status) {
-                            let mut on = r.ticked;
-                            if ui.checkbox(&mut on, "").changed() {
-                                tick = Some((i, on));
-                            }
-                        } else {
-                            // `exists` (and a comparison this build doesn't
-                            // know) has no box.
-                            ui.label("");
+            // A row per entry: the box and the plan in narrow columns, the
+            // entry's name in all the width left, its reason under it.
+            const BOX_W: f32 = 24.0;
+            const PLAN_W: f32 = 64.0;
+            for (i, r) in d.rows.iter().enumerate() {
+                let Some(e) = incoming.entries.get(r.index) else {
+                    continue;
+                };
+                let (plan, reason) = row_plan(r);
+                let taken = matches!(plan, "add" | "replace");
+                ui.horizontal_top(|ui| {
+                    if has_box(r.status) {
+                        let mut on = r.ticked;
+                        if ui
+                            .add_sized([BOX_W, 20.0], egui::Checkbox::without_text(&mut on))
+                            .changed()
+                        {
+                            tick = Some((i, on));
                         }
-                        let (plan, reason) = row_plan(r);
-                        let taken = matches!(plan, "add" | "replace");
-                        ui.label(
+                    } else {
+                        // `exists` (and a comparison this build doesn't
+                        // know) has no box.
+                        ui.add_space(BOX_W);
+                    }
+                    ui.add_sized(
+                        [PLAN_W, 20.0],
+                        egui::Label::new(
                             egui::RichText::new(plan)
                                 .font(theme::f_sb(12.5))
                                 .color(if taken { p.txt } else { p.txt3 }),
-                        );
+                        ),
+                    );
+                    ui.vertical(|ui| {
                         let name = import_row_name(e);
                         ui.label(
                             egui::RichText::new(name.as_str())
                                 .font(theme::f_reg(12.5))
                                 .color(p.txt),
                         );
-                        ui.label(
-                            egui::RichText::new(reason.unwrap_or(""))
-                                .font(theme::f_reg(12.0))
-                                .color(p.txt3),
-                        );
-                        ui.end_row();
-                    }
+                        if let Some(reason) = reason {
+                            ui.label(
+                                egui::RichText::new(reason)
+                                    .font(theme::f_reg(11.5))
+                                    .color(p.txt3),
+                            );
+                        }
+                    });
                 });
+                ui.add_space(4.0);
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if theme::button(ui, p, BtnKind::Ghost, "Tick all").clicked() {
@@ -4287,14 +4350,15 @@ impl App {
             let k = chosen(&d.rows).len();
             let button = match &d.target {
                 ImportTarget::Existing(_) => format!("Import {}", entries(k)),
-                ImportTarget::New => format!(
+                ImportTarget::New if refusal.is_none() => format!(
                     "Create vault \"{}\" and import {}",
-                    sanitize_title(d.new_name.trim()),
+                    sanitize_title(new_name),
                     entries(k)
                 ),
+                ImportTarget::New => format!("Create vault and import {}", entries(k)),
             };
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if k == 0 {
+            right_row(ui, 32.0, |ui| {
+                if k == 0 || refusal.is_some() {
                     theme::button_disabled(ui, p, &button);
                 } else {
                     import =
@@ -4308,15 +4372,23 @@ impl App {
                 }
             });
             let under = if k == 0 {
-                Some("Nothing to add.")
+                Some("Nothing to add.".to_owned())
+            } else if let Some(e) = &refusal {
+                // Nothing typed yet says what to do; anything else, what
+                // New vault would say.
+                Some(if new_name.is_empty() {
+                    IMPORT_NAME_NEEDED.to_owned()
+                } else {
+                    vault_error_text(e)
+                })
             } else if d.target == ImportTarget::New {
-                Some("This asks for two touches.")
+                Some("This asks for two touches.".to_owned())
             } else {
                 None
             };
             if let Some(text) = under {
                 ui.add_space(4.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                right_row(ui, 16.0, |ui| {
                     ui.label(
                         egui::RichText::new(text)
                             .font(theme::f_reg(11.5))
@@ -4498,6 +4570,18 @@ fn new_vault_row(
             .color(p.txt3),
     );
     clicks
+}
+
+/// A right-aligned row `height` tall. A right-to-left layout added straight
+/// to a card takes all the height left in it, which leaves an empty gap
+/// above its buttons.
+fn right_row<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), height),
+        egui::Layout::right_to_left(egui::Align::Center),
+        add,
+    )
+    .inner
 }
 
 /// A vault chip: a rounded, selectable label.
@@ -4730,7 +4814,7 @@ mod tests {
     use super::*;
     use keyroost_transport::vault::fake::FakeKey;
     use keyroost_transport::vault::{unlock, VaultAuth, VaultProblem, VaultRef};
-    use keyroost_vault::{Entry, Vault};
+    use keyroost_vault::{seal, Entry, Vault};
     use zeroize::Zeroizing;
 
     fn entry(title: &str) -> Entry {
@@ -5950,6 +6034,7 @@ mod tests {
             gen,
             gen_open,
             confirm,
+            scroll_to_confirm,
             new_vault,
             export_for,
             export,
@@ -5970,6 +6055,7 @@ mod tests {
         assert_eq!(gen.length, 32, "kept: the generator's settings");
         assert!(!gen_open);
         assert!(confirm.is_none());
+        assert!(!scroll_to_confirm);
         assert!(new_vault.is_none());
         assert!(export_for.is_none());
         assert!(export.is_none());
@@ -6002,74 +6088,74 @@ mod tests {
         assert_eq!(kb(1331), "1.3");
         assert_eq!(kb(4096), "4");
         assert_eq!(kb(0), "0");
-        // 2725 free at 36 bytes an entry: room for 75.
+        // 2725 free at 80 bytes an entry: room for 34.
+        assert_eq!(TYPICAL_ENTRY_BYTES, 80);
         assert_eq!(
-            space_line(&cap(1371, 4096), 36),
-            "1.3 of 4 KB used \u{00B7} room for about 75 more entries"
+            space_line(&cap(1371, 4096)),
+            "1.3 of 4 KB used \u{00B7} room for about 34 more entries"
         );
         assert_eq!(
-            space_line(&cap(4000, 4096), 80),
+            space_line(&cap(4000, 4096)),
             "3.9 of 4 KB used \u{00B7} room for about 1 more entry"
         );
-        assert_eq!(
-            space_line(&cap(4050, 4096), 80),
-            "4 of 4 KB used \u{00B7} full"
-        );
-        assert_eq!(
-            space_line(&cap(4096, 4096), 0),
-            "4 of 4 KB used \u{00B7} full",
-            "never a division by zero"
-        );
+        assert_eq!(space_line(&cap(4050, 4096)), "4 of 4 KB used \u{00B7} full");
     }
 
-    #[test]
-    fn entry_bytes_estimate_defaults_and_grows() {
-        assert_eq!(entry_bytes_estimate(&[]), DEFAULT_ENTRY_BYTES);
-        assert_eq!(DEFAULT_ENTRY_BYTES, 80);
-        let mut key = FakeKey::new();
-        key.add_vault("Empty", &Vault::default());
-        let vaults = unlocked(&mut key);
-        assert_eq!(entry_bytes_estimate(&vaults), 80, "no entries to go by");
-        assert_eq!(entry_bytes_estimate(&[unavailable(Some("Work"))]), 80);
-
-        let ten = Vault {
-            entries: (0..10).map(|i| entry(&format!("Site {i}"))).collect(),
-        };
-        let mut key = FakeKey::new();
-        key.add_vault("Ten", &ten);
-        let vaults = unlocked(&mut key);
-        let secret = [1u8; 32];
-        let growth =
-            seal(&ten, &secret).unwrap().len() - seal(&Vault::default(), &secret).unwrap().len();
-        let est = entry_bytes_estimate(&vaults);
-        assert!((1..=growth).contains(&est), "{est} of {growth}");
+    /// The "room for about N" number of the session's store.
+    fn room(app: &App) -> u64 {
+        app.vault_session().unwrap().unlocked.capacity.free_bytes / TYPICAL_ENTRY_BYTES
     }
 
+    /// The room line follows only the free space: it never rises after an
+    /// add or falls after a delete, whatever the entries hold.
     #[test]
-    fn entry_bytes_are_set_at_unlock_not_per_frame() {
+    fn room_falls_with_adds_and_rises_with_deletes() {
         let mut key = FakeKey::new();
-        let p = two_vaults(&mut key);
+        two_vaults(&mut key);
         let mut app = app();
         unlock_into(&mut app, &mut key);
-        let s = app.vault_session().unwrap();
-        assert_eq!(s.entry_bytes, entry_bytes_estimate(&s.unlocked.vaults));
-        let before = s.entry_bytes;
-
-        // A Refresh that finds more entries sets it again.
-        let mut v = key.vault_on_key(&p).unwrap();
-        // Random notes, which compress poorly: each entry adds more.
-        v.entries.extend((0..20).map(|_| {
-            let mut e = entry(&keyroost_vault::new_id());
-            e.notes = (0..8).map(|_| keyroost_vault::new_id()).collect();
-            e
-        }));
-        key.put_vault(&p, &v);
-        let mut unlocked = app.vault_session().unwrap().unlocked.clone();
-        let result = run_reload(&mut key, &mut unlocked).map_err(VaultJobError::from);
-        app.vault_apply_reload(Some(KEY.into()), unlocked, result);
-        let s = app.vault_session().unwrap();
-        assert_eq!(s.entry_bytes, entry_bytes_estimate(&s.unlocked.vaults));
-        assert!(s.entry_bytes > before, "{} > {before}", s.entry_bytes);
+        let mut last = room(&app);
+        let start = last;
+        for i in 0..6 {
+            app.vault_add_entry();
+            let f = form(&mut app);
+            replace_text(
+                &mut f.title,
+                &format!("Site {i} {}", keyroost_vault::new_id()),
+            );
+            replace_text(&mut f.username, &format!("user{i}@example.com"));
+            replace_text(&mut f.password, &keyroost_vault::new_id());
+            if i % 2 == 0 {
+                replace_text(&mut f.notes, &keyroost_vault::new_id().repeat(i + 1));
+            }
+            save_form(&mut app, &mut key);
+            let now = room(&app);
+            assert!(now <= last, "add {i}: {now} after {last}");
+            last = now;
+        }
+        assert!(last < start, "six adds use room");
+        let ids: Vec<String> = app
+            .selected_vault()
+            .unwrap()
+            .state
+            .as_ref()
+            .unwrap()
+            .contents
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        for id in ids.iter().take(5) {
+            delete_by_id(&mut app, &mut key, id);
+            let now = room(&app);
+            assert!(now >= last, "delete: {now} after {last}");
+            last = now;
+        }
+        let shown = space_line(&app.vault_session().unwrap().unlocked.capacity);
+        assert!(
+            shown.ends_with(&format!("room for about {last} more entries")),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -7352,7 +7438,11 @@ mod tests {
         unlock_into(&mut app, &mut key);
         app.vault.open_entry = Some(ia.clone());
         delete_by_id(&mut app, &mut key, &ia);
-        assert_eq!(app.vault.info.as_deref(), Some("Entry \"GitHub\" deleted."));
+        // Named as its row: another entry is titled GitHub too.
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some("Entry \"GitHub (alice)\" deleted.")
+        );
         assert!(app.vault.open_entry.is_none());
         let on_key = key.vault_on_key(&p).unwrap();
         assert_eq!(on_key.entries.len(), 2);
@@ -9396,7 +9486,7 @@ mod tests {
         let text = list_text(&mut app);
         for line in [
             "A new vault named\u{2026}",
-            "5 entries in travel.t2vault for vault \"Travel\":",
+            "5 entries in travel.t2vault for new vault \"Travel\":",
             "0 entries in the vault; 4 will be added, 0 replaced, 0 left as is, 1 skipped.",
             "Create vault \"Travel\" and import 4 entries",
             "This asks for two touches.",
@@ -10207,5 +10297,239 @@ mod tests {
             "Delete entry 2 and rewrite the array? Requires your PIN. This removes the key's \
              name."
         );
+    }
+
+    // ----- Hardware-run UI fixes -----
+
+    /// Every text galley one headless frame of the list draws: its text,
+    /// where, and how many lines it wrapped to.
+    fn list_galleys(app: &mut App) -> Vec<(String, egui::Rect, usize)> {
+        use crate::tests::TestFrame;
+        use crate::ui::theme::Mode;
+        fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect, usize)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((
+                    t.galley.text().to_owned(),
+                    shape.visual_bounding_rect(),
+                    t.galley.rows.len(),
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.test_frame(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| app.render_vault_list(ui, &palette));
+        });
+        let mut out = Vec::new();
+        for clipped in output.shapes {
+            collect(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// An import preview of `backup` into Personal, opened.
+    fn preview_of(backup: Vault) -> (App, FakeKey) {
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &key_vault());
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        import_dialog_for(&mut app, Path::new("demo.t2vault"));
+        app.vault_apply_import_open(Some(KEY.into()), Ok(backup));
+        (app, key)
+    }
+
+    #[test]
+    fn an_import_rows_name_has_the_width() {
+        let mut backup = backup_vault();
+        backup.entries.push(kv(
+            "exexexex",
+            "Example Mail",
+            "demo@example.com",
+            "pw",
+            "https://mail.example.com/inbox",
+            120,
+        ));
+        let (mut app, _key) = preview_of(backup);
+        let galleys = list_galleys(&mut app);
+        let name = "Example Mail (demo@example.com) \u{00B7} mail.example.com";
+        let row = galleys
+            .iter()
+            .find(|(t, _, _)| t == name)
+            .unwrap_or_else(|| panic!("{name} is drawn: {galleys:?}"));
+        assert_eq!(row.2, 1, "one line");
+        // A reason sits under its entry's name, not squeezed beside it.
+        let github = galleys
+            .iter()
+            .find(|(t, _, _)| t == "GitHub (alice)")
+            .unwrap();
+        let reason = galleys.iter().find(|(t, _, _)| t == NEWER).unwrap();
+        assert!(
+            reason.1.top() >= github.1.bottom() - 1.0 && reason.1.left() >= github.1.left() - 1.0,
+            "{reason:?} under {github:?}"
+        );
+    }
+
+    #[test]
+    fn an_import_into_a_new_vault_waits_for_a_name() {
+        assert!(matches!(
+            new_name_refusal("", &[]),
+            Some(VaultKeyError::Vault(_))
+        ));
+        assert!(matches!(
+            new_name_refusal(&"x".repeat(33), &[]),
+            Some(VaultKeyError::Vault(_))
+        ));
+        assert!(matches!(
+            new_name_refusal("Personal", &[Some("Personal".into())]),
+            Some(VaultKeyError::DuplicateName(_))
+        ));
+        assert!(new_name_refusal("Travel", &[Some("Personal".into()), None]).is_none());
+
+        let (mut app, key) = preview_of(backup_vault());
+        app.vault_import_set_target(ImportTarget::New);
+        import_dialog(&mut app).new_name.clear();
+        let k = entries(chosen(&import_dialog(&mut app).rows).len());
+        let unnamed_button = format!("Create vault and import {k}");
+        let text: String = list_galleys(&mut app)
+            .into_iter()
+            .map(|(t, _, _)| t + "\n")
+            .collect();
+        assert!(text.contains("for a new vault:"), "{text}");
+        assert!(text.contains(&unnamed_button), "{text}");
+        assert!(text.contains(IMPORT_NAME_NEEDED), "{text}");
+        assert!(!text.contains("\"\""), "no empty quotes: {text}");
+        assert!(!text.contains("(unnamed)"), "{text}");
+        // The button is disabled: a click starts nothing.
+        let before = key.creds.len();
+        click_in_list(&mut app, &unnamed_button);
+        assert_eq!(key.creds.len(), before);
+        assert!(app.vault.import.is_some());
+        // A name a vault already has: New vault's words.
+        replace_text(&mut import_dialog(&mut app).new_name, " Personal ");
+        let text: String = list_galleys(&mut app)
+            .into_iter()
+            .map(|(t, _, _)| t + "\n")
+            .collect();
+        let dup = vault_error_text(&VaultKeyError::DuplicateName("Personal".into()));
+        assert!(text.contains(&dup), "{dup}: {text}");
+        assert!(text.contains(&unnamed_button), "{text}");
+        // A name it takes.
+        replace_text(&mut import_dialog(&mut app).new_name, "Travel");
+        let text: String = list_galleys(&mut app)
+            .into_iter()
+            .map(|(t, _, _)| t + "\n")
+            .collect();
+        assert!(text.contains("for new vault \"Travel\":"), "{text}");
+        assert!(
+            text.contains(&format!("Create vault \"Travel\" and import {k}")),
+            "{text}"
+        );
+        assert!(text.contains("This asks for two touches."), "{text}");
+    }
+
+    #[test]
+    fn a_delete_question_names_the_entry_as_its_row() {
+        let v = Vault {
+            entries: vec![
+                kv("a1", "GitHub", "alice", "p", "https://github.com", 1),
+                kv("a2", "GitHub", "alice", "p", "https://x.example", 1),
+                kv("b1", "GitHub", "bob", "p", "", 1),
+                kv("c1", "Bank", "", "p", "", 1),
+                kv("d1", "Mail", "", "p", "https://mail.example", 1),
+                kv("d2", "Mail", "", "p", "", 1),
+            ],
+        };
+        let name = |i: usize| entry_shown_name(&v, &v.entries[i]).to_string();
+        assert_eq!(name(3), "Bank", "a unique title is enough");
+        assert_eq!(name(2), "GitHub (bob)");
+        assert_eq!(name(0), "GitHub (alice) \u{00B7} github.com");
+        assert_eq!(name(1), "GitHub (alice) \u{00B7} x.example");
+        assert_eq!(name(4), "Mail \u{00B7} mail.example");
+
+        let mut key = FakeKey::new();
+        let (_, _, bob) = two_githubs(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_ask_delete_entry(&bob);
+        let text = list_text(&mut app);
+        assert!(
+            text.contains("Delete entry \"GitHub (bob)\" from vault \"Personal\""),
+            "{text}"
+        );
+        delete_by_id(&mut app, &mut key, &bob);
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some("Entry \"GitHub (bob)\" deleted.")
+        );
+    }
+
+    #[test]
+    fn the_experimental_line_doesnt_repeat_the_pill() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let text: String = frame_texts(&ctx, Vec::new(), experimental_note)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(text.matches("Experimental").count(), 1, "{text}");
+        assert!(
+            text.contains("Please report problems and keep a backup."),
+            "{text}"
+        );
+    }
+
+    /// The vault's questions come into view once when asked: the flag is
+    /// set by the asking button and spent by the card's first frame.
+    #[test]
+    fn a_new_question_scrolls_into_view_once() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let bank = session_entry(&app, "Bank").id.clone();
+        for ask in [
+            &mut |app: &mut App| app.vault_ask_rotate() as (),
+            &mut |app: &mut App| app.vault_ask_delete_vault(),
+            &mut |app: &mut App| app.vault_ask_delete_entry(&bank),
+        ] as [&mut dyn FnMut(&mut App); 3]
+        {
+            ask(&mut app);
+            assert!(app.vault.scroll_to_confirm);
+            list_text(&mut app);
+            assert!(app.vault.confirm.is_some(), "still asked");
+            assert!(!app.vault.scroll_to_confirm, "scrolled once");
+            app.vault.confirm = None;
+        }
+    }
+
+    /// The entry form's card ends with its buttons: no empty gap above
+    /// Cancel / Save.
+    #[test]
+    fn the_entry_form_is_as_tall_as_its_content() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_add_entry();
+        let galleys = list_galleys(&mut app);
+        let at = |label: &str| {
+            galleys
+                .iter()
+                .find(|(t, _, _)| t.starts_with(label))
+                .unwrap_or_else(|| panic!("{label}: {galleys:?}"))
+                .1
+        };
+        let gap = at("Save").top() - at("Saving writes the vault").bottom();
+        assert!(gap < 40.0, "{gap} px between the last line and Save");
     }
 }
