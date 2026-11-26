@@ -10,19 +10,21 @@
 
 use std::sync::{Arc, Mutex};
 
+use keyroost_ctap::large_blobs::BlobCapacity;
 use keyroost_ctap::transport::CtapTransport;
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
 use keyroost_transport::vault::{
     self, CtapVaultKey, LeftOver, Unlocked, VaultAuth, VaultKey, VaultKeyError, VaultOnKey,
     VaultStep,
 };
+use keyroost_vault::{seal, Entry, Vault};
 use zeroize::Zeroizing;
 
 use crate::ui::device::{CapTab, DeviceId};
 use crate::ui::theme::{self, BtnKind, Palette};
 use crate::{
-    completion_still_valid, fido_unread_line, guard_secret_field, open_fido, sanitize_title, App,
-    FidoTarget, Severity, TypedSecrets,
+    completion_still_valid, fido_unread_line, guard_secret_field, now_secs_f64, open_fido,
+    sanitize_title, App, FidoTarget, Severity, TypedSecrets,
 };
 
 /// Where problems are reported: the CLI help's URL.
@@ -98,7 +100,7 @@ pub(crate) fn with_vault_tab(mut tabs: Vec<CapTab>, offer: VaultOffer) -> Vec<Ca
     not(test),
     expect(
         dead_code,
-        reason = "the vault's list and messages count entries with it"
+        reason = "the vault's messages count entries with it (later tasks)"
     )
 )]
 pub(crate) fn entries(n: usize) -> String {
@@ -166,6 +168,177 @@ pub(crate) fn overview_line(
         },
     }
 }
+
+/// What one entry adds to a sealed vault when nothing is known yet: a short
+/// login with no notes, rounded up.
+pub(crate) const DEFAULT_ENTRY_BYTES: usize = 80;
+
+/// About how many bytes one entry takes on the key, from the open vaults:
+/// what their entries add to a sealed empty vault, per entry, sealed under a
+/// stand-in secret (the size doesn't depend on it). At least 1;
+/// [`DEFAULT_ENTRY_BYTES`] with no entries to go by. Seals every open vault,
+/// so it runs when the contents change, never while drawing.
+pub(crate) fn entry_bytes_estimate(vaults: &[VaultOnKey]) -> usize {
+    let secret = [0x5a_u8; 32];
+    let Ok(empty) = seal(&Vault::default(), &secret).map(|b| b.len()) else {
+        return DEFAULT_ENTRY_BYTES;
+    };
+    let mut grown = 0usize;
+    let mut count = 0usize;
+    for open in vaults.iter().filter_map(|v| v.state.as_ref().ok()) {
+        let n = open.contents.entries.len();
+        if n == 0 {
+            continue;
+        }
+        let Ok(sealed) = seal(&open.contents, &secret) else {
+            return DEFAULT_ENTRY_BYTES;
+        };
+        grown += sealed.len().saturating_sub(empty);
+        count += n;
+    }
+    grown
+        .checked_div(count)
+        .map_or(DEFAULT_ENTRY_BYTES, |n| n.max(1))
+}
+
+/// `bytes` in KB with one decimal, a trailing `.0` dropped: `1.3`, `4`.
+pub(crate) fn kb(bytes: u64) -> String {
+    let s = format!("{:.1}", bytes as f64 / 1024.0);
+    s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
+}
+
+/// How full the key's store is, in plain numbers: `1.3 of 4 KB used · room
+/// for about 75 more entries`, or `· full` when not one more fits.
+pub(crate) fn space_line(cap: &BlobCapacity, entry_bytes: usize) -> String {
+    let used = format!("{} of {} KB used", kb(cap.used_bytes), kb(cap.max_bytes));
+    let n = cap.free_bytes / entry_bytes.max(1) as u64;
+    match n {
+        0 => format!("{used} \u{00B7} full"),
+        1 => format!("{used} \u{00B7} room for about 1 more entry"),
+        n => format!("{used} \u{00B7} room for about {n} more entries"),
+    }
+}
+
+/// When an entry last changed, as an opened entry says it: `modified` and
+/// `now` in minutes since the Unix epoch. Recent changes in days, older (or
+/// clock-skewed) ones as a date; `None` for an entry with no time.
+pub(crate) fn changed_ago(modified: i64, now: i64) -> Option<String> {
+    if modified <= 0 {
+        return None;
+    }
+    let days = now.saturating_sub(modified) / (24 * 60);
+    Some(match days {
+        0 if now >= modified => "changed today".to_owned(),
+        1 => "changed yesterday".to_owned(),
+        2..=59 => format!("changed {days} days ago"),
+        _ => {
+            let (y, m, d) = keyroost_pgpkey::cert::civil_from_days(modified.div_euclid(24 * 60));
+            format!("changed on {y:04}-{m:02}-{d:02}")
+        }
+    })
+}
+
+/// Whether `hay` holds `needle` (already lower-cased), ignoring case,
+/// without a lower-cased copy of `hay`: a username is private.
+fn contains_folded(hay: &str, needle: &[char]) -> bool {
+    needle.is_empty()
+        || hay.char_indices().any(|(i, _)| {
+            let mut h = fold(&hay[i..]);
+            needle.iter().all(|n| h.next() == Some(*n))
+        })
+}
+
+/// Whether entry `e` matches the filter: its title, username or URL holds
+/// `filter`, ignoring case. Never its notes or password, which the list
+/// doesn't show. An empty filter matches every entry.
+pub(crate) fn matches_filter(e: &Entry, filter: &str) -> bool {
+    let needle: Vec<char> = fold(filter.trim()).collect();
+    [&e.title, &e.username, &e.url]
+        .iter()
+        .any(|f| contains_folded(f, &needle))
+}
+
+/// The entries of `v` the list shows for `filter`, as indices into
+/// `v.entries`: sorted by title, then username, ignoring case.
+pub(crate) fn shown_rows(v: &Vault, filter: &str) -> Vec<usize> {
+    let mut rows: Vec<usize> = (0..v.entries.len())
+        .filter(|&i| matches_filter(&v.entries[i], filter))
+        .collect();
+    rows.sort_by(|&a, &b| {
+        let (a, b) = (&v.entries[a], &v.entries[b]);
+        // Compared a character at a time: no lower-cased copies to wipe.
+        fold(&a.title)
+            .cmp(fold(&b.title))
+            .then_with(|| fold(&a.username).cmp(fold(&b.username)))
+    });
+    rows
+}
+
+/// `s` lower-cased, a character at a time.
+fn fold(s: &str) -> impl Iterator<Item = char> + '_ {
+    s.chars().flat_map(char::to_lowercase)
+}
+
+/// A URL's host: no scheme, no `user:password@`, no path, query or
+/// fragment. `https://alice@github.com/login` → `github.com`.
+fn url_host(url: &str) -> &str {
+    let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority.rsplit_once('@').map_or(authority, |(_, h)| h)
+}
+
+/// Push `text` to `out` with control characters (from another program's
+/// entry) flattened to spaces.
+fn push_flat(out: &mut String, text: &str) {
+    out.extend(text.chars().map(|c| if c.is_control() { ' ' } else { c }));
+}
+
+/// An entry's row: `title · username · host`, empty parts left out. Built
+/// in a wiped buffer: the username is private.
+fn row_line(e: &Entry) -> Zeroizing<String> {
+    let mut line = Zeroizing::new(String::with_capacity(
+        e.title.len() + e.username.len() + e.url.len() + 8,
+    ));
+    for part in [e.title.as_str(), e.username.as_str(), url_host(&e.url)] {
+        if part.trim().is_empty() {
+            continue;
+        }
+        if !line.is_empty() {
+            line.push_str(" \u{00B7} ");
+        }
+        push_flat(&mut line, part);
+    }
+    line
+}
+
+/// What a row's copy button copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyWhat {
+    Username,
+    Password,
+}
+
+impl CopyWhat {
+    /// The copied flash's key for entry `id`: `"{id}:u"` / `"{id}:p"`.
+    fn flash_key(self, id: &str) -> String {
+        match self {
+            CopyWhat::Username => format!("{id}:u"),
+            CopyWhat::Password => format!("{id}:p"),
+        }
+    }
+}
+
+/// The index in `vaults` of the vault with credential ID `selected`; the
+/// first vault when none is selected or that one is no longer listed.
+pub(crate) fn selected_index(vaults: &[VaultOnKey], selected: Option<&[u8]>) -> Option<usize> {
+    selected
+        .and_then(|id| vaults.iter().position(|v| v.vault_ref.credential_id == id))
+        .or_else(|| (!vaults.is_empty()).then_some(0))
+}
+
+/// The Backup card's reason for a backup, in one sentence.
+const BACKUP_TEXT: &str = "A vault lives only on this key: if the key is lost or reset, the \
+                           vault goes with it. Keep a backup file, protected by a passphrase.";
 
 /// The "Experimental" pill and the line asking for reports and a backup.
 pub(crate) fn experimental_note(ui: &mut egui::Ui, p: &Palette) {
@@ -373,6 +546,10 @@ pub(crate) struct VaultSession {
         expect(dead_code, reason = "the vault's writes read it (later tasks)")
     )]
     pub(crate) pin_from_fido: bool,
+    /// About how many bytes one more entry takes ([`entry_bytes_estimate`]),
+    /// for the space line. Set whenever the contents change, never while
+    /// drawing.
+    pub(crate) entry_bytes: usize,
 }
 
 /// The Vault tab's state for the selected key. Replaced whole when another
@@ -391,6 +568,18 @@ pub(crate) struct VaultState {
     /// The touch prompt a running vault job shows on the touch banner.
     /// Kept across a lock, so a job still running keeps its prompt.
     pub(crate) progress: Arc<Mutex<Option<String>>>,
+    /// The chosen vault's credential ID; `None`, or an ID no longer listed,
+    /// shows the first vault.
+    pub(crate) selected: Option<Vec<u8>>,
+    /// The list's filter: titles, usernames and URLs.
+    pub(crate) filter: String,
+    /// The opened entry's ID.
+    pub(crate) open_entry: Option<String>,
+    /// The entry whose password Show reveals; only ever the opened one.
+    pub(crate) revealed: Option<String>,
+    /// The "Copied" flash: `"{id}:u"` / `"{id}:p"` and when it ends (unix
+    /// seconds).
+    pub(crate) copied: Option<(String, f64)>,
 }
 
 impl TypedSecrets for VaultState {
@@ -490,11 +679,13 @@ impl App {
         match result {
             Ok(unlocked) => {
                 self.vault.error = None;
+                let entry_bytes = entry_bytes_estimate(&unlocked.vaults);
                 self.vault.session = Some(VaultSession {
                     device,
                     auth: Some(auth),
                     unlocked,
                     pin_from_fido,
+                    entry_bytes,
                 });
                 // One PIN entry serves both tabs: the FIDO2 tab unlocks with
                 // the PIN the key just accepted (no touch).
@@ -560,6 +751,7 @@ impl App {
         match result {
             Ok(()) => {
                 if let Some(s) = self.vault_session_mut() {
+                    s.entry_bytes = entry_bytes_estimate(&unlocked.vaults);
                     s.unlocked = unlocked;
                 }
                 self.vault.error = None;
@@ -574,15 +766,69 @@ impl App {
     }
 
     /// Lock the vault: the state is rebuilt, so every field (the session's
-    /// secrets, the PIN box, and whatever later forms hold) drops and wipes.
-    /// The touch prompt cell stays for a job still running. `why` is shown.
+    /// secrets, the PIN box, and whatever later forms hold) drops and wipes,
+    /// and a username or password copied from it that the clipboard still
+    /// holds is cleared. The touch prompt cell stays for a job still
+    /// running. `why` is shown.
     pub(crate) fn vault_lock(&mut self, why: Option<String>) {
+        self.clear_vault_clipboard_now();
         let progress = std::mem::take(&mut self.vault.progress);
         self.vault = VaultState {
             error: why,
             progress,
             ..Default::default()
         };
+    }
+
+    /// The vault the list shows: the selected one, else the first.
+    pub(crate) fn selected_vault(&self) -> Option<&VaultOnKey> {
+        let vaults = &self.vault_session()?.unlocked.vaults;
+        selected_index(vaults, self.vault.selected.as_deref()).map(|i| &vaults[i])
+    }
+
+    /// Show vault `id` (its credential ID): the opened entry closes and a
+    /// shown password hides.
+    pub(crate) fn vault_select(&mut self, id: Vec<u8>) {
+        self.vault.selected = Some(id);
+        self.vault.open_entry = None;
+        self.vault.revealed = None;
+    }
+
+    /// Open entry `id`, or close it when it is the open one. A shown
+    /// password hides either way.
+    pub(crate) fn vault_toggle_entry(&mut self, id: &str) {
+        self.vault.revealed = None;
+        if self.vault.open_entry.as_deref() == Some(id) {
+            self.vault.open_entry = None;
+        } else {
+            self.vault.open_entry = Some(id.to_owned());
+        }
+    }
+
+    /// Whether the shown vault can be changed: it opened. A vault that
+    /// can't be opened is left as it is (only Delete vault… reaches it).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "gates add, edit, delete, export, import and rotate (later tasks)"
+        )
+    )]
+    pub(crate) fn vault_writable(&self) -> bool {
+        self.selected_vault().is_some_and(|v| v.state.is_ok())
+    }
+
+    /// The text a row's copy button puts on the clipboard: entry `id` of the
+    /// shown vault (by ID, so two entries titled alike never swap), `None`
+    /// when it has no such value.
+    pub(crate) fn vault_copy_text(&self, id: &str, what: CopyWhat) -> Option<Zeroizing<String>> {
+        let open = self.selected_vault()?.state.as_ref().ok()?;
+        let e = open.contents.entries.iter().find(|e| e.id == id)?;
+        let value: &str = match what {
+            CopyWhat::Username => &e.username,
+            CopyWhat::Password => &e.password,
+        };
+        (!value.is_empty()).then(|| Zeroizing::new(value.to_owned()))
     }
 
     /// A vault change that worked: `shown` in the pane, `logged` in the
@@ -701,14 +947,6 @@ impl App {
                         }
                     });
                 });
-                // Until the list is drawn: what the key holds.
-                let vaults = self.vault_session().map(|s| s.unlocked.vaults.as_slice());
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(overview_line(offer, false, vaults))
-                        .font(theme::f_reg(13.0))
-                        .color(p.txt),
-                );
             }
             if offer == VaultOffer::Ready {
                 return;
@@ -754,7 +992,385 @@ impl App {
         if offer == VaultOffer::Ready && self.vault_session().is_none() {
             self.vault_unlock_card(ui, p);
         }
+        if unlocked && self.vault_session().is_some() {
+            self.render_vault_list(ui, p);
+        }
     }
+
+    /// The unlocked vaults: a chip per vault, how full the key is, the
+    /// filter, a row per entry with its copy buttons (the opened one with its
+    /// password behind Show, its URL and notes), then the Backup card.
+    fn render_vault_list(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(session) = self.vault_session() else {
+            return;
+        };
+        let vaults = &session.unlocked.vaults;
+        if vaults.is_empty() {
+            ui.label(
+                egui::RichText::new("No vaults on this key yet.")
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            );
+            return;
+        }
+        let now = now_secs_f64();
+        if self.vault.copied.as_ref().is_some_and(|(_, t)| now >= *t) {
+            self.vault.copied = None;
+        }
+        // What this frame's clicks ask for, acted on once the list is drawn.
+        let mut select: Option<Vec<u8>> = None;
+        let mut toggle: Option<String> = None;
+        let mut copy: Option<(String, CopyWhat)> = None;
+        let mut reveal: Option<Option<String>> = None;
+        // The filter box edits a copy while the session is borrowed.
+        let mut filter = std::mem::take(&mut self.vault.filter);
+
+        let session = self.vault_session().expect("checked above");
+        let vaults = &session.unlocked.vaults;
+        let shown = selected_index(vaults, self.vault.selected.as_deref()).unwrap_or(0);
+
+        // One chip per vault, keyed by credential ID: two vaults may share
+        // a name.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for (i, v) in vaults.iter().enumerate() {
+                if chip(ui, p, &chip_label(v), i == shown).clicked() && i != shown {
+                    select = Some(v.vault_ref.credential_id.clone());
+                }
+            }
+        });
+        ui.add_space(6.0);
+        let cap = &session.unlocked.capacity;
+        ui.horizontal(|ui| {
+            space_bar(ui, p, cap);
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(space_line(cap, session.entry_bytes))
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+            );
+        });
+        ui.add_space(8.0);
+
+        match &vaults[shown].state {
+            Err(problem) => {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "This vault can't be opened: {}. It is left as it is.",
+                        sanitize_title(problem.to_string().trim_end_matches('.'))
+                    ))
+                    .font(theme::f_reg(13.0))
+                    .color(p.warn),
+                );
+            }
+            Ok(open) => {
+                ui.add(
+                    egui::TextEdit::singleline(&mut filter)
+                        .margin(theme::TEXT_EDIT_MARGIN)
+                        .hint_text("Filter entries\u{2026}")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+                let rows = shown_rows(&open.contents, &filter);
+                theme::card_frame(p).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    if rows.is_empty() {
+                        let text = if open.contents.entries.is_empty() {
+                            "(none)"
+                        } else {
+                            "No entries match the filter."
+                        };
+                        ui.label(
+                            egui::RichText::new(text)
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt3),
+                        );
+                    }
+                    for (n, &i) in rows.iter().enumerate() {
+                        let e = &open.contents.entries[i];
+                        if n > 0 {
+                            ui.separator();
+                        }
+                        let is_open = self.vault.open_entry.as_deref() == Some(e.id.as_str());
+                        let flash = |what: CopyWhat| {
+                            self.vault
+                                .copied
+                                .as_ref()
+                                .is_some_and(|(k, _)| *k == what.flash_key(&e.id))
+                        };
+                        let row = entry_row(
+                            ui,
+                            p,
+                            e,
+                            [flash(CopyWhat::Username), flash(CopyWhat::Password)],
+                        );
+                        if row.toggle {
+                            toggle = Some(e.id.clone());
+                        }
+                        if let Some(what) = row.copy {
+                            copy = Some((e.id.clone(), what));
+                        }
+                        if is_open {
+                            let showing = self.vault.revealed.as_deref() == Some(e.id.as_str());
+                            if let Some(show) = opened_entry(ui, p, e, showing) {
+                                reveal = Some(show.then(|| e.id.clone()));
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        ui.add_space(12.0);
+        theme::card_frame(p).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new("Backup")
+                    .font(theme::f_sb(13.5))
+                    .color(p.txt),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(BACKUP_TEXT)
+                    .font(theme::f_reg(12.0))
+                    .color(p.txt3),
+            );
+        });
+
+        self.vault.filter = filter;
+        if let Some(id) = select {
+            self.vault_select(id);
+        }
+        if let Some(id) = toggle {
+            self.vault_toggle_entry(&id);
+        }
+        if let Some(r) = reveal {
+            self.vault.revealed = r;
+        }
+        if let Some((id, what)) = copy {
+            if let Some(mut text) = self.vault_copy_text(&id, what) {
+                let text = std::mem::take(&mut *text);
+                self.copy_secret_from(ui.ctx(), text, true);
+                self.vault.copied = Some((what.flash_key(&id), now + COPIED_FLASH_SECS));
+            }
+        }
+        if let Some((_, t)) = &self.vault.copied {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.05)));
+        }
+    }
+}
+
+/// How long a copy button says "Copied" (the Authenticator codes' flash).
+const COPIED_FLASH_SECS: f64 = 1.2;
+
+/// A vault chip: a rounded, selectable label.
+fn chip(ui: &mut egui::Ui, p: &Palette, label: &str, on: bool) -> egui::Response {
+    let (fill, fg, stroke) = if on {
+        (p.accent_soft(), p.txt, egui::Stroke::new(1.0, p.accent))
+    } else {
+        (p.raised2, p.txt2, egui::Stroke::new(1.0, p.line))
+    };
+    let r = ui.add(
+        egui::Button::new(egui::RichText::new(label).font(theme::f_sb(12.0)).color(fg))
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(egui::CornerRadius::same(14)),
+    );
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    r
+}
+
+/// The small bar before the space line: how much of the store is used.
+fn space_bar(ui: &mut egui::Ui, p: &Palette, cap: &BlobCapacity) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(150.0, 6.0), egui::Sense::hover());
+    let frac = if cap.max_bytes == 0 {
+        1.0
+    } else {
+        (cap.used_bytes as f32 / cap.max_bytes as f32).clamp(0.0, 1.0)
+    };
+    let r = egui::CornerRadius::same(4);
+    ui.painter().rect_filled(rect, r, p.line);
+    let mut used = rect;
+    used.set_width(rect.width() * frac);
+    ui.painter().rect_filled(used, r, p.accent);
+}
+
+/// What a click on an entry's row asks for.
+struct RowClicks {
+    /// The row itself: open or close the entry.
+    toggle: bool,
+    copy: Option<CopyWhat>,
+}
+
+/// One entry's row: `title · username · host`, and its two copy buttons
+/// (disabled for an empty value; "Copied" while `flash` says so).
+fn entry_row(ui: &mut egui::Ui, p: &Palette, e: &Entry, flash: [bool; 2]) -> RowClicks {
+    let mut clicks = RowClicks {
+        toggle: false,
+        copy: None,
+    };
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for (what, label, has, flashing) in [
+                (
+                    CopyWhat::Password,
+                    "Copy password",
+                    !e.password.is_empty(),
+                    flash[1],
+                ),
+                (
+                    CopyWhat::Username,
+                    "Copy username",
+                    !e.username.is_empty(),
+                    flash[0],
+                ),
+            ] {
+                if !has {
+                    theme::button_disabled(ui, p, label);
+                } else if flashing {
+                    theme::button(ui, p, BtnKind::Ghost, "Copied");
+                } else if theme::button(ui, p, BtnKind::Ghost, label).clicked() {
+                    clicks.copy = Some(what);
+                }
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let line = row_line(e);
+                let title_len = line_title_len(e, &line);
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    &line[..title_len],
+                    0.0,
+                    egui::TextFormat::simple(theme::f_sb(13.0), p.txt),
+                );
+                job.append(
+                    &line[title_len..],
+                    0.0,
+                    egui::TextFormat::simple(theme::f_reg(12.5), p.txt3),
+                );
+                job.wrap.max_rows = 1;
+                job.wrap.break_anywhere = true;
+                job.wrap.max_width = ui.available_width();
+                let resp = ui.add(egui::Label::new(job).sense(egui::Sense::click()));
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                clicks.toggle = resp.clicked();
+            });
+        });
+    });
+    clicks
+}
+
+/// How many bytes of `line` (`row_line(e)`) are the title, drawn in bold:
+/// its length once flattened as [`push_flat`] does.
+fn line_title_len(e: &Entry, line: &str) -> usize {
+    if e.title.trim().is_empty() {
+        return 0;
+    }
+    let n = e
+        .title
+        .chars()
+        .map(|c| if c.is_control() { 1 } else { c.len_utf8() })
+        .sum::<usize>();
+    if line.is_char_boundary(n.min(line.len())) {
+        n.min(line.len())
+    } else {
+        0
+    }
+}
+
+/// The opened entry under its row: the password behind Show, the URL, the
+/// notes (shown, as `entry show` does), and when it last changed. Returns
+/// `Some(show)` when Show or Hide was clicked.
+fn opened_entry(ui: &mut egui::Ui, p: &Palette, e: &Entry, showing: bool) -> Option<bool> {
+    let mut clicked = None;
+    egui::Frame::new()
+        .fill(p.raised2)
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let field = |ui: &mut egui::Ui, label: &str| {
+                ui.add_sized(
+                    [80.0, 20.0],
+                    egui::Label::new(
+                        egui::RichText::new(label)
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt3),
+                    ),
+                );
+            };
+            let value = |ui: &mut egui::Ui, text: &str| {
+                if text.is_empty() {
+                    ui.label(
+                        egui::RichText::new("(none)")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt3),
+                    );
+                } else {
+                    let mut flat = Zeroizing::new(String::with_capacity(text.len()));
+                    flat.extend(text.chars().map(|c| {
+                        if c.is_control() && c != '\n' {
+                            ' '
+                        } else {
+                            c
+                        }
+                    }));
+                    ui.label(
+                        egui::RichText::new(flat.as_str())
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt),
+                    );
+                }
+            };
+            ui.horizontal(|ui| {
+                field(ui, "Password");
+                if e.password.is_empty() {
+                    value(ui, "");
+                } else {
+                    if showing {
+                        ui.label(
+                            egui::RichText::new(e.password.as_str())
+                                .font(theme::f_mono(13.0))
+                                .color(p.txt),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("\u{2022}".repeat(8))
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        );
+                    }
+                    let label = if showing { "Hide" } else { "Show" };
+                    if theme::button(ui, p, BtnKind::Ghost, label).clicked() {
+                        clicked = Some(!showing);
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                field(ui, "URL");
+                value(ui, &e.url);
+            });
+            ui.horizontal_top(|ui| {
+                field(ui, "Notes");
+                value(ui, &e.notes);
+            });
+            if let Some(when) = changed_ago(e.modified_minutes, vault::now_minutes()) {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(when)
+                                .font(theme::f_reg(11.5))
+                                .color(p.txt3),
+                        );
+                    });
+                });
+            }
+        });
+    clicked
 }
 
 #[cfg(test)]
@@ -1545,5 +2161,504 @@ mod tests {
         assert!(!app.holds_unlocked_secrets());
         app.idle_lock_tick(t0 + crate::IDLE_LOCK_AFTER * 2, false);
         assert_eq!(app.log.len(), lines, "nothing left to lock, nothing logged");
+    }
+
+    // ----- the list: space, rows, copy, Show -----
+
+    use crate::{clear_if_still_held, clipboard_clear_for};
+
+    fn cap(used: u64, max: u64) -> BlobCapacity {
+        BlobCapacity {
+            max_bytes: max,
+            used_bytes: used,
+            free_bytes: max - used,
+            entry_count: 1,
+        }
+    }
+
+    fn login(title: &str, username: &str, password: &str) -> Entry {
+        let mut e = entry(title);
+        e.username = username.into();
+        e.password = Zeroizing::new(password.into());
+        e
+    }
+
+    #[test]
+    fn kb_and_space_line() {
+        assert_eq!(kb(1331), "1.3");
+        assert_eq!(kb(4096), "4");
+        assert_eq!(kb(0), "0");
+        // 2725 free at 36 bytes an entry: room for 75.
+        assert_eq!(
+            space_line(&cap(1371, 4096), 36),
+            "1.3 of 4 KB used \u{00B7} room for about 75 more entries"
+        );
+        assert_eq!(
+            space_line(&cap(4000, 4096), 80),
+            "3.9 of 4 KB used \u{00B7} room for about 1 more entry"
+        );
+        assert_eq!(
+            space_line(&cap(4050, 4096), 80),
+            "4 of 4 KB used \u{00B7} full"
+        );
+        assert_eq!(
+            space_line(&cap(4096, 4096), 0),
+            "4 of 4 KB used \u{00B7} full",
+            "never a division by zero"
+        );
+    }
+
+    #[test]
+    fn entry_bytes_estimate_defaults_and_grows() {
+        assert_eq!(entry_bytes_estimate(&[]), DEFAULT_ENTRY_BYTES);
+        assert_eq!(DEFAULT_ENTRY_BYTES, 80);
+        let mut key = FakeKey::new();
+        key.add_vault("Empty", &Vault::default());
+        let vaults = unlocked(&mut key);
+        assert_eq!(entry_bytes_estimate(&vaults), 80, "no entries to go by");
+        assert_eq!(entry_bytes_estimate(&[unavailable(Some("Work"))]), 80);
+
+        let ten = Vault {
+            entries: (0..10).map(|i| entry(&format!("Site {i}"))).collect(),
+        };
+        let mut key = FakeKey::new();
+        key.add_vault("Ten", &ten);
+        let vaults = unlocked(&mut key);
+        let secret = [1u8; 32];
+        let growth =
+            seal(&ten, &secret).unwrap().len() - seal(&Vault::default(), &secret).unwrap().len();
+        let est = entry_bytes_estimate(&vaults);
+        assert!((1..=growth).contains(&est), "{est} of {growth}");
+    }
+
+    #[test]
+    fn entry_bytes_are_set_at_unlock_not_per_frame() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let s = app.vault_session().unwrap();
+        assert_eq!(s.entry_bytes, entry_bytes_estimate(&s.unlocked.vaults));
+        let before = s.entry_bytes;
+
+        // A Refresh that finds more entries sets it again.
+        let mut v = key.vault_on_key(&p).unwrap();
+        // Random notes, which compress poorly: each entry adds more.
+        v.entries.extend((0..20).map(|_| {
+            let mut e = entry(&keyroost_vault::new_id());
+            e.notes = (0..8).map(|_| keyroost_vault::new_id()).collect();
+            e
+        }));
+        key.put_vault(&p, &v);
+        let mut unlocked = app.vault_session().unwrap().unlocked.clone();
+        let result = run_reload(&mut key, &mut unlocked).map_err(VaultJobError::from);
+        app.vault_apply_reload(Some(KEY.into()), unlocked, result);
+        let s = app.vault_session().unwrap();
+        assert_eq!(s.entry_bytes, entry_bytes_estimate(&s.unlocked.vaults));
+        assert!(s.entry_bytes > before, "{} > {before}", s.entry_bytes);
+    }
+
+    #[test]
+    fn changed_ago_words() {
+        const DAY: i64 = 24 * 60;
+        // 2026-11-26, noon UTC.
+        let now = 20_783 * DAY + 12 * 60;
+        assert_eq!(changed_ago(now, now).as_deref(), Some("changed today"));
+        assert_eq!(
+            changed_ago(now - DAY + 5, now).as_deref(),
+            Some("changed today")
+        );
+        assert_eq!(
+            changed_ago(now - DAY, now).as_deref(),
+            Some("changed yesterday")
+        );
+        assert_eq!(
+            changed_ago(now - 3 * DAY, now).as_deref(),
+            Some("changed 3 days ago")
+        );
+        assert_eq!(
+            changed_ago(now - 59 * DAY, now).as_deref(),
+            Some("changed 59 days ago")
+        );
+        assert_eq!(
+            changed_ago(now - 60 * DAY, now).as_deref(),
+            Some("changed on 2026-09-27")
+        );
+        // A time from a clock ahead of this one: the date.
+        assert_eq!(
+            changed_ago(now + 2 * DAY, now).as_deref(),
+            Some("changed on 2026-11-28")
+        );
+        assert_eq!(
+            changed_ago(now + 5, now).as_deref(),
+            Some("changed on 2026-11-26")
+        );
+        assert_eq!(changed_ago(0, now), None, "no time recorded");
+        assert_eq!(changed_ago(-5, now), None);
+    }
+
+    #[test]
+    fn filter_never_searches_notes_or_passwords() {
+        let mut e = login("GitHub", "Alice", "hunter22");
+        e.url = "https://github.com/login".into();
+        e.notes = "recovery: tulip-garden".into();
+        for hit in ["", "  ", "git", "HUB", "alice", "LIC", "github.com/log"] {
+            assert!(matches_filter(&e, hit), "{hit:?}");
+        }
+        for miss in ["hunter", "tulip", "recovery", "bank"] {
+            assert!(!matches_filter(&e, miss), "{miss:?}");
+        }
+        // Case folds beyond ASCII.
+        let e = login("Ärzte", "", "x");
+        assert!(matches_filter(&e, "ärz"));
+    }
+
+    #[test]
+    fn rows_sort_by_title_then_username() {
+        let v = Vault {
+            entries: vec![
+                login("bank", "zed", "1"),
+                login("GitHub", "bob", "2"),
+                login("Bank", "amy", "3"),
+                login("apple", "x", "4"),
+                login("github", "Alice", "5"),
+            ],
+        };
+        let order = |filter: &str| -> Vec<String> {
+            shown_rows(&v, filter)
+                .into_iter()
+                .map(|i| format!("{}/{}", v.entries[i].title, v.entries[i].username))
+                .collect()
+        };
+        assert_eq!(
+            order(""),
+            [
+                "apple/x",
+                "Bank/amy",
+                "bank/zed",
+                "github/Alice",
+                "GitHub/bob"
+            ]
+        );
+        assert_eq!(order("git"), ["github/Alice", "GitHub/bob"]);
+        assert!(order("nothing").is_empty());
+
+        // The row: title, username and the URL's host, empty parts left out.
+        let mut e = login("GitHub", "alice", "x");
+        e.url = "https://alice:pw@github.com:443/login?next=1".into();
+        assert_eq!(
+            row_line(&e).as_str(),
+            "GitHub \u{00B7} alice \u{00B7} github.com:443"
+        );
+        let mut e = login("Router", "admin", "x");
+        e.url = "192.168.1.1/admin".into();
+        assert_eq!(
+            row_line(&e).as_str(),
+            "Router \u{00B7} admin \u{00B7} 192.168.1.1"
+        );
+        let e = login("Router", "", "x");
+        assert_eq!(row_line(&e).as_str(), "Router");
+        // Another program's control characters can't break the row.
+        let e = login("a\u{1b}[2Jb\u{85}c", "", "x");
+        let line = row_line(&e);
+        assert_eq!(line.as_str(), "a [2Jb c");
+        assert_eq!(line_title_len(&e, &line), line.len());
+    }
+
+    /// A key whose Personal vault holds two "GitHub" logins; its ID and
+    /// the two entries' IDs.
+    fn two_githubs(key: &mut FakeKey) -> (Vec<u8>, String, String) {
+        let a = login("GitHub", "alice", "pw-a");
+        let b = login("GitHub", "bob", "pw-b");
+        let (ia, ib) = (a.id.clone(), b.id.clone());
+        let c = login("Router", "", "pw-c");
+        let p = key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![a, b, c],
+            },
+        );
+        key.add_vault("Work", &Vault::default());
+        (p, ia, ib)
+    }
+
+    #[test]
+    fn duplicate_titles_copy_their_own_password() {
+        let mut key = FakeKey::new();
+        let (_, a, b) = two_githubs(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let text = |what| app.vault_copy_text(&b, what).map(|t| t.as_str().to_owned());
+        assert_eq!(text(CopyWhat::Password).as_deref(), Some("pw-b"));
+        assert_eq!(text(CopyWhat::Username).as_deref(), Some("bob"));
+        assert_eq!(
+            app.vault_copy_text(&a, CopyWhat::Password)
+                .as_deref()
+                .map(String::as_str),
+            Some("pw-a")
+        );
+        // The empty username copies nothing (its button is disabled).
+        let open = app.selected_vault().unwrap().state.as_ref().unwrap();
+        let router = open.contents.entries[2].id.clone();
+        assert_eq!(app.vault_copy_text(&router, CopyWhat::Username), None);
+        assert!(app
+            .vault_copy_text("no-such-id", CopyWhat::Password)
+            .is_none());
+        assert_eq!(CopyWhat::Username.flash_key(&a), format!("{a}:u"));
+        assert_eq!(CopyWhat::Password.flash_key(&a), format!("{a}:p"));
+    }
+
+    #[test]
+    fn selection_follows_the_credential_id() {
+        assert_eq!(selected_index(&[], None), None);
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        key.add_vault("Home", &Vault::default());
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let name = |app: &App| app.selected_vault().unwrap().vault_ref.name.clone();
+        assert_eq!(
+            name(&app).as_deref(),
+            Some("Personal"),
+            "the first by default"
+        );
+        let work = app.vault_session().unwrap().unlocked.vaults[1]
+            .vault_ref
+            .credential_id
+            .clone();
+        app.vault_select(work);
+        assert_eq!(name(&app).as_deref(), Some("Work"));
+        // A vault before it leaves the list: still Work.
+        app.vault
+            .session
+            .as_mut()
+            .unwrap()
+            .unlocked
+            .vaults
+            .remove(0);
+        assert_eq!(name(&app).as_deref(), Some("Work"));
+        // Work itself gone: the first vault.
+        app.vault
+            .session
+            .as_mut()
+            .unwrap()
+            .unlocked
+            .vaults
+            .remove(0);
+        assert_eq!(name(&app).as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn unavailable_vault_disables_every_write() {
+        let mut app = app();
+        assert!(!app.vault_writable(), "locked");
+        let mut key = FakeKey::new();
+        let (_, a, _) = two_githubs(&mut key);
+        let damaged = key.add_vault("Old", &Vault::default());
+        key.put_blob(&damaged, b"not a vault at all, just bytes");
+        unlock_into(&mut app, &mut key);
+        assert!(app.vault_writable(), "Personal opened");
+        app.vault_select(damaged);
+        let shown = app.selected_vault().unwrap();
+        assert!(shown.state.is_err(), "{:?}", shown.state);
+        assert_eq!(chip_label(shown), "Old \u{00B7} (unavailable)");
+        assert!(!app.vault_writable());
+        assert!(app.vault_copy_text(&a, CopyWhat::Password).is_none());
+    }
+
+    #[test]
+    fn reveal_clears_on_collapse_and_chip_change() {
+        let mut key = FakeKey::new();
+        let (_, a, b) = two_githubs(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+
+        app.vault_toggle_entry(&a);
+        assert_eq!(app.vault.open_entry.as_deref(), Some(a.as_str()));
+        app.vault.revealed = Some(a.clone());
+        app.vault_toggle_entry(&a);
+        assert_eq!(app.vault.open_entry, None, "closed");
+        assert_eq!(app.vault.revealed, None);
+
+        app.vault_toggle_entry(&a);
+        app.vault.revealed = Some(a.clone());
+        app.vault_toggle_entry(&b);
+        assert_eq!(app.vault.open_entry.as_deref(), Some(b.as_str()));
+        assert_eq!(app.vault.revealed, None, "another opened");
+
+        app.vault.revealed = Some(b.clone());
+        let work = app.vault_session().unwrap().unlocked.vaults[1]
+            .vault_ref
+            .credential_id
+            .clone();
+        app.vault_select(work);
+        assert_eq!(app.vault.revealed, None, "the chip changed");
+        assert_eq!(app.vault.open_entry, None);
+
+        app.vault.open_entry = Some(b.clone());
+        app.vault.revealed = Some(b.clone());
+        app.vault.filter = "git".into();
+        app.vault_lock(None);
+        assert_eq!(app.vault.revealed, None, "locked");
+        assert_eq!(app.vault.open_entry, None);
+        assert!(app.vault.filter.is_empty());
+        assert!(app.vault.selected.is_none());
+    }
+
+    #[test]
+    fn clear_only_when_the_clipboard_still_holds_it() {
+        let mut cleared = false;
+        assert!(clear_if_still_held(
+            "pw-a",
+            || Some("pw-a".to_owned()),
+            || cleared = true
+        ));
+        assert!(cleared);
+
+        let mut cleared = false;
+        assert!(!clear_if_still_held(
+            "pw-a",
+            || Some("copied elsewhere".to_owned()),
+            || cleared = true
+        ));
+        assert!(!cleared, "someone else's text stays");
+
+        let mut cleared = false;
+        assert!(!clear_if_still_held("pw-a", || None, || cleared = true));
+        assert!(!cleared, "an unreadable clipboard is left alone");
+    }
+
+    #[test]
+    fn copying_schedules_the_clear_45_seconds_out() {
+        let c = clipboard_clear_for("x".to_owned(), 100.0, true);
+        assert_eq!(c.at, 145.0);
+        assert_eq!(c.text.as_str(), "x");
+        assert!(c.from_vault);
+        assert!(!clipboard_clear_for("x".to_owned(), 0.0, false).from_vault);
+    }
+
+    #[test]
+    fn lock_clears_a_vault_copy_now() {
+        // No clipboard handle in a test: the clear reads nothing and touches
+        // no real clipboard.
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.clipboard_clear_at = Some(clipboard_clear_for("pw".into(), 1e12, true));
+        app.vault_lock(None);
+        assert!(
+            app.clipboard_clear_at.is_none(),
+            "a vault copy goes at Lock"
+        );
+        assert!(app.secret_clipboard.is_none(), "no real clipboard opened");
+
+        // Someone else's copy (an Authenticator code) keeps its 45 s.
+        unlock_into(&mut app, &mut key);
+        app.clipboard_clear_at = Some(clipboard_clear_for("123456".into(), 1e12, false));
+        app.vault_lock(None);
+        assert!(app.clipboard_clear_at.is_some());
+        app.clear_vault_clipboard_now();
+        assert!(app.clipboard_clear_at.is_some());
+
+        app.clipboard_clear_at = Some(clipboard_clear_for("pw".into(), 1e12, true));
+        app.clear_vault_clipboard_now();
+        assert!(app.clipboard_clear_at.is_none());
+    }
+
+    /// The text one headless frame of the list draws.
+    fn list_text(app: &mut App) -> String {
+        use crate::tests::TestFrame;
+        use crate::ui::theme::Mode;
+        fn collect(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    text.push_str(t.galley.text());
+                    text.push('\n');
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, text)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.test_frame(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_vault_list(ui, &palette);
+            });
+        });
+        let mut text = String::new();
+        for clipped in output.shapes {
+            collect(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    #[test]
+    fn the_list_draws_rows_and_hides_the_password_until_show() {
+        let mut key = FakeKey::new();
+        let (_, a, _) = two_githubs(&mut key);
+        let damaged = key.add_vault("Old", &Vault::default());
+        key.put_blob(&damaged, b"not a vault at all, just bytes");
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        if let Some(e) = app.vault.session.as_mut().and_then(|s| {
+            s.unlocked.vaults[0]
+                .state
+                .as_mut()
+                .ok()?
+                .contents
+                .entries
+                .first_mut()
+        }) {
+            e.url = "https://github.com/login".into();
+            e.notes = "recovery: tulip-garden".into();
+        }
+
+        let text = list_text(&mut app);
+        for shown in [
+            "Personal \u{00B7} 3",
+            "Work \u{00B7} 0",
+            "Old \u{00B7} (unavailable)",
+            "KB used",
+            "GitHub \u{00B7} alice \u{00B7} github.com",
+            "Copy username",
+            "Copy password",
+            "A vault lives only on this key",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("tulip"), "notes show only when opened");
+
+        app.vault_toggle_entry(&a);
+        let text = list_text(&mut app);
+        assert!(text.contains("tulip-garden"), "notes shown when opened");
+        assert!(
+            text.contains("Show") && text.contains("changed on"),
+            "{text}"
+        );
+        assert!(!text.contains("pw-a"), "the password stays hidden");
+        app.vault.revealed = Some(a.clone());
+        let text = list_text(&mut app);
+        assert!(text.contains("pw-a") && text.contains("Hide"), "{text}");
+
+        app.vault.filter = "nothing like it".into();
+        assert!(list_text(&mut app).contains("No entries match the filter."));
+
+        app.vault_select(damaged);
+        let text = list_text(&mut app);
+        assert!(
+            text.contains("This vault can't be opened: ") && text.contains("It is left as it is."),
+            "{text}"
+        );
+        assert!(!text.contains("Copy password"));
     }
 }

@@ -45,6 +45,46 @@ use keyroost_ctap::{AuthenticatorInfo, CtapHidDevice, InitResponse};
 /// the workspace version, so it can never drift from the release.
 const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
+/// How long a copied secret (a code, a vault username or password) stays on
+/// the clipboard before the app clears it, if the clipboard still holds it.
+const CLIPBOARD_CLEAR_AFTER_SECS: f64 = 45.0;
+
+/// A secret the app put on the clipboard, to clear once `at` (unix seconds)
+/// passes if the clipboard still holds it. The remembered copy is wiped when
+/// this is dropped: cleared, or replaced by the next copy.
+struct ClipboardClear {
+    text: zeroize::Zeroizing<String>,
+    at: f64,
+    /// Copied from the vault: a vault Lock clears it at once.
+    from_vault: bool,
+}
+
+/// The clear for `text` copied at `now`: [`CLIPBOARD_CLEAR_AFTER_SECS`] out.
+fn clipboard_clear_for(text: String, now: f64, from_vault: bool) -> ClipboardClear {
+    ClipboardClear {
+        text: zeroize::Zeroizing::new(text),
+        at: now + CLIPBOARD_CLEAR_AFTER_SECS,
+        from_vault,
+    }
+}
+
+/// Clear the clipboard through `clear` only when `read` says it still holds
+/// `held`: text copied elsewhere since, or a clipboard that can't be read,
+/// is left alone. Returns whether it cleared.
+fn clear_if_still_held(
+    held: &str,
+    read: impl FnOnce() -> Option<String>,
+    clear: impl FnOnce(),
+) -> bool {
+    let current = read().map(zeroize::Zeroizing::new);
+    if current.is_some_and(|c| c.as_str() == held) {
+        clear();
+        true
+    } else {
+        false
+    }
+}
+
 /// How long the app keeps an unlocked FIDO session, a retained OATH password
 /// or OTP PIN, and displayed codes without a click, key press or scroll
 /// before locking them (see `App::idle_lock`). The lock messages below take
@@ -5313,11 +5353,11 @@ struct App {
     cap_tab_by_device: std::collections::HashMap<DeviceId, CapTab>,
     /// Error from the last device enumeration, surfaced in the sidebar.
     devices_error: Option<String>,
-    /// When set: the OTP code we placed on the clipboard and the time
-    /// (now_secs_f64 epoch) to clear it — codes shouldn't sit in
-    /// clipboard-manager history forever. Cleared conditionally: only if the
-    /// clipboard still holds that exact code.
-    clipboard_clear_at: Option<(String, f64)>,
+    /// When set: the secret we placed on the clipboard and the time
+    /// (now_secs_f64 epoch) to clear it — codes and passwords shouldn't sit
+    /// in clipboard-manager history forever. Cleared conditionally: only if
+    /// the clipboard still holds that exact text.
+    clipboard_clear_at: Option<ClipboardClear>,
     /// The clipboard handle secrets are copied through (see
     /// [`App::copy_secret`]), created on first use. Kept alive rather than
     /// made per copy: on X11 the copying app serves the clipboard's contents,
@@ -7514,10 +7554,57 @@ impl App {
     /// Falls back to egui's own clipboard path when the marked copy can't be
     /// made, so copying never silently stops working.
     fn copy_secret(&mut self, ctx: &egui::Context, text: String) {
+        self.copy_secret_from(ctx, text, false);
+    }
+
+    /// [`App::copy_secret`], with where the secret came from: a vault copy
+    /// (`from_vault`) is also cleared when the vault locks.
+    pub(crate) fn copy_secret_from(&mut self, ctx: &egui::Context, text: String, from_vault: bool) {
         if !copy_concealed(&mut self.secret_clipboard, &text) {
             ctx.copy_text(text.clone());
         }
-        self.clipboard_clear_at = Some((text, now_secs_f64() + 45.0));
+        self.clipboard_clear_at = Some(clipboard_clear_for(text, now_secs_f64(), from_vault));
+    }
+
+    /// Clear the clipboard now if it still holds the secret we copied, and
+    /// forget that secret either way. The read and the clear go through the
+    /// same long-lived handle the secret was copied with (`copy_secret`)
+    /// when there is one. If the clipboard can't be read (e.g. some Wayland
+    /// setups), it fails open and clears nothing rather than risk destroying
+    /// foreign content.
+    fn clear_clipboard_if_ours(&mut self) {
+        let Some(held) = self.clipboard_clear_at.take() else {
+            return;
+        };
+        // Tests never open the real clipboard: with no handle, the read
+        // below finds nothing and nothing is cleared.
+        #[cfg(not(test))]
+        if self.secret_clipboard.is_none() {
+            self.secret_clipboard = arboard::Clipboard::new().ok();
+        }
+        let handle = std::cell::RefCell::new(self.secret_clipboard.as_mut());
+        clear_if_still_held(
+            &held.text,
+            || handle.borrow_mut().as_mut()?.get_text().ok(),
+            || {
+                if let Some(cb) = handle.borrow_mut().as_mut() {
+                    let _ = cb.clear();
+                }
+            },
+        );
+    }
+
+    /// A vault Lock: a username or password copied from the vault and still
+    /// on the clipboard is cleared at once, not after its 45 s. Any other
+    /// copy keeps its own timer.
+    pub(crate) fn clear_vault_clipboard_now(&mut self) {
+        if self
+            .clipboard_clear_at
+            .as_ref()
+            .is_some_and(|c| c.from_vault)
+        {
+            self.clear_clipboard_if_ours();
+        }
     }
 
     /// A change to the key's large-blob storage that worked: the tab's
@@ -17209,27 +17296,15 @@ impl eframe::App for App {
         // take `&Context`) use this cheap `Context` handle cloned from it.
         let ctx_owned = root_ui.ctx().clone();
         let ctx = &ctx_owned;
-        // Clipboard hygiene: ~45s after an OTP code was copied, clear the
-        // clipboard so the code doesn't live on in clipboard-manager history —
-        // but only if the clipboard still holds that exact code. Content the
-        // user copied elsewhere in the meantime is never clobbered. arboard is
-        // already in the tree via eframe's clipboard integration; if the
-        // clipboard can't be read (e.g. some Wayland setups), fail open and
-        // clear nothing rather than risk destroying foreign content.
-        // The read and the clear go through the same long-lived handle the
-        // secret was copied with (`copy_secret`) when there is one.
-        if let Some((ref code, t)) = self.clipboard_clear_at {
+        // Clipboard hygiene: ~45s after a secret was copied, clear the
+        // clipboard so it doesn't live on in clipboard-manager history — but
+        // only if the clipboard still holds that exact text. Content the user
+        // copied elsewhere in the meantime is never clobbered (see
+        // `clear_clipboard_if_ours`).
+        if let Some(t) = self.clipboard_clear_at.as_ref().map(|c| c.at) {
             let now = now_secs_f64();
             if now >= t {
-                if self.secret_clipboard.is_none() {
-                    self.secret_clipboard = arboard::Clipboard::new().ok();
-                }
-                if let Some(cb) = self.secret_clipboard.as_mut() {
-                    if cb.get_text().is_ok_and(|current| current == *code) {
-                        let _ = cb.clear();
-                    }
-                }
-                self.clipboard_clear_at = None;
+                self.clear_clipboard_if_ours();
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.1)));
             }
@@ -29215,7 +29290,7 @@ mod tests {
     /// One headless egui frame for a test. The frame's texture changes are
     /// cleared, as a renderer would apply them: egui 0.37 asserts (in debug
     /// builds) that a frame's output never drops them unapplied.
-    trait TestFrame {
+    pub(crate) trait TestFrame {
         fn test_frame(
             &self,
             input: egui::RawInput,
