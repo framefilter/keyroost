@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use keyroost_ctap::large_blobs::BlobCapacity;
+use keyroost_ctap::large_blobs::{BlobCapacity, CredentialData};
 use keyroost_ctap::transport::CtapTransport;
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
 use keyroost_transport::vault::{
@@ -381,6 +381,14 @@ pub(crate) enum VaultJobError {
     /// Opening the key failed (or it speaks no CTAP2): the text to show.
     Open(String),
     Vault(VaultKeyError),
+    /// A vault delete removed the vault's data but not its credential: the
+    /// vault is left with no data (`cause` says what stopped it), and
+    /// `capacity` is the store after the data went. Deleting it again
+    /// finishes the job.
+    DataRemoved {
+        cause: VaultKeyError,
+        capacity: BlobCapacity,
+    },
 }
 
 impl From<VaultKeyError> for VaultJobError {
@@ -510,6 +518,10 @@ pub(crate) fn job_error_text(e: &VaultJobError) -> String {
     match e {
         VaultJobError::Open(s) => as_sentence(s),
         VaultJobError::Vault(e) => vault_error_text(e),
+        VaultJobError::DataRemoved { cause, .. } => as_sentence(&format!(
+            "the vault's entries were removed from the key, but deleting the vault itself \
+             failed: {cause}; Delete vault\u{2026} again finishes it"
+        )),
     }
 }
 
@@ -611,21 +623,42 @@ pub(crate) fn run_create<K: VaultKey>(
 
 /// Delete the vault `target` (found by its credential ID, so a vault of the
 /// same name is never touched): no touch unless the key lists no
-/// largeBlobKey for it. Returns how full the store is afterwards.
+/// largeBlobKey for it. Returns how full the store is afterwards. A delete
+/// that failed after the vault's data went is
+/// [`VaultJobError::DataRemoved`], so the pane stops showing entries the key
+/// no longer holds.
 pub(crate) fn run_delete_vault<K: VaultKey>(
     key: &mut K,
     auth: &mut VaultAuth,
     target: &VaultRef,
     touches: &mut TouchProgress,
-) -> Result<BlobCapacity, VaultKeyError> {
+) -> Result<BlobCapacity, VaultJobError> {
     let cred = vault::list_credentials(key, auth)?
         .into_iter()
         .find(|c| c.vault.credential_id == target.credential_id)
         .ok_or_else(|| VaultKeyError::VaultGone {
             name: target.name.clone(),
         })?;
-    vault::delete(key, auth, &cred, &mut |s| touches.step(s))?;
-    Ok(key.read_blobs()?.capacity(key.info()))
+    if let Err(cause) = vault::delete(key, auth, &cred, &mut |s| touches.step(s)) {
+        // Whether the data went before the failure: then only the
+        // credential is left, as a vault with no data.
+        let after = cred.large_blob_key.as_ref().and_then(|lbk| {
+            key.read_blobs()
+                .ok()
+                .filter(|a| matches!(a.credential_data(lbk), CredentialData::Absent))
+        });
+        return Err(match after {
+            Some(array) => VaultJobError::DataRemoved {
+                cause,
+                capacity: array.capacity(key.info()),
+            },
+            None => VaultJobError::Vault(cause),
+        });
+    }
+    Ok(key
+        .read_blobs()
+        .map_err(VaultKeyError::from)?
+        .capacity(key.info()))
 }
 
 /// Give the open vault `old` a new key: a new vault of the same name with
@@ -637,6 +670,44 @@ pub(crate) fn run_rotate<K: VaultKey>(
     touches: &mut TouchProgress,
 ) -> Result<Created, VaultKeyError> {
     vault::rotate(key, auth, old, &mut |s| touches.step(s))
+}
+
+/// Whether `e` is a rotate that was refused and undone because the vault
+/// changed (or went) on the key since it was unlocked.
+fn changed_during_rotate(e: &VaultKeyError) -> bool {
+    matches!(
+        e,
+        VaultKeyError::CreateUndone { cause, .. }
+            if matches!(**cause, VaultKeyError::ChangedDuringRotate)
+    )
+}
+
+/// What a rotate job read again after the vault changed on the key: the
+/// open vaults as the key holds them now, or why they couldn't be read.
+pub(crate) type Reloaded = (Unlocked, Result<(), VaultJobError>);
+
+/// After a rotate refused because the vault changed on the key: read the
+/// open vaults again (no PIN, no touch), so the list shows what the key
+/// holds now. `None` for any other outcome.
+pub(crate) fn reload_after_rotate<K: VaultKey>(
+    key: &mut K,
+    result: &Result<Created, VaultKeyError>,
+    mut unlocked: Unlocked,
+) -> Option<Reloaded> {
+    let changed = result.as_ref().err().is_some_and(changed_during_rotate);
+    changed.then(|| {
+        let r = run_reload(key, &mut unlocked).map_err(VaultJobError::from);
+        (unlocked, r)
+    })
+}
+
+/// A rotate refused because vault `name` changed on the key meanwhile.
+fn changed_during_rotate_text(name: &str) -> String {
+    format!(
+        "Vault \"{}\" changed on the key while its key was being rotated, so nothing was \
+         rotated. The list now shows it as the key holds it; check it and rotate again.",
+        sanitize_title(name)
+    )
 }
 
 /// What the pane says once a vault is made: the CLI's backup reminder,
@@ -2287,10 +2358,8 @@ impl App {
             let result = {
                 // A touch only on a key that lists no largeBlobKey for it.
                 let mut touches = TouchProgress::new(shown, 1);
-                open_vault_key(&target).and_then(|mut key| {
-                    run_delete_vault(&mut key, &mut auth, &vault, &mut touches)
-                        .map_err(VaultJobError::from)
-                })
+                open_vault_key(&target)
+                    .and_then(|mut key| run_delete_vault(&mut key, &mut auth, &vault, &mut touches))
             };
             Box::new(move |app: &mut App| {
                 app.vault_apply_delete_vault(for_device, auth, vault, result);
@@ -2319,6 +2388,27 @@ impl App {
         self.vault_give_back_auth(auth);
         let capacity = match result {
             Ok(capacity) => capacity,
+            Err(e @ VaultJobError::DataRemoved { capacity, .. }) => {
+                // The entries are gone from the key: the vault shows with no
+                // data, as a new unlock would list it, until it is deleted.
+                if let Some(s) = self.vault_session_mut() {
+                    if let Some(open) = s
+                        .unlocked
+                        .vaults
+                        .iter_mut()
+                        .find(|v| v.vault_ref.credential_id == vault.credential_id)
+                        .and_then(|v| v.state.as_mut().ok())
+                    {
+                        open.contents = Vault::default();
+                        open.stored = false;
+                    }
+                    s.unlocked.capacity = capacity;
+                    s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
+                }
+                self.vault.open_entry = None;
+                self.vault.revealed = None;
+                return self.vault_fail(&e);
+            }
             Err(e) => return self.vault_job_failed(&e, pin_from_fido),
         };
         if let Some(s) = self.vault_session_mut() {
@@ -2353,20 +2443,29 @@ impl App {
             }));
             return;
         };
+        // Read again with the held secrets if the vault changed meanwhile.
+        let Some(unlocked) = self.vault_session().map(|s| s.unlocked.clone()) else {
+            return;
+        };
         self.vault.error = None;
         self.vault.info = None;
         let shown = self.vault.progress.clone();
         let for_device = self.selected_device.clone();
         let queued = self.spawn_job("Rotating the vault key\u{2026}", move || {
             let mut auth = auth;
-            let result = {
+            let (result, reloaded) = {
                 let mut touches = TouchProgress::new(shown, 2);
-                open_vault_key(&target).and_then(|mut key| {
-                    run_rotate(&mut key, &mut auth, &old, &mut touches).map_err(VaultJobError::from)
-                })
+                match open_vault_key(&target) {
+                    Err(e) => (Err(e), None),
+                    Ok(mut key) => {
+                        let r = run_rotate(&mut key, &mut auth, &old, &mut touches);
+                        let reloaded = reload_after_rotate(&mut key, &r, unlocked);
+                        (r.map_err(VaultJobError::from), reloaded)
+                    }
+                }
             };
             Box::new(move |app: &mut App| {
-                app.vault_apply_rotate(for_device, auth, vault, result);
+                app.vault_apply_rotate(for_device, auth, vault, result, reloaded);
             })
         });
         if !queued {
@@ -2376,13 +2475,16 @@ impl App {
 
     /// The end of a rotate: the new vault takes the old one's place in the
     /// list, and the selection follows it when the old one was shown. A
-    /// rotate that left two copies on the key locks with which to delete.
+    /// rotate that left two copies on the key locks with which to delete. A
+    /// rotate refused because the vault changed on the key meanwhile shows
+    /// the vaults as `reloaded` read them (locks when that one is gone).
     pub(crate) fn vault_apply_rotate(
         &mut self,
         for_device: Option<DeviceId>,
         auth: VaultAuth,
         old: VaultRef,
         result: Result<Created, VaultJobError>,
+        reloaded: Option<Reloaded>,
     ) {
         if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
             return;
@@ -2393,6 +2495,11 @@ impl App {
         self.vault_give_back_auth(auth);
         let Created { open, capacity } = match result {
             Ok(created) => created,
+            Err(VaultJobError::Vault(e @ VaultKeyError::CreateUndone { left_over, .. }))
+                if changed_during_rotate(&e) && !left_over.any() =>
+            {
+                return self.vault_rotate_changed(&old, reloaded);
+            }
             Err(e) => return self.vault_job_failed(&e, pin_from_fido),
         };
         let n = open.contents.entries.len();
@@ -2430,6 +2537,35 @@ impl App {
             format!("vault \"{name}\" rotated"),
         );
         self.space_note("Vault", &capacity);
+    }
+
+    /// A rotate of `old` refused (and cleanly undone) because the vault
+    /// changed on the key since unlock: nothing was rotated, and the list
+    /// takes what the key holds now (`reloaded`, read with no touch). A
+    /// vault gone from the key, or a read that failed, locks.
+    fn vault_rotate_changed(&mut self, old: &VaultRef, reloaded: Option<Reloaded>) {
+        let text = changed_during_rotate_text(&shown_name(old.name.as_deref()));
+        match reloaded {
+            Some((unlocked, Ok(()))) => {
+                self.log(Severity::Warn, format!("Vault: {text}"));
+                if let Some(s) = self.vault_session_mut() {
+                    s.entry_bytes = entry_bytes_estimate(&unlocked.vaults);
+                    s.unlocked = unlocked;
+                }
+                self.vault_fix_selection();
+                self.vault.info = None;
+                self.vault.error = Some(text);
+            }
+            Some((_, Err(e))) => {
+                let why = format!("{text} {}", job_error_text(&e));
+                self.log(Severity::Err, format!("Vault: {why}"));
+                self.vault_lock(Some(why));
+            }
+            None => {
+                self.log(Severity::Err, format!("Vault: {text}"));
+                self.vault_lock(Some(text));
+            }
+        }
     }
 
     /// A create, delete or rotate that failed. What left the list stale
@@ -5349,7 +5485,7 @@ mod tests {
         let mut auth = app.vault_take_auth().expect("the session's auth");
         let result = {
             let mut touches = TouchProgress::new(Arc::new(Mutex::new(None)), 1);
-            run_delete_vault(key, &mut auth, &vault, &mut touches).map_err(VaultJobError::from)
+            run_delete_vault(key, &mut auth, &vault, &mut touches)
         };
         app.vault_apply_delete_vault(Some(KEY.into()), auth, vault, result);
     }
@@ -5361,18 +5497,21 @@ mod tests {
             panic!("a confirmed rotate");
         };
         let (mut auth, old) = app.vault_take_for_save(&vault).expect("an open vault");
+        let unlocked = app.vault_session().unwrap().unlocked.clone();
         let banner = Arc::new(Mutex::new(None));
         let mut watched = Watched {
             key,
             banner: banner.clone(),
             at_touch: Vec::new(),
         };
-        let result = {
+        let (result, reloaded) = {
             let mut touches = TouchProgress::new(banner.clone(), 2);
-            run_rotate(&mut watched, &mut auth, &old, &mut touches).map_err(VaultJobError::from)
+            let r = run_rotate(&mut watched, &mut auth, &old, &mut touches);
+            let reloaded = reload_after_rotate(&mut watched, &r, unlocked);
+            (r.map_err(VaultJobError::from), reloaded)
         };
         let seen = watched.at_touch;
-        app.vault_apply_rotate(Some(KEY.into()), auth, vault, result);
+        app.vault_apply_rotate(Some(KEY.into()), auth, vault, result, reloaded);
         seen
     }
 
@@ -6064,7 +6203,7 @@ mod tests {
         let other: Option<DeviceId> = Some("serial:BBB".into());
         let failed = || VaultJobError::Vault(VaultKeyError::NoVaults);
         app.vault_apply_delete_vault(other.clone(), pin_auth(), vault.clone(), Err(failed()));
-        app.vault_apply_rotate(other.clone(), pin_auth(), vault, Err(failed()));
+        app.vault_apply_rotate(other.clone(), pin_auth(), vault, Err(failed()), None);
         app.vault_apply_create(other, pin_auth(), None, Err(failed()));
         assert!(app.vault.error.is_none() && app.log.is_empty());
         assert_eq!(
@@ -6098,5 +6237,179 @@ mod tests {
                 backup_reminder("Travel")
             ))
         );
+    }
+
+    #[test]
+    fn a_vault_changed_during_rotate_reloads_and_rotates_nothing() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let mut changed = key.vault_on_key(&p).unwrap();
+        changed.entries[0].username = "changed-elsewhere".into();
+        let on_key = changed.clone();
+        // Another program saves to it right after the new vault is written.
+        key.after_write = Some((
+            1,
+            Box::new(move |k: &mut FakeKey| k.put_vault(&p.clone(), &on_key)),
+        ));
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let p = app
+            .selected_vault()
+            .unwrap()
+            .vault_ref
+            .credential_id
+            .clone();
+        let before = key.log.len();
+        app.vault_ask_rotate();
+        rotate_into(&mut app, &mut key);
+        let s = app.vault_session().expect("still unlocked");
+        assert!(s.auth.is_some());
+        assert_eq!(s.unlocked.vaults.len(), 2);
+        assert_eq!(s.unlocked.vaults[0].vault_ref.credential_id, p);
+        assert_eq!(
+            session_entry(&app, &changed.entries[0].title).username,
+            "changed-elsewhere",
+            "the list shows what the key holds now"
+        );
+        let err = app.vault.error.clone().unwrap();
+        assert_eq!(
+            err,
+            "Vault \"Personal\" changed on the key while its key was being rotated, so \
+             nothing was rotated. The list now shows it as the key holds it; check it and \
+             rotate again."
+        );
+        assert!(app.vault.info.is_none());
+        // Nothing left behind: the two vaults and their data, no more.
+        assert_eq!(key.creds.len(), 2, "the new credential was removed");
+        assert_eq!(key.vault_on_key(&p), Some(changed));
+        let mut expected = key.array();
+        for c in &key.creds {
+            expected = expected.without_credential_blob(&c.lbk.unwrap());
+        }
+        assert_eq!(
+            expected.capacity(&key.info).used_bytes,
+            FakeKey::new().array().capacity(&key.info).used_bytes,
+            "no orphan blob"
+        );
+        // The reload asked for no touch beyond the rotate's two.
+        let touches = key.log[before..]
+            .iter()
+            .filter(|c| matches!(c, Call::Assertions(_) | Call::MakeCredential))
+            .count();
+        assert_eq!(touches, 2);
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.severity == Severity::Warn && l.text == format!("Vault: {err}")));
+    }
+
+    #[test]
+    fn a_vault_deleted_during_rotate_locks() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let lbk = key.creds[0].lbk.unwrap();
+        let gone = p.clone();
+        key.after_write = Some((
+            1,
+            Box::new(move |k: &mut FakeKey| {
+                let array = k.array().without_credential_blob(&lbk);
+                k.set_array(&array);
+                k.creds.retain(|c| c.id != gone);
+            }),
+        ));
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_ask_rotate();
+        rotate_into(&mut app, &mut key);
+        assert!(app.vault.session.is_none(), "locked");
+        let err = app.vault.error.clone().unwrap();
+        assert!(
+            err.starts_with(
+                "Vault \"Personal\" changed on the key while its key was being rotated, so \
+                 nothing was rotated."
+            ),
+            "{err}"
+        );
+        assert!(
+            err.ends_with("Unlock again to see what the key holds now."),
+            "{err}"
+        );
+        // Only Work is left, with its data and nothing else.
+        assert_eq!(key.creds.len(), 1);
+        let work_lbk = key.creds[0].lbk.unwrap();
+        assert_eq!(
+            key.array()
+                .without_credential_blob(&work_lbk)
+                .capacity(&key.info)
+                .used_bytes,
+            FakeKey::new().array().capacity(&key.info).used_bytes,
+            "no orphan blob"
+        );
+    }
+
+    #[test]
+    fn a_half_done_vault_delete_shows_no_data_and_finishes_on_retry() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        key.delete_fails = true;
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault.open_entry = Some(session_entry_ids(&app)[0].clone());
+        app.vault_ask_delete_vault();
+        delete_vault_into(&mut app, &mut key);
+        let s = app.vault_session().expect("still unlocked");
+        assert!(s.auth.is_some());
+        assert_eq!(
+            s.unlocked.capacity.used_bytes,
+            key.array().capacity(&key.info).used_bytes
+        );
+        assert_eq!(chip_labels(&app)[0], "Personal \u{00B7} (none)");
+        assert!(app.vault.open_entry.is_none());
+        assert!(
+            !list_text(&mut app).contains("GitHub"),
+            "no entry the key lost"
+        );
+        let err = app.vault.error.clone().unwrap();
+        assert!(
+            err.starts_with(
+                "The vault's entries were removed from the key, but deleting the \
+                             vault itself failed"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.ends_with("Delete vault\u{2026} again finishes it."),
+            "{err}"
+        );
+        assert!(
+            key.creds.iter().any(|c| c.id == p),
+            "the credential is left"
+        );
+        assert_eq!(key.vault_on_key(&p), None, "its data is gone");
+        // Again, once the key lets it: done.
+        key.delete_fails = false;
+        app.vault_select(p.clone());
+        app.vault_ask_delete_vault();
+        delete_vault_into(&mut app, &mut key);
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some("Vault \"Personal\" deleted.")
+        );
+        assert!(key.creds.iter().all(|c| c.id != p));
+    }
+
+    #[test]
+    fn a_vault_delete_that_failed_early_keeps_the_entries() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        key.write_refusals.push_back(0x30);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_ask_delete_vault();
+        delete_vault_into(&mut app, &mut key);
+        assert!(app.vault_session().is_some());
+        assert_eq!(chip_labels(&app)[0], "Personal \u{00B7} 2");
+        assert_eq!(key.vault_on_key(&p).unwrap().entries.len(), 2);
+        assert!(!app.vault.error.clone().unwrap().contains("finishes it"));
     }
 }
