@@ -58,6 +58,82 @@ pub enum CtapError {
     /// The operating system's random source failed, so nothing that needs
     /// a fresh nonce was built (there is no fallback).
     Random,
+    /// Built-in user verification (a fingerprint) was not offered, refused
+    /// or blocked. The caller can ask for the PIN instead. Never a PIN-auth
+    /// error: a refused finger does not invalidate a PIN session.
+    Fingerprint(FingerprintError),
+}
+
+/// Why a fingerprint (CTAP 2.1 built-in user verification) did not give a
+/// pinUvAuthToken. Every case reads as one plain sentence that points the
+/// user at the PIN, with the CTAP2 status in parentheses when the key sent
+/// one.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintError {
+    /// The key's getInfo does not offer built-in UV with permission tokens.
+    NotOffered,
+    /// The key offers built-in UV but has no fingerprint enrolled
+    /// (getInfo `uv: false`).
+    NoneEnrolled,
+    /// No fingerprint tries are left: `status` is `Some(0x3C)` when the key
+    /// said so on a token request, `None` when getUVRetries read 0.
+    Blocked { status: Option<u8> },
+    /// The key answered the token request with this CTAP2 status.
+    Refused(u8),
+}
+
+impl std::fmt::Display for FingerprintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (sentence, status) = match *self {
+            FingerprintError::NotOffered => (
+                "this key does not offer fingerprint unlock; use the PIN instead",
+                None,
+            ),
+            FingerprintError::NoneEnrolled => (
+                "this key has no fingerprint enrolled; use the PIN instead",
+                None,
+            ),
+            FingerprintError::Blocked { status } => (
+                "fingerprint unlock is blocked after too many tries; use the PIN instead",
+                // getUVRetries read 0: no status to show, say what was read.
+                Some(status.ok_or("no fingerprint tries left")),
+            ),
+            FingerprintError::Refused(code) => (
+                match code {
+                    0x3F => "the fingerprint was not recognized; try again or use the PIN instead",
+                    0x2F | 0x3A => "timed out waiting for the fingerprint; use the PIN instead",
+                    // From getPinUvAuthTokenUsingUvWithPermissions, NOT_ALLOWED
+                    // means built-in UV is supported but not configured.
+                    0x30 => "this key has no fingerprint enrolled; use the PIN instead",
+                    _ => "the key did not accept the fingerprint; use the PIN instead",
+                },
+                Some(Ok(code)),
+            ),
+        };
+        match status {
+            None => f.write_str(sentence),
+            Some(Err(why)) => write!(f, "{sentence} ({why})"),
+            Some(Ok(code)) => match ctap_status_name(code) {
+                Some(name) => write!(f, "{sentence} (CTAP2 status 0x{code:02X} {name})"),
+                None => write!(f, "{sentence} (CTAP2 status 0x{code:02X})"),
+            },
+        }
+    }
+}
+
+/// The CTAP2 statuses a built-in UV token request
+/// (`getPinUvAuthTokenUsingUvWithPermissions`) answers when the finger did not
+/// unlock the key, as a [`FingerprintError`]. Any other status is not about
+/// the finger and stays a [`CtapError::StatusCode`] (`None`).
+pub(crate) fn fingerprint_refusal(code: u8) -> Option<FingerprintError> {
+    match code {
+        0x3C => Some(FingerprintError::Blocked { status: Some(code) }),
+        // OPERATION_DENIED, USER_ACTION_TIMEOUT, NOT_ALLOWED, PIN_AUTH_BLOCKED,
+        // ACTION_TIMEOUT, UV_INVALID, UNAUTHORIZED_PERMISSION.
+        0x27 | 0x2F | 0x30 | 0x34 | 0x3A | 0x3F | 0x40 => Some(FingerprintError::Refused(code)),
+        _ => None,
+    }
 }
 
 impl CtapError {
@@ -107,6 +183,7 @@ impl std::fmt::Display for CtapError {
                 write!(f, "the card refused the FIDO request ({sw1:02X}{sw2:02X})")
             }
             CtapError::Random => write!(f, "the system's random number source failed"),
+            CtapError::Fingerprint(e) => write!(f, "{e}"),
         }
     }
 }
@@ -175,7 +252,10 @@ fn ctap_status_name(code: u8) -> Option<&'static str> {
         0x3A => "CTAP2_ERR_ACTION_TIMEOUT",
         0x3B => "CTAP2_ERR_UP_REQUIRED",
         0x3C => "CTAP2_ERR_UV_BLOCKED",
-        0x3F => "CTAP2_ERR_INTEGRITY_FAILURE",
+        0x3D => "CTAP2_ERR_INTEGRITY_FAILURE",
+        0x3E => "CTAP2_ERR_INVALID_SUBCOMMAND",
+        0x3F => "CTAP2_ERR_UV_INVALID",
+        0x40 => "CTAP2_ERR_UNAUTHORIZED_PERMISSION",
         _ => return None,
     })
 }
@@ -418,6 +498,100 @@ mod tests {
         // The timeout code keeps its own words.
         let t = CtapError::StatusCode(0x2F).to_string();
         assert!(t.starts_with("timed out waiting"), "{t}");
+    }
+
+    #[test]
+    fn fingerprint_error_texts() {
+        assert_eq!(
+            FingerprintError::NotOffered.to_string(),
+            "this key does not offer fingerprint unlock; use the PIN instead"
+        );
+        assert_eq!(
+            FingerprintError::NoneEnrolled.to_string(),
+            "this key has no fingerprint enrolled; use the PIN instead"
+        );
+        assert_eq!(
+            FingerprintError::Blocked { status: None }.to_string(),
+            "fingerprint unlock is blocked after too many tries; use the PIN instead \
+             (no fingerprint tries left)"
+        );
+        assert_eq!(
+            FingerprintError::Blocked { status: Some(0x3C) }.to_string(),
+            "fingerprint unlock is blocked after too many tries; use the PIN instead \
+             (CTAP2 status 0x3C CTAP2_ERR_UV_BLOCKED)"
+        );
+        assert_eq!(
+            FingerprintError::Refused(0x3F).to_string(),
+            "the fingerprint was not recognized; try again or use the PIN instead \
+             (CTAP2 status 0x3F CTAP2_ERR_UV_INVALID)"
+        );
+        assert_eq!(
+            FingerprintError::Refused(0x2F).to_string(),
+            "timed out waiting for the fingerprint; use the PIN instead \
+             (CTAP2 status 0x2F CTAP2_ERR_USER_ACTION_TIMEOUT)"
+        );
+        assert_eq!(
+            FingerprintError::Refused(0x3A).to_string(),
+            "timed out waiting for the fingerprint; use the PIN instead \
+             (CTAP2 status 0x3A CTAP2_ERR_ACTION_TIMEOUT)"
+        );
+        assert_eq!(
+            FingerprintError::Refused(0x27).to_string(),
+            "the key did not accept the fingerprint; use the PIN instead \
+             (CTAP2 status 0x27 CTAP2_ERR_OPERATION_DENIED)"
+        );
+        assert_eq!(
+            FingerprintError::Refused(0x34).to_string(),
+            "the key did not accept the fingerprint; use the PIN instead \
+             (CTAP2 status 0x34 CTAP2_ERR_PIN_AUTH_BLOCKED)"
+        );
+        assert_eq!(
+            FingerprintError::Refused(0x40).to_string(),
+            "the key did not accept the fingerprint; use the PIN instead \
+             (CTAP2 status 0x40 CTAP2_ERR_UNAUTHORIZED_PERMISSION)"
+        );
+        // From getPinUvAuthTokenUsingUvWithPermissions, NOT_ALLOWED means
+        // built-in UV is supported but not configured (CTAP 2.1 §6.5.5.7.3).
+        assert_eq!(
+            FingerprintError::Refused(0x30).to_string(),
+            "this key has no fingerprint enrolled; use the PIN instead \
+             (CTAP2 status 0x30 CTAP2_ERR_NOT_ALLOWED)"
+        );
+        // The CtapError wrapper shows the same sentence.
+        assert_eq!(
+            CtapError::Fingerprint(FingerprintError::NotOffered).to_string(),
+            FingerprintError::NotOffered.to_string()
+        );
+    }
+
+    #[test]
+    fn fingerprint_refusal_maps_the_built_in_uv_statuses() {
+        assert_eq!(
+            fingerprint_refusal(0x3C),
+            Some(FingerprintError::Blocked { status: Some(0x3C) })
+        );
+        for code in [0x27, 0x2F, 0x30, 0x34, 0x3A, 0x3F, 0x40] {
+            assert_eq!(
+                fingerprint_refusal(code),
+                Some(FingerprintError::Refused(code))
+            );
+        }
+        for code in [0x2B, 0x31, 0x33, 0x37, 0x11] {
+            assert_eq!(fingerprint_refusal(code), None);
+        }
+        // A fingerprint refusal never relocks a PIN session.
+        assert!(!CtapError::Fingerprint(FingerprintError::Refused(0x34)).is_pin_auth_error());
+    }
+
+    #[test]
+    fn status_names_match_ctap_2_1() {
+        assert_eq!(ctap_status_name(0x3D), Some("CTAP2_ERR_INTEGRITY_FAILURE"));
+        assert_eq!(ctap_status_name(0x3E), Some("CTAP2_ERR_INVALID_SUBCOMMAND"));
+        assert_eq!(ctap_status_name(0x3F), Some("CTAP2_ERR_UV_INVALID"));
+        assert_eq!(
+            ctap_status_name(0x40),
+            Some("CTAP2_ERR_UNAUTHORIZED_PERMISSION")
+        );
     }
 
     #[test]

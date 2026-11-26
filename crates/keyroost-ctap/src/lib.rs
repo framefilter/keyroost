@@ -30,6 +30,6 @@ pub mod ssh_cert;
 pub mod transport;
 
 pub use bio_enroll::{BioEnrollment, CaptureStatus, Enrollment, SensorInfo};
-pub use cmd::{get_info, reset, AuthenticatorInfo, CtapError};
+pub use cmd::{get_info, reset, AuthenticatorInfo, CtapError, FingerprintError};
 pub use config::Configurator;
 pub use hid::{set_trace, CtapHidDevice, InitResponse};
