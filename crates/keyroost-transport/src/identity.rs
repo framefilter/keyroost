@@ -357,6 +357,10 @@ pub fn feitian_cos_version(reader: &str, debug: bool) -> Option<String> {
 /// ([`keyroost_piv::fingerprint::atr_names_utrust`]), or the key doesn't
 /// answer with a version.
 ///
+/// The read ([`keyroost_piv::fingerprint::UTRUST_GET_FIRMWARE_VERSION`]) is
+/// not in Identiv/Hirsch's documentation; it was found in Identiv/Hirsch's
+/// uTrust Token Manager (Windows).
+///
 /// No application is selected for it: the key answers the read whichever
 /// one is selected, and that one stays selected.
 pub fn utrust_firmware_version(reader: &str, debug: bool) -> Option<String> {

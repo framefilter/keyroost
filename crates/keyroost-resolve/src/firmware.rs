@@ -24,12 +24,14 @@
 //!   the three bytes read, `47.17.00` for that key, where Feitian writes
 //!   4.7.17. When that read gives nothing (no reader for the key here, or
 //!   a key that doesn't answer it), the INIT bytes are shown as they are.
-//! * Identiv, now Hirsch (uTrust FIDO2): bytes that are not the version printed on the
-//!   key (`0.0.1` on a uTrust FIDO2 NFC with firmware 3.33). The key gives
-//!   that version over its smart-card reader, to the read Identiv's own
-//!   program sends (`keyroost_transport::identity::utrust_firmware_version`),
-//!   and it is shown as read, `3.33`. When that read gives nothing, the INIT
-//!   bytes are shown as they are.
+//! * Identiv/Hirsch (uTrust FIDO2): bytes that are not the version printed
+//!   on the key (`0.0.1` on a uTrust FIDO2 NFC with firmware 3.33). The key
+//!   gives that version over its smart-card reader
+//!   (`keyroost_transport::identity::utrust_firmware_version`), to a
+//!   command that is not in Identiv/Hirsch's documentation: it was found
+//!   in Identiv/Hirsch's uTrust Token Manager (Windows). It is shown as
+//!   read, `3.33`. When that read gives nothing, the INIT bytes are shown
+//!   as they are.
 //!
 //! [`key_firmware`] applies these rules for one key; the CLI's `fido info`
 //! and the app's key header both show what it returns.
@@ -46,8 +48,8 @@ const TOKEN2_VID: u16 = keyroost_proto::USB_VID;
 /// Feitian's USB vendor ID.
 const FEITIAN_VID: u16 = 0x096e;
 
-/// Identiv's USB vendor ID, which its uTrust FIDO2 keys carry under the
-/// Hirsch name too.
+/// Identiv's USB vendor ID, which uTrust FIDO2 keys carry under both the
+/// Identiv and the Hirsch name.
 const IDENTIV_VID: u16 = 0x04e6;
 
 /// The firmware to show for the FIDO key at HID `path`, whose CTAPHID INIT
@@ -55,9 +57,10 @@ const IDENTIV_VID: u16 = 0x04e6;
 /// ([`init_firmware`]); for a Token2, the release its serial names (the
 /// row's `serial` when the scan read it, else read over USB); for a
 /// Feitian key, the COS version it reports over `reader`, else its INIT
-/// bytes as they are; for an Identiv uTrust FIDO2 key, the firmware version
-/// it gives over `reader`, else its INIT bytes as they are; when INIT says
-/// 0.0.0 (a Nitrokey 3), what the admin application reports over `reader`.
+/// bytes as they are; for an Identiv/Hirsch uTrust FIDO2 key, the firmware
+/// version it gives over `reader`, else its INIT bytes as they are; when
+/// INIT says 0.0.0 (a Nitrokey 3), what the admin application reports over
+/// `reader`.
 /// `None` when the key doesn't say, or isn't found by `path`.
 ///
 /// May ask the key (the Token2 serial, the admin application), so run it

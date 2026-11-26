@@ -376,13 +376,26 @@ pub fn atr_names_utrust(atr: &[u8]) -> bool {
 /// ([`GLOBAL_PLATFORM_GET_CPLC`]) reply, read with the card manager
 /// ([`GLOBAL_PLATFORM_ISD_AID`]) selected: the four bytes of the IC Serial
 /// Number field (offset 12 of the structure [`parse_cplc_serial`]
-/// describes), each as two hex digits. This is the number Identiv's uTrust
-/// Token Manager shows as the key's serial number, and it is the last eight
-/// digits of the serial number printed on the key: measured on a uTrust
-/// FIDO2 NFC with firmware 3.33, whose label carries nine more digits in
-/// front that this read does not give. That program reads it this way for
-/// the keys it calls uTrust FIDO2 NFC and NFC+ and for GOV keys it knows by
-/// their model number; only the NFC key has been measured.
+/// describes), each as two hex digits.
+///
+/// The read itself is documented: Identiv/Hirsch's uTrust FIDO2 Technical
+/// Manual (<https://go.hirschsecure.com/hubfs/44142801/LACS/manual/uTrust_FIDO2_Technical_Manual.pdf>)
+/// describes selecting the security domain and GET DATA for tag `9F 7F`,
+/// and says the CPLC data is on each key to tell keys apart. Which four
+/// bytes are the serial is not in that manual: it was found in
+/// Identiv/Hirsch's uTrust Token Manager (Windows), which shows them as the
+/// key's serial number. On one uTrust FIDO2 NFC with firmware 3.33 they
+/// are the last eight digits of the serial number printed on the key,
+/// whose label carries nine more digits in front that this read does not
+/// give. The reporter of #271 confirmed that their key, with firmware
+/// 3.30, shows a serial this way.
+///
+/// Whether these four bytes differ from key to key is not verified: only
+/// one key has been measured. The manual says the CPLC bytes after the
+/// first two are random and made anew when the security domain is
+/// initialized, which the key measured does not match (its CPLC has the
+/// standard fields filled in); neither has been checked on a second key.
+/// Two connected keys with the same serial are not merged.
 ///
 /// [`parse_cplc_serial`] is HID's rule and gives nothing here: the batch
 /// identifier of the key measured has hex digits above 9.
@@ -405,18 +418,24 @@ pub fn parse_utrust_serial(data: &[u8]) -> Option<String> {
 }
 
 /// The read a uTrust FIDO2 key gives its firmware version to,
-/// `B1 05 42 00 00`: the one Identiv's uTrust Token Manager sends. A uTrust
-/// FIDO2 NFC answers it whichever application is selected (measured
-/// straight after connecting, with the card manager and with PIV).
-/// [`parse_utrust_firmware_version`] reads the answer.
+/// `B1 05 42 00 00`. It is not in Identiv/Hirsch's documentation (the
+/// uTrust FIDO2 Technical Manual does not list it); it was found in
+/// Identiv/Hirsch's uTrust Token Manager (Windows), which sends it to show
+/// a key's firmware version. A uTrust FIDO2 NFC answers it whichever
+/// application is selected (measured straight after connecting, with the
+/// card manager and with PIV). [`parse_utrust_firmware_version`] reads the
+/// answer.
 pub const UTRUST_GET_FIRMWARE_VERSION: [u8; 5] = [0xB1, 0x05, 0x42, 0x00, 0x00];
 
 /// A uTrust FIDO2 key's firmware version out of the answer to
-/// [`UTRUST_GET_FIRMWARE_VERSION`]: its first four bytes as text, `3.33`
-/// for the answer `33 2E 33 33`, which is the version printed on that key.
-/// `None` when the answer is shorter, or when those four bytes are not
-/// digits and dots starting with a digit, so that an answer meaning
-/// something else is not shown as a version.
+/// [`UTRUST_GET_FIRMWARE_VERSION`] (a command found in Identiv/Hirsch's
+/// uTrust Token Manager, not in the vendor's documentation): its first four
+/// bytes as text, `3.33` for the answer `33 2E 33 33`. That these are the
+/// version printed on the key was measured on one key with firmware 3.33,
+/// and the reporter of #271 confirmed it on firmware 3.30. `None` when the
+/// answer is shorter, or when those four bytes are not digits and dots
+/// starting with a digit, so that an answer meaning something else is not
+/// shown as a version.
 #[must_use]
 pub fn parse_utrust_firmware_version(data: &[u8]) -> Option<String> {
     let text = data.get(..4)?;
@@ -2679,7 +2698,7 @@ mod tests {
         assert_eq!(parse_cplc_serial(&cplc), None);
     }
 
-    // --- Identiv uTrust FIDO2: serial number and firmware version -----------
+    // --- Identiv/Hirsch uTrust FIDO2: serial number and firmware version ----
 
     /// The CPLC reply of a uTrust FIDO2 NFC key, as measured, with other
     /// digits in its IC Serial Number field.
@@ -2698,7 +2717,7 @@ mod tests {
         // HID's rule gives nothing for this card: its batch identifier
         // (6A C9) is not decimal digits.
         assert_eq!(parse_cplc_serial(&reply), None);
-        // Digits above 9 print as capitals, as Identiv's program prints them.
+        // Digits above 9 print as capitals, as the vendor's program does.
         let mut cplc = vec![0u8; 42];
         cplc[12..16].copy_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]);
         assert_eq!(parse_utrust_serial(&cplc).as_deref(), Some("ABCDEF01"));

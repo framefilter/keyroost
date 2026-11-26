@@ -96,6 +96,39 @@ untested because an earlier row already answered the question.
 | AAGUID (E3) | yes | NO | yes | none | reject (model-level) |
 | Trussed/solo2 UUID (E5) | not tested | not tested | — | — | not pursued — E1 sufficed, and this would have needed a management interface |
 
+### Identiv/Hirsch uTrust FIDO2 NFC (`04e6:5a11`, fw 3.33; one unit, contributor's)
+
+Measured on Windows by the contributor of
+[#290](https://github.com/framefilter/keyroost/pull/290), on one key; there is
+no uTrust key on our bench. The reporter of
+[#271](https://github.com/framefilter/keyroost/issues/271) confirmed that
+keyroost shows a serial and the firmware version on a key with firmware 3.30.
+
+| Candidate | Stable re-plug? | Unique per unit? | Read-only? | Privacy cost | Verdict |
+|---|---|---|---|---|---|
+| USB iSerial (E1) | n/a | n/a | yes | — | **not available** — the key has no USB serial string; the reader's `VENDOR_IFD_SERIAL_NO` answers `?` on Windows. That attribute is never taken as the key's serial: on a separate reader (NFC, say) it would be the reader's own serial, shared by every key placed on it |
+| PIV GET SERIAL | n/a | n/a | yes | — | **not available** — `6D00` |
+| CPLC IC Serial Number (card manager) | not tested | **not verified** — one unit | yes (GlobalPlatform SELECT + GET DATA) | correlatable across interfaces; mitigated by local-only storage | **adopted** (`keyroost_piv::fingerprint::parse_utrust_serial`) |
+
+**Where the serial read comes from.** The read itself is in Identiv/Hirsch's
+[uTrust FIDO2 Technical Manual](https://go.hirschsecure.com/hubfs/44142801/LACS/manual/uTrust_FIDO2_Technical_Manual.pdf):
+SELECT the security domain (`00 A4 04 00 07 A0 00 00 01 51 00 00 00`), then
+GET DATA for tag `9F7F` (`80 CA 9F 7F 00`), 42 bytes, which the manual says
+are on each key "to assure unique identification of the keys in CMS". Which
+four bytes are shown as the serial is not in the manual: it was found in
+Identiv/Hirsch's uTrust Token Manager (Windows), which shows the IC Serial
+Number field (offset 12, four bytes, as hex). On the key measured that is the
+last eight digits of the 17-digit serial printed on it.
+
+**Not verified.** Whether the IC Serial Number differs from key to key: only
+one key was measured. The manual says the bytes after the first two are random
+and made anew when the security domain is initialized; the key measured has
+the standard CPLC fields filled in instead, and neither reading has been
+checked on a second key. Two connected keys with the same serial are not
+merged (the duplicate-serial handling above). Also not verified: the key over
+NFC, other uTrust models (NFC+, GOV), Linux and macOS, and `fido reset`
+re-identifying the key by this serial after the replug.
+
 ## Privacy review (gate before any FIDO implementation)
 
 1. Does the chosen ID create a tracking/correlation vector beyond this host?
@@ -188,6 +221,20 @@ smart-card interface (2026-10): the SELECT answers `U2F_V2` with `9000`, and
 the version query answers `6D00` (instruction not supported). keyroost
 therefore doesn't use that query, and shows no FIDO firmware version for a
 NEO from it.
+
+## Identiv/Hirsch uTrust FIDO2: firmware version over the smart-card interface
+
+A uTrust FIDO2 key's CTAPHID INIT version bytes are not the firmware version
+printed on it (`0.0.1` on a key with firmware 3.33), and its getInfo carries
+no `firmwareVersion`. The command keyroost sends for it, `B1 05 42 00 00`, is
+not in Identiv/Hirsch's documentation (the uTrust FIDO2 Technical Manual does
+not list it): it was found in Identiv/Hirsch's uTrust Token Manager (Windows).
+On the contributor's uTrust FIDO2 NFC it answers `33 2E 33 33` `9000`
+("3.33") whichever application is selected; the reporter of
+[#271](https://github.com/framefilter/keyroost/issues/271) confirmed the
+version shown on firmware 3.30. It is sent only to a key with USB vendor ID
+`04E6` whose card's ATR names uTrust; any other answer leaves the INIT bytes
+shown. Other uTrust models are not measured.
 
 # Thread B — Capabilities & day-to-day security uses
 
