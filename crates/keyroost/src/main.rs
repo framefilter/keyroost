@@ -321,6 +321,22 @@ fn blob_space_line(
     keyroost_resolve::store_note(cap).map(|note| format!("{subject}: {note}"))
 }
 
+/// The Storage tab's question before entry `idx` (0-based) is deleted, with
+/// what deleting it loses: the key's name, or a password vault's entries.
+fn lb_delete_question(idx: usize, is_name: bool, is_vault: bool) -> String {
+    let loses = if is_name {
+        " This removes the key's name."
+    } else if is_vault {
+        " This is a password vault: deleting it loses every entry in it."
+    } else {
+        ""
+    };
+    format!(
+        "Delete entry {} and rewrite the array? Requires your PIN.{loses}",
+        idx + 1
+    )
+}
+
 /// The naming dialog's message for a key with no storage for its own name.
 const KEY_NAME_NO_STORAGE: &str =
     "This key can't store a name on itself; save the name on this computer.";
@@ -630,6 +646,9 @@ struct SecurityKeysState {
     fp_progress: Option<std::sync::Arc<std::sync::Mutex<EnrollProgress>>>,
     /// Pending delete confirmation: the template id awaiting "Are you sure?".
     fp_confirm_delete: Option<Vec<u8>>,
+    /// The passkey of a password vault whose Remove waits for its
+    /// confirmation (its credential ID). Other passkeys are removed at once.
+    passkey_confirm_delete: Option<Vec<u8>>,
     /// Inline rename editor: (template_id, new-name buffer).
     fp_rename: Option<(Vec<u8>, String)>,
     /// Pending advanced-config action awaiting typed confirmation + PIN.
@@ -5699,8 +5718,13 @@ enum FileTarget {
     /// queue, remembering which view asked.
     ImportCodes(import_flow::Origin),
     /// Vault tab "Export backup…" destination: the chosen file opens the
-    /// passphrase dialog for the vault in `vault.export_for`.
-    VaultExport,
+    /// passphrase dialog for the vault in `vault.export_for`. Carries the
+    /// vault's credential ID and the key it is on, so a file chosen for one
+    /// vault is never used for another's backup.
+    VaultExport {
+        credential_id: Vec<u8>,
+        device: Option<DeviceId>,
+    },
     /// Vault tab "Import backup…" source: the chosen file opens the import
     /// dialog, while `vault.import_asked` says one was asked for.
     VaultImport,
@@ -5926,7 +5950,10 @@ impl App {
                             FileTarget::ImportCodes(origin) => {
                                 self.import_flow.enqueue([path], &origin);
                             }
-                            FileTarget::VaultExport => self.vault_export_chosen(path),
+                            FileTarget::VaultExport {
+                                credential_id,
+                                device,
+                            } => self.vault_export_chosen(path, &credential_id, device.as_ref()),
                             FileTarget::VaultImport => self.vault_import_chosen(path),
                         }
                     } else {
@@ -5955,8 +5982,12 @@ impl App {
             FileTarget::SshCertSave(id) => {
                 self.security_keys.ssh_cert_pending.remove(&id);
             }
-            // No file: no backup is waiting for one.
-            FileTarget::VaultExport => self.vault.export_for = None,
+            // No file: the backup this dialog was for no longer waits (one
+            // for another vault still does).
+            FileTarget::VaultExport {
+                credential_id,
+                device,
+            } => self.vault_export_dismissed(&credential_id, device.as_ref()),
             // No file: no import is waiting for one.
             FileTarget::VaultImport => self.vault.import_asked = false,
             _ => {}
@@ -7369,6 +7400,8 @@ impl App {
     fn lock_session(&mut self) {
         self.security_keys.session = None;
         self.security_keys.session_device = None;
+        // A vault passkey's question is about the list that just went.
+        self.security_keys.passkey_confirm_delete = None;
         wipe(&mut self.security_keys.pin_input);
     }
 
@@ -7441,9 +7474,9 @@ impl App {
     /// [`TypedSecrets`] list; the vault's ([`vault_pane::VaultState`])
     /// appended when `vault` is set. The idle lock wipes the list outside
     /// the vault through it, so a form left half-filled doesn't keep its
-    /// secret; an unlocked vault is wiped by [`Self::vault_lock`] rebuilding
-    /// its state, and only a PIN typed into a locked Vault tab through the
-    /// vault's own list.
+    /// secret. An unlocked vault is wiped by [`Self::vault_lock`] rebuilding
+    /// its state; the vault's own list is wiped on its own only for a PIN
+    /// typed into a locked Vault tab.
     ///
     /// Left out on purpose: the Molto2 customer key. Empty there means the
     /// factory default key, so wiping it would quietly switch the next
@@ -8316,25 +8349,39 @@ impl App {
                 .and_then(|token| Self::refresh_with_token(&target, token, pin))
                 .map_err(SessionOpError::from_boxed);
             Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    let outcome = if wrote { Ok(()) } else { result.map(|_| ()) };
-                    app.log_moved_on(for_device.as_ref(), "deleting a passkey", &outcome);
-                    return; // selection changed mid-delete; drop the refresh
-                }
-                if wrote {
-                    app.log(Severity::Ok, "Passkey deleted");
-                }
-                match result {
-                    Ok(fresh) => {
-                        app.security_keys.session = Some(fresh);
-                        app.security_keys.session_device = for_device.clone();
-                        app.security_keys.error = None;
-                    }
-                    Err(e) if wrote => app.fail_session_op(&e, "passkey list not read again"),
-                    Err(e) => app.fail_session_op(&e, "delete failed"),
-                }
+                app.apply_passkey_deleted(for_device, &cred_id, wrote, result);
             })
         });
+    }
+
+    /// The end of a passkey delete: `wrote` whether passkey `cred_id` is
+    /// gone, `result` the list read again after it. A vault unlocked with
+    /// that passkey goes with it ([`Self::vault_passkey_deleted`]).
+    fn apply_passkey_deleted(
+        &mut self,
+        for_device: Option<DeviceId>,
+        cred_id: &[u8],
+        wrote: bool,
+        result: Result<UnlockedSession, SessionOpError>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+            let outcome = if wrote { Ok(()) } else { result.map(|_| ()) };
+            self.log_moved_on(for_device.as_ref(), "deleting a passkey", &outcome);
+            return; // selection changed mid-delete; drop the refresh
+        }
+        if wrote {
+            self.log(Severity::Ok, "Passkey deleted");
+            self.vault_passkey_deleted(cred_id);
+        }
+        match result {
+            Ok(fresh) => {
+                self.security_keys.session = Some(fresh);
+                self.security_keys.session_device = for_device;
+                self.security_keys.error = None;
+            }
+            Err(e) if wrote => self.fail_session_op(&e, "passkey list not read again"),
+            Err(e) => self.fail_session_op(&e, "delete failed"),
+        }
     }
 
     /// Delete one passkey; returns the token that worked (a token another
@@ -8496,7 +8543,7 @@ impl App {
                 // back into this form after the key has accepted the change.
                 // The vault was opened with the old PIN: it locks too.
                 self.lock_session();
-                self.vault_lock(None);
+                self.vault_lock(Some(vault_pane::pin_changed_text()));
                 self.fetch_selected_info();
             }
             Err(e) => {
@@ -8644,7 +8691,7 @@ impl App {
                 app.security_keys.info = None;
                 app.security_keys.error = None;
                 // The reset wiped every vault with the passkeys.
-                app.vault_lock(None);
+                app.vault_lock(Some(vault_pane::FIDO_RESET_LOCKED.to_owned()));
                 // When this reset was a factory reset's finale, record it —
                 // the Overview report is where the user is looking, and the
                 // activity log, where the permanent record lives.
@@ -12433,6 +12480,7 @@ impl App {
         self.security_keys.fp_autoloaded = false;
         self.security_keys.fp_new_name.clear();
         self.security_keys.fp_confirm_delete = None;
+        self.security_keys.passkey_confirm_delete = None;
         self.security_keys.fp_rename = None;
         if let Some(p) = self.security_keys.fp_progress.take() {
             if let Ok(g) = p.lock() {
@@ -21161,6 +21209,7 @@ impl App {
         if unlocked && subview == FidoSubview::Passkeys {
             ui.add_space(14.0);
             let mut delete: Option<Vec<u8>> = None;
+            let mut ask_delete: Option<Vec<u8>> = None;
             // Collected in the credential loop (below), applied after the card so
             // the extract job isn't dispatched while `self` is borrowed by the
             // cloned rps list: (rp id, credential's largeBlob key).
@@ -21237,7 +21286,13 @@ impl App {
                                             )
                                             .clicked()
                                             {
-                                                delete = Some(c.credential_id.clone());
+                                                // A vault's passkey asks first:
+                                                // deleting it loses the vault.
+                                                if vault_pane::is_vault_passkey(&rp.id) {
+                                                    ask_delete = Some(c.credential_id.clone());
+                                                } else {
+                                                    delete = Some(c.credential_id.clone());
+                                                }
                                             }
                                             // SSH credentials that carry a largeBlob
                                             // key can hold an OpenSSH certificate;
@@ -21341,7 +21396,12 @@ impl App {
                     });
                 }
             });
-            if let Some(id) = delete {
+            if let Some(id) = ask_delete {
+                self.security_keys.passkey_confirm_delete = Some(id);
+            }
+            // A vault passkey's question, under the list.
+            let confirmed = self.render_vault_passkey_confirm(ui, p);
+            if let Some(id) = delete.or(confirmed) {
                 self.delete_credential(id);
             }
             if let Some((rp_id, key)) = save_cert {
@@ -22381,29 +22441,19 @@ impl App {
                     keyroost_ctap::large_blobs::EntryKind::KeyName(_)
                 )
             });
+            let is_vault = self
+                .security_keys
+                .lb_vault_labels
+                .get(idx)
+                .is_some_and(Option::is_some);
             ui.add_space(6.0);
             theme::card_frame(p)
                 .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Delete entry {} and rewrite the array? Requires your PIN.{}",
-                            idx + 1,
-                            if is_name {
-                                " This removes the key's name."
-                            } else if self
-                                .security_keys
-                                .lb_vault_labels
-                                .get(idx)
-                                .is_some_and(Option::is_some)
-                            {
-                                " This is a password vault: deleting it loses every entry in it."
-                            } else {
-                                ""
-                            }
-                        ))
-                        .font(theme::f_reg(12.5))
-                        .color(p.txt),
+                        egui::RichText::new(lb_delete_question(idx, is_name, is_vault))
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt),
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {

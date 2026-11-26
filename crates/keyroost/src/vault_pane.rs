@@ -276,6 +276,7 @@ fn contains_folded(hay: &str, needle: &[char]) -> bool {
 /// Whether entry `e` matches the filter: its title, username or URL holds
 /// `filter`, ignoring case. Never its notes or password, which the list
 /// doesn't show. An empty filter matches every entry.
+///
 /// The list lower-cases the filter once ([`shown_rows`]); this one-entry
 /// form is for tests.
 #[cfg(test)]
@@ -499,10 +500,7 @@ pub(crate) fn vault_error_text(e: &VaultKeyError) -> String {
             return old_not_deleted_text(name.as_deref(), cause, *old);
         }
         VaultKeyError::VaultGone { .. } => {
-            return format!(
-                "{} Unlock again to see what the key holds now.",
-                as_sentence(&e.to_string())
-            );
+            return format!("{} {UNLOCK_AGAIN}", as_sentence(&e.to_string()));
         }
         _ => "",
     };
@@ -532,7 +530,7 @@ fn old_not_deleted_text(name: Option<&str>, cause: &VaultKeyError, old: OldVault
         ),
     };
     format!(
-        "{} Unlock the vault again to see both copies.",
+        "{} {UNLOCK_AGAIN}",
         as_sentence(&format!(
             "the new {which} is in place with every entry checked, but deleting the old one \
              failed: {cause}; {next}"
@@ -732,10 +730,13 @@ pub(crate) fn reload_after_rotate<K: VaultKey>(
 fn changed_during_rotate_text(name: &str) -> String {
     format!(
         "Vault \"{}\" changed on the key while its key was being rotated, so nothing was \
-         rotated. The list now shows it as the key holds it; check it and rotate again.",
+         rotated.",
         sanitize_title(name)
     )
 }
+
+/// After [`changed_during_rotate_text`], when the list was read again.
+const ROTATE_AGAIN: &str = "The list now shows it as the key holds it; check it and rotate again.";
 
 /// What the pane says once a vault is made: the CLI's backup reminder,
 /// with the app's Export backup… for its command.
@@ -774,9 +775,42 @@ const ROTATE_EXPLAINED: &str = "Gives this vault a new key. Use it after unlocki
                                 a computer you no longer trust, then change the passwords that \
                                 matter.";
 
-/// Why the vault locked when a create, delete or rotate couldn't start.
-const JOB_NOT_STARTED: &str =
-    "That couldn't start, and nothing was changed. Unlock the vault again.";
+/// How every line that locks the vault ends: one wording across the tab
+/// (the idle lock keeps the app-wide "unlock again to continue").
+const UNLOCK_AGAIN: &str = "Unlock the vault again to see what the key holds now.";
+
+/// Why the vault locked when the FIDO2 tab changed the PIN it was opened
+/// with.
+pub(crate) fn pin_changed_text() -> String {
+    format!("The FIDO2 PIN was changed, so the vault locked. {UNLOCK_AGAIN}")
+}
+
+/// Why the vault locked at a FIDO2 reset: nothing is left to unlock.
+pub(crate) const FIDO_RESET_LOCKED: &str =
+    "The FIDO2 reset wiped the key's passkeys and every vault on it.";
+
+/// `why` the vault locked, then [`UNLOCK_AGAIN`] (once).
+fn with_unlock_again(why: &str) -> String {
+    if why.ends_with(UNLOCK_AGAIN) {
+        why.to_owned()
+    } else {
+        format!("{why} {UNLOCK_AGAIN}")
+    }
+}
+
+/// Why the vault locked when a create, delete or rotate couldn't start
+/// (then [`UNLOCK_AGAIN`]).
+const JOB_NOT_STARTED: &str = "That couldn't start, and nothing was changed.";
+
+/// The unlock job couldn't be queued: the PIN typed for it is wiped.
+const UNLOCK_NOT_STARTED: &str = "Unlocking couldn't start; press Unlock again.";
+
+/// [`UNLOCK_NOT_STARTED`] when the PIN came from the Vault tab's box.
+const UNLOCK_NOT_STARTED_TYPED: &str =
+    "Unlocking couldn't start; type the PIN and press Unlock again.";
+
+/// A Refresh of the unlocked vault couldn't be queued.
+const REFRESH_NOT_STARTED: &str = "Reading the vault couldn't start; press Refresh again.";
 
 /// Whether the key refused the vault's PIN (or locked it): every retry
 /// would spend another of the key's PIN tries, so the vault locks.
@@ -791,9 +825,9 @@ fn pin_refused(e: &VaultJobError) -> bool {
 /// What the job label and the CLI say while a vault is written.
 const SAVE_LABEL: &str = "Saving to the key\u{2026}";
 
-/// Why the vault locked when a save job couldn't be started.
-const SAVE_NOT_STARTED: &str =
-    "The save couldn't start, and nothing was written. Unlock the vault again.";
+/// Why the vault locked when a save job couldn't be started (then
+/// [`UNLOCK_AGAIN`]).
+const SAVE_NOT_STARTED: &str = "The save couldn't start, and nothing was written.";
 
 /// The CLI's `an entry needs a title`, as a sentence.
 const NEEDS_TITLE: &str = "An entry needs a title.";
@@ -1079,6 +1113,25 @@ pub(crate) struct VaultSession {
     pub(crate) entry_bytes: usize,
 }
 
+impl VaultSession {
+    /// The session's vault `credential_id`: found by credential ID, never
+    /// by name, since two vaults may share one.
+    pub(crate) fn vault(&self, credential_id: &[u8]) -> Option<&VaultOnKey> {
+        self.unlocked
+            .vaults
+            .iter()
+            .find(|v| v.vault_ref.credential_id == credential_id)
+    }
+
+    /// [`Self::vault`], to change it.
+    pub(crate) fn vault_mut(&mut self, credential_id: &[u8]) -> Option<&mut VaultOnKey> {
+        self.unlocked
+            .vaults
+            .iter_mut()
+            .find(|v| v.vault_ref.credential_id == credential_id)
+    }
+}
+
 /// The Vault tab's state for the selected key. Replaced whole when another
 /// key is selected, and on lock ([`App::vault_lock`]), so every field
 /// drops and wipes through its own `Drop` / `Zeroizing`.
@@ -1207,6 +1260,11 @@ impl App {
             .filter(|s| completion_still_valid(Some(&s.device), selected.as_ref()))
     }
 
+    /// Vault `credential_id` of the session ([`VaultSession::vault`]).
+    pub(crate) fn session_vault(&self, credential_id: &[u8]) -> Option<&VaultOnKey> {
+        self.vault_session()?.vault(credential_id)
+    }
+
     /// The PIN an unlock uses: the FIDO2 tab's, when that tab is unlocked on
     /// this key (`true`), else the one typed in the Vault tab's box, which
     /// empties.
@@ -1247,7 +1305,7 @@ impl App {
         let for_device = self.selected_device.clone();
         self.vault.error = None;
         self.vault.info = None;
-        self.spawn_job("Unlocking the vault\u{2026}", move || {
+        let queued = self.spawn_job("Unlocking the vault\u{2026}", move || {
             let mut auth = auth;
             let result = {
                 let mut touches = TouchProgress::new(shown, 1);
@@ -1259,6 +1317,19 @@ impl App {
                 app.vault_apply_unlock(for_device, auth, pin_from_fido, typed_pin, result);
             })
         });
+        if !queued {
+            // The job dropped (and wiped) the PIN it took; the box is wiped
+            // too, so nothing typed waits for a retry.
+            wipe(&mut self.vault.pin_input);
+            self.vault.error = Some(
+                if pin_from_fido {
+                    UNLOCK_NOT_STARTED
+                } else {
+                    UNLOCK_NOT_STARTED_TYPED
+                }
+                .to_owned(),
+            );
+        }
     }
 
     /// The end of an unlock. A result for a key no longer selected is
@@ -1323,13 +1394,17 @@ impl App {
         };
         let unlocked = session.unlocked.clone();
         let for_device = self.selected_device.clone();
-        self.spawn_job("Reading the vault\u{2026}", move || {
+        let queued = self.spawn_job("Reading the vault\u{2026}", move || {
             let mut unlocked = unlocked;
             let result = open_vault_key(&target).and_then(|mut key| {
                 run_reload(&mut key, &mut unlocked).map_err(VaultJobError::from)
             });
             Box::new(move |app: &mut App| app.vault_apply_reload(for_device, unlocked, result))
         });
+        if !queued {
+            self.vault.info = None;
+            self.vault.error = Some(REFRESH_NOT_STARTED.to_owned());
+        }
     }
 
     /// The end of a Refresh. Lands only on the session it was read for, so a
@@ -1461,13 +1536,7 @@ impl App {
         let Some(id) = self.vault.selected.as_deref() else {
             return;
         };
-        let listed = self.vault_session().is_some_and(|s| {
-            s.unlocked
-                .vaults
-                .iter()
-                .any(|v| v.vault_ref.credential_id == id)
-        });
-        if !listed {
+        if self.session_vault(id).is_none() {
             self.vault.selected = None;
             self.vault.open_entry = None;
             self.vault.revealed = None;
@@ -1525,8 +1594,10 @@ impl App {
     }
 
     /// Open the form that adds an entry to the shown vault, when it opened.
+    /// Refused while a job runs: a save still running reports on the form
+    /// it was started from.
     pub(crate) fn vault_add_entry(&mut self) {
-        if !self.vault_writable() {
+        if !self.vault_writable() || self.refuse_if_busy() {
             return;
         }
         let Some(v) = self.selected_vault() else {
@@ -1538,8 +1609,12 @@ impl App {
         self.vault.info = None;
     }
 
-    /// Open the form that edits entry `id` of the shown vault.
+    /// Open the form that edits entry `id` of the shown vault. Refused
+    /// while a job runs, as Add entry is.
     pub(crate) fn vault_edit_entry(&mut self, id: &str) {
+        if self.refuse_if_busy() {
+            return;
+        }
         let Some(v) = self.selected_vault() else {
             return;
         };
@@ -1557,8 +1632,12 @@ impl App {
         self.vault.info = None;
     }
 
-    /// Close the form; what was typed is wiped.
+    /// Close the form; what was typed is wiped. Not while a job runs (the
+    /// button is disabled then): a save still running reports on this form.
     pub(crate) fn vault_cancel_form(&mut self) {
+        if self.busy() {
+            return;
+        }
         self.vault.form = None;
     }
 
@@ -1654,11 +1733,7 @@ impl App {
 
     /// Entry `id` of `vault` as the session holds it.
     fn vault_entry(&self, vault: &VaultRef, id: &str) -> Option<Entry> {
-        self.vault_session()?
-            .unlocked
-            .vaults
-            .iter()
-            .find(|v| v.vault_ref.credential_id == vault.credential_id)?
+        self.session_vault(&vault.credential_id)?
             .state
             .as_ref()
             .ok()?
@@ -1677,17 +1752,13 @@ impl App {
         &mut self,
         vault: &VaultRef,
     ) -> Option<(VaultAuth, OpenVault)> {
-        let s = self.vault_session_mut()?;
-        let open = s
-            .unlocked
-            .vaults
-            .iter()
-            .find(|v| v.vault_ref.credential_id == vault.credential_id)?
+        let open = self
+            .session_vault(&vault.credential_id)?
             .state
             .as_ref()
             .ok()?
             .clone();
-        let auth = s.auth.take()?;
+        let auth = self.vault_session_mut()?.auth.take()?;
         Some((auth, open))
     }
 
@@ -1732,8 +1803,9 @@ impl App {
         if !queued {
             // The job and the auth it took are gone: lock rather than keep
             // a session that can't save.
-            self.log(Severity::Err, format!("Vault: {SAVE_NOT_STARTED}"));
-            self.vault_lock(Some(SAVE_NOT_STARTED.to_owned()));
+            let why = with_unlock_again(SAVE_NOT_STARTED);
+            self.log(Severity::Err, format!("Vault: {why}"));
+            self.vault_lock(Some(why));
         }
     }
 
@@ -1745,12 +1817,8 @@ impl App {
             return;
         };
         s.auth = Some(auth);
-        if let Some(v) = s
-            .unlocked
-            .vaults
-            .iter_mut()
-            .find(|v| v.vault_ref.credential_id == open.vault_ref.credential_id)
-        {
+        let id = open.vault_ref.credential_id.clone();
+        if let Some(v) = s.vault_mut(&id) {
             v.state = Ok(open);
         }
         s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
@@ -1781,18 +1849,9 @@ impl App {
         let name = shown_name(vault.name.as_deref());
         match result {
             Err(e @ VaultJobError::Vault(VaultKeyError::VaultGone { .. })) => {
-                let text = job_error_text(&e);
-                self.log(Severity::Err, format!("Vault: {text}"));
-                self.vault_lock(Some(text));
+                self.vault_job_failed(&e, pin_from_fido);
             }
-            Err(e) if pin_refused(&e) => {
-                self.vault_fail(&e);
-                let why = self.vault.error.take();
-                self.vault_lock(why);
-                if pin_from_fido {
-                    self.relock_fido_session();
-                }
-            }
+            Err(e) if pin_refused(&e) => self.vault_job_failed(&e, pin_from_fido),
             Ok(saved) => {
                 if let Some(s) = self.vault_session_mut() {
                     s.unlocked.capacity = saved.capacity;
@@ -1882,11 +1941,7 @@ impl App {
         let id = f.editing.as_ref().map(|e| canon_id(&e.id));
         let cred = f.vault.credential_id.clone();
         let current = id.as_ref().and_then(|id| {
-            self.vault_session()?
-                .unlocked
-                .vaults
-                .iter()
-                .find(|v| v.vault_ref.credential_id == cred)?
+            self.session_vault(&cred)?
                 .state
                 .as_ref()
                 .ok()?
@@ -2383,8 +2438,9 @@ impl App {
     /// A job that took the session's auth couldn't be queued: the auth went
     /// with it, so lock rather than keep a session that can't write.
     fn vault_not_started(&mut self) {
-        self.log(Severity::Err, format!("Vault: {JOB_NOT_STARTED}"));
-        self.vault_lock(Some(JOB_NOT_STARTED.to_owned()));
+        let why = with_unlock_again(JOB_NOT_STARTED);
+        self.log(Severity::Err, format!("Vault: {why}"));
+        self.vault_lock(Some(why));
     }
 
     /// The `+ New vault` chip: open the name box, or close it again.
@@ -2619,10 +2675,7 @@ impl App {
                 // data, as a new unlock would list it, until it is deleted.
                 if let Some(s) = self.vault_session_mut() {
                     if let Some(open) = s
-                        .unlocked
-                        .vaults
-                        .iter_mut()
-                        .find(|v| v.vault_ref.credential_id == vault.credential_id)
+                        .vault_mut(&vault.credential_id)
                         .and_then(|v| v.state.as_mut().ok())
                     {
                         open.contents = Vault::default();
@@ -2740,13 +2793,8 @@ impl App {
                 vault_ref: open.vault_ref.clone(),
                 state: Ok(open),
             };
-            match s
-                .unlocked
-                .vaults
-                .iter()
-                .position(|v| v.vault_ref.credential_id == old.credential_id)
-            {
-                Some(i) => s.unlocked.vaults[i] = new,
+            match s.vault_mut(&old.credential_id) {
+                Some(v) => *v = new,
                 None => s.unlocked.vaults.push(new),
             }
             s.unlocked.capacity = capacity;
@@ -2776,6 +2824,7 @@ impl App {
         let text = changed_during_rotate_text(&shown_name(old.name.as_deref()));
         match reloaded {
             Some((unlocked, Ok(()))) => {
+                let text = format!("{text} {ROTATE_AGAIN}");
                 self.log(Severity::Warn, format!("Vault: {text}"));
                 if let Some(s) = self.vault_session_mut() {
                     s.entry_bytes = entry_bytes_estimate(&unlocked.vaults);
@@ -2786,19 +2835,21 @@ impl App {
                 self.vault.info = None;
                 self.vault.error = Some(text);
             }
+            // Locked: only a new unlock shows the vault now.
             Some((_, Err(e))) => {
-                let why = format!("{text} {}", job_error_text(&e));
+                let why = with_unlock_again(&format!("{text} {}", job_error_text(&e)));
                 self.log(Severity::Err, format!("Vault: {why}"));
                 self.vault_lock(Some(why));
             }
             None => {
-                self.log(Severity::Err, format!("Vault: {text}"));
-                self.vault_lock(Some(text));
+                let why = with_unlock_again(&text);
+                self.log(Severity::Err, format!("Vault: {why}"));
+                self.vault_lock(Some(why));
             }
         }
     }
 
-    /// A create, delete or rotate that failed. What left the list stale
+    /// A create, delete, rotate or save that failed. What left the list stale
     /// locks the vault (only a new unlock lists what the key holds now): a
     /// vault gone elsewhere, a failed create that left something behind, a
     /// rotate that left two copies. A refused PIN locks it too, so no retry
@@ -2841,13 +2892,7 @@ impl App {
             Some(VaultConfirm::Rotate { vault }) => (vault.clone(), true),
             _ => return,
         };
-        let listed = self.vault_session().is_some_and(|s| {
-            s.unlocked
-                .vaults
-                .iter()
-                .any(|v| v.vault_ref.credential_id == vault.credential_id)
-        });
-        if !listed {
+        if self.session_vault(&vault.credential_id).is_none() {
             self.vault.confirm = None;
             return;
         }
@@ -2962,8 +3007,10 @@ impl App {
 
     /// The add / edit form (the mockup's): Title, Username, Password with
     /// Show and Generate, the generator's settings behind `change`, URL and
-    /// Notes, then Cancel / Save.
+    /// Notes, then Cancel / Save. Cancel waits for a running save, so its
+    /// end finds the form it reports on.
     fn render_entry_form(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let busy = self.busy();
         let waiting = self.waiting_for().map(str::to_owned);
         let Some(mut form) = self.vault.form.take() else {
             return;
@@ -3085,7 +3132,11 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 save = theme::key_button(ui, p, BtnKind::Primary, "Save", waiting.as_deref())
                     .clicked();
-                cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
+                if busy {
+                    theme::button_disabled(ui, p, "Cancel");
+                } else {
+                    cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
+                }
             });
         });
         self.vault.gen = gen;
@@ -3122,6 +3173,14 @@ fn backup_pending_text(vault: &VaultRef) -> String {
 
 /// The busy label while a backup is encrypted and written.
 const EXPORT_LABEL: &str = "Writing backup\u{2026}";
+
+/// A save dialog opened before a lock chose a file while a backup of
+/// another vault waits for its own dialog: that file isn't used.
+const EXPORT_OTHER_VAULT: &str =
+    "The file chosen was for a backup of another vault, so nothing was written to it.";
+
+/// Write backup's job couldn't be queued; the dialog stays as it was.
+const EXPORT_NOT_STARTED: &str = "Writing the backup couldn't start; press Write backup again.";
 
 /// The passphrase dialog of Export backup…, for the file the save dialog
 /// chose. Both boxes are secrets: Write backup, Cancel, Lock and the idle
@@ -3208,19 +3267,43 @@ impl App {
         };
         let vault = v.vault_ref.clone();
         let file = backup_file_name(vault.name.as_deref().unwrap_or_default());
+        let target = FileTarget::VaultExport {
+            credential_id: vault.credential_id.clone(),
+            device: self.selected_device.clone(),
+        };
         self.vault.export_for = Some(vault);
-        self.spawn_file_dialog(
-            FileTarget::VaultExport,
-            true,
-            &[("Vault backup", &["t2vault"])],
-            Some(&file),
-        );
+        self.spawn_file_dialog(target, true, &[("Vault backup", &["t2vault"])], Some(&file));
     }
 
-    /// The save dialog chose `path`: the passphrase dialog for the vault
-    /// Export backup… was pressed for. Nothing when that is gone (a lock or
-    /// another key in the meantime rebuilt the tab's state).
-    pub(crate) fn vault_export_chosen(&mut self, path: PathBuf) {
+    /// Whether the backup waiting for a file is the one a save dialog was
+    /// opened for: vault `credential_id` on key `device`.
+    fn vault_export_waits_for(&self, credential_id: &[u8], device: Option<&DeviceId>) -> bool {
+        self.selected_device.as_ref() == device
+            && self
+                .vault
+                .export_for
+                .as_ref()
+                .is_some_and(|v| v.credential_id == credential_id)
+    }
+
+    /// The save dialog for vault `credential_id` on key `device` chose
+    /// `path`: the passphrase dialog for that vault. Nothing when no backup
+    /// waits (a lock or another key in the meantime rebuilt the tab's
+    /// state); a backup of another vault waiting (Export backup… pressed
+    /// again after a lock) keeps waiting, and the file isn't used for it.
+    pub(crate) fn vault_export_chosen(
+        &mut self,
+        path: PathBuf,
+        credential_id: &[u8],
+        device: Option<&DeviceId>,
+    ) {
+        if !self.vault_export_waits_for(credential_id, device) {
+            if self.vault.export_for.is_some() {
+                self.vault.info = None;
+                self.vault.error = Some(EXPORT_OTHER_VAULT.to_owned());
+            }
+            return;
+        }
         let Some(vault) = self.vault.export_for.take() else {
             return;
         };
@@ -3237,6 +3320,19 @@ impl App {
         });
     }
 
+    /// The save dialog for vault `credential_id` on key `device` was
+    /// cancelled: that backup no longer waits. One waiting for another
+    /// vault's dialog still does.
+    pub(crate) fn vault_export_dismissed(
+        &mut self,
+        credential_id: &[u8],
+        device: Option<&DeviceId>,
+    ) {
+        if self.vault_export_waits_for(credential_id, device) {
+            self.vault.export_for = None;
+        }
+    }
+
     /// Cancel: the dialog closes and its boxes are wiped.
     pub(crate) fn vault_export_cancel(&mut self) {
         self.vault.export = None;
@@ -3246,17 +3342,9 @@ impl App {
     /// what to say when it is no longer there to back up.
     fn vault_export_contents(&self, vault: &VaultRef) -> Result<Vault, String> {
         let name = shown_name(vault.name.as_deref());
-        let v = self
-            .vault_session()
-            .and_then(|s| {
-                s.unlocked
-                    .vaults
-                    .iter()
-                    .find(|v| v.vault_ref.credential_id == vault.credential_id)
-            })
-            .ok_or_else(|| {
-                format!("Vault \"{name}\" is no longer on this key; nothing was written.")
-            })?;
+        let v = self.session_vault(&vault.credential_id).ok_or_else(|| {
+            format!("Vault \"{name}\" is no longer on this key; nothing was written.")
+        })?;
         match &v.state {
             Ok(open) => Ok(open.contents.clone()),
             Err(_) => Err(format!(
@@ -3274,7 +3362,7 @@ impl App {
         };
         if let Err(e) = check_export_passphrase(&d.passphrase, &d.repeat) {
             self.vault.info = None;
-            self.vault.error = Some(e);
+            self.vault.error = Some(as_sentence(&e));
             return;
         }
         let (vault, path) = (d.vault.clone(), d.path.clone());
@@ -3296,11 +3384,14 @@ impl App {
         self.vault.error = None;
         self.vault.info = None;
         let for_device = self.selected_device.clone();
-        self.spawn_job(EXPORT_LABEL, move || {
+        let queued = self.spawn_job(EXPORT_LABEL, move || {
             let result = write_backup(&contents, &passphrase, &path);
             drop((contents, passphrase));
             Box::new(move |app: &mut App| app.vault_apply_export(for_device, name, file, result))
         });
+        if !queued {
+            self.vault.error = Some(EXPORT_NOT_STARTED.to_owned());
+        }
     }
 
     /// The end of Write backup for vault `name` (as shown) and `file`:
@@ -3345,7 +3436,7 @@ impl App {
             }
             Err(e) => {
                 self.vault.info = None;
-                self.vault.error = Some(e);
+                self.vault.error = Some(as_sentence(&e));
             }
         }
     }
@@ -3814,13 +3905,7 @@ impl App {
         let ImportTarget::Existing(vault) = target else {
             return Ok(None);
         };
-        self.vault_session()
-            .and_then(|s| {
-                s.unlocked
-                    .vaults
-                    .iter()
-                    .find(|v| v.vault_ref.credential_id == vault.credential_id)
-            })
+        self.session_vault(&vault.credential_id)
             .and_then(|v| v.state.as_ref().ok())
             .map(|open| Some(&open.contents))
             .ok_or_else(|| {
@@ -4259,10 +4344,155 @@ impl App {
     }
 }
 
+/// Whether a passkey listed on the FIDO2 tab is a password vault's: its
+/// relying party is the vault's.
+pub(crate) fn is_vault_passkey(rp_id: &str) -> bool {
+    rp_id == keyroost_vault::RP_ID
+}
+
+/// The question before a vault's passkey is deleted on the FIDO2 tab.
+const PASSKEY_DELETE_QUESTION: &str = "Delete this passkey? This cannot be undone.";
+
+/// Under [`PASSKEY_DELETE_QUESTION`]: the vault the passkey unlocks (`name`
+/// when the vault session or the passkey list knows it) and what deleting
+/// it loses, in the Storage tab's words.
+pub(crate) fn vault_passkey_warning(name: Option<&str>) -> String {
+    let which = match name {
+        Some(n) => format!("password vault \"{}\"", sanitize_title(n)),
+        None => "a password vault".to_owned(),
+    };
+    format!(
+        "This passkey unlocks {which}: deleting it loses every entry in it. To keep them, \
+         export a backup first."
+    )
+}
+
+/// Why the vault locked after its passkey was deleted on the FIDO2 tab.
+fn passkey_deleted_text(name: Option<&str>) -> String {
+    format!(
+        "{} {UNLOCK_AGAIN}",
+        as_sentence(&format!(
+            "vault \"{}\" is no longer on the key: its passkey was deleted on the FIDO2 tab",
+            shown_name(name)
+        ))
+    )
+}
+
+/// A password vault's passkey on the FIDO2 tab.
+impl App {
+    /// The name of the vault passkey `credential_id` unlocks: the unlocked
+    /// vault's, else the one its user handle carries in the passkey list.
+    fn vault_passkey_name(&self, credential_id: &[u8]) -> Option<String> {
+        let name = match self.session_vault(credential_id) {
+            Some(v) => v.vault_ref.name.clone(),
+            None => self
+                .fido_session()?
+                .rps
+                .iter()
+                .flat_map(|(_, creds)| creds.iter())
+                .find(|c| c.credential_id == credential_id)
+                .and_then(|c| {
+                    keyroost_ctap::get_assertion::vault_name_from_user_id(&c.user.id)
+                        .or_else(|| c.user.name.clone())
+                }),
+        };
+        name.filter(|n| !n.is_empty())
+    }
+
+    /// The confirmation card of a vault passkey's Remove, under the passkey
+    /// list: which vault it unlocks and that its entries go with it, with
+    /// Export backup… first while that vault is unlocked. The passkey to
+    /// delete once confirmed; a click refused while a job runs keeps the
+    /// question. A passkey no longer listed drops it.
+    pub(crate) fn render_vault_passkey_confirm(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+    ) -> Option<Vec<u8>> {
+        let id = self.security_keys.passkey_confirm_delete.clone()?;
+        let listed = self.fido_session().is_some_and(|s| {
+            s.rps
+                .iter()
+                .any(|(_, creds)| creds.iter().any(|c| c.credential_id == id))
+        });
+        if !listed {
+            self.security_keys.passkey_confirm_delete = None;
+            return None;
+        }
+        let warning = vault_passkey_warning(self.vault_passkey_name(&id).as_deref());
+        let can_export = self.session_vault(&id).is_some_and(|v| v.state.is_ok());
+        let waiting = self.waiting_for().map(str::to_owned);
+        let (mut confirm, mut cancel, mut export) = (false, false, false);
+        ui.add_space(10.0);
+        theme::card_frame(p)
+            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.colored_label(p.err, PASSKEY_DELETE_QUESTION);
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(warning)
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if can_export {
+                        export = theme::button(ui, p, BtnKind::Default, EXPORT_BUTTON).clicked();
+                        ui.add_space(6.0);
+                    }
+                    confirm = theme::key_button(
+                        ui,
+                        p,
+                        BtnKind::Danger,
+                        "Delete passkey",
+                        waiting.as_deref(),
+                    )
+                    .clicked();
+                    ui.add_space(6.0);
+                    cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
+                });
+            });
+        if export {
+            self.vault_passkey_export(id);
+            None
+        } else if cancel {
+            self.security_keys.passkey_confirm_delete = None;
+            None
+        } else if confirm && !self.refuse_if_busy() {
+            self.security_keys.passkey_confirm_delete = None;
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Export backup… on a vault passkey's question: the Vault tab, that
+    /// vault shown, and its backup's save dialog. The question waits on the
+    /// FIDO2 tab.
+    pub(crate) fn vault_passkey_export(&mut self, credential_id: Vec<u8>) {
+        self.cap_tab = CapTab::Vault;
+        self.vault_select(credential_id);
+        self.vault_export_start();
+    }
+
+    /// Passkey `credential_id` was deleted on the FIDO2 tab. When an
+    /// unlocked vault's, that vault went with it: the session locks, as for
+    /// a vault gone elsewhere, so no later save reports success into data
+    /// no unlock can open.
+    pub(crate) fn vault_passkey_deleted(&mut self, credential_id: &[u8]) {
+        let Some(v) = self.session_vault(credential_id) else {
+            return;
+        };
+        let text = passkey_deleted_text(v.vault_ref.name.as_deref());
+        self.log(Severity::Warn, format!("Vault: {text}"));
+        self.vault_lock(Some(text));
+    }
+}
+
 /// How long a copy button says "Copied" (the Authenticator codes' flash).
 const COPIED_FLASH_SECS: f64 = 1.2;
 
-/// A vault chip: a rounded, selectable label.
 /// What the New vault row's buttons asked for this frame.
 #[derive(Default)]
 struct NewVaultClicks {
@@ -4306,6 +4536,7 @@ fn new_vault_row(
     clicks
 }
 
+/// A vault chip: a rounded, selectable label.
 fn chip(ui: &mut egui::Ui, p: &Palette, label: &str, on: bool) -> egui::Response {
     let (fill, fg, stroke) = if on {
         (p.accent_soft(), p.txt, egui::Stroke::new(1.0, p.accent))
@@ -5147,10 +5378,7 @@ mod tests {
             err.starts_with("Vault \"Work\" is no longer on the key"),
             "{err}"
         );
-        assert!(
-            err.ends_with("Unlock again to see what the key holds now."),
-            "{err}"
-        );
+        assert!(err.ends_with(UNLOCK_AGAIN), "{err}");
     }
 
     #[test]
@@ -5241,19 +5469,13 @@ mod tests {
                 undone(false, false),
                 "its new credential was removed again.",
             ),
-            (
-                old_not_deleted(OldVault::Kept),
-                " Unlock the vault again to see both copies.",
-            ),
-            (
-                old_not_deleted(OldVault::Emptied),
-                " Unlock the vault again to see both copies.",
-            ),
+            (old_not_deleted(OldVault::Kept), UNLOCK_AGAIN),
+            (old_not_deleted(OldVault::Emptied), UNLOCK_AGAIN),
             (
                 VaultKeyError::VaultGone {
                     name: Some("Work".into()),
                 },
-                " Unlock again to see what the key holds now.",
+                UNLOCK_AGAIN,
             ),
             (VaultKeyError::Conflict, "nothing was written."),
         ];
@@ -6645,7 +6867,7 @@ mod tests {
         let err = app.vault.error.as_deref().unwrap();
         assert!(
             err.starts_with("Vault \"Personal\" is no longer on the key")
-                && err.ends_with("Unlock again to see what the key holds now."),
+                && err.ends_with(UNLOCK_AGAIN),
             "{err}"
         );
     }
@@ -7862,10 +8084,7 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("delete either"), "{err}");
-        assert!(
-            err.ends_with("Unlock the vault again to see both copies."),
-            "{err}"
-        );
+        assert!(err.ends_with(UNLOCK_AGAIN), "{err}");
         assert!(app
             .log
             .iter()
@@ -7911,10 +8130,7 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("(none)"), "{err}");
-        assert!(
-            err.ends_with("Unlock the vault again to see both copies."),
-            "{err}"
-        );
+        assert!(err.ends_with(UNLOCK_AGAIN), "{err}");
     }
 
     #[test]
@@ -7950,10 +8166,7 @@ mod tests {
             err.contains("then rotate the one left again with Rotate vault key\u{2026}"),
             "{err}"
         );
-        assert!(
-            err.ends_with("Unlock the vault again to see both copies."),
-            "{err}"
-        );
+        assert!(err.ends_with(UNLOCK_AGAIN), "{err}");
     }
 
     #[test]
@@ -8200,10 +8413,10 @@ mod tests {
             ),
             "{err}"
         );
-        assert!(
-            err.ends_with("Unlock again to see what the key holds now."),
-            "{err}"
-        );
+        assert!(err.ends_with(UNLOCK_AGAIN), "{err}");
+        // Locked, nothing is listed: no line points at the list.
+        assert!(!err.contains(ROTATE_AGAIN), "{err}");
+        assert_eq!(err.matches(UNLOCK_AGAIN).count(), 1, "{err}");
         // Only Work is left, with its data and nothing else.
         assert_eq!(key.creds.len(), 1);
         let work_lbk = key.creds[0].lbk.unwrap();
@@ -8298,12 +8511,30 @@ mod tests {
         dir
     }
 
-    /// The save dialog Export backup… asked for resolves to `path` (`None`:
+    /// The save dialog Export backup… asked for (the one still queued,
+    /// else the one for the backup waiting) resolves to `path` (`None`:
     /// cancelled), the way `drain_file_dialogs` receives it.
     fn choose_file(app: &mut App, path: Option<std::path::PathBuf>) {
+        let target = match app.file_dialog_queue.pop() {
+            Some(request) => request.target,
+            None => FileTarget::VaultExport {
+                credential_id: app
+                    .vault
+                    .export_for
+                    .as_ref()
+                    .map(|v| v.credential_id.clone())
+                    .unwrap_or_default(),
+                device: app.selected_device.clone(),
+            },
+        };
+        resolve_dialog(app, target, path);
+    }
+
+    /// A save dialog for `target` resolves to `path`.
+    fn resolve_dialog(app: &mut App, target: FileTarget, path: Option<std::path::PathBuf>) {
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(path).unwrap();
-        app.pending_files.push((FileTarget::VaultExport, rx));
+        app.pending_files.push((target, rx));
         app.drain_file_dialogs();
     }
 
@@ -8314,7 +8545,7 @@ mod tests {
         unlock_into(app, key);
         app.vault_export_start();
         let request = app.file_dialog_queue.pop().expect("a save dialog");
-        assert!(request.target == FileTarget::VaultExport && request.save);
+        assert!(matches!(request.target, FileTarget::VaultExport { .. }) && request.save);
         assert_eq!(
             request.filters,
             vec![("Vault backup".to_owned(), vec!["t2vault".to_owned()])]
@@ -8428,12 +8659,17 @@ mod tests {
         ] {
             assert!(text.contains(line), "{line}: {text}");
         }
+        // Shown as sentences, like the rest of the tab.
         for (pass, repeat, said) in [
-            (BACKUP_PASS, "correct horse battery!", PASSPHRASES_DIFFER),
+            (
+                BACKUP_PASS,
+                "correct horse battery!",
+                "The two passphrases don't match.",
+            ),
             (
                 "short",
                 "short",
-                "use a backup passphrase of at least 10 characters",
+                "Use a backup passphrase of at least 10 characters.",
             ),
         ] {
             type_passphrases(&mut app, pass, repeat);
@@ -8532,7 +8768,17 @@ mod tests {
             file.clone(),
             Err(e.clone()),
         );
-        assert_eq!(app.vault.error.as_deref(), Some(e.as_str()));
+        assert_eq!(
+            app.vault.error.as_deref(),
+            Some(
+                format!(
+                    "Cannot write {}: refusing to write secret output through a symlink.",
+                    link.display()
+                )
+                .as_str()
+            ),
+            "shown as a sentence"
+        );
         assert!(app.vault.export.is_some());
         assert_eq!(
             app.log.last().unwrap().text,
@@ -9456,5 +9702,421 @@ mod tests {
         app.vault_select(damaged);
         app.vault_import_start();
         assert!(app.file_dialog_queue.is_empty());
+    }
+
+    // ----- Final review fixes -----
+
+    /// Every text shape of one headless frame drawn by `render`, with where
+    /// it was drawn.
+    fn frame_texts(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        mut render: impl FnMut(&mut egui::Ui, &Palette),
+    ) -> Vec<(String, egui::Rect)> {
+        use crate::tests::TestFrame;
+        use crate::ui::theme::Mode;
+        fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    out.push((t.galley.text().to_owned(), shape.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let output = ctx.test_frame(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| render(ui, &palette));
+        });
+        let mut out = Vec::new();
+        for clipped in output.shapes {
+            collect(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Click the text `label` that `render` draws, as a person would: a
+    /// frame to lay it out, then the pointer moves there, presses and lets
+    /// go.
+    fn click_text(label: &str, mut render: impl FnMut(&mut egui::Ui, &Palette)) {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let texts = frame_texts(&ctx, Vec::new(), &mut render);
+        let pos = texts
+            .iter()
+            .find(|(t, _)| t == label)
+            .map(|(_, r)| r.center())
+            .unwrap_or_else(|| panic!("{label} is drawn: {texts:?}"));
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![press(true)],
+            vec![press(false)],
+        ] {
+            frame_texts(&ctx, events, &mut render);
+        }
+    }
+
+    fn click_in_list(app: &mut App, label: &str) {
+        click_text(label, |ui, p| app.render_vault_list(ui, p));
+    }
+
+    /// Save → Cancel → Add entry can't happen: while a save runs, its form's
+    /// Cancel is disabled and Add entry / Edit don't open another form, so
+    /// the save's end reports on the form it was started from.
+    #[test]
+    fn a_running_save_keeps_its_form() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let github = session_entry(&app, "GitHub");
+        app.vault_add_entry();
+        replace_text(&mut form(&mut app).title, "Saving");
+        // The save's job is in flight.
+        app.busy_jobs = 1;
+        click_in_list(&mut app, "Cancel");
+        assert_eq!(form(&mut app).title, "Saving", "Cancel is disabled");
+        app.vault_cancel_form();
+        assert_eq!(form(&mut app).title, "Saving");
+        app.vault_add_entry();
+        assert_eq!(form(&mut app).title, "Saving", "no new form");
+        app.vault_edit_entry(&github.id);
+        assert!(form(&mut app).editing.is_none(), "no edit form either");
+        assert_eq!(form(&mut app).title, "Saving");
+        // Once the save ended, Cancel works (the click reaches it).
+        app.busy_jobs = 0;
+        click_in_list(&mut app, "Cancel");
+        assert!(app.vault.form.is_none());
+    }
+
+    /// The FIDO2 tab's passkey list with every credential on `key` under
+    /// the vault's relying party.
+    fn passkeys_of(app: &mut App, key: &FakeKey) {
+        use keyroost_ctap::cred_mgmt::{Credential, CredentialUser, RelyingParty};
+        let creds = key
+            .creds
+            .iter()
+            .map(|c| Credential {
+                credential_id: c.id.clone(),
+                user: CredentialUser {
+                    id: c.user_id.clone(),
+                    name: c.user_name.clone(),
+                    display_name: None,
+                },
+                algorithm: None,
+                large_blob_key: None,
+            })
+            .collect();
+        let mut session = fido_session(FakeKey::PIN);
+        session.rps = Arc::new(vec![(
+            RelyingParty {
+                id: keyroost_vault::RP_ID.to_owned(),
+                name: None,
+                rp_id_hash: None,
+            },
+            creds,
+        )]);
+        app.security_keys.session = Some(session);
+        app.security_keys.session_device = Some(KEY.into());
+    }
+
+    #[test]
+    fn a_vault_passkey_warns_before_it_is_deleted() {
+        assert!(is_vault_passkey("fido2-vault.token2"));
+        assert!(!is_vault_passkey("github.com"));
+        assert_eq!(
+            vault_passkey_warning(Some("Personal")),
+            "This passkey unlocks password vault \"Personal\": deleting it loses every entry \
+             in it. To keep them, export a backup first."
+        );
+        assert_eq!(
+            vault_passkey_warning(None),
+            "This passkey unlocks a password vault: deleting it loses every entry in it. To \
+             keep them, export a backup first."
+        );
+
+        let mut key = FakeKey::new();
+        let personal = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        passkeys_of(&mut app, &key);
+        app.security_keys.passkey_confirm_delete = Some(personal.clone());
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let drawn = |app: &mut App| -> String {
+            frame_texts(&ctx, Vec::new(), |ui, p| {
+                app.render_vault_passkey_confirm(ui, p);
+            })
+            .into_iter()
+            .map(|(t, _)| t + "\n")
+            .collect()
+        };
+        let text = drawn(&mut app);
+        for line in [
+            PASSKEY_DELETE_QUESTION,
+            &vault_passkey_warning(Some("Personal")),
+            EXPORT_BUTTON,
+            "Delete passkey",
+            "Cancel",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        // Locked, the passkey list still names the vault; there is nothing
+        // to export from here.
+        app.vault_lock(None);
+        let text = drawn(&mut app);
+        assert!(
+            text.contains(&vault_passkey_warning(Some("Personal"))),
+            "{text}"
+        );
+        assert!(!text.contains(EXPORT_BUTTON), "{text}");
+    }
+
+    #[test]
+    fn a_vault_passkeys_question_answers() {
+        let mut key = FakeKey::new();
+        let personal = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        passkeys_of(&mut app, &key);
+        let mut confirmed = None;
+        // Cancel drops the question.
+        app.security_keys.passkey_confirm_delete = Some(personal.clone());
+        click_text("Cancel", |ui, p| {
+            confirmed = confirmed.take().or(app.render_vault_passkey_confirm(ui, p));
+        });
+        assert!(confirmed.is_none() && app.security_keys.passkey_confirm_delete.is_none());
+        // Export backup… goes to the Vault tab with that vault's save
+        // dialog; the question waits.
+        app.security_keys.passkey_confirm_delete = Some(personal.clone());
+        app.vault_select(
+            app.vault_session().unwrap().unlocked.vaults[1]
+                .vault_ref
+                .credential_id
+                .clone(),
+        );
+        click_text(EXPORT_BUTTON, |ui, p| {
+            confirmed = confirmed.take().or(app.render_vault_passkey_confirm(ui, p));
+        });
+        assert!(confirmed.is_none());
+        assert_eq!(app.cap_tab, CapTab::Vault);
+        assert_eq!(app.vault.selected.as_deref(), Some(personal.as_slice()));
+        assert_eq!(
+            app.vault
+                .export_for
+                .as_ref()
+                .map(|v| v.credential_id.clone()),
+            Some(personal.clone())
+        );
+        assert!(app.security_keys.passkey_confirm_delete.is_some());
+        // Delete passkey hands the passkey over; refused while a job runs.
+        app.busy_jobs = 1;
+        click_text("Delete passkey", |ui, p| {
+            confirmed = confirmed.take().or(app.render_vault_passkey_confirm(ui, p));
+        });
+        assert!(confirmed.is_none() && app.security_keys.passkey_confirm_delete.is_some());
+        app.busy_jobs = 0;
+        click_text("Delete passkey", |ui, p| {
+            confirmed = confirmed.take().or(app.render_vault_passkey_confirm(ui, p));
+        });
+        assert_eq!(confirmed, Some(personal));
+        assert!(app.security_keys.passkey_confirm_delete.is_none());
+    }
+
+    #[test]
+    fn deleting_a_vaults_passkey_drops_the_vault() {
+        let mut key = FakeKey::new();
+        let personal = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        passkeys_of(&mut app, &key);
+        let fresh = || Ok(fido_session(FakeKey::PIN));
+        // Another passkey: the vault stays.
+        app.apply_passkey_deleted(Some(KEY.into()), b"some website", true, fresh());
+        assert!(app.vault_session().is_some());
+        // A delete that failed changes nothing.
+        app.apply_passkey_deleted(
+            Some(KEY.into()),
+            &personal,
+            false,
+            Err(crate::SessionOpError::msg("not deleted")),
+        );
+        assert!(app.vault_session().is_some());
+        // The vault's own passkey: the vault leaves the session, as one
+        // gone elsewhere does, so no later save can report success.
+        app.apply_passkey_deleted(Some(KEY.into()), &personal, true, fresh());
+        assert!(app.vault.session.is_none());
+        let err = app.vault.error.clone().unwrap();
+        assert_eq!(
+            err,
+            format!(
+                "Vault \"Personal\" is no longer on the key: its passkey was deleted on the \
+                 FIDO2 tab. {UNLOCK_AGAIN}"
+            )
+        );
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.severity == Severity::Warn && l.text == format!("Vault: {err}")));
+        assert!(app.security_keys.session.is_some(), "the FIDO2 tab stays");
+    }
+
+    #[test]
+    fn pin_change_and_fido_reset_say_why_the_vault_locked() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.apply_pin_changed(Ok(()));
+        assert_eq!(
+            app.vault.error.as_deref(),
+            Some(
+                "The FIDO2 PIN was changed, so the vault locked. Unlock the vault again to see \
+                 what the key holds now."
+            )
+        );
+        let mut app = super::tests::app();
+        unlock_into(&mut app, &mut key);
+        App::apply_reset_path_outcome(&mut app, Some(&KEY.to_owned()), Ok(()));
+        assert_eq!(app.vault.error.as_deref(), Some(FIDO_RESET_LOCKED));
+    }
+
+    /// The tab's lines that send the person back to Unlock all end alike.
+    #[test]
+    fn every_unlock_again_line_is_worded_alike() {
+        let gone = vault_error_text(&VaultKeyError::VaultGone {
+            name: Some("Work".into()),
+        });
+        let old = vault_error_text(&VaultKeyError::OldNotDeleted {
+            name: Some("Personal".into()),
+            cause: Box::new(VaultKeyError::Ctap(CtapError::StatusCode(0x30))),
+            old: OldVault::Kept,
+        });
+        for text in [
+            gone,
+            old,
+            pin_changed_text(),
+            with_unlock_again(JOB_NOT_STARTED),
+            with_unlock_again(SAVE_NOT_STARTED),
+            passkey_deleted_text(None),
+        ] {
+            assert!(text.ends_with(UNLOCK_AGAIN), "{text}");
+            assert_eq!(text.matches("nlock").count(), 1, "{text}");
+        }
+    }
+
+    /// A dead worker: every job is refused as not queued.
+    fn dead_worker(app: &mut App) {
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
+        drop(job_rx);
+        let (_result_tx, result_rx) = std::sync::mpsc::channel();
+        app.worker = Some(crate::Worker { job_tx, result_rx });
+    }
+
+    #[test]
+    fn an_unlock_that_cant_start_says_so_and_wipes_the_pin() {
+        // The job is never run: nothing opens this path.
+        let mut app = App {
+            devices: vec![crate::ui::device::Device {
+                hid_path: Some("/nonexistent/keyroost-test/hidraw0".into()),
+                ..crate::tests::test_key(KEY, "AAA", None)
+            }],
+            selected_device: Some(KEY.into()),
+            ..Default::default()
+        };
+        dead_worker(&mut app);
+        replace_text(&mut app.vault.pin_input, FakeKey::PIN);
+        app.vault_unlock();
+        assert!(app.vault.pin_input.is_empty(), "the typed PIN is wiped");
+        assert_eq!(app.vault.error.as_deref(), Some(UNLOCK_NOT_STARTED_TYPED));
+        assert!(app.vault.session.is_none());
+        // With the FIDO2 tab's PIN, there is nothing to type again.
+        app.security_keys.session = Some(fido_session(FakeKey::PIN));
+        app.security_keys.session_device = Some(KEY.into());
+        app.vault_unlock();
+        assert_eq!(app.vault.error.as_deref(), Some(UNLOCK_NOT_STARTED));
+    }
+
+    /// A save dialog opened for one vault before a lock resolves after
+    /// Export backup… was pressed for another: its file isn't used for that
+    /// backup, which keeps waiting for its own dialog.
+    #[test]
+    fn a_save_dialog_for_another_vault_is_not_used() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_export_start();
+        let first = app.file_dialog_queue.pop().unwrap().target;
+        app.vault_lock(None);
+        unlock_into(&mut app, &mut key);
+        let work = app.vault_session().unwrap().unlocked.vaults[1]
+            .vault_ref
+            .clone();
+        app.vault_select(work.credential_id.clone());
+        app.vault_export_start();
+        let second = app.file_dialog_queue.pop().unwrap().target;
+        resolve_dialog(&mut app, first.clone(), Some("personal.t2vault".into()));
+        assert!(app.vault.export.is_none(), "no passphrase dialog for Work");
+        assert_eq!(app.vault.error.as_deref(), Some(EXPORT_OTHER_VAULT));
+        assert_eq!(
+            app.vault
+                .export_for
+                .as_ref()
+                .map(|v| v.credential_id.clone()),
+            Some(work.credential_id.clone()),
+            "Work's backup still waits"
+        );
+        // A cancelled dialog of the other vault doesn't drop it either.
+        resolve_dialog(&mut app, first, None);
+        assert!(app.vault.export_for.is_some());
+        // A dialog for the same vault on another key isn't used either.
+        let FileTarget::VaultExport { credential_id, .. } = second.clone() else {
+            panic!("a backup's save dialog");
+        };
+        let elsewhere = FileTarget::VaultExport {
+            credential_id,
+            device: Some("serial:BBB".into()),
+        };
+        resolve_dialog(&mut app, elsewhere, Some("work.t2vault".into()));
+        assert!(app.vault.export.is_none());
+        // Its own dialog opens the passphrase dialog for Work.
+        resolve_dialog(&mut app, second, Some("work.t2vault".into()));
+        let d = app.vault.export.as_ref().expect("the passphrase dialog");
+        assert_eq!(d.vault.credential_id, work.credential_id);
+        assert_eq!(d.path, Path::new("work.t2vault"));
+    }
+
+    /// The Storage tab's question names what a delete loses (ruling R4).
+    #[test]
+    fn storage_delete_says_what_it_loses() {
+        assert_eq!(
+            crate::lb_delete_question(0, false, false),
+            "Delete entry 1 and rewrite the array? Requires your PIN."
+        );
+        assert_eq!(
+            crate::lb_delete_question(3, false, true),
+            "Delete entry 4 and rewrite the array? Requires your PIN. This is a password \
+             vault: deleting it loses every entry in it."
+        );
+        assert_eq!(
+            crate::lb_delete_question(1, true, false),
+            "Delete entry 2 and rewrite the array? Requires your PIN. This removes the key's \
+             name."
+        );
     }
 }
