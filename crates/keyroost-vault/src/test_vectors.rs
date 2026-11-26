@@ -1,4 +1,4 @@
-//! Known-answer vectors produced by running fidoparole's own `vault.rs`
+//! Known-answer vectors produced by running FidoParole's own `vault.rs`
 //! (github.com/token2/fidoparole, `src-tauri/src/vault.rs`, main branch as
 //! fetched 2026-11-21) with fixed randomness in a throwaway harness. Later
 //! tests must reproduce these bytes exactly.
@@ -22,7 +22,7 @@ pub(crate) const BACKUP_NONCE: [u8; 12] = [0x55; 12];
 /// Argon2id (m_cost KiB, t_cost, p_cost); small m for test speed.
 pub(crate) const BACKUP_PARAMS: (u32, u32, u32) = (8, 1, 1);
 
-/// The 32 bytes of fidoparole's `hmac_salt()`: SHA-256("WebAuthn PRF" || 0x00 || PRF_INPUT).
+/// The 32 bytes of FidoParole's `hmac_salt()`: SHA-256("WebAuthn PRF" || 0x00 || PRF_INPUT).
 pub(crate) const PRF_SALT_HEX: &str =
     "2cb008f0aa5722f2396e4a7fb744ff15189d98a932e843cc9a6d65eaaf3726c8";
 

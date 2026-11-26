@@ -1,0 +1,325 @@
+//! `fido vault` refusals that need no key, each run against its own empty
+//! config directory with no key connected.
+mod common;
+
+use std::process::Stdio;
+
+/// Run keyroostctl with `args`, the PIN in `KR_TEST_PIN`, no terminal and
+/// no key: (exit code, stdout, stderr).
+fn run(args: &[&str]) -> (i32, String, String) {
+    run_with(args, &[])
+}
+
+/// [`run`] with more environment variables (a passphrase in `KR_PASS`).
+fn run_with(args: &[&str], vars: &[(&str, &str)]) -> (i32, String, String) {
+    let out = common::keyroostctl()
+        .args(args)
+        .env("KR_TEST_PIN", "123456")
+        .envs(vars.iter().copied())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn vault_list_with_no_key_fails_like_fido_ssh_list() {
+    let ssh = run(&["fido", "ssh", "list", "--pin", "env:KR_TEST_PIN"]);
+    let vault = run(&["fido", "vault", "list", "--pin", "env:KR_TEST_PIN"]);
+    assert_ne!(ssh.0, 0, "{ssh:?}");
+    assert!(ssh.2.starts_with("error: "), "{ssh:?}");
+    assert_eq!(vault, ssh);
+}
+
+#[test]
+fn vault_list_without_a_pin_source_is_refused_before_the_key() {
+    let (code, out, err) = run(&["fido", "vault", "list"]);
+    assert_eq!(code, 1);
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains("no PIN given: pass --pin env:NAME or --pin stdin"),
+        "{err}"
+    );
+}
+
+/// What `vault add` prints for a name the vault format can't hold: the
+/// format's own refusal, before any key is looked for.
+fn assert_name_refused_before_the_key(name: &str) {
+    let (code, out, err) = run(&["fido", "vault", "add", name, "--pin", "env:KR_TEST_PIN"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(
+        err,
+        format!("error: {}\n", keyroost_vault::VaultError::NameLength),
+        "no key message, only the name's"
+    );
+}
+
+#[test]
+fn vault_add_refuses_a_name_over_32_bytes_before_the_key() {
+    assert_name_refused_before_the_key(&"é".repeat(17));
+}
+
+#[test]
+fn vault_add_refuses_an_empty_name() {
+    assert_name_refused_before_the_key("");
+}
+
+/// `entry add` with no password source, no `--generate-password` and no
+/// terminal is refused before any key is looked for, naming both ways out.
+#[test]
+fn entry_add_without_password_or_terminal_is_refused() {
+    let (code, out, err) = run(&[
+        "fido",
+        "vault",
+        "entry",
+        "add",
+        "Gmail",
+        "--pin",
+        "env:KR_TEST_PIN",
+    ]);
+    assert_eq!(code, 1, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(
+        err,
+        "error: no password given: pass --password env:NAME, --password stdin or \
+         --generate-password\n",
+        "no key message, only the refusal"
+    );
+}
+
+/// `entry add --generate-password` needs no password source and goes on to
+/// look for the key.
+#[test]
+fn entry_add_with_generate_reaches_the_key() {
+    let (code, out, err) = run(&[
+        "fido",
+        "vault",
+        "entry",
+        "add",
+        "Gmail",
+        "--generate-password",
+        "--pin",
+        "env:KR_TEST_PIN",
+    ]);
+    let ssh = run(&["fido", "ssh", "list", "--pin", "env:KR_TEST_PIN"]);
+    assert_eq!((code, out, err), ssh);
+}
+
+/// The backup in `tests/fixtures/vault.t2vault`: FidoParole's backup test
+/// vector, passphrase `correct horse battery` (cheap KDF settings).
+const BACKUP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vault.t2vault");
+const BACKUP_PASS: &str = "correct horse battery";
+
+fn import(pass: &str) -> (i32, String, String) {
+    run_with(
+        &[
+            "fido",
+            "vault",
+            "import",
+            "-i",
+            BACKUP,
+            "--passphrase",
+            "env:KR_PASS",
+            "--pin",
+            "env:KR_TEST_PIN",
+            "--yes",
+        ],
+        &[("KR_PASS", pass)],
+    )
+}
+
+/// A wrong passphrase is refused when the file is read, before any key is
+/// looked for.
+#[test]
+fn import_wrong_passphrase_fails_before_the_key() {
+    let (code, out, err) = import("wrong passphrase");
+    assert_eq!(code, 1, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(
+        err,
+        format!("error: {BACKUP}: {}\n", keyroost_vault::VaultError::Decrypt),
+        "no key message, only the file's"
+    );
+}
+
+/// The right passphrase opens the file; the run then looks for the key.
+#[test]
+fn import_good_passphrase_reaches_the_key() {
+    let ssh = run(&["fido", "ssh", "list", "--pin", "env:KR_TEST_PIN"]);
+    assert_eq!(import(BACKUP_PASS), ssh);
+}
+
+/// An `--entry` title no backup entry has is refused once the file is
+/// open, before any key is looked for.
+#[test]
+fn import_unknown_entry_is_refused_before_the_key() {
+    let (code, out, err) = run_with(
+        &[
+            "fido",
+            "vault",
+            "import",
+            "-i",
+            BACKUP,
+            "--entry",
+            "Gmial",
+            "--passphrase",
+            "env:KR_PASS",
+            "--pin",
+            "env:KR_TEST_PIN",
+            "--dry-run",
+        ],
+        &[("KR_PASS", BACKUP_PASS)],
+    );
+    assert_eq!(code, 1, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(err, "error: no entry in the backup is titled \"Gmial\"\n");
+}
+
+fn export(out: &std::path::Path, pass: &str) -> (i32, String, String) {
+    run_with(
+        &[
+            "fido",
+            "vault",
+            "export",
+            "Personal",
+            "-o",
+            out.to_str().unwrap(),
+            "--passphrase",
+            "env:KR_PASS",
+            "--pin",
+            "env:KR_TEST_PIN",
+        ],
+        &[("KR_PASS", pass)],
+    )
+}
+
+#[test]
+fn export_refuses_an_existing_file_before_the_key() {
+    let dir = common::TempDir::new("vault-export");
+    let out = dir.join("personal.t2vault");
+    std::fs::write(&out, b"keep me").unwrap();
+    let (code, stdout, err) = export(&out, BACKUP_PASS);
+    assert_eq!(code, 1, "{err}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert_eq!(
+        err,
+        format!(
+            "error: {} already exists; pass --overwrite to replace it\n",
+            out.display()
+        )
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), b"keep me");
+}
+
+#[test]
+fn export_refuses_a_short_passphrase_before_the_key() {
+    let dir = common::TempDir::new("vault-export");
+    let out = dir.join("personal.t2vault");
+    let (code, stdout, err) = export(&out, "123456789");
+    assert_eq!(code, 1, "{err}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert_eq!(
+        err,
+        format!("error: {}\n", keyroost_vault::VaultError::ShortPassphrase)
+    );
+    assert!(!out.exists());
+}
+
+/// A `--path` no key answers at: selection takes it as typed (no key
+/// needed), so a run gets as far as its first use of the key.
+const NO_KEY_PATH: &str = "/nonexistent/kr-vault-test-hidraw";
+
+/// Without a terminal and without `--yes`, a command whose question comes
+/// after the unlock is refused once the key is selected, before the PIN is
+/// used or the key touched: the refusal `confirm` would give, and nothing
+/// on stdout. With `--yes` the same run goes on to open the key.
+fn assert_refused_before_the_pin(args: &[&str], vars: &[(&str, &str)], action: &str) {
+    let mut all = args.to_vec();
+    all.extend(["--path", NO_KEY_PATH, "--pin", "env:KR_TEST_PIN"]);
+    let (code, out, err) = run_with(&all, vars);
+    assert_eq!(code, 1, "{err}");
+    assert!(out.is_empty(), "{out}");
+    let last = err.lines().last().unwrap_or_default();
+    assert!(
+        last.starts_with(&format!("error: refusing to {action} on ")),
+        "{err}"
+    );
+    assert!(last.ends_with(" without confirmation; add --yes"), "{err}");
+    all.push("--yes");
+    let (code, _, err) = run_with(&all, vars);
+    assert_eq!(code, 1, "{err}");
+    assert!(!err.contains("refusing to"), "with --yes: {err}");
+}
+
+#[test]
+fn rotate_without_terminal_or_yes_is_refused_before_the_pin() {
+    assert_refused_before_the_pin(
+        &["fido", "vault", "rotate", "Personal"],
+        &[],
+        "rotate the key of vault \"Personal\"",
+    );
+}
+
+#[test]
+fn vault_delete_without_terminal_or_yes_is_refused_before_the_pin() {
+    assert_refused_before_the_pin(
+        &["fido", "vault", "delete", "Personal"],
+        &[],
+        "delete vault \"Personal\"",
+    );
+}
+
+#[test]
+fn entry_delete_without_terminal_or_yes_is_refused_before_the_pin() {
+    assert_refused_before_the_pin(
+        &["fido", "vault", "entry", "delete", "Gmail"],
+        &[],
+        "delete entry \"Gmail\"",
+    );
+    assert_refused_before_the_pin(
+        &[
+            "fido", "vault", "entry", "delete", "Gmail", "--vault", "Work",
+        ],
+        &[],
+        "delete entry \"Gmail\" from vault \"Work\"",
+    );
+}
+
+#[test]
+fn import_without_terminal_or_yes_is_refused_before_the_pin() {
+    let pass = [("KR_PASS", BACKUP_PASS)];
+    let args = [
+        "fido",
+        "vault",
+        "import",
+        "-i",
+        BACKUP,
+        "--passphrase",
+        "env:KR_PASS",
+    ];
+    assert_refused_before_the_pin(&args, &pass, "import vault.t2vault");
+    let mut named = args.to_vec();
+    named.extend(["--vault", "Personal"]);
+    assert_refused_before_the_pin(
+        &named,
+        &pass,
+        "import vault.t2vault into vault \"Personal\"",
+    );
+    // A dry run asks nothing, so it is not refused.
+    let mut dry = args.to_vec();
+    dry.extend([
+        "--dry-run",
+        "--path",
+        NO_KEY_PATH,
+        "--pin",
+        "env:KR_TEST_PIN",
+    ]);
+    let (code, _, err) = run_with(&dry, &pass);
+    assert_eq!(code, 1, "{err}");
+    assert!(!err.contains("refusing to"), "{err}");
+}

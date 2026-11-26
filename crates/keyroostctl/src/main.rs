@@ -59,6 +59,7 @@ mod overview;
 mod prompt;
 mod secrets;
 mod target;
+mod vault_cmd;
 
 use crate::output::{emit_json, json_output};
 use crate::secrets::{SecretSource, Secrets, Source, Spec};
@@ -2950,6 +2951,27 @@ enum FidoCmd {
     Ssh {
         #[command(subcommand)]
         cmd: SshCertCmd,
+    },
+    /// Keep passwords in vaults on the key, in FidoParole's vault format (experimental).
+    ///
+    /// Experimental: please report problems at
+    /// https://github.com/framefilter/keyroost/issues and keep a backup.
+    ///
+    /// Each vault is a FIDO2 credential on the key; its entries are sealed
+    /// with a secret only the key gives out (after the PIN and a touch) and
+    /// stored in the key's large-blob store. If the key is lost or reset,
+    /// its vaults go with it: keep a backup.
+    ///
+    /// The large-blob store is shared space on the key, meant for data that
+    /// belongs to a passkey; each vault is kept there as the data of its own
+    /// credential. Websites may store data there too, so keep vaults small;
+    /// `fido vault list` shows how full the store is.
+    // The URL is help text: --help prints it as is, so rustdoc leaves it
+    // plain too.
+    #[allow(rustdoc::bare_urls)]
+    Vault {
+        #[command(subcommand)]
+        cmd: vault_cmd::FidoVaultCmd,
     },
 }
 
@@ -13760,33 +13782,20 @@ fn write_private_file(
     if mode == crate::prompt::OutMode::New {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true).mode(0o600);
-        let mut f = opts.open(path).map_err(|e| {
+        let f = opts.open(path).map_err(|e| {
             if e.kind() == ErrorKind::AlreadyExists {
                 Error::new(ErrorKind::AlreadyExists, crate::prompt::APPEARED)
             } else {
                 e
             }
         })?;
-        return f.write_all(data).and_then(|_| f.sync_all());
+        return fill_new_file(path, f, data, |f| f.sync_all());
     }
-
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let fname = path
-        .file_name()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "output path has no file name"))?;
 
     // 1) Create the temp file first. create_new = O_CREAT|O_EXCL, which refuses
     //    to follow a symlink at the final component and fails if the path already
     //    exists — so this file is unambiguously fresh and owned by our euid.
-    let tmp = parent.join(format!(
-        ".{}.keyroost-tmp-{}",
-        fname.to_string_lossy(),
-        std::process::id()
-    ));
+    let tmp = temp_beside(path)?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
     let mut f = opts.open(&tmp)?;
@@ -13844,15 +13853,102 @@ fn write_private_file(
     Ok(())
 }
 
-/// Non-Unix fallback: create/overwrite with owner-intent semantics. Windows ACL
-/// hardening is out of scope for this helper.
+/// Non-Unix fallback: a new file is created exclusively; an agreed
+/// overwrite goes through a temp file renamed over the old one
+/// ([`replace_via_temp`]), so a failed write never leaves the old file
+/// truncated. Windows ACL hardening is out of scope for this helper.
 #[cfg(not(unix))]
 fn write_private_file(
     path: &std::path::Path,
     data: &[u8],
     mode: crate::prompt::OutMode,
 ) -> std::io::Result<()> {
-    mode.write(path, data)
+    match mode {
+        crate::prompt::OutMode::New => {
+            fill_new_file(path, mode.open(path)?, data, |f| f.sync_all())
+        }
+        crate::prompt::OutMode::Replace => replace_via_temp(
+            path,
+            data,
+            |tmp| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(tmp)
+            },
+            |f| f.sync_all(),
+        ),
+    }
+}
+
+/// The temp file a replacing write goes through: hidden, beside `path` (so
+/// the rename stays on one file system), named for this process.
+fn temp_beside(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let fname = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output path has no file name",
+        )
+    })?;
+    Ok(parent.join(format!(
+        ".{}.keyroost-tmp-{}",
+        fname.to_string_lossy(),
+        std::process::id()
+    )))
+}
+
+/// Replace `path` with `data` without truncating it in place: `open` makes
+/// a fresh temp file beside it (exclusively, so it is this run's own),
+/// `data` is written and synced there, then the temp is renamed over
+/// `path`. A write or rename that fails removes the temp and leaves the old
+/// file whole. A symbolic link at `path` is refused, never written through.
+/// The non-Unix `--overwrite` path (Unix has its own, with owner and 0600
+/// checks); `open` and `sync` are seams for tests.
+#[cfg_attr(all(unix, not(test)), allow(dead_code))]
+fn replace_via_temp<W: std::io::Write>(
+    path: &std::path::Path,
+    data: &[u8],
+    open: impl FnOnce(&std::path::Path) -> std::io::Result<W>,
+    sync: impl FnOnce(&mut W) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "refusing to write secret output through a symlink",
+        ));
+    }
+    let tmp = temp_beside(path)?;
+    fill_new_file(&tmp, open(&tmp)?, data, sync)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write `data` into `f`, the file this run just created at `path`, then
+/// `sync` it. When either fails (a full disk), the partial file is removed
+/// before the error is returned: a truncated secret output is worse than
+/// none, and a retry would refuse it as a file that is already there. Only
+/// for a file created exclusively (`create_new`), so what is removed is
+/// this run's own.
+fn fill_new_file<W: std::io::Write>(
+    path: &std::path::Path,
+    mut f: W,
+    data: &[u8],
+    sync: impl FnOnce(&mut W) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let written = f.write_all(data).and_then(|()| sync(&mut f));
+    if written.is_err() {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+    }
+    written
 }
 
 /// Accept a certificate as DER or PEM, returning DER bytes.
@@ -14642,11 +14738,23 @@ fn fido_pin(
     flag: Option<&SecretSource>,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
     let mut sec = Secrets::real();
-    let src = Source::from_flag(flag);
-    sec.check(&FIDO_PIN, src)?;
+    sec.check(&FIDO_PIN, Source::from_flag(flag))?;
     let dev = crate::target::select_fido(path)?;
-    let pin = sec.read(&FIDO_PIN, src)?;
-    fido_reverify_if_prompted(&sec, &dev)?;
+    fido_pin_with(&mut sec, &dev, flag)
+}
+
+/// The PIN for a FIDO command that reads other secrets first, from the
+/// command's one `Secrets` (so a PIN on stdin takes the line after them):
+/// read last, then `dev` (the key selected before any secret was read) is
+/// re-found if a secret was typed at the hidden prompt. The caller has
+/// already checked every source, the PIN's included.
+fn fido_pin_with<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    dev: &keyroost_resolve::Device,
+    flag: Option<&SecretSource>,
+) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
+    let pin = sec.read(&FIDO_PIN, Source::from_flag(flag))?;
+    fido_reverify_if_prompted(sec, dev)?;
     Ok(pin)
 }
 
@@ -14732,6 +14840,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
         FidoCmd::Config { cmd } => run_fido_config(cmd),
         FidoCmd::Blob { cmd } => run_fido_large_blob(cmd),
         FidoCmd::Ssh { cmd } => run_fido_ssh_cert(cmd),
+        FidoCmd::Vault { cmd } => vault_cmd::run_fido_vault(cmd),
     }
 }
 
@@ -16841,6 +16950,20 @@ fn run_fido_creds_metadata(
     })
 }
 
+/// One credential in `fido credential list --json`. The user handle is
+/// bytes (often not UTF-8), so it is hex like the credential ID: every byte
+/// is kept.
+fn credential_json(c: &keyroost_ctap::cred_mgmt::Credential) -> json_out::FidoCredentialJson {
+    json_out::FidoCredentialJson {
+        credential_id: hex_encode(&c.credential_id),
+        user_id: hex_encode(&c.user.id),
+        user_name: c.user.name.clone(),
+        user_display_name: c.user.display_name.clone(),
+        algorithm: c.algorithm,
+        algorithm_name: c.algorithm.map(cose_algorithm_name),
+    }
+}
+
 fn run_fido_creds_list(
     path: Option<&std::path::Path>,
     pin: &str,
@@ -16854,17 +16977,7 @@ fn run_fido_creds_list(
                     Some(hash) => mgr.list_credentials(&hash)?,
                     None => Vec::new(),
                 };
-                let credentials = creds
-                    .iter()
-                    .map(|c| json_out::FidoCredentialJson {
-                        credential_id: hex_encode(&c.credential_id),
-                        user_id: String::from_utf8_lossy(&c.user.id).into_owned(),
-                        user_name: c.user.name.clone(),
-                        user_display_name: c.user.display_name.clone(),
-                        algorithm: c.algorithm,
-                        algorithm_name: c.algorithm.map(cose_algorithm_name),
-                    })
-                    .collect();
+                let credentials = creds.iter().map(credential_json).collect();
                 relying_parties.push(json_out::FidoRelyingPartyJson {
                     rp_id: rp.id.clone(),
                     rp_name: rp.name.clone().filter(|n| !n.is_empty()),
@@ -18237,6 +18350,8 @@ mod cli_tests {
             ("fido fingerprint delete", IRREVERSIBLE),
             ("fido blob delete", IRREVERSIBLE),
             ("fido blob clear", IRREVERSIBLE),
+            ("fido vault delete", IRREVERSIBLE),
+            ("fido vault entry delete", IRREVERSIBLE),
             ("molto delete", IRREVERSIBLE),
             ("molto reset", IRREVERSIBLE),
             ("oath delete", IRREVERSIBLE),
@@ -18274,7 +18389,10 @@ mod cli_tests {
         // Commands that ask before a change that destroys no key, seed or
         // certificate: a token setting, `piv cert request`, which replaces a
         // key only with the optional `--generate-key`, a key's name, and the
-        // code imports, which replace a code only with `--replace`.
+        // code imports, which replace a code only with `--replace`, a vault
+        // rotate, whose old vault goes only after its entries are checked
+        // in the new one, and a vault import, which replaces an entry only
+        // with a newer copy unless asked.
         let confirms_only = [
             "prog config set",
             "piv cert request",
@@ -18283,6 +18401,8 @@ mod cli_tests {
             "oath import",
             "otp import",
             "feitian import",
+            "fido vault rotate",
+            "fido vault import",
         ];
         let tree = all_commands();
         for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {
@@ -20881,6 +21001,19 @@ mod cli_tests {
     }
 
     #[test]
+    fn fido_pin_with_reads_after_content_secrets() {
+        // One `Secrets` per command: the content secret takes stdin line 1,
+        // the PIN line 2.
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
+        let mut sec = Secrets::new(FakeIo::piped(&["pass\n", "1234\n"]));
+        let pass = sec.read(&PGP_PASSPHRASE, Source::new(None, true)).unwrap();
+        let pin = fido_pin_with(&mut sec, &test_fido_row(), Some(&SecretSource::Stdin)).unwrap();
+        assert_eq!((pass.as_str(), pin.as_str()), ("pass", "1234"));
+        assert_eq!(sec.io.lines_read, 2);
+    }
+
+    #[test]
     fn fido_reverify_checks_the_key_shown_before_the_pin() {
         // After a hidden prompt the re-check gets the very row the caller
         // selected before the PIN, never a fresh selection; with no prompt
@@ -22906,6 +23039,121 @@ mod cli_tests {
         assert_eq!(mode & 0o777, 0o600, "re-write should tighten to 0600");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A new file whose write fails (a full disk, here a writer that
+    /// fails partway) is removed, not left truncated; a write that goes
+    /// through keeps it.
+    #[test]
+    fn fill_new_file_removes_a_partial_file() {
+        struct Full(usize);
+        impl std::io::Write for Full {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::other("no space left on device"));
+                }
+                let n = b.len().min(self.0);
+                self.0 -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("keyroost_fill_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("backup.t2vault");
+
+        std::fs::write(&path, b"part").unwrap();
+        let err = fill_new_file(&path, Full(4), b"partial data", |_| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("no space"), "{err}");
+        assert!(!path.exists(), "a partial file was left behind");
+
+        // A failing sync removes it too.
+        std::fs::write(&path, b"all").unwrap();
+        let err = fill_new_file(&path, Full(100), b"all", |_| {
+            Err(std::io::Error::other("sync failed"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("sync failed"), "{err}");
+        assert!(!path.exists());
+
+        // Success leaves the file alone.
+        std::fs::write(&path, b"kept").unwrap();
+        fill_new_file(&path, Full(100), b"kept", |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An agreed overwrite outside Unix goes through a temp file: a write
+    /// that fails partway leaves the old file whole and no temp behind; one
+    /// that goes through replaces it; a symbolic link is refused.
+    #[test]
+    fn replace_via_temp_never_truncates_the_old_file() {
+        struct Full(std::fs::File, usize);
+        impl std::io::Write for Full {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                if self.1 == 0 {
+                    return Err(std::io::Error::other("no space left on device"));
+                }
+                let n = self.0.write(&b[..b.len().min(self.1)])?;
+                self.1 -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.flush()
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("keyroost_replace_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("backup.t2vault");
+        let only_the_file = |dir: &std::path::Path| {
+            let names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["backup.t2vault"], "a temp file was left behind");
+        };
+        let open = |room: usize| {
+            move |tmp: &std::path::Path| {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(tmp)?;
+                Ok(Full(f, room))
+            }
+        };
+
+        std::fs::write(&path, b"the old backup").unwrap();
+        let err =
+            replace_via_temp(&path, b"a new backup", open(4), |f| f.0.sync_all()).unwrap_err();
+        assert!(err.to_string().contains("no space"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"the old backup");
+        only_the_file(&dir);
+
+        let err = replace_via_temp(&path, b"a new backup", open(100), |_| {
+            Err(std::io::Error::other("sync failed"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("sync failed"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"the old backup");
+        only_the_file(&dir);
+
+        replace_via_temp(&path, b"a new backup", open(100), |f| f.0.sync_all()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"a new backup");
+        only_the_file(&dir);
+
+        #[cfg(unix)]
+        {
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            let err = replace_via_temp(&link, b"x", open(100), |_| Ok(())).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(&path).unwrap(), b"a new backup");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -26102,6 +26350,9 @@ mod cli_tests {
             Cmd::Fido {
                 cmd: FidoCmd::Pin { cmd },
             } => fido_pin_secret_pair(cmd),
+            Cmd::Fido {
+                cmd: FidoCmd::Vault { cmd },
+            } => vault_cmd::vault_secret_pair(cmd),
             _ => None,
         }
     }
@@ -26210,6 +26461,8 @@ mod cli_tests {
                 "molto customer-key change",
                 "molto import",
                 "fido pin change",
+                "fido vault export",
+                "fido vault import",
                 "oath add",
                 "oath import",
                 "oath password set",
@@ -27113,6 +27366,27 @@ mod cli_tests {
         let v = serde_json::to_value(&no_name).unwrap();
         assert!(v["rp_name"].is_null(), "rp_name should be null: {v}");
         assert!(v.as_object().unwrap().contains_key("rp_name"));
+    }
+
+    #[test]
+    fn creds_list_json_user_id_is_hex_like_the_credential_id() {
+        // A user handle is bytes, often not UTF-8: hex keeps every byte.
+        let c = keyroost_ctap::cred_mgmt::Credential {
+            credential_id: vec![0xAB, 0x01],
+            user: keyroost_ctap::cred_mgmt::CredentialUser {
+                id: vec![0xFF, 0x00, 0x80, 0x41],
+                name: Some("alice".into()),
+                display_name: None,
+            },
+            algorithm: Some(-7),
+            large_blob_key: None,
+        };
+        let v = serde_json::to_value(credential_json(&c)).unwrap();
+        assert_eq!(v["user_id"], "ff008041");
+        assert_eq!(v["credential_id"], "ab01");
+        assert!(!v.to_string().contains('\u{FFFD}'), "{v}");
+        assert_eq!(v["user_name"], "alice");
+        assert!(v["user_display_name"].is_null());
     }
 
     // ---- large-blob shaping (pure logic; no hardware) ----

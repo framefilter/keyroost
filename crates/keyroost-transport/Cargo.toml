@@ -28,6 +28,9 @@ keyroost-import = { path = "../keyroost-import", version = "0.16.0" }
 # For the CtapTransport trait — the PC/SC CTAP backend (NFC + contact readers)
 # implements it so FIDO2 commands can run over a smart-card reader, not just USB-HID.
 keyroost-ctap = { path = "../keyroost-ctap", version = "0.16.0" }
+# The FIDO2 password vault formats (seal/open, the credential's RP and
+# hmac-secret input) the `vault` sessions store on a key.
+keyroost-vault = { path = "../keyroost-vault", version = "0.16.0" }
 pcsc = "2"
 # hidapi backs the Token2 OTP USB-HID transport on macOS / Windows; Linux uses
 # the dependency-free hidraw `File` path (same split as keyroost-ctap). Optional

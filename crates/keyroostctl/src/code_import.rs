@@ -698,12 +698,38 @@ fn shown_name(row: &keyroost_import::plan::PlanRow) -> String {
 }
 
 /// "1 entry" / "3 entries".
-fn entries(n: usize) -> String {
+pub(crate) fn entries(n: usize) -> String {
     if n == 1 {
         "1 entry".to_owned()
     } else {
         format!("{n} entries")
     }
+}
+
+/// The rows of an import preview, one per entry: the plan word in a
+/// 10-wide column, the name (already sanitized) in a column as wide as the
+/// widest name but never past [`NAME_COLUMN_MAX`], then the reason. A name
+/// longer than the column gets its reason on the next line, under the
+/// reason column. Shared by the code imports and `fido vault import`.
+pub(crate) fn plan_row_lines(rows: &[(&str, String, Option<String>)]) -> Vec<String> {
+    let width = rows
+        .iter()
+        .map(|(_, n, _)| n.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(NAME_COLUMN_MAX);
+    let mut out = Vec::with_capacity(rows.len());
+    for (word, name, reason) in rows {
+        match reason {
+            None => out.push(format!("  {word:<10}{name}")),
+            Some(reason) if name.chars().count() > width => {
+                out.push(format!("  {word:<10}{name}"));
+                out.push(format!("{}{reason}", " ".repeat(2 + 10 + width + 2)));
+            }
+            Some(reason) => out.push(format!("  {word:<10}{name:<width$}  {reason}")),
+        }
+    }
+    out
 }
 
 /// The preview: one header line, one line per entry (two when the name is
@@ -738,23 +764,19 @@ pub(crate) fn preview_lines(
             }
         })
         .collect();
-    let width = names
+    let rows: Vec<(&str, String, Option<String>)> = plan
+        .rows
         .iter()
-        .map(|n| n.chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(NAME_COLUMN_MAX);
-    for (row, name) in plan.rows.iter().zip(&names) {
-        let word = row.verdict.word();
-        match verdict_reason(&row.verdict, plan.store) {
-            None => out.push(format!("  {word:<10}{name}")),
-            Some(reason) if name.chars().count() > width => {
-                out.push(format!("  {word:<10}{name}"));
-                out.push(format!("{}{reason}", " ".repeat(2 + 10 + width + 2)));
-            }
-            Some(reason) => out.push(format!("  {word:<10}{name:<width$}  {reason}")),
-        }
-    }
+        .zip(names)
+        .map(|(row, name)| {
+            (
+                row.verdict.word(),
+                name,
+                verdict_reason(&row.verdict, plan.store),
+            )
+        })
+        .collect();
+    out.extend(plan_row_lines(&rows));
     let c = plan.counts();
     let on_key = match (plan.store, view.unread.is_none()) {
         (_, false) => String::new(),
@@ -1019,6 +1041,37 @@ mod tests {
             "0 on the key; 1 will be added, 0 replaced, 1 left as is, 0 skipped."
         );
         assert_eq!(lines.len(), 5);
+    }
+
+    /// The shared row layout on its own: one name column as wide as the
+    /// widest name (at most `NAME_COLUMN_MAX`), a reason after it, and a
+    /// longer name's reason on the next line under that column.
+    #[test]
+    fn plan_row_lines_layout() {
+        let long = "x".repeat(NAME_COLUMN_MAX + 1);
+        let rows = [
+            ("add", "GitHub (alice)".to_owned(), None),
+            (
+                "skip",
+                "Bank".to_owned(),
+                Some("not named with --entry".to_owned()),
+            ),
+            ("exists", long.clone(), Some("left as is".to_owned())),
+        ];
+        assert_eq!(
+            plan_row_lines(&rows),
+            [
+                "  add       GitHub (alice)".to_owned(),
+                format!(
+                    "  skip      {:<w$}  not named with --entry",
+                    "Bank",
+                    w = NAME_COLUMN_MAX
+                ),
+                format!("  exists    {long}"),
+                format!("{}left as is", " ".repeat(2 + 10 + NAME_COLUMN_MAX + 2)),
+            ]
+        );
+        assert!(plan_row_lines(&[]).is_empty());
     }
 
     fn slot_row(index: usize, label: &str, slot: Option<u8>, verdict: Verdict) -> PlanRow {

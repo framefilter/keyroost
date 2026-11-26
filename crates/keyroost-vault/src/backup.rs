@@ -7,7 +7,7 @@
 
 use crate::blob::{aead_open, aead_seal, deflate, inflate};
 use crate::error::VaultError;
-use crate::model::{from_json, to_json, Vault};
+use crate::model::{canon_id, from_json, to_json, Vault};
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 5] = b"T2VBK";
@@ -86,7 +86,31 @@ pub fn import_backup(bytes: &[u8], passphrase: &str) -> Result<Vault, VaultError
     let (header, ct) = bytes.split_at(HEADER_LEN);
     let key = argon2_key(passphrase, &header[18..34], &params)?;
     let plain = aead_open(&key, nonce, header, ct)?;
-    from_json(&inflate(&plain)?)
+    let v = from_json(&inflate(&plain)?)?;
+    check_unique_ids(&v)?;
+    Ok(v)
+}
+
+/// [`VaultError::DuplicateId`] when two entries share an id (compared as
+/// [`canon_id`]): an import matches entries by id, so such a backup could
+/// only be imported by guessing which entry is meant.
+fn check_unique_ids(v: &Vault) -> Result<(), VaultError> {
+    let mut seen = std::collections::HashSet::new();
+    if v.entries.iter().all(|e| seen.insert(canon_id(&e.id))) {
+        Ok(())
+    } else {
+        Err(VaultError::DuplicateId)
+    }
+}
+
+/// The rule a new backup's passphrase must meet: at least 10 characters
+/// (Unicode scalar values, not bytes). [`export_backup`] applies it; a front
+/// end can check it before the key is used.
+pub fn check_passphrase(pass: &str) -> Result<(), VaultError> {
+    if pass.chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(VaultError::ShortPassphrase);
+    }
+    Ok(())
 }
 
 pub(crate) fn export_backup_with(
@@ -96,9 +120,7 @@ pub(crate) fn export_backup_with(
     salt: [u8; 16],
     nonce: [u8; 12],
 ) -> Result<Vec<u8>, VaultError> {
-    if pass.chars().count() < MIN_PASSPHRASE_CHARS {
-        return Err(VaultError::ShortPassphrase);
-    }
+    check_passphrase(pass)?;
     let mut header = Vec::with_capacity(HEADER_LEN);
     header.extend_from_slice(MAGIC);
     header.push(VERSION);
@@ -151,6 +173,49 @@ mod tests {
     fn wrong_passphrase_is_decrypt_error() {
         let r = import_backup(&unhex(BACKUP_HEX), "wrong horse battery");
         assert_eq!(r.unwrap_err(), VaultError::Decrypt);
+    }
+
+    #[test]
+    fn duplicate_ids_are_refused() {
+        let mut v = sample();
+        let mut twin = v.entries[0].clone();
+        twin.title = "Other".into();
+        v.entries.push(twin);
+        let b = export_backup_with(&v, BACKUP_PASS, &P, BACKUP_SALT, BACKUP_NONCE).unwrap();
+        assert_eq!(
+            import_backup(&b, BACKUP_PASS).unwrap_err(),
+            VaultError::DuplicateId
+        );
+        assert_eq!(
+            VaultError::DuplicateId.to_string(),
+            "this backup lists two entries with the same id; it may be damaged"
+        );
+
+        // A format-1 UUID id and its shortened form are the same entry.
+        let mut v = sample();
+        let mut a = v.entries[0].clone();
+        a.id = "00112233-4455-6677-8899-aabbccddeeff".into();
+        let mut b = a.clone();
+        b.id = canon_id(&a.id);
+        assert_ne!(a.id, b.id);
+        v.entries = vec![a, b];
+        let bytes = export_backup_with(&v, BACKUP_PASS, &P, BACKUP_SALT, BACKUP_NONCE).unwrap();
+        assert_eq!(
+            import_backup(&bytes, BACKUP_PASS).unwrap_err(),
+            VaultError::DuplicateId
+        );
+    }
+
+    #[test]
+    fn check_passphrase_matches_export_rule() {
+        assert_eq!(
+            check_passphrase("123456789").unwrap_err(),
+            VaultError::ShortPassphrase
+        );
+        assert_eq!(check_passphrase("1234567890"), Ok(()));
+        // Characters, not bytes, as the export counts them.
+        assert_eq!(check_passphrase("ééééé"), Err(VaultError::ShortPassphrase));
+        assert_eq!(check_passphrase("ééééééééél"), Ok(()));
     }
 
     #[test]

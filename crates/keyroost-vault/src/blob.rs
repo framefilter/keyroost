@@ -18,7 +18,7 @@ const TAG_LEN: usize = 16;
 const KDF_INFO: &[u8] = b"Token2 fido2-vault v1 / AES-256-GCM";
 const MAX_INFLATED: usize = 16 * 1024 * 1024;
 
-/// Raw DEFLATE at level 9 (byte-identical to fidoparole's output).
+/// Raw DEFLATE at level 9 (byte-identical to FidoParole's output).
 pub(crate) fn deflate(b: &[u8]) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec(b, 9)
 }

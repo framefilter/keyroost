@@ -5,6 +5,7 @@
 pub const SOURCES: &[(&str, &str)] = &[
     ("main.rs", include_str!("../src/main.rs")),
     ("overview.rs", include_str!("../src/overview.rs")),
+    ("vault_cmd.rs", include_str!("../src/vault_cmd.rs")),
 ];
 
 const CHATTER: &[&str] = &[

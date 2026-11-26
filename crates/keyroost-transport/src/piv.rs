@@ -3652,7 +3652,7 @@ impl<'tx> PivSession<'tx> {
             piv::parse_general_auth(&resp2, 0x82).map_err(TransportError::PivParse)?
         };
         let expected = Zeroizing::new(block_crypt(alg, key, &challenge, CryptOp::Encrypt)?);
-        if !ct_eq(z2, &expected) {
+        if !crate::ct_eq(z2, &expected) {
             return Err(TransportError::PivManagementAuthFailed);
         }
         Ok(())
@@ -7207,11 +7207,6 @@ fn public_key_from_metadata(raw: &[u8]) -> Result<PublicKey, keyroost_piv::Parse
         }),
         _ => Err(keyroost_piv::ParseError::NotPublicKey),
     }
-}
-
-/// Constant-time slice equality (fold-XOR; no early exit on the bytes).
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Map a PIV status word to success or a labeled APDU error.

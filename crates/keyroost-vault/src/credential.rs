@@ -35,6 +35,16 @@ pub fn user_handle(name: &str) -> Result<Vec<u8>, VaultError> {
     Ok(handle)
 }
 
+/// The user handle of a vault credential with no name: the `0x01` tag and
+/// 8 random bytes, as [`user_handle`] makes them, with no name after. A
+/// vault that had none keeps none when its key is rotated. A failed system
+/// random source is [`VaultError::Random`].
+pub fn unnamed_user_handle() -> Result<Vec<u8>, VaultError> {
+    let mut handle = vec![0x01; 1 + 8];
+    getrandom::fill(&mut handle[1..]).map_err(|_| VaultError::Random)?;
+    Ok(handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,6 +69,14 @@ mod tests {
         assert_eq!(&h[9..], b"Mail");
         // The 8 middle bytes are fresh each time.
         assert_ne!(user_handle("Mail").unwrap()[1..9], h[1..9]);
+    }
+
+    #[test]
+    fn unnamed_user_handle_layout() {
+        let h = unnamed_user_handle().unwrap();
+        assert_eq!(h.len(), 1 + 8);
+        assert_eq!(h[0], 0x01);
+        assert_ne!(unnamed_user_handle().unwrap()[1..], h[1..]);
     }
 
     #[test]

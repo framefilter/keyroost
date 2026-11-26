@@ -46,7 +46,14 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   direct USB. Resident-credential metadata surfaces the fuller passkey detail
   too: the user's UPN, display name, user id, and the full credential id.
   Resident SSH credentials can be listed and their stored OpenSSH certificate
-  extracted from largeBlob to a `-cert.pub` file (`fido ssh`).
+  extracted from largeBlob to a `-cert.pub` file (`fido ssh`). Also an
+  encrypted password vault on FIDO2 keys with a large-blob store, opened with
+  the PIN and a touch (`fido vault`, experimental); it uses Token2 FidoParole's vault and
+  backup formats, checked against FidoParole's own vault code and libfido2.
+  The large-blob store is shared space on the key, meant for data that
+  belongs to a passkey; each vault is kept there as the data of its own
+  credential. Websites may store data there too, so keep vaults small;
+  `fido vault list` shows how full the store is.
 - **OATH (TOTP/HOTP)** — list, add, delete, and compute codes over PC/SC,
   including applet-password set / clear / unlock, and a factory reset of the
   applet (`oath reset`) — the recovery path for a forgotten password. In
@@ -735,6 +742,11 @@ keyroostctl fido pin status
 keyroostctl fido credential list             # asks for the PIN (nothing is shown as you type)
 keyroostctl fido ssh list                     # list SSH certs stored in resident credentials
 keyroostctl fido ssh export --rp ssh:demo --out demo-cert.pub
+keyroostctl fido vault add Personal           # a new password vault on the key (two touches)
+keyroostctl fido vault entry add GitHub --username alice --generate-password
+keyroostctl fido vault entry show GitHub --reveal
+keyroostctl fido vault export Personal -o personal.t2vault
+keyroostctl fido vault import -i personal.t2vault --dry-run   # preview; writes nothing
 
 # --- OATH over PC/SC ---
 keyroostctl oath list
@@ -1089,7 +1101,7 @@ old script.
 | Crate | Purpose | External deps |
 |---|---|---|
 | `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
-| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP and Feitian OTP sessions, import writers for OATH / Token2 OTP / Feitian OTP / Molto2 (in-tree `keyroost-import`), PIV key import from `.p12` / `.pfx` (in-tree `keyroost-p12`) and the slot self-test (in-tree `keyroost-pivtest`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
+| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP and Feitian OTP sessions, import writers for OATH / Token2 OTP / Feitian OTP / Molto2 (in-tree `keyroost-import`), PIV key import from `.p12` / `.pfx` (in-tree `keyroost-p12`), the slot self-test (in-tree `keyroost-pivtest`) and FIDO2 password vault sessions (in-tree `keyroost-vault`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
 | `keyroost-hid` | USB HID enumeration of FIDO devices, and the "same physical USB device" evidence used to pair a key's FIDO and smart-card sides | none on Linux (`sysfs`); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
 | `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management, creating and reading credentials (makeCredential / getAssertion with `hmac-secret`, `largeBlobKey` and `credProtect`), large-blob storage (including the name a key carries) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`) and `getrandom` for client-PIN, `aes-gcm` + `miniz_oxide` for largeBlob entries, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
@@ -1104,13 +1116,13 @@ old script.
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match), naming (names on the key and on this computer), and the model table and bundled FIDO metadata the CLI and the app both show | `serde`/`serde_json` (the bundled FIDO metadata); in-tree, including `keyroost-ctap` |
 | `keyroost-rsakey` | Host-side RSA key loading (PKCS#1/PKCS#8, PEM/DER, 2048-4096 bits) for OpenPGP import | `rsa`, `zeroize` |
 | `keyroost-pgpkey` | Host-side OpenPGP key sets: key generation, GnuPG-compatible passphrase-protected backups, reading backups and GnuPG exports, expiry changes; restore onto a card behind the `card` feature | `rsa`, `p256`, `p384`, `p521`, `k256`, `ed25519-dalek`, `x25519-dalek`, `sha2`, `aes`, `getrandom`, `zeroize`; in-tree `keyroost-transport` (behind `card`) |
-| `keyroost-vault` | FIDO2 password vault kept in a key's large-blob storage: the vault and backup formats of Token2's [fidoparole](https://github.com/token2/fidoparole) (reused with Token2's approval), merging a backup in, and a password generator; no hardware | `aes-gcm`, `hmac`, `sha2`, `miniz_oxide`, `serde`/`serde_json`, `getrandom`, `zeroize`, `argon2` (with `blake2`) for the backup passphrase |
+| `keyroost-vault` | FIDO2 password vault kept in a key's large-blob store: the vault and backup formats of Token2's [FidoParole](https://github.com/token2/fidoparole) (reused with Token2's approval), merging a backup in, and a password generator; no hardware | `aes-gcm`, `hmac`, `sha2`, `miniz_oxide`, `serde`/`serde_json`, `getrandom`, `zeroize`, `argon2` (with `blake2`) for the backup passphrase |
 | `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers, file classification, and the per-key import plan and write loop | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`, `aes-gcm`, `base64` (behind `encrypted`, which implies `bulk`) |
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots and Google Authenticator export batches — always built in; the GUI's *live screen* capture is behind the `qr` feature (on in the release archives and the AppImage, off in the Flatpak) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
 | `keyroost-winwebauthn` | Windows-only helper for the non-admin FIDO2 path: detect a FIDO key via the HID access-denied signal, open Windows' security-key settings, and relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-windevtree` | Windows-only device-tree lookups that let a key's FIDO HID node and smart-card reader be recognized as one physical key, without opening the device or connecting to the card; isolates the unsafe Win32 FFI; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-screengrab` | Windows-only still screen capture (GDI `BitBlt`) for QR-from-screen; isolates the unsafe Win32 FFI from the GUI crate; inert on non-Windows | `windows-sys` (Windows only) |
-| `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `serde`/`serde_json`, `zeroize`, `rpassword` (hidden PIN/password prompt) |
+| `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `serde`/`serde_json`, `zeroize`, `rpassword` (hidden PIN/password prompt); in-tree `keyroost-vault` |
 | `keyroost` | egui desktop GUI | `eframe`, `egui`, `arboard`, `rfd`, `pollster`, `png`, `base64`, `serde`/`serde_json`, `zeroize`; `x11rb`/`ashpd` on Linux (`qr` feature); `wgpu` (DirectX 12 only) on Windows; `winresource` build-dep on Windows |
 
 ## Protocol

@@ -136,6 +136,12 @@ fn ctap_status_hint(code: u8) -> Option<&'static str> {
         0x3B => "the key needs a physical touch to continue",
         0x3C => "user verification is temporarily blocked \u{2014} remove and re-insert the key",
         0x2F => "timed out waiting for you to act on the key",
+        // Not always a timeout. A YubiKey 5 (firmware 5.7) answered a
+        // touch that didn't come in time with this, where 0x2F was expected.
+        0x27 => {
+            "the key refused the operation; on some keys this means the touch \
+                 didn't come in time"
+        }
         _ => return None,
     })
 }
@@ -151,6 +157,7 @@ fn ctap_status_name(code: u8) -> Option<&'static str> {
         0x12 => "CTAP2_ERR_INVALID_CBOR",
         0x14 => "CTAP2_ERR_MISSING_PARAMETER",
         0x19 => "CTAP2_ERR_CREDENTIAL_EXCLUDED",
+        0x27 => "CTAP2_ERR_OPERATION_DENIED",
         0x2B => "CTAP2_ERR_UNSUPPORTED_OPTION",
         0x2C => "CTAP2_ERR_INVALID_OPTION",
         0x2D => "CTAP2_ERR_KEEPALIVE_CANCEL",
@@ -398,6 +405,19 @@ mod tests {
         assert!(!CtapError::StatusCode(0x32).is_pin_auth_error());
         assert!(!CtapError::StatusCode(0x30).is_pin_auth_error());
         assert!(!CtapError::EmptyResponse.is_pin_auth_error());
+    }
+
+    #[test]
+    fn operation_denied_reads_in_plain_words() {
+        let s = CtapError::StatusCode(0x27).to_string();
+        assert_eq!(
+            s,
+            "the key refused the operation; on some keys this means the touch \
+             didn't come in time (CTAP2 status 0x27 CTAP2_ERR_OPERATION_DENIED)"
+        );
+        // The timeout code keeps its own words.
+        let t = CtapError::StatusCode(0x2F).to_string();
+        assert!(t.starts_with("timed out waiting"), "{t}");
     }
 
     #[test]

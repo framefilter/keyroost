@@ -553,7 +553,8 @@ pub(crate) struct FidoRelyingPartyJson {
 pub(crate) struct FidoCredentialJson {
     /// Full hex credentialId (the value `fido credential delete ID` expects).
     pub credential_id: String,
-    /// The user handle, rendered as UTF-8 (lossy), as the human prints it.
+    /// Full hex user handle, like `credential_id`: the handle is bytes, often
+    /// not text.
     pub user_id: String,
     pub user_name: Option<String>,
     pub user_display_name: Option<String>,
@@ -611,6 +612,133 @@ pub(crate) struct FidoSshCredentialJson {
     /// Whether the key's largeBlob store holds an OpenSSH certificate for this
     /// credential (what `fido ssh export` saves).
     pub cert_present: bool,
+}
+
+/// `keyroostctl fido vault --json list` — one entry per vault on the key,
+/// and how full the large-blob store that holds them is.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultListJson {
+    pub vaults: Vec<FidoVaultJson>,
+    pub capacity: FidoLargeBlobCapacityJson,
+}
+
+/// One vault in the `fido vault list` output.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultJson {
+    /// The vault's name; `null` when the credential carries none.
+    pub name: Option<String>,
+    /// Full hex credentialId, as `fido ssh list` gives it.
+    pub credential_id: String,
+    /// `ok`, `no-data` (opens empty: nothing stored yet) or `unavailable`.
+    pub state: &'static str,
+    /// How many entries it holds; `null` when it is `unavailable`.
+    pub entry_count: Option<usize>,
+    /// Why an `unavailable` vault does not open; `null` otherwise.
+    pub detail: Option<String>,
+}
+
+/// `keyroostctl --json fido vault entry list` — the entries of one vault,
+/// without their passwords or notes.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultEntryListJson {
+    /// The vault's name; `null` when the credential carries none.
+    pub vault: Option<String>,
+    pub entries: Vec<FidoVaultEntryJson>,
+}
+
+/// One entry in `fido vault entry list`. Its fields are entry data, wiped
+/// when it is dropped.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultEntryJson {
+    /// The entry's id in the vault, as FidoParole stores it.
+    pub id: String,
+    pub title: String,
+    /// `null` when the entry has none.
+    pub username: Option<String>,
+    /// `null` when the entry has none.
+    pub url: Option<String>,
+    /// Last changed, `YYYY-MM-DD` (UTC).
+    pub changed: String,
+}
+
+impl Drop for FidoVaultEntryJson {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.id.zeroize();
+        self.title.zeroize();
+        self.username.zeroize();
+        self.url.zeroize();
+    }
+}
+
+/// `keyroostctl --json fido vault import` — what the import does with each
+/// backup entry, as the preview shows it. Never a password.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultImportJson {
+    /// The vault imported into; `null` when the credential carries no name.
+    pub vault: Option<String>,
+    /// Whether the import makes the vault (the key had none of that name).
+    pub creates: bool,
+    pub dry_run: bool,
+    pub entries: Vec<FidoVaultImportRowJson>,
+}
+
+/// One backup entry in `fido vault import`. Its text is entry data, wiped
+/// when it is dropped.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultImportRowJson {
+    /// Its place in the backup, from 0.
+    pub index: usize,
+    /// The entry's id, as FidoParole stores it.
+    pub id: String,
+    pub title: String,
+    /// `null` when the entry has none.
+    pub username: Option<String>,
+    /// `add`, `replace`, `exists` or `skip`.
+    pub plan: &'static str,
+    /// Why a row is not a plain add; `null` for one.
+    pub reason: Option<&'static str>,
+}
+
+impl Drop for FidoVaultImportRowJson {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.id.zeroize();
+        self.title.zeroize();
+        self.username.zeroize();
+    }
+}
+
+/// `keyroostctl --json fido vault entry show` — one entry; the password
+/// only with `--reveal`. Every field is wiped when it is dropped.
+#[derive(Serialize)]
+pub(crate) struct FidoVaultEntryShowJson {
+    pub vault: Option<String>,
+    pub id: String,
+    pub title: String,
+    /// `null` when the entry has none, as for `url` and `notes`.
+    pub username: Option<String>,
+    pub url: Option<String>,
+    pub notes: Option<String>,
+    /// Last changed, `YYYY-MM-DD` (UTC).
+    pub changed: String,
+    /// The password with `--reveal`; `null` without it (an entry with no
+    /// password is `""`).
+    pub password: Option<String>,
+}
+
+impl Drop for FidoVaultEntryShowJson {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.vault.zeroize();
+        self.id.zeroize();
+        self.title.zeroize();
+        self.username.zeroize();
+        self.url.zeroize();
+        self.notes.zeroize();
+        self.changed.zeroize();
+        self.password.zeroize();
+    }
 }
 
 /// `keyroostctl fido blob --json list` — one entry per stored blob.

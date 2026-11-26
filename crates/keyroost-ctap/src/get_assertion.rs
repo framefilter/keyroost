@@ -359,7 +359,8 @@ fn check_request(info: &AuthenticatorInfo, req: &GetAssertionRequest) -> Result<
 }
 
 /// Turn one getAssertion / getNextAssertion reply into a complete
-/// [`Assertion`], checking the outputs the request asked for are there.
+/// [`Assertion`]. An output the request asked for but the key left out stays
+/// `None`; judging that is the caller's job.
 /// `first` marks the getAssertion reply, the one whose `0x2E` means "no
 /// matching credential".
 fn read_one(resp: &[u8], req: &GetAssertionRequest, first: bool) -> Result<Assertion, CtapError> {
@@ -376,16 +377,6 @@ fn read_one(resp: &[u8], req: &GetAssertionRequest, first: bool) -> Result<Asser
     let credential_id = credential_id
         .or_else(|| req.allow.map(<[u8]>::to_vec))
         .ok_or(NO_CREDENTIAL)?;
-    if req.large_blob_key && assertion.large_blob_key.is_none() {
-        return Err(CtapError::InvalidResponseShape(
-            "the key returned no largeBlobKey for an assertion",
-        ));
-    }
-    if req.hmac.is_some() && assertion.hmac_output.is_none() {
-        return Err(CtapError::InvalidResponseShape(
-            "the key returned no hmac-secret output for an assertion",
-        ));
-    }
     Ok(Assertion {
         credential_id,
         ..assertion
@@ -400,9 +391,11 @@ fn read_one(resp: &[u8], req: &GetAssertionRequest, first: bool) -> Result<Asser
 /// long timeout, restored afterwards; getNextAssertion needs no touch and
 /// runs under the caller's timeout. Requests the key's getInfo says it cannot
 /// honor are refused before anything is sent. A key with no matching
-/// credential answers [`CtapError::NoCredentials`]. When the request asked
-/// for `largeBlobKey` or `hmac-secret`, an assertion without that output is
-/// an error.
+/// credential answers [`CtapError::NoCredentials`].
+///
+/// One odd credential must not hide the others, so an assertion lacking a
+/// requested `largeBlobKey` or `hmac-secret` output is returned with that
+/// field `None` rather than failing the batch; the caller judges it.
 pub fn get_assertions(
     dev: &mut impl CtapTransport,
     info: &AuthenticatorInfo,
@@ -919,40 +912,28 @@ mod tests {
     }
 
     #[test]
-    fn missing_requested_outputs_are_refused() {
+    fn missing_requested_outputs_are_left_empty() {
         let token = v1_token();
         let session = v1_session();
         let req = vault_request(&token, &session);
-        let cases = [
-            Resp {
-                lbk: None,
-                ..vault_resp(&[0x01], "v", None)
-            },
-            Resp {
-                hmac_enc: None,
-                ..vault_resp(&[0x01], "v", None)
-            },
-        ];
-        for resp in cases {
-            let mut dev = ScriptedDevice::new(vec![ok(encode_resp(&resp))]);
-            assert!(matches!(
-                get_assertions(&mut dev, &full_info(), &req),
-                Err(CtapError::InvalidResponseShape(_))
-            ));
-        }
-        // A later assertion of the batch lacking its largeBlobKey fails the
-        // whole call too.
+        // One odd credential must not hide the others: the batch succeeds and
+        // the missing outputs stay None for the caller to judge.
         let mut dev = ScriptedDevice::new(vec![
-            ok(encode_resp(&vault_resp(&[0x01], "one", Some(2)))),
+            ok(encode_resp(&vault_resp(&[0x01], "one", Some(3)))),
             ok(encode_resp(&Resp {
                 lbk: None,
                 ..vault_resp(&[0x02], "two", None)
             })),
+            ok(encode_resp(&Resp {
+                hmac_enc: None,
+                ..vault_resp(&[0x03], "three", None)
+            })),
         ]);
-        assert!(matches!(
-            get_assertions(&mut dev, &full_info(), &req),
-            Err(CtapError::InvalidResponseShape(_))
-        ));
+        let v = get_assertions(&mut dev, &full_info(), &req).unwrap();
+        assert_eq!(v.len(), 3);
+        assert!(v[0].hmac_output.is_some() && v[0].large_blob_key.is_some());
+        assert!(v[1].large_blob_key.is_none());
+        assert!(v[2].hmac_output.is_none());
 
         // Not asked for: their absence is fine.
         let plain = GetAssertionRequest {

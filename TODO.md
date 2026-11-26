@@ -98,6 +98,14 @@ Being worked on right now — check with whoever holds it before starting.
 Not yet run. Everything here is behavior that automated tests cannot reach;
 items marked *(no hardware)* need a device the maintainer does not have.
 
+- **Lift the "experimental" label on the password vault (`fido vault`).**
+  Shipped experimental in v0.17 ([#285](https://github.com/framefilter/keyroost/pull/285)).
+  Lift it once the vault has run on the Windows test round (consoles,
+  `--reveal`), on a Token2 PIN+ (the fresh-token retry) and another key
+  with a large-blob store besides the YubiKey, and in the app's
+  Vault tab, and user reports have had a release to come in; then drop
+  "(experimental)" from the `fido vault` help, the README and the app.
+
 - **Lift the "experimental" label on the Token2 PIN+ OATH and OpenPGP
   applets.** PIV is exercised on a PIN+ Dual Ace R3.4 since #251; verify
   OATH and OpenPGP over CCID on a PIN+ key (on Windows: Linux's libccid
@@ -151,6 +159,13 @@ plan's two-key manual steps were never executed):
 ---
 
 ## Deferred to a later release
+
+- **Interactive CLI import for vault backups.** Start from the
+  `fido vault import` preview, where each row says `add`, `replace`,
+  `exists` or `skip` with its reason, and explore letting the user pick, in
+  the terminal, which rows to bring in or overwrite. Not decided whether it
+  gets built, since vaults may grow large; the goal is a smoother CLI path
+  than `--entry`. Vault CLI PR: [#285](https://github.com/framefilter/keyroost/pull/285).
 
 - **Keep copied codes out of clipboard history on native Wayland** (waits for
   GNOME). Copies are marked `x-kde-passwordManagerHint=secret` on X11 and

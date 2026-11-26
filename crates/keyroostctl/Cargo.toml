@@ -40,6 +40,8 @@ keyroost-import = { path = "../keyroost-import", version = "0.16.0", features = 
 keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.16.0" }
 # Host-side OpenPGP key sets: create with a backup, restore, change expiry.
 keyroost-pgpkey = { path = "../keyroost-pgpkey", version = "0.16.0", features = ["card"] }
+# The vault formats (`fido vault`); the key side is keyroost-transport::vault.
+keyroost-vault = { path = "../keyroost-vault", version = "0.16.0" }
 clap = { version = "4", features = ["derive"] }
 # Same project family as clap; generate shell completions / a man page at
 # runtime (`completions` / `manpage` subcommands) rather than from a build

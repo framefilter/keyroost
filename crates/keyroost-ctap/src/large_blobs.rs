@@ -47,6 +47,8 @@
 //! fragment carries `length` (the total) at `offset = 0`, and subsequent
 //! fragments must follow immediately at increasing offsets.
 
+use std::fmt;
+
 use crate::cbor::{self, Value};
 use crate::client_pin::PinUvAuthToken;
 use crate::cmd::{AuthenticatorInfo, CtapError};
@@ -99,6 +101,29 @@ pub struct BlobCapacity {
     pub used_bytes: u64,
     pub free_bytes: u64,
     pub entry_count: usize,
+}
+
+/// One credential's data in a large-blob array
+/// ([`LargeBlobArray::credential_data`]).
+pub enum CredentialData {
+    /// No entry is sealed under the credential's largeBlobKey.
+    Absent,
+    /// The decrypted, inflated data; wiped when dropped.
+    Present(Zeroizing<Vec<u8>>),
+    /// An entry is sealed under the credential's largeBlobKey, but none
+    /// inflates: there is data, and it cannot be read.
+    Unreadable,
+}
+
+// Hand-written so the data never lands in a log.
+impl fmt::Debug for CredentialData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CredentialData::Absent => f.write_str("Absent"),
+            CredentialData::Present(d) => write!(f, "Present(<{} bytes>)", d.len()),
+            CredentialData::Unreadable => f.write_str("Unreadable"),
+        }
+    }
 }
 
 /// The empty large-blob array: an empty CBOR array (`0x80`) followed by the
@@ -433,6 +458,21 @@ impl LargeBlobArray {
         })
     }
 
+    /// What this array holds for the credential whose largeBlobKey is
+    /// `key`: its data as [`credential_blob`](Self::credential_blob) reads
+    /// it, or, when none reads, whether an entry sealed under `key` is there
+    /// all the same. A reader that must not mistake damaged data for no data
+    /// (and overwrite it) asks this instead of `credential_blob`.
+    pub fn credential_data(&self, key: &[u8; 32]) -> CredentialData {
+        if let Some(data) = self.credential_blob(key) {
+            CredentialData::Present(data)
+        } else if self.items.iter().any(|i| is_sealed_under(i, key)) {
+            CredentialData::Unreadable
+        } else {
+            CredentialData::Absent
+        }
+    }
+
     /// A copy with `plaintext` stored as this credential's entry (CTAP 2.1
     /// §6.10.3): raw DEFLATE (RFC 1951, as current libfido2 writes), then
     /// AES-256-GCM under `key` with a fresh random 12-byte nonce and AAD
@@ -550,6 +590,18 @@ fn encode_entry(e: &LargeBlobEntry) -> Vec<u8> {
 pub fn max_fragment_length(info: &AuthenticatorInfo) -> usize {
     let max = info.max_msg_size.unwrap_or(DEFAULT_MAX_MSG_SIZE);
     max.saturating_sub(MSG_SIZE_OVERHEAD).max(1) as usize
+}
+
+/// Largest fragment a `set` sends: [`max_fragment_length`], but never more
+/// than the spec's 1024-byte `maxMsgSize` floor allows (960 bytes).
+///
+/// A YubiKey 5 (firmware 5.7, `maxMsgSize` 1536) refused a single
+/// 1,290-byte `set` fragment with `CTAP1_ERR_OTHER` (libfido2's
+/// `fido2-token -S -b` got the same refusal), and took the same array in
+/// 960-byte fragments. Every authenticator must accept a 1024-byte message,
+/// so smaller fragments only cost round trips.
+pub fn max_write_fragment_length(info: &AuthenticatorInfo) -> usize {
+    max_fragment_length(info).min((DEFAULT_MAX_MSG_SIZE - MSG_SIZE_OVERHEAD) as usize)
 }
 
 fn dispatch(dev: &mut impl CtapTransport, params: Value) -> Result<Value, CtapError> {
@@ -728,7 +780,7 @@ pub fn write(
     token: &PinUvAuthToken,
     serialized: &[u8],
 ) -> Result<(), CtapError> {
-    let frag_len = max_fragment_length(info);
+    let frag_len = max_write_fragment_length(info);
     let total = serialized.len() as u64;
     let mut offset: usize = 0;
 
@@ -1368,6 +1420,28 @@ mod tests {
     }
 
     #[test]
+    fn writes_never_send_fragments_past_the_spec_floor() {
+        for (reported, expected) in [
+            (Some(1536), 960),
+            (Some(1200), 960),
+            (None, 960),
+            (Some(800), 736),
+        ] {
+            let info = AuthenticatorInfo {
+                max_msg_size: reported,
+                ..Default::default()
+            };
+            assert_eq!(max_write_fragment_length(&info), expected, "{reported:?}");
+        }
+        // Reads keep the size the key reports.
+        let info = AuthenticatorInfo {
+            max_msg_size: Some(1536),
+            ..Default::default()
+        };
+        assert_eq!(max_fragment_length(&info), 1472);
+    }
+
+    #[test]
     fn text_note_roundtrips_through_serialization() {
         let text = "hello \u{1f511} keyroost note — 123";
         let arr = array_of(vec![LargeBlobEntry::from_text(text)]);
@@ -1664,6 +1738,46 @@ mod tests {
                 .map(|v| v.len()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn credential_data_reports_an_entry_that_wont_inflate() {
+        // Nothing sealed under the key: absent.
+        let others = array_of(Vec::new())
+            .with_entry_for_test(sealed_entry(&RP_KEY, b"someone else's data"))
+            .with_text_note("a keyroost note");
+        assert!(matches!(
+            others.credential_data(&VAULT_KEY),
+            CredentialData::Absent
+        ));
+
+        // Sealed under the key, but the plaintext is not DEFLATE (0xFF opens
+        // a block of the reserved type): unreadable, never absent.
+        let broken =
+            others.with_entry_for_test(sealed_compressed(&VAULT_KEY, b"\xff\xff not deflate", 32));
+        assert!(matches!(
+            broken.credential_data(&VAULT_KEY),
+            CredentialData::Unreadable
+        ));
+        assert!(broken.credential_blob(&VAULT_KEY).is_none());
+        // Another credential's view of the same array is unchanged.
+        assert!(matches!(
+            broken.credential_data(&RP_KEY),
+            CredentialData::Present(ref d) if &d[..] == b"someone else's data"
+        ));
+
+        // A good entry: present, as credential_blob returns it.
+        let good = others
+            .with_credential_blob(&VAULT_KEY, b"vault v1")
+            .unwrap();
+        match good.credential_data(&VAULT_KEY) {
+            CredentialData::Present(d) => assert_eq!(&d[..], b"vault v1"),
+            other => panic!("expected present, got {other:?}"),
+        }
+        // The Debug form never shows the data.
+        let shown = format!("{:?}", good.credential_data(&VAULT_KEY));
+        assert!(!shown.contains("118"), "{shown}");
+        assert!(shown.contains("8 bytes"), "{shown}");
     }
 
     #[test]
