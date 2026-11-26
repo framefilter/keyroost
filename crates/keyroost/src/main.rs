@@ -5679,6 +5679,9 @@ enum FileTarget {
     /// Vault tab "Export backup…" destination: the chosen file opens the
     /// passphrase dialog for the vault in `vault.export_for`.
     VaultExport,
+    /// Vault tab "Import backup…" source: the chosen file opens the import
+    /// dialog, while `vault.import_asked` says one was asked for.
+    VaultImport,
 }
 
 /// An SSH certificate extracted from a credential's largeBlob, waiting for the
@@ -5902,6 +5905,7 @@ impl App {
                                 self.import_flow.enqueue([path], &origin);
                             }
                             FileTarget::VaultExport => self.vault_export_chosen(path),
+                            FileTarget::VaultImport => self.vault_import_chosen(path),
                         }
                     } else {
                         // Cancelled: drop whatever payload was waiting on this
@@ -5922,7 +5926,8 @@ impl App {
     /// user cancelled, or the helper thread went away. A save-certificate
     /// dialog parks its certificate; without this a cancelled save would
     /// leave it in the map for the rest of the session. A vault backup's
-    /// dialog forgets which vault it was for.
+    /// dialog forgets which vault it was for, and an import's that a file
+    /// was asked for.
     fn discard_file_target(&mut self, target: FileTarget) {
         match target {
             FileTarget::SshCertSave(id) => {
@@ -5930,6 +5935,8 @@ impl App {
             }
             // No file: no backup is waiting for one.
             FileTarget::VaultExport => self.vault.export_for = None,
+            // No file: no import is waiting for one.
+            FileTarget::VaultImport => self.vault.import_asked = false,
             _ => {}
         }
     }
@@ -7363,7 +7370,8 @@ impl App {
 
     /// Whether a dialog holds what a typed password opened: the entries of a
     /// file read for import (seeds, decrypted or not), an OpenPGP key set
-    /// made or read from a backup, or the key from a .p12 file.
+    /// made or read from a backup, the key from a .p12 file, or the entries
+    /// of a vault backup opened for import.
     fn holds_opened_secrets(&self) -> bool {
         self.import_flow
             .dialog
@@ -7372,6 +7380,11 @@ impl App {
             || self.openpgp.created.is_some()
             || self.openpgp.restore_loaded.is_some()
             || self.piv.key_import.contents.is_some()
+            || self
+                .vault
+                .import
+                .as_ref()
+                .is_some_and(|d| d.incoming.is_some())
     }
 
     /// Every field holding a secret typed or pasted and not yet sent to a

@@ -20,8 +20,8 @@ use keyroost_transport::vault::{
     VaultKey, VaultKeyError, VaultOnKey, VaultRef, VaultStep,
 };
 use keyroost_vault::{
-    backup_file_name, canon_id, check_passphrase, export_backup, generate_password, new_id, seal,
-    user_handle, Entry, GenOptions, Vault,
+    backup_file_name, canon_id, check_passphrase, classify, export_backup, generate_password,
+    import_backup, new_id, seal, user_handle, Entry, GenOptions, ImportStatus, Vault,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -1029,13 +1029,9 @@ pub(crate) enum SaveKind {
     Delete {
         title: Zeroizing<String>,
     },
-    #[expect(
-        dead_code,
-        reason = "importing a backup saves through this too (not yet drawn)"
-    )]
-    Import {
-        chosen: usize,
-    },
+    /// The ticked rows of the import dialog; [`Saved`] counts what was
+    /// added and replaced.
+    Import,
 }
 
 /// A destructive vault action waiting for its Yes. Keyed by credential ID /
@@ -1107,6 +1103,12 @@ pub(crate) struct VaultState {
     pub(crate) export_for: Option<VaultRef>,
     /// The backup's passphrase dialog; it takes the list's place while open.
     pub(crate) export: Option<ExportDialog>,
+    /// Import backup…'s open dialog is up; the chosen file opens
+    /// [`Self::import`].
+    pub(crate) import_asked: bool,
+    /// The import dialog: the backup's passphrase, then its preview. It
+    /// takes the list's place while open.
+    pub(crate) import: Option<ImportDialog>,
 }
 
 impl TypedSecrets for VaultState {
@@ -1116,6 +1118,9 @@ impl TypedSecrets for VaultState {
             out.extend(f.secrets_mut());
         }
         if let Some(d) = self.export.as_mut() {
+            out.extend(d.secrets_mut());
+        }
+        if let Some(d) = self.import.as_mut() {
             out.extend(d.secrets_mut());
         }
         out
@@ -1686,8 +1691,18 @@ impl App {
                             format!("entry deleted from vault \"{name}\""),
                         );
                     }
-                    // Its own line comes with the import view.
-                    SaveKind::Import { .. } => {}
+                    SaveKind::Import => {
+                        // Closing the dialog drops (and wipes) the backup.
+                        self.vault.import = None;
+                        let (added, replaced) = (saved.added, saved.replaced);
+                        self.vault_done(
+                            imported_line(&name, added, replaced),
+                            format!(
+                                "imported into vault \"{name}\": {added} added, \
+                                 {replaced} replaced"
+                            ),
+                        );
+                    }
                 }
                 // Every write that leaves the store nearly full says so,
                 // whatever it was.
@@ -1698,6 +1713,30 @@ impl App {
             {
                 self.log(Severity::Warn, format!("Vault: {}", job_error_text(&e)));
                 self.vault_rebase_form();
+            }
+            Err(e @ VaultJobError::Vault(VaultKeyError::Conflict))
+                if matches!(kind, SaveKind::Import) =>
+            {
+                // The session holds the vault as the key does now (put back
+                // above): the preview is worked out again against it.
+                self.log(Severity::Warn, format!("Vault: {}", job_error_text(&e)));
+                self.vault.info = None;
+                self.vault_import_classify();
+                if let Some(d) = self.vault.import.as_mut() {
+                    d.notice = Some(IMPORT_CHANGED_ON_KEY.to_owned());
+                }
+            }
+            Err(e @ VaultJobError::Vault(VaultKeyError::Conflict))
+                if matches!(kind, SaveKind::Import) =>
+            {
+                // The session holds the vault as the key does now (put back
+                // above): the preview is worked out again against it.
+                self.log(Severity::Warn, format!("Vault: {}", job_error_text(&e)));
+                self.vault.info = None;
+                self.vault_import_classify();
+                if let Some(d) = self.vault.import.as_mut() {
+                    d.notice = Some(IMPORT_CHANGED_ON_KEY.to_owned());
+                }
             }
             Err(e @ VaultJobError::Vault(VaultKeyError::Conflict))
                 if matches!(kind, SaveKind::Delete { .. }) =>
@@ -1931,6 +1970,10 @@ impl App {
             self.render_export_dialog(ui, p);
             return;
         }
+        if self.vault.import.is_some() {
+            self.render_vault_import_dialog(ui, p);
+            return;
+        }
         self.render_vault_confirm(ui, p);
         let Some(session) = self.vault_session() else {
             return;
@@ -1948,6 +1991,11 @@ impl App {
             if new_vault_row(ui, p, name, waiting.as_deref(), false).create {
                 self.vault_create();
             }
+            // A backup makes a vault too.
+            ui.add_space(12.0);
+            if theme::button(ui, p, BtnKind::Default, IMPORT_BUTTON).clicked() {
+                self.vault_import_start();
+            }
             return;
         }
         let now = now_secs_f64();
@@ -1964,7 +2012,8 @@ impl App {
         let mut delete: Option<String> = None;
         let mut new_chip = false;
         let mut new_row = NewVaultClicks::default();
-        let (mut rotate, mut delete_vault, mut export) = (false, false, false);
+        let (mut rotate, mut delete_vault) = (false, false);
+        let (mut export, mut import) = (false, false);
         // The filter and name boxes edit copies while the session is
         // borrowed.
         let mut filter = std::mem::take(&mut self.vault.filter);
@@ -2100,11 +2149,15 @@ impl App {
                     .color(p.txt3),
             );
             ui.add_space(8.0);
-            if writable {
-                export = theme::button(ui, p, BtnKind::Default, EXPORT_BUTTON).clicked();
-            } else {
-                theme::button_disabled(ui, p, EXPORT_BUTTON);
-            }
+            ui.horizontal(|ui| {
+                if writable {
+                    export = theme::button(ui, p, BtnKind::Default, EXPORT_BUTTON).clicked();
+                    import = theme::button(ui, p, BtnKind::Default, IMPORT_BUTTON).clicked();
+                } else {
+                    theme::button_disabled(ui, p, EXPORT_BUTTON);
+                    theme::button_disabled(ui, p, IMPORT_BUTTON);
+                }
+            });
         });
 
         // The shown vault as a whole. Delete vault… reaches a vault that
@@ -2151,6 +2204,9 @@ impl App {
         }
         if export {
             self.vault_export_start();
+        }
+        if import {
+            self.vault_import_start();
         }
         if let Some(id) = select {
             self.vault_select(id);
@@ -2224,7 +2280,17 @@ impl App {
     /// the key already has, is refused here, before any job, with nothing
     /// taken; the box keeps the name.
     pub(crate) fn vault_take_for_create(&mut self) -> Option<(String, VaultAuth)> {
-        let name = self.vault.new_vault.as_deref()?.trim().to_owned();
+        let typed = self.vault.new_vault.clone()?;
+        let name = self.vault_check_new_name(&typed)?;
+        let auth = self.vault_take_auth()?;
+        Some((name, auth))
+    }
+
+    /// A new vault's name as typed, spaces around it dropped, when the
+    /// format takes it and no vault on the key has it; otherwise `None`
+    /// with the reason in the pane.
+    fn vault_check_new_name(&mut self, typed: &str) -> Option<String> {
+        let name = typed.trim().to_owned();
         let taken = self
             .vault_session()?
             .unlocked
@@ -2241,8 +2307,7 @@ impl App {
             self.vault.error = Some(vault_error_text(&e));
             return None;
         }
-        let auth = self.vault_take_auth()?;
-        Some((name, auth))
+        Some(name)
     }
 
     /// Create vault: an empty vault of the typed name on the selected key,
@@ -2254,6 +2319,18 @@ impl App {
         let Some((name, auth)) = self.vault_take_for_create() else {
             return;
         };
+        self.vault_spawn_create(name, auth, Vault::default(), None);
+    }
+
+    /// The create job: vault `name` holding `initial` (`imported` entries
+    /// of a backup, or none) on the selected key, two touches.
+    fn vault_spawn_create(
+        &mut self,
+        name: String,
+        auth: VaultAuth,
+        initial: Vault,
+        imported: Option<usize>,
+    ) {
         let Some(target) = self.selected_fido_target() else {
             self.vault_give_back_auth(auth);
             return;
@@ -2267,12 +2344,13 @@ impl App {
             let result = {
                 let mut touches = TouchProgress::new(shown, 2);
                 open_vault_key(&target).and_then(|mut key| {
-                    run_create(&mut key, &mut auth, &name, &Vault::default(), &mut touches)
+                    run_create(&mut key, &mut auth, &name, &initial, &mut touches)
                         .map_err(VaultJobError::from)
                 })
             };
+            drop(initial);
             Box::new(move |app: &mut App| {
-                app.vault_apply_create(for_device, auth, None, result);
+                app.vault_apply_create(for_device, auth, imported, result);
             })
         });
         if !queued {
@@ -2315,12 +2393,14 @@ impl App {
         }
         self.vault_select(id);
         self.vault.new_vault = None;
+        if imported.is_some() {
+            // Closing the dialog drops (and wipes) the backup.
+            self.vault.import = None;
+        }
         let reminder = backup_reminder(&name);
         let shown = match imported {
             None => reminder,
-            Some(n) => {
-                format!("Imported into vault \"{name}\": {n} added, 0 replaced. {reminder}")
-            }
+            Some(n) => format!("{} {reminder}", imported_line(&name, n, 0)),
         };
         self.vault_done(shown, format!("vault \"{name}\" created"));
         self.space_note("Vault", &capacity);
@@ -3209,6 +3289,775 @@ impl App {
             self.vault_export_cancel();
         } else if write {
             self.vault_export();
+        }
+    }
+}
+
+/// The CLI's line after an import wrote.
+fn imported_line(vault: &str, added: usize, replaced: usize) -> String {
+    format!("Imported into vault \"{vault}\": {added} added, {replaced} replaced.")
+}
+
+/// The button that imports a backup file.
+const IMPORT_BUTTON: &str = "Import backup\u{2026}";
+
+/// The busy label while a backup is read and decrypted.
+const IMPORT_OPEN_LABEL: &str = "Opening backup\u{2026}";
+
+/// The largest backup file read: the CLI's limit.
+const MAX_BACKUP_BYTES: usize = keyroost_qr::file::MAX_FILE_BYTES;
+
+/// An import refused because an entry it touches changed on the key.
+const IMPORT_CHANGED_ON_KEY: &str = "An entry in this vault changed on the key since it was \
+                                     opened; nothing was written. The list below shows the vault \
+                                     as it is now.";
+
+/// Import backup… pressed while the open dialog of an earlier one is up.
+const IMPORT_PENDING: &str =
+    "A backup file is already being chosen: finish or cancel that dialog first.";
+
+/// A row left unticked.
+const NOT_TICKED: &str = "not ticked";
+/// The backup's copy was changed later than the key's.
+const NEWER: &str = "the backup's copy is newer";
+/// The key's copy was changed later: left alone unless ticked.
+const OLDER: &str = "the key's copy is newer (tick it to replace it)";
+/// The key's newer copy, ticked to be replaced.
+const OLDER_TAKEN: &str = "replaces the key's newer copy";
+/// An entry the vault already holds as it is.
+const SAME: &str = "already in the vault; left as is";
+/// A comparison this build doesn't know (the CLI's words).
+const UNKNOWN_STATUS: &str = "this build can't tell how it compares";
+
+/// Where an import writes: a vault on the key (by credential ID), or a new
+/// vault it creates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ImportTarget {
+    Existing(VaultRef),
+    New,
+}
+
+/// One backup entry in the import preview: how it compares with the
+/// target vault and whether it is ticked. Holds no entry text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImportRow {
+    /// Its place in the backup, from 0.
+    pub index: usize,
+    pub status: ImportStatus,
+    pub ticked: bool,
+}
+
+/// Whether a row has a box: a new entry, or one whose copies differ. An
+/// entry already in the vault, or a comparison this build doesn't know,
+/// has none.
+pub(crate) fn has_box(s: ImportStatus) -> bool {
+    matches!(
+        s,
+        ImportStatus::New | ImportStatus::Newer | ImportStatus::Older
+    )
+}
+
+/// Pre-ticked: the rows the CLI takes by default (add and replace).
+pub(crate) fn default_tick(s: ImportStatus) -> bool {
+    matches!(s, ImportStatus::New | ImportStatus::Newer)
+}
+
+/// What the import does with a row, and why: the CLI's plan words
+/// (`add`, `replace`, `exists`, `skip`) and reasons, with the app's ticks
+/// in place of `--replace` and `--entry`.
+pub(crate) fn plan_of(s: ImportStatus, ticked: bool) -> (&'static str, Option<&'static str>) {
+    match (s, ticked) {
+        (ImportStatus::New, true) => ("add", None),
+        (ImportStatus::Newer, true) => ("replace", Some(NEWER)),
+        (ImportStatus::Older, true) => ("replace", Some(OLDER_TAKEN)),
+        (ImportStatus::New | ImportStatus::Newer, false) => ("skip", Some(NOT_TICKED)),
+        (ImportStatus::Older, false) => ("skip", Some(OLDER)),
+        (ImportStatus::Same, _) => ("exists", Some(SAME)),
+        _ => ("skip", Some(UNKNOWN_STATUS)),
+    }
+}
+
+/// The plan of `r`; a row with no box counts as unticked.
+fn row_plan(r: &ImportRow) -> (&'static str, Option<&'static str>) {
+    plan_of(r.status, r.ticked && has_box(r.status))
+}
+
+/// The backup indices the import writes: its ticked `add` and `replace`
+/// rows.
+pub(crate) fn chosen(rows: &[ImportRow]) -> Vec<usize> {
+    rows.iter()
+        .filter(|r| matches!(row_plan(r).0, "add" | "replace"))
+        .map(|r| r.index)
+        .collect()
+}
+
+/// The CLI's summary line under the preview; `on_key` entries are in the
+/// target vault now.
+pub(crate) fn import_summary(rows: &[ImportRow], on_key: usize) -> String {
+    let count = |w: &str| rows.iter().filter(|r| row_plan(r).0 == w).count();
+    format!(
+        "{} in the vault; {} will be added, {} replaced, {} left as is, {} skipped.",
+        entries(on_key),
+        count("add"),
+        count("replace"),
+        count("exists"),
+        count("skip")
+    )
+}
+
+/// The preview's rows for `incoming` against `current` (`None`: a new
+/// vault, where every entry is new), with the default ticks.
+fn preview_rows(current: Option<&Vault>, incoming: &Vault) -> Vec<ImportRow> {
+    let statuses = match current {
+        Some(current) => classify(current, incoming),
+        None => (0..incoming.entries.len())
+            .map(|i| (i, ImportStatus::New))
+            .collect(),
+    };
+    statuses
+        .into_iter()
+        .map(|(index, status)| ImportRow {
+            index,
+            status,
+            ticked: default_tick(status),
+        })
+        .collect()
+}
+
+/// A backup entry as its preview row names it: `title (username) · host`,
+/// empty parts left out (the code imports' `title (username)`, with the
+/// URL's host so two entries titled alike can be told apart). Never an ID.
+fn import_row_name(e: &Entry) -> Zeroizing<String> {
+    let mut s = Zeroizing::new(String::with_capacity(
+        e.title.len() + e.username.len() + e.url.len() + 8,
+    ));
+    push_flat(&mut s, &e.title);
+    if !e.username.trim().is_empty() {
+        s.push_str(" (");
+        push_flat(&mut s, &e.username);
+        s.push(')');
+    }
+    let host = url_host(&e.url);
+    if !host.trim().is_empty() {
+        s.push_str(" \u{00B7} ");
+        push_flat(&mut s, host);
+    }
+    s
+}
+
+/// A file's name as the preview names it.
+fn file_label(path: &Path) -> String {
+    sanitize_title(&path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    ))
+}
+
+/// A backup file's bytes, in a wiped buffer, refused past
+/// [`MAX_BACKUP_BYTES`] (the CLI's words).
+fn read_backup_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
+    use std::io::Read;
+    let read_err = |e: std::io::Error| format!("cannot read {}: {e}", path.display());
+    let f = std::fs::File::open(path).map_err(read_err)?;
+    // Sized up front, so the buffer isn't grown (and copied) while it fills.
+    let len = f.metadata().map_or(0, |m| m.len());
+    let cap = usize::try_from(len)
+        .unwrap_or(MAX_BACKUP_BYTES)
+        .min(MAX_BACKUP_BYTES)
+        + 1;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(cap));
+    f.take(MAX_BACKUP_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read_err)?;
+    if bytes.len() > MAX_BACKUP_BYTES {
+        return Err(format!(
+            "{}: larger than 16 MiB, too large for a vault backup. Nothing was read.",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Read and decrypt the backup at `path`: its entries, or what to say.
+/// Runs on the worker (Argon2id takes a moment); the file's bytes are wiped
+/// once read. A backup listing one ID twice is refused (the crate's check).
+pub(crate) fn open_backup(path: &Path, passphrase: &str) -> Result<Vault, String> {
+    let bytes = read_backup_file(path)?;
+    import_backup(&bytes, passphrase).map_err(|e| e.to_string())
+}
+
+/// The import dialog of Import backup…: the passphrase, then a preview of
+/// every backup entry, each ticked or not. The passphrase box is a secret;
+/// the opened backup's entries wipe themselves when dropped (Import, Cancel,
+/// Lock, the idle lock).
+pub(crate) struct ImportDialog {
+    /// The file the open dialog chose.
+    pub path: PathBuf,
+    pub passphrase: String,
+    pub target: ImportTarget,
+    /// The new vault's name when `target` is [`ImportTarget::New`]. Not a
+    /// secret: vault names are listed without unlocking.
+    pub new_name: String,
+    /// The backup's entries, once opened.
+    pub incoming: Option<Vault>,
+    /// One per backup entry, in the backup's order.
+    pub rows: Vec<ImportRow>,
+    /// What the dialog says: a backup that didn't open, an import refused.
+    pub notice: Option<String>,
+}
+
+impl ImportDialog {
+    pub(crate) fn new(path: PathBuf, target: ImportTarget, new_name: String) -> Self {
+        Self {
+            path,
+            passphrase: String::new(),
+            target,
+            new_name,
+            incoming: None,
+            rows: Vec::new(),
+            notice: None,
+        }
+    }
+}
+
+impl TypedSecrets for ImportDialog {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        vec![&mut self.passphrase]
+    }
+}
+
+impl Drop for ImportDialog {
+    fn drop(&mut self) {
+        self.wipe_typed();
+    }
+}
+
+/// What the preview's button starts.
+pub(crate) enum ImportJob {
+    /// Into a vault on the key: the one save path, no touch. The change
+    /// (the whole backup) is boxed: it is far larger than a create.
+    Save {
+        vault: VaultRef,
+        kind: SaveKind,
+        change: Box<Change>,
+    },
+    /// Into a new vault: created holding the ticked entries, two touches.
+    Create {
+        name: String,
+        auth: VaultAuth,
+        initial: Vault,
+    },
+}
+
+/// Import backup…: a backup file's entries into a vault, each one ticked
+/// or not, as `fido vault import` plans them.
+impl App {
+    /// Import backup…: ask which file to open. Not for a vault that can't
+    /// be opened; a key with no vault imports into a new one.
+    pub(crate) fn vault_import_start(&mut self) {
+        if self.vault_session().is_none() {
+            return;
+        }
+        if self.selected_vault().is_some() && !self.vault_writable() {
+            return;
+        }
+        if self.vault.import_asked {
+            self.vault.info = None;
+            self.vault.error = Some(IMPORT_PENDING.to_owned());
+            return;
+        }
+        self.vault.import_asked = true;
+        self.spawn_file_dialog(
+            FileTarget::VaultImport,
+            false,
+            &[("Vault backup", &["t2vault"])],
+            None,
+        );
+    }
+
+    /// The open dialog chose `path`: the import dialog, into the shown
+    /// vault, or into a new vault named after the file when the key has
+    /// none. Nothing when the tab was locked or rebuilt meanwhile.
+    pub(crate) fn vault_import_chosen(&mut self, path: PathBuf) {
+        if !std::mem::take(&mut self.vault.import_asked) || self.vault_session().is_none() {
+            return;
+        }
+        let shown = self
+            .selected_vault()
+            .filter(|v| v.state.is_ok())
+            .map(|v| v.vault_ref.clone());
+        let (target, new_name) = match shown {
+            Some(v) => (ImportTarget::Existing(v), String::new()),
+            None => (
+                ImportTarget::New,
+                path.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+        };
+        self.vault.error = None;
+        self.vault.info = None;
+        self.vault.import = Some(ImportDialog::new(path, target, new_name));
+    }
+
+    /// Cancel: the dialog closes; its passphrase and the backup's entries
+    /// are wiped.
+    pub(crate) fn vault_import_cancel(&mut self) {
+        self.vault.import = None;
+    }
+
+    /// Open backup: read and decrypt the file with the typed passphrase.
+    /// No key: a wrong passphrase fails before the key is used.
+    pub(crate) fn vault_import_open(&mut self) {
+        let Some(d) = self.vault.import.as_mut() else {
+            return;
+        };
+        if d.passphrase.is_empty() || d.incoming.is_some() {
+            return;
+        }
+        d.notice = None;
+        let path = d.path.clone();
+        let passphrase = Zeroizing::new(d.passphrase.clone());
+        let for_device = self.selected_device.clone();
+        self.spawn_job(IMPORT_OPEN_LABEL, move || {
+            let result = open_backup(&path, &passphrase);
+            drop(passphrase);
+            Box::new(move |app: &mut App| app.vault_apply_import_open(for_device, result))
+        });
+    }
+
+    /// The end of Open backup. A result for another key, or one whose
+    /// dialog is gone, is dropped (and wiped). Opened: the passphrase box is
+    /// wiped and the preview shows; otherwise the dialog says why.
+    pub(crate) fn vault_apply_import_open(
+        &mut self,
+        for_device: Option<DeviceId>,
+        result: Result<Vault, String>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref())
+            || self.vault_session().is_none()
+        {
+            return;
+        }
+        let Some(d) = self.vault.import.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(incoming) => {
+                wipe(&mut d.passphrase);
+                d.incoming = Some(incoming);
+                d.notice = None;
+                self.vault_import_classify();
+            }
+            Err(e) => d.notice = Some(as_sentence(&e)),
+        }
+    }
+
+    /// The target vault's contents as the session holds them; `None` for a
+    /// new vault. `Err`, what to say, when that vault is no longer open in
+    /// the session.
+    fn vault_import_current(&self, target: &ImportTarget) -> Result<Option<&Vault>, String> {
+        let ImportTarget::Existing(vault) = target else {
+            return Ok(None);
+        };
+        self.vault_session()
+            .and_then(|s| {
+                s.unlocked
+                    .vaults
+                    .iter()
+                    .find(|v| v.vault_ref.credential_id == vault.credential_id)
+            })
+            .and_then(|v| v.state.as_ref().ok())
+            .map(|open| Some(&open.contents))
+            .ok_or_else(|| {
+                vault_error_text(&VaultKeyError::VaultGone {
+                    name: vault.name.clone(),
+                })
+            })
+    }
+
+    /// Work the preview out again against the target as the session holds
+    /// it, with the default ticks.
+    fn vault_import_classify(&mut self) {
+        let Some(d) = self.vault.import.as_ref() else {
+            return;
+        };
+        let Some(incoming) = d.incoming.as_ref() else {
+            return;
+        };
+        let (rows, notice) = match self.vault_import_current(&d.target) {
+            Ok(current) => (preview_rows(current, incoming), None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        if let Some(d) = self.vault.import.as_mut() {
+            d.rows = rows;
+            if notice.is_some() {
+                d.notice = notice;
+            }
+        }
+    }
+
+    /// Into vault: another target, and the preview against it.
+    pub(crate) fn vault_import_set_target(&mut self, target: ImportTarget) {
+        let Some(d) = self.vault.import.as_mut() else {
+            return;
+        };
+        if d.target == target {
+            return;
+        }
+        d.target = target;
+        d.notice = None;
+        self.vault_import_classify();
+    }
+
+    /// Tick or untick row `i`; a row with no box stays as it is.
+    pub(crate) fn vault_import_tick(&mut self, i: usize, on: bool) {
+        if let Some(r) = self
+            .vault
+            .import
+            .as_mut()
+            .and_then(|d| d.rows.get_mut(i))
+            .filter(|r| has_box(r.status))
+        {
+            r.ticked = on;
+        }
+    }
+
+    /// Tick all / Untick all: every row with a box.
+    pub(crate) fn vault_import_tick_all(&mut self, on: bool) {
+        if let Some(d) = self.vault.import.as_mut() {
+            for r in d.rows.iter_mut().filter(|r| has_box(r.status)) {
+                r.ticked = on;
+            }
+        }
+    }
+
+    /// What the preview's button starts, with what it takes from the
+    /// session. `None`, with nothing taken, when nothing is ticked, the
+    /// new vault's name is refused (said in the pane), or a job holds the
+    /// session's auth.
+    pub(crate) fn vault_take_import(&mut self) -> Option<ImportJob> {
+        let d = self.vault.import.as_ref()?;
+        let incoming = d.incoming.as_ref()?;
+        let picked = chosen(&d.rows);
+        if picked.is_empty() {
+            return None;
+        }
+        match d.target.clone() {
+            ImportTarget::Existing(vault) => Some(ImportJob::Save {
+                vault,
+                kind: SaveKind::Import,
+                change: Box::new(Change::Import {
+                    incoming: incoming.clone(),
+                    chosen: picked,
+                }),
+            }),
+            ImportTarget::New => {
+                let initial = Vault {
+                    entries: picked
+                        .iter()
+                        .filter_map(|&i| incoming.entries.get(i).cloned())
+                        .collect(),
+                };
+                let typed = d.new_name.clone();
+                let name = self.vault_check_new_name(&typed)?;
+                let auth = self.vault_take_auth()?;
+                Some(ImportJob::Create {
+                    name,
+                    auth,
+                    initial,
+                })
+            }
+        }
+    }
+
+    /// The preview's button: the ticked entries into the vault on the key
+    /// (no touch), or into a new vault it creates (two touches). The button
+    /// is the confirmation, as the CLI's `import … into vault` and
+    /// `create vault` questions are.
+    pub(crate) fn vault_import(&mut self) {
+        // Before anything is taken: a refused job would drop it.
+        if self.refuse_if_busy() {
+            return;
+        }
+        if let Some(d) = self.vault.import.as_mut() {
+            d.notice = None;
+        }
+        match self.vault_take_import() {
+            None => {}
+            Some(ImportJob::Save {
+                vault,
+                kind,
+                change,
+            }) => self.vault_start_save(vault, kind, *change),
+            Some(ImportJob::Create {
+                name,
+                auth,
+                initial,
+            }) => {
+                let n = initial.entries.len();
+                self.vault_spawn_create(name, auth, initial, Some(n));
+            }
+        }
+    }
+
+    /// The import dialog: which file, the passphrase and Open backup; once
+    /// opened, the target vault and the preview, a row per backup entry with
+    /// its box, plan and reason, then the summary and the button. Cancel
+    /// waits for a running job, so its end finds the dialog.
+    fn render_vault_import_dialog(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let busy = self.busy();
+        let waiting = self.waiting_for().map(str::to_owned);
+        // The target choices: every vault that opened, by chip label.
+        let choices: Vec<(VaultRef, String)> = self
+            .vault_session()
+            .map(|s| {
+                s.unlocked
+                    .vaults
+                    .iter()
+                    .filter(|v| v.state.is_ok())
+                    .map(|v| (v.vault_ref.clone(), chip_label(v)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let on_key = self
+            .vault
+            .import
+            .as_ref()
+            .and_then(|d| self.vault_import_current(&d.target).ok().flatten())
+            .map_or(0, |v| v.entries.len());
+        let Some(d) = self.vault.import.as_mut() else {
+            return;
+        };
+        let (mut open, mut cancel, mut import) = (false, false, false);
+        let mut tick: Option<(usize, bool)> = None;
+        let mut tick_all: Option<bool> = None;
+        let mut target: Option<ImportTarget> = None;
+        const LABEL_W: f32 = 90.0;
+        let label = |text: &str| {
+            egui::Label::new(
+                egui::RichText::new(text)
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
+            )
+        };
+        theme::card_frame(p).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new("Import backup")
+                    .font(theme::f_sb(14.5))
+                    .color(p.txt),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(sanitize_title(&d.path.display().to_string()))
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
+            );
+            ui.add_space(8.0);
+            let Some(incoming) = d.incoming.as_ref() else {
+                // Not opened yet: the passphrase and Open backup.
+                ui.horizontal(|ui| {
+                    ui.add_sized([LABEL_W, 24.0], label("Passphrase"));
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut d.passphrase)
+                            .margin(theme::TEXT_EDIT_MARGIN)
+                            .desired_width(f32::INFINITY)
+                            .password(true),
+                    );
+                    guard_secret_field(ui.ctx(), &resp);
+                    open = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                });
+                if let Some(n) = &d.notice {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.warn, n);
+                }
+                ui.add_space(8.0);
+                let can_open = !busy && !d.passphrase.is_empty();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if can_open {
+                        open |= theme::button(ui, p, BtnKind::Primary, "Open backup").clicked();
+                    } else {
+                        theme::button_disabled(ui, p, "Open backup");
+                    }
+                    if busy {
+                        theme::button_disabled(ui, p, "Cancel");
+                    } else {
+                        cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
+                    }
+                });
+                open &= can_open;
+                return;
+            };
+
+            // Into vault: one on the key (by chip label), or a new one.
+            let new_label = "A new vault named\u{2026}";
+            let selected_text = match &d.target {
+                ImportTarget::Existing(v) => choices
+                    .iter()
+                    .find(|(c, _)| c.credential_id == v.credential_id)
+                    .map_or_else(|| shown_name(v.name.as_deref()), |(_, l)| l.clone()),
+                ImportTarget::New => new_label.to_owned(),
+            };
+            ui.horizontal(|ui| {
+                ui.add_sized([LABEL_W, 24.0], label("Into vault"));
+                egui::ComboBox::from_id_salt("vault-import-target")
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        for (v, chip) in &choices {
+                            let on = matches!(
+                                &d.target,
+                                ImportTarget::Existing(t) if t.credential_id == v.credential_id
+                            );
+                            if ui.selectable_label(on, chip).clicked() && !on {
+                                target = Some(ImportTarget::Existing(v.clone()));
+                            }
+                        }
+                        let on = d.target == ImportTarget::New;
+                        if ui.selectable_label(on, new_label).clicked() && !on {
+                            target = Some(ImportTarget::New);
+                        }
+                    });
+                if d.target == ImportTarget::New {
+                    ui.add_sized(
+                        [220.0, 28.0],
+                        egui::TextEdit::singleline(&mut d.new_name)
+                            .margin(theme::TEXT_EDIT_MARGIN)
+                            .hint_text("Vault name"),
+                    );
+                }
+            });
+            ui.add_space(8.0);
+
+            let vault_name = match &d.target {
+                ImportTarget::Existing(v) => shown_name(v.name.as_deref()),
+                ImportTarget::New => shown_name(Some(d.new_name.trim())),
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} in {} for vault \"{vault_name}\":",
+                    entries(incoming.entries.len()),
+                    file_label(&d.path)
+                ))
+                .font(theme::f_sb(13.0))
+                .color(p.txt),
+            );
+            ui.add_space(6.0);
+            egui::Grid::new("vault-import-rows")
+                .num_columns(4)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    for (i, r) in d.rows.iter().enumerate() {
+                        let Some(e) = incoming.entries.get(r.index) else {
+                            continue;
+                        };
+                        if has_box(r.status) {
+                            let mut on = r.ticked;
+                            if ui.checkbox(&mut on, "").changed() {
+                                tick = Some((i, on));
+                            }
+                        } else {
+                            // `exists` (and a comparison this build doesn't
+                            // know) has no box.
+                            ui.label("");
+                        }
+                        let (plan, reason) = row_plan(r);
+                        let taken = matches!(plan, "add" | "replace");
+                        ui.label(
+                            egui::RichText::new(plan)
+                                .font(theme::f_sb(12.5))
+                                .color(if taken { p.txt } else { p.txt3 }),
+                        );
+                        let name = import_row_name(e);
+                        ui.label(
+                            egui::RichText::new(name.as_str())
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt),
+                        );
+                        ui.label(
+                            egui::RichText::new(reason.unwrap_or(""))
+                                .font(theme::f_reg(12.0))
+                                .color(p.txt3),
+                        );
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Ghost, "Tick all").clicked() {
+                    tick_all = Some(true);
+                }
+                if theme::button(ui, p, BtnKind::Ghost, "Untick all").clicked() {
+                    tick_all = Some(false);
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(import_summary(&d.rows, on_key))
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
+            );
+            if let Some(n) = &d.notice {
+                ui.add_space(6.0);
+                ui.colored_label(p.warn, n);
+            }
+            ui.add_space(8.0);
+            let k = chosen(&d.rows).len();
+            let button = match &d.target {
+                ImportTarget::Existing(_) => format!("Import {}", entries(k)),
+                ImportTarget::New => format!(
+                    "Create vault \"{}\" and import {}",
+                    sanitize_title(d.new_name.trim()),
+                    entries(k)
+                ),
+            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if k == 0 {
+                    theme::button_disabled(ui, p, &button);
+                } else {
+                    import =
+                        theme::key_button(ui, p, BtnKind::Primary, &button, waiting.as_deref())
+                            .clicked();
+                }
+                if busy {
+                    theme::button_disabled(ui, p, "Cancel");
+                } else {
+                    cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
+                }
+            });
+            let under = if k == 0 {
+                Some("Nothing to add.")
+            } else if d.target == ImportTarget::New {
+                Some("This asks for two touches.")
+            } else {
+                None
+            };
+            if let Some(text) = under {
+                ui.add_space(4.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(text)
+                            .font(theme::f_reg(11.5))
+                            .color(p.txt3),
+                    );
+                });
+            }
+        });
+        if let Some(t) = target {
+            self.vault_import_set_target(t);
+        }
+        if let Some((i, on)) = tick {
+            self.vault_import_tick(i, on);
+        }
+        if let Some(on) = tick_all {
+            self.vault_import_tick_all(on);
+        }
+        if cancel {
+            self.vault_import_cancel();
+        } else if open {
+            self.vault_import_open();
+        } else if import {
+            self.vault_import();
         }
     }
 }
@@ -7130,5 +7979,772 @@ mod tests {
         assert!(!app.vault_writable());
         app.vault_export_start();
         assert!(app.vault.export_for.is_none() && app.file_dialog_queue.is_empty());
+    }
+
+    // ----- Import backup… -----
+
+    use keyroost_vault::ImportStatus;
+
+    const IMPORT_PASS: &str = "a backup passphrase";
+
+    fn kv(id: &str, title: &str, username: &str, password: &str, url: &str, m: i64) -> Entry {
+        Entry {
+            id: id.into(),
+            title: title.into(),
+            username: username.into(),
+            password: Zeroizing::new(password.into()),
+            url: url.into(),
+            notes: String::new(),
+            modified_minutes: m,
+        }
+    }
+
+    /// Personal as the key holds it.
+    fn key_vault() -> Vault {
+        Vault {
+            entries: vec![
+                kv("ghghghgh", "GitHub", "alice", "gh-key", "", 100),
+                kv("bkbkbkbk", "Bank", "", "bank-key", "", 200),
+                kv("fofofofo", "Forum", "bob", "forum", "", 100),
+            ],
+        }
+    }
+
+    /// The backup: two new entries that share a title, GitHub newer than
+    /// the key's, Bank older, Forum the same.
+    fn backup_vault() -> Vault {
+        Vault {
+            entries: vec![
+                kv("mama0001", "Mail", "alice", "mail-a", "", 120),
+                kv(
+                    "mama0002",
+                    "Mail",
+                    "bob",
+                    "mail-b",
+                    "https://mail.example/x",
+                    120,
+                ),
+                kv("ghghghgh", "GitHub", "alice", "gh-backup", "", 150),
+                kv("bkbkbkbk", "Bank", "", "bank-backup", "", 150),
+                kv("fofofofo", "Forum", "bob", "forum", "", 100),
+            ],
+        }
+    }
+
+    /// A fresh temp folder of this test run's own.
+    fn import_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "keyroost-vault-import-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The open dialog Import backup… asked for resolves to `path` (`None`:
+    /// cancelled), the way `drain_file_dialogs` receives it.
+    fn choose_backup(app: &mut App, path: Option<std::path::PathBuf>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(path).unwrap();
+        app.pending_files.push((FileTarget::VaultImport, rx));
+        app.drain_file_dialogs();
+    }
+
+    /// Press Import backup… and pick `path`.
+    fn import_dialog_for(app: &mut App, path: &Path) {
+        app.vault_import_start();
+        let request = app.file_dialog_queue.pop().expect("an open dialog");
+        assert!(request.target == FileTarget::VaultImport && !request.save);
+        assert_eq!(
+            request.filters,
+            vec![("Vault backup".to_owned(), vec!["t2vault".to_owned()])]
+        );
+        assert_eq!(request.default_name, None);
+        choose_backup(app, Some(path.to_owned()));
+        assert!(app.vault.import.is_some(), "the dialog opens");
+    }
+
+    fn import_dialog(app: &mut App) -> &mut ImportDialog {
+        app.vault.import.as_mut().expect("the import dialog")
+    }
+
+    /// One Open backup run the tests share (Argon2id is slow in a test
+    /// build): the backup written with the real writer, then opened through
+    /// the dialog against Personal.
+    struct OpenRun {
+        bytes: Vec<u8>,
+        opened: Vault,
+        rows: Vec<ImportRow>,
+        target: ImportTarget,
+        passphrase_left: String,
+        notice: Option<String>,
+    }
+
+    fn opened_backup() -> &'static OpenRun {
+        static RUN: std::sync::OnceLock<OpenRun> = std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            let dir = import_dir("run");
+            let path = dir.join("personal.t2vault");
+            let bytes = keyroost_vault::export_backup(&backup_vault(), IMPORT_PASS).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let mut key = FakeKey::new();
+            key.add_vault("Personal", &key_vault());
+            let mut app = app();
+            unlock_into(&mut app, &mut key);
+            import_dialog_for(&mut app, &path);
+            replace_text(&mut import_dialog(&mut app).passphrase, IMPORT_PASS);
+            app.vault_import_open();
+            let d = import_dialog(&mut app);
+            let run = OpenRun {
+                bytes,
+                opened: d.incoming.clone().expect("the backup opened"),
+                rows: d.rows.clone(),
+                target: d.target.clone(),
+                passphrase_left: d.passphrase.clone(),
+                notice: d.notice.clone(),
+            };
+            let _ = std::fs::remove_dir_all(&dir);
+            run
+        })
+    }
+
+    /// An unlocked key holding Personal (`key_vault`), its backup opened in
+    /// the import dialog; Personal's credential ID.
+    fn opened_into(app: &mut App, key: &mut FakeKey) -> Vec<u8> {
+        let id = key.add_vault("Personal", &key_vault());
+        unlock_into(app, key);
+        open_shared_backup(app);
+        id
+    }
+
+    /// Import backup… on the unlocked `app`, the shared backup opened.
+    fn open_shared_backup(app: &mut App) {
+        import_dialog_for(app, Path::new("personal.t2vault"));
+        app.vault_apply_import_open(Some(KEY.into()), Ok(opened_backup().opened.clone()));
+    }
+
+    /// Press the preview's button, the job running against `key`.
+    fn import_into(app: &mut App, key: &mut FakeKey) {
+        match app.vault_take_import().expect("something to import") {
+            ImportJob::Save {
+                vault,
+                kind,
+                change,
+            } => save_into(app, key, vault, kind, *change),
+            ImportJob::Create { .. } => panic!("an import into a vault on the key"),
+        }
+    }
+
+    fn ticks(app: &mut App) -> Vec<bool> {
+        import_dialog(app).rows.iter().map(|r| r.ticked).collect()
+    }
+
+    fn statuses(app: &mut App) -> Vec<ImportStatus> {
+        import_dialog(app).rows.iter().map(|r| r.status).collect()
+    }
+
+    #[test]
+    fn plan_words_and_reasons() {
+        use ImportStatus::*;
+        let not_ticked = Some("not ticked");
+        for (status, ticked, want) in [
+            (New, true, ("add", None)),
+            (New, false, ("skip", not_ticked)),
+            (Newer, true, ("replace", Some("the backup's copy is newer"))),
+            (Newer, false, ("skip", not_ticked)),
+            (
+                Older,
+                false,
+                (
+                    "skip",
+                    Some("the key's copy is newer (tick it to replace it)"),
+                ),
+            ),
+            (
+                Older,
+                true,
+                ("replace", Some("replaces the key's newer copy")),
+            ),
+            (
+                Same,
+                false,
+                ("exists", Some("already in the vault; left as is")),
+            ),
+            (
+                Same,
+                true,
+                ("exists", Some("already in the vault; left as is")),
+            ),
+        ] {
+            assert_eq!(plan_of(status, ticked), want, "{status:?} {ticked}");
+        }
+        assert!(has_box(New) && has_box(Newer) && has_box(Older));
+        assert!(!has_box(Same), "exists has no box");
+        assert_eq!(
+            UNKNOWN_STATUS, "this build can't tell how it compares",
+            "the CLI's words"
+        );
+    }
+
+    #[test]
+    fn default_ticks_take_add_and_replace() {
+        use ImportStatus::*;
+        assert!(default_tick(New) && default_tick(Newer));
+        assert!(!default_tick(Older) && !default_tick(Same));
+
+        let run = opened_backup();
+        assert_eq!(run.notice, None);
+        assert!(
+            run.passphrase_left.is_empty(),
+            "the passphrase box is wiped"
+        );
+        assert!(
+            matches!(&run.target, ImportTarget::Existing(v) if v.name.as_deref() == Some("Personal"))
+        );
+        assert_eq!(run.opened, backup_vault());
+        assert_eq!(
+            run.rows,
+            vec![
+                ImportRow {
+                    index: 0,
+                    status: New,
+                    ticked: true
+                },
+                ImportRow {
+                    index: 1,
+                    status: New,
+                    ticked: true
+                },
+                ImportRow {
+                    index: 2,
+                    status: Newer,
+                    ticked: true
+                },
+                ImportRow {
+                    index: 3,
+                    status: Older,
+                    ticked: false
+                },
+                ImportRow {
+                    index: 4,
+                    status: Same,
+                    ticked: false
+                },
+            ]
+        );
+        assert_eq!(chosen(&run.rows), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn import_summary_counts() {
+        use ImportStatus::*;
+        let rows = [
+            ImportRow {
+                index: 0,
+                status: New,
+                ticked: true,
+            },
+            ImportRow {
+                index: 1,
+                status: Newer,
+                ticked: true,
+            },
+            ImportRow {
+                index: 2,
+                status: Older,
+                ticked: false,
+            },
+            ImportRow {
+                index: 3,
+                status: Same,
+                ticked: false,
+            },
+        ];
+        assert_eq!(
+            import_summary(&rows, 5),
+            "5 entries in the vault; 1 will be added, 1 replaced, 1 left as is, 1 skipped."
+        );
+        assert_eq!(chosen(&rows), vec![0, 1]);
+        let one = [ImportRow {
+            index: 0,
+            status: New,
+            ticked: false,
+        }];
+        assert_eq!(
+            import_summary(&one, 1),
+            "1 entry in the vault; 0 will be added, 0 replaced, 0 left as is, 1 skipped."
+        );
+        assert!(chosen(&one).is_empty());
+    }
+
+    #[test]
+    fn wrong_passphrase_fails_before_the_key() {
+        let dir = import_dir("wrong");
+        let path = dir.join("personal.t2vault");
+        std::fs::write(&path, &opened_backup().bytes).unwrap();
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &key_vault());
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let calls = key.log.len();
+        let stored = key.stored().to_vec();
+        import_dialog_for(&mut app, &path);
+        // Open backup needs a passphrase first.
+        app.vault_import_open();
+        assert!(import_dialog(&mut app).incoming.is_none());
+        replace_text(
+            &mut import_dialog(&mut app).passphrase,
+            "not the passphrase",
+        );
+        app.vault_import_open();
+        let d = import_dialog(&mut app);
+        assert_eq!(
+            d.notice.as_deref(),
+            Some("Could not decrypt the vault (wrong key or passphrase, or damaged data).")
+        );
+        assert!(d.incoming.is_none() && d.rows.is_empty());
+        assert_eq!(key.log.len(), calls, "the key was not used");
+        assert_eq!(key.stored(), &stored[..]);
+        assert!(app.vault_session().unwrap().auth.is_some());
+
+        // A file that isn't there says so in the CLI's words.
+        let gone = dir.join("gone.t2vault");
+        assert_eq!(
+            open_backup(&gone, IMPORT_PASS).unwrap_err(),
+            format!(
+                "cannot read {}: No such file or directory (os error 2)",
+                gone.display()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_backup_listing_one_id_twice_is_refused() {
+        let dir = import_dir("dup");
+        let path = dir.join("dup.t2vault");
+        let mut twice = backup_vault();
+        twice.entries[1].id = twice.entries[0].id.clone();
+        std::fs::write(
+            &path,
+            keyroost_vault::export_backup(&twice, IMPORT_PASS).unwrap(),
+        )
+        .unwrap();
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &key_vault());
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        import_dialog_for(&mut app, &path);
+        replace_text(&mut import_dialog(&mut app).passphrase, IMPORT_PASS);
+        app.vault_import_open();
+        let d = import_dialog(&mut app);
+        assert_eq!(
+            d.notice.as_deref(),
+            Some("This backup lists two entries with the same id; it may be damaged.")
+        );
+        assert!(d.incoming.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_applies_only_ticked_rows() {
+        let mut key = FakeKey::new();
+        let mut app = app();
+        let id = opened_into(&mut app, &mut key);
+        // The second "Mail" unticked, the older Bank ticked.
+        app.vault_import_tick(1, false);
+        app.vault_import_tick(3, true);
+        // A row with no box can't be ticked.
+        app.vault_import_tick(4, true);
+        assert_eq!(ticks(&mut app), vec![true, false, true, true, false]);
+        let calls = key.log.len();
+        import_into(&mut app, &mut key);
+        assert!(!touched_since(&key, calls), "an import asks no touch");
+        let on_key = key.vault_on_key(&id).unwrap();
+        let backup = backup_vault();
+        let find = |id: &str| on_key.entries.iter().find(|e| e.id == id).cloned();
+        assert_eq!(find("mama0001"), Some(backup.entries[0].clone()));
+        assert_eq!(find("mama0002"), None, "the unticked Mail is not added");
+        assert_eq!(find("ghghghgh"), Some(backup.entries[2].clone()));
+        assert_eq!(
+            find("bkbkbkbk"),
+            Some(backup.entries[3].clone()),
+            "ticked: replaced"
+        );
+        assert_eq!(on_key.entries.len(), 4);
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some("Imported into vault \"Personal\": 1 added, 2 replaced.")
+        );
+        assert!(app.vault.import.is_none(), "the dialog closes");
+        let s = app.vault_session().unwrap();
+        assert!(s.auth.is_some());
+        assert_eq!(
+            chip_label(app.selected_vault().unwrap()),
+            "Personal \u{00B7} 4"
+        );
+        let last = app.log.last().unwrap();
+        assert_eq!(last.severity, Severity::Ok);
+        assert_eq!(
+            last.text,
+            "Vault: imported into vault \"Personal\": 1 added, 2 replaced"
+        );
+        for l in &app.log {
+            for secret in ["Mail", "GitHub", "Bank", "alice", "gh-backup"] {
+                assert!(!l.text.contains(secret), "{}", l.text);
+            }
+        }
+    }
+
+    #[test]
+    fn tick_all_and_untick_all() {
+        let mut key = FakeKey::new();
+        let mut app = app();
+        opened_into(&mut app, &mut key);
+        app.vault_import_tick_all(true);
+        assert_eq!(ticks(&mut app), vec![true, true, true, true, false]);
+        assert_eq!(chosen(&import_dialog(&mut app).rows), vec![0, 1, 2, 3]);
+        app.vault_import_tick_all(false);
+        assert_eq!(ticks(&mut app), vec![false; 5]);
+    }
+
+    #[test]
+    fn nothing_ticked_disables_import() {
+        let mut key = FakeKey::new();
+        let mut app = app();
+        opened_into(&mut app, &mut key);
+        let text = list_text(&mut app);
+        assert!(text.contains("Import 3 entries"), "{text}");
+        assert!(!text.contains("Nothing to add."), "{text}");
+        app.vault_import_tick_all(false);
+        let text = list_text(&mut app);
+        assert!(text.contains("Nothing to add."), "{text}");
+        let calls = key.log.len();
+        assert!(app.vault_take_import().is_none());
+        app.vault_import();
+        assert_eq!(key.log.len(), calls, "the key was not used");
+        assert!(app.vault_session().unwrap().auth.is_some(), "nothing taken");
+        assert!(app.vault.import.is_some(), "the dialog stays");
+    }
+
+    #[test]
+    fn the_preview_draws_each_row_with_its_plan_and_reason() {
+        let mut key = FakeKey::new();
+        let mut app = app();
+        opened_into(&mut app, &mut key);
+        let text = list_text(&mut app);
+        for line in [
+            "Import backup",
+            "personal.t2vault",
+            "Into vault",
+            "Personal \u{00B7} 3",
+            "5 entries in personal.t2vault for vault \"Personal\":",
+            "Mail (alice)",
+            "Mail (bob) \u{00B7} mail.example",
+            "GitHub (alice)",
+            "the backup's copy is newer",
+            "the key's copy is newer (tick it to replace it)",
+            "already in the vault; left as is",
+            "Tick all",
+            "Untick all",
+            "3 entries in the vault; 2 will be added, 1 replaced, 1 left as is, 1 skipped.",
+            "Import 3 entries",
+            "Cancel",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        for word in ["add", "replace", "skip", "exists"] {
+            assert!(text.lines().any(|l| l == word), "{word}: {text}");
+        }
+        for secret in ["mail-a", "gh-backup", "bank-backup", "mama0001", "ghghghgh"] {
+            assert!(!text.contains(secret), "{secret}: {text}");
+        }
+        // Before the backup is opened: the passphrase box and Open backup.
+        app.vault.import.as_mut().unwrap().incoming = None;
+        let text = list_text(&mut app);
+        for line in ["Passphrase", "Open backup", "Cancel"] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        assert!(!text.contains("Tick all"), "{text}");
+    }
+
+    #[test]
+    fn changing_the_target_reclassifies() {
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &key_vault());
+        key.add_vault("Work", &Vault::default());
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        open_shared_backup(&mut app);
+        use ImportStatus::*;
+        assert_eq!(statuses(&mut app), vec![New, New, Newer, Older, Same]);
+        app.vault_import_tick(0, false);
+        app.vault_import_set_target(ImportTarget::New);
+        assert_eq!(statuses(&mut app), vec![New; 5]);
+        assert_eq!(ticks(&mut app), vec![true; 5], "the default ticks again");
+        let work = app.vault_session().unwrap().unlocked.vaults[1]
+            .vault_ref
+            .clone();
+        assert_eq!(work.name.as_deref(), Some("Work"));
+        app.vault_import_set_target(ImportTarget::Existing(work));
+        assert_eq!(statuses(&mut app), vec![New; 5]);
+        let text = list_text(&mut app);
+        assert!(text.contains("for vault \"Work\":"), "{text}");
+        assert!(
+            text.contains("0 entries in the vault; 5 will be added"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn import_into_a_new_vault_creates_it_with_two_touches() {
+        let mut key = FakeKey::new();
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        assert!(app.vault_session().unwrap().unlocked.vaults.is_empty());
+        // A key with no vault still offers Import backup….
+        assert!(list_text(&mut app).contains("Import backup\u{2026}"));
+        import_dialog_for(&mut app, Path::new("/backups/travel.t2vault"));
+        {
+            let d = import_dialog(&mut app);
+            assert!(d.target == ImportTarget::New);
+            assert_eq!(d.new_name, "travel", "the file's name");
+        }
+        app.vault_apply_import_open(Some(KEY.into()), Ok(opened_backup().opened.clone()));
+        assert_eq!(statuses(&mut app), vec![ImportStatus::New; 5]);
+        app.vault_import_tick(4, false);
+        replace_text(&mut import_dialog(&mut app).new_name, "Travel");
+        let text = list_text(&mut app);
+        for line in [
+            "A new vault named\u{2026}",
+            "5 entries in travel.t2vault for vault \"Travel\":",
+            "0 entries in the vault; 4 will be added, 0 replaced, 0 left as is, 1 skipped.",
+            "Create vault \"Travel\" and import 4 entries",
+            "This asks for two touches.",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        let Some(ImportJob::Create {
+            name,
+            mut auth,
+            initial,
+        }) = app.vault_take_import()
+        else {
+            panic!("a create");
+        };
+        assert_eq!(name, "Travel");
+        let backup = backup_vault();
+        assert_eq!(initial.entries, backup.entries[..4].to_vec());
+        let banner = Arc::new(Mutex::new(None));
+        let mut watched = Watched {
+            key: &mut key,
+            banner: banner.clone(),
+            at_touch: Vec::new(),
+        };
+        let result = {
+            let mut touches = TouchProgress::new(banner.clone(), 2);
+            run_create(&mut watched, &mut auth, &name, &initial, &mut touches)
+                .map_err(VaultJobError::from)
+        };
+        assert_eq!(
+            watched.at_touch,
+            vec![
+                Some("Touch your key (1 of 2)\u{2026}".to_owned()),
+                Some("Touch your key (2 of 2)\u{2026}".to_owned()),
+            ]
+        );
+        app.vault_apply_create(Some(KEY.into()), auth, Some(initial.entries.len()), result);
+        assert_eq!(
+            app.vault.info,
+            Some(format!(
+                "Imported into vault \"Travel\": 4 added, 0 replaced. {}",
+                backup_reminder("Travel")
+            ))
+        );
+        assert!(app.vault.import.is_none(), "the dialog closes");
+        let new = app.selected_vault().unwrap().vault_ref.clone();
+        assert_eq!(new.name.as_deref(), Some("Travel"));
+        assert_eq!(key.vault_on_key(&new.credential_id), Some(initial));
+    }
+
+    #[test]
+    fn a_new_vault_name_is_checked_before_the_job() {
+        let mut key = FakeKey::new();
+        let mut app = app();
+        opened_into(&mut app, &mut key);
+        app.vault_import_set_target(ImportTarget::New);
+        for (name, said) in [
+            (
+                "Personal",
+                "this key already holds a vault named \"Personal\"",
+            ),
+            ("", "a vault name must be 1 to 32 bytes long"),
+        ] {
+            replace_text(&mut import_dialog(&mut app).new_name, name);
+            let calls = key.log.len();
+            assert!(app.vault_take_import().is_none(), "{name}");
+            assert_eq!(key.log.len(), calls);
+            let err = app.vault.error.clone().unwrap_or_default().to_lowercase();
+            assert!(err.contains(&said.to_lowercase()), "{name}: {err}");
+            assert!(app.vault_session().unwrap().auth.is_some(), "nothing taken");
+            assert!(app.vault.import.is_some(), "the dialog stays");
+        }
+    }
+
+    #[test]
+    fn import_conflict_reclassifies_the_preview() {
+        let mut key = FakeKey::new();
+        let id = key.add_vault("Personal", &key_vault());
+        // Another program changes GitHub (a ticked replace) after unlock.
+        let mut theirs = key_vault();
+        theirs.entries[0].password = Zeroizing::new("gh-theirs".into());
+        theirs.entries[0].modified_minutes = 300;
+        key.hook = writes_elsewhere(id.clone(), theirs.clone());
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        open_shared_backup(&mut app);
+        assert_eq!(statuses(&mut app)[2], ImportStatus::Newer, "as unlocked");
+        import_into(&mut app, &mut key);
+        assert_eq!(
+            key.vault_on_key(&id),
+            Some(theirs.clone()),
+            "nothing was written"
+        );
+        let d = import_dialog(&mut app);
+        assert_eq!(
+            d.notice.as_deref(),
+            Some(
+                "An entry in this vault changed on the key since it was opened; nothing was \
+                 written. The list below shows the vault as it is now."
+            )
+        );
+        use ImportStatus::*;
+        assert_eq!(statuses(&mut app), vec![New, New, Older, Older, Same]);
+        assert_eq!(ticks(&mut app), vec![true, true, false, false, false]);
+        assert_eq!(session_entry(&app, "GitHub").password.as_str(), "gh-theirs");
+        assert!(app.vault_session().unwrap().auth.is_some());
+        assert!(app.log.iter().any(|l| l.severity == Severity::Warn));
+        // Importing again now adds the two Mails and leaves GitHub alone.
+        import_into(&mut app, &mut key);
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some("Imported into vault \"Personal\": 2 added, 0 replaced.")
+        );
+        let on_key = key.vault_on_key(&id).unwrap();
+        assert_eq!(on_key.entries.len(), 5);
+        assert_eq!(on_key.entries[0], theirs.entries[0]);
+    }
+
+    #[test]
+    fn import_logs_the_store_note() {
+        // What the store holds after this import, from a first run.
+        let mut key = FakeKey::new();
+        let mut app = app();
+        opened_into(&mut app, &mut key);
+        import_into(&mut app, &mut key);
+        let after = app.vault_session().unwrap().unlocked.capacity.used_bytes;
+        assert!(
+            app.log.iter().all(|l| l.severity != Severity::Warn),
+            "room left: no note"
+        );
+        // The same import into a store just big enough for it.
+        let mut key = FakeKey::new();
+        let mut app = super::tests::app();
+        opened_into(&mut app, &mut key);
+        key.set_max_bytes(after + 40);
+        import_into(&mut app, &mut key);
+        assert!(app.vault.import.is_none(), "never refused for it");
+        let cap = app.vault_session().unwrap().unlocked.capacity;
+        let line = blob_space_line("Vault", &cap).expect("under a quarter free");
+        assert_eq!(
+            app.log
+                .iter()
+                .filter(|l| l.severity == Severity::Warn && l.text == line)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_decrypted_backup_counts_for_the_idle_lock() {
+        let mut app = app();
+        assert!(!app.holds_opened_secrets());
+        app.vault.import = Some(ImportDialog::new(
+            "personal.t2vault".into(),
+            ImportTarget::New,
+            String::new(),
+        ));
+        assert!(!app.holds_opened_secrets(), "nothing opened yet");
+        assert!(!app.holds_unlocked_secrets());
+        import_dialog(&mut app).passphrase.push_str(IMPORT_PASS);
+        assert!(
+            app.holds_unlocked_secrets(),
+            "a typed passphrase is a typed secret"
+        );
+        assert_eq!(app.vault.secrets_mut().len(), 2);
+        import_dialog(&mut app).incoming = Some(backup_vault());
+        assert!(app.holds_opened_secrets());
+
+        // The idle lock drops the dialog and what it opened.
+        let mut key = FakeKey::new();
+        let mut app = super::tests::app();
+        opened_into(&mut app, &mut key);
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + crate::IDLE_LOCK_AFTER, false);
+        assert!(app.vault.import.is_none());
+        assert!(!app.holds_unlocked_secrets());
+    }
+
+    #[test]
+    fn import_dialog_wipes_and_cancel_forgets_the_file() {
+        let mut d = ImportDialog::new("p.t2vault".into(), ImportTarget::New, String::new());
+        d.passphrase.push_str(IMPORT_PASS);
+        assert_eq!(d.secrets_mut().len(), 1);
+        d.wipe_typed();
+        assert!(d.passphrase.is_empty());
+
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &key_vault());
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        // A cancelled open dialog opens nothing; a second press while one is
+        // open asks for no second dialog.
+        app.vault_import_start();
+        app.vault_import_start();
+        assert_eq!(app.file_dialog_queue.len(), 1);
+        app.file_dialog_queue.clear();
+        choose_backup(&mut app, None);
+        assert!(app.vault.import.is_none());
+        // A dialog resolved after a lock opens nothing.
+        app.vault_import_start();
+        app.vault_lock(None);
+        unlock_into(&mut app, &mut key);
+        choose_backup(&mut app, Some("p.t2vault".into()));
+        assert!(app.vault.import.is_none());
+        // Cancel closes the dialog.
+        import_dialog_for(&mut app, Path::new("p.t2vault"));
+        app.vault_import_cancel();
+        assert!(app.vault.import.is_none());
+    }
+
+    #[test]
+    fn an_opened_backup_for_another_key_is_dropped() {
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &key_vault());
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        import_dialog_for(&mut app, Path::new("p.t2vault"));
+        app.vault_apply_import_open(Some("serial:BBB".into()), Ok(backup_vault()));
+        assert!(import_dialog(&mut app).incoming.is_none());
+        // An unavailable shown vault offers no import into it.
+        let damaged = key.add_vault("Old", &Vault::default());
+        key.put_blob(&damaged, b"not a vault at all, just bytes");
+        let mut app = super::tests::app();
+        unlock_into(&mut app, &mut key);
+        app.vault_select(damaged);
+        app.vault_import_start();
+        assert!(app.file_dialog_queue.is_empty());
     }
 }
