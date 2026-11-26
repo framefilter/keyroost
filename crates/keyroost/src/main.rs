@@ -7620,11 +7620,12 @@ impl App {
         self.security_keys.lb_status = Some(status);
     }
 
-    /// After a note saved: [`blob_space_line`] as a warning in the activity
-    /// log and on the status bar, when less than a quarter of the store is
-    /// free. The save itself is never refused for it.
-    fn storage_space_note(&mut self, cap: &keyroost_ctap::large_blobs::BlobCapacity) {
-        if let Some(line) = blob_space_line("Storage", cap) {
+    /// After a write to the large-blob store (a note on the Storage tab, a
+    /// vault): [`blob_space_line`] under `subject` as a warning in the
+    /// activity log and on the status bar, when less than a quarter of the
+    /// store is free. The write itself is never refused for it.
+    fn space_note(&mut self, subject: &str, cap: &keyroost_ctap::large_blobs::BlobCapacity) {
+        if let Some(line) = blob_space_line(subject, cap) {
             self.log(Severity::Warn, line);
         }
     }
@@ -21563,7 +21564,7 @@ impl App {
                             "Saved. {n} entr{} total.",
                             if n == 1 { "y" } else { "ies" }
                         ));
-                        app.storage_space_note(&cap);
+                        app.space_note("Storage", &cap);
                         app.security_keys.error = None;
                     }
                     Err(e) => {
@@ -21640,7 +21641,7 @@ impl App {
                         app.security_keys.lb_editing = None;
                         app.security_keys.lb_edit_text.clear();
                         app.storage_done("Note updated.".into());
-                        app.storage_space_note(&cap);
+                        app.space_note("Storage", &cap);
                         app.security_keys.error = None;
                     }
                     Err(e) => {

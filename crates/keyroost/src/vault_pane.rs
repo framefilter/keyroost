@@ -14,17 +14,17 @@ use keyroost_ctap::large_blobs::BlobCapacity;
 use keyroost_ctap::transport::CtapTransport;
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
 use keyroost_transport::vault::{
-    self, CtapVaultKey, LeftOver, Unlocked, VaultAuth, VaultKey, VaultKeyError, VaultOnKey,
-    VaultStep,
+    self, Change, CtapVaultKey, LeftOver, OpenVault, Saved, Unlocked, VaultAuth, VaultKey,
+    VaultKeyError, VaultOnKey, VaultRef, VaultStep,
 };
-use keyroost_vault::{seal, Entry, Vault};
-use zeroize::Zeroizing;
+use keyroost_vault::{canon_id, generate_password, new_id, seal, Entry, GenOptions, Vault};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::ui::device::{CapTab, DeviceId};
 use crate::ui::theme::{self, BtnKind, Palette};
 use crate::{
     completion_still_valid, fido_unread_line, guard_secret_field, now_secs_f64, open_fido,
-    sanitize_title, App, FidoTarget, Severity, TypedSecrets,
+    sanitize_title, wipe, App, FidoTarget, Severity, TypedSecrets,
 };
 
 /// Where problems are reported: the CLI help's URL.
@@ -541,24 +541,238 @@ pub(crate) fn run_reload<K: VaultKey>(
     vault::reload(key, unlocked)
 }
 
+/// Save `change` to `open` on `key` with the secrets held: no PIN unless the
+/// key dropped the token, no touch.
+pub(crate) fn run_save<K: VaultKey>(
+    key: &mut K,
+    auth: &mut VaultAuth,
+    open: &mut OpenVault,
+    change: &Change,
+    touches: &mut TouchProgress,
+) -> Result<Saved, VaultKeyError> {
+    vault::save(key, auth, open, change, &mut |s| touches.step(s))
+}
+
+/// Whether the key refused the vault's PIN (or locked it): every retry
+/// would spend another of the key's PIN tries, so the vault locks.
+fn pin_refused(e: &VaultJobError) -> bool {
+    matches!(
+        e,
+        VaultJobError::Vault(VaultKeyError::Ctap(c))
+            if c.is_pin_auth_error() || matches!(c, CtapError::StatusCode(0x32))
+    )
+}
+
+/// What the job label and the CLI say while a vault is written.
+const SAVE_LABEL: &str = "Saving to the key\u{2026}";
+
+/// The CLI's `an entry needs a title`, as a sentence.
+const NEEDS_TITLE: &str = "An entry needs a title.";
+
+/// The form's notice when the entry it edits changed on the key.
+const CHANGED_ON_KEY: &str = "This entry changed on the key since the vault was opened; nothing \
+                              was written. Check it and save again.";
+
+/// The form's notice when the entry it edits was deleted on the key.
+const DELETED_ON_KEY: &str = "This entry was deleted on the key; Save adds it again.";
+
+/// The generator's settings in one line: `Generate: 20 characters · A–Z
+/// a–z 0–9 symbols`, the classes that are off left out. The length and the
+/// classes are the ones [`generate_password`] uses (with every class off,
+/// lower case).
+pub(crate) fn gen_summary(o: &GenOptions) -> String {
+    let mut classes: Vec<&str> = [
+        (o.upper, "A\u{2013}Z"),
+        (o.lower, "a\u{2013}z"),
+        (o.digits, "0\u{2013}9"),
+        (o.symbols, "symbols"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if classes.is_empty() {
+        classes.push("a\u{2013}z");
+    }
+    let length = o.length.clamp(classes.len().max(4), 128);
+    format!(
+        "Generate: {length} characters \u{00B7} {}",
+        classes.join(" ")
+    )
+}
+
+/// Set an entry's text field to `value`, wiping what it held first (a
+/// plain assignment would free the old bytes unwiped).
+fn replace_text(field: &mut String, value: &str) {
+    field.zeroize();
+    field.push_str(value);
+}
+
+/// The add / edit form of one vault entry. Every text box is listed as a
+/// secret (usernames and notes are as private as the password), so Save,
+/// Cancel, Lock and the idle lock all wipe them.
+pub(crate) struct EntryForm {
+    /// The entry as read, for an edit: `Change::Edit`'s `before`. `None`
+    /// adds a new entry.
+    pub(crate) editing: Option<Entry>,
+    /// The vault it saves to, found by credential ID.
+    pub(crate) vault: VaultRef,
+    pub(crate) title: String,
+    pub(crate) username: String,
+    pub(crate) password: String,
+    pub(crate) url: String,
+    pub(crate) notes: String,
+    /// The password box shows its text.
+    pub(crate) show_password: bool,
+    /// Why the last Save didn't go through, shown in the form.
+    pub(crate) notice: Option<String>,
+}
+
+impl TypedSecrets for EntryForm {
+    fn secrets_mut(&mut self) -> Vec<&mut String> {
+        let Self {
+            editing: _,
+            vault: _,
+            title,
+            username,
+            password,
+            url,
+            notes,
+            show_password: _,
+            notice: _,
+        } = self;
+        vec![title, username, password, url, notes]
+    }
+}
+
+impl Drop for EntryForm {
+    fn drop(&mut self) {
+        self.wipe_typed();
+    }
+}
+
+impl EntryForm {
+    /// An empty form that adds an entry to `vault`.
+    pub(crate) fn for_add(vault: VaultRef) -> Self {
+        EntryForm {
+            editing: None,
+            vault,
+            title: String::new(),
+            username: String::new(),
+            password: String::new(),
+            url: String::new(),
+            notes: String::new(),
+            show_password: false,
+            notice: None,
+        }
+    }
+
+    /// A form holding `e` as read, to edit it.
+    pub(crate) fn for_edit(vault: VaultRef, e: &Entry) -> Self {
+        EntryForm {
+            editing: Some(e.clone()),
+            vault,
+            title: e.title.clone(),
+            username: e.username.clone(),
+            password: e.password.as_str().to_owned(),
+            url: e.url.clone(),
+            notes: e.notes.clone(),
+            show_password: false,
+            notice: None,
+        }
+    }
+
+    /// Whether any field differs from where the form started: empty for an
+    /// add, the entry as read for an edit.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the idle lock reads it (not yet wired)")
+    )]
+    pub(crate) fn is_dirty(&self) -> bool {
+        let start: [&str; 5] = match &self.editing {
+            Some(e) => [&e.title, &e.username, &e.password, &e.url, &e.notes],
+            None => [""; 5],
+        };
+        [
+            &self.title,
+            &self.username,
+            &self.password,
+            &self.url,
+            &self.notes,
+        ]
+        .into_iter()
+        .zip(start)
+        .any(|(now, was)| now != was)
+    }
+
+    /// The change Save writes, stamped `now` (minutes since the epoch): a new
+    /// entry with a new ID, or the entry as read becoming the typed values
+    /// under its own ID. A title that is empty or only spaces is refused.
+    pub(crate) fn change(&self, now: i64) -> Result<Change, &'static str> {
+        if self.title.trim().is_empty() {
+            return Err(NEEDS_TITLE);
+        }
+        match &self.editing {
+            None => Ok(Change::Add(Entry {
+                id: new_id(),
+                title: self.title.clone(),
+                username: self.username.clone(),
+                password: Zeroizing::new(self.password.clone()),
+                url: self.url.clone(),
+                notes: self.notes.clone(),
+                modified_minutes: now,
+            })),
+            Some(before) => {
+                let mut after = before.clone();
+                replace_text(&mut after.title, &self.title);
+                replace_text(&mut after.username, &self.username);
+                replace_text(&mut after.password, &self.password);
+                replace_text(&mut after.url, &self.url);
+                replace_text(&mut after.notes, &self.notes);
+                after.modified_minutes = now;
+                Ok(Change::Edit {
+                    before: before.clone(),
+                    after,
+                })
+            }
+        }
+    }
+}
+
+/// What a vault save was for, so its end reports in that change's words.
+/// The titles are entry data: held wiped, shown in the pane, never logged.
+pub(crate) enum SaveKind {
+    Add {
+        title: Zeroizing<String>,
+    },
+    Edit {
+        title: Zeroizing<String>,
+    },
+    #[expect(
+        dead_code,
+        reason = "deleting an entry saves through this too (not yet drawn)"
+    )]
+    Delete {
+        title: Zeroizing<String>,
+    },
+    #[expect(
+        dead_code,
+        reason = "importing a backup saves through this too (not yet drawn)"
+    )]
+    Import {
+        chosen: usize,
+    },
+}
+
 /// The unlocked vaults of one key. Reached only through
 /// [`App::vault_session`], which refuses it once another key is selected.
 pub(crate) struct VaultSession {
     /// The key it was unlocked on.
     pub(crate) device: DeviceId,
     /// The PIN and the token the writes reuse; `None` while a job holds it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the vault's writes take it (later tasks)")
-    )]
     pub(crate) auth: Option<VaultAuth>,
     pub(crate) unlocked: Unlocked,
     /// The PIN came from the FIDO2 tab's session, so a refusal of it
     /// locks that tab too.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the vault's writes read it (later tasks)")
-    )]
     pub(crate) pin_from_fido: bool,
     /// About how many bytes one more entry takes ([`entry_bytes_estimate`]),
     /// for the space line. Set whenever the contents change, never while
@@ -594,11 +808,21 @@ pub(crate) struct VaultState {
     /// The "Copied" flash: `"{id}:u"` / `"{id}:p"` and when it ends (unix
     /// seconds).
     pub(crate) copied: Option<(String, f64)>,
+    /// The add / edit entry form; it takes the list's place while open.
+    pub(crate) form: Option<EntryForm>,
+    /// The generator's length and character sets. Kept across a lock.
+    pub(crate) gen: GenOptions,
+    /// The generator's settings are shown under the password box.
+    pub(crate) gen_open: bool,
 }
 
 impl TypedSecrets for VaultState {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
-        vec![&mut *self.pin_input]
+        let mut out = vec![&mut *self.pin_input];
+        if let Some(f) = self.form.as_mut() {
+            out.extend(f.secrets_mut());
+        }
+        out
     }
 }
 
@@ -710,13 +934,9 @@ impl App {
                 }
             }
             Err(e) => {
-                let pin_refused = matches!(
-                    &e,
-                    VaultJobError::Vault(VaultKeyError::Ctap(c))
-                        if c.is_pin_auth_error() || matches!(c, CtapError::StatusCode(0x32))
-                );
+                let refused = pin_refused(&e);
                 self.vault_fail(&e);
-                if pin_refused && pin_from_fido {
+                if refused && pin_from_fido {
                     // The shared PIN is wrong on the FIDO2 tab too.
                     self.relock_fido_session();
                 }
@@ -784,13 +1004,15 @@ impl App {
     /// secrets, the PIN box, and whatever later forms hold) drops and wipes,
     /// and a username or password copied from it that the clipboard still
     /// holds is cleared. The touch prompt cell stays for a job still
-    /// running. `why` is shown.
+    /// running, and the generator's settings stay. `why` is shown.
     pub(crate) fn vault_lock(&mut self, why: Option<String>) {
         self.clear_vault_clipboard_now();
         let progress = std::mem::take(&mut self.vault.progress);
+        let gen = std::mem::take(&mut self.vault.gen);
         self.vault = VaultState {
             error: why,
             progress,
+            gen,
             ..Default::default()
         };
     }
@@ -852,13 +1074,6 @@ impl App {
 
     /// Whether the shown vault can be changed: it opened. A vault that
     /// can't be opened is left as it is (only Delete vault… reaches it).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "gates add, edit, delete, export, import and rotate (later tasks)"
-        )
-    )]
     pub(crate) fn vault_writable(&self) -> bool {
         self.selected_vault().is_some_and(|v| v.state.is_ok())
     }
@@ -876,12 +1091,289 @@ impl App {
         (!value.is_empty()).then(|| Zeroizing::new(value.to_owned()))
     }
 
+    /// Open the form that adds an entry to the shown vault, when it opened.
+    pub(crate) fn vault_add_entry(&mut self) {
+        if !self.vault_writable() {
+            return;
+        }
+        let Some(v) = self.selected_vault() else {
+            return;
+        };
+        let form = EntryForm::for_add(v.vault_ref.clone());
+        self.vault.form = Some(form);
+        self.vault.error = None;
+        self.vault.info = None;
+    }
+
+    /// Open the form that edits entry `id` of the shown vault.
+    pub(crate) fn vault_edit_entry(&mut self, id: &str) {
+        let Some(v) = self.selected_vault() else {
+            return;
+        };
+        let Some(e) = v
+            .state
+            .as_ref()
+            .ok()
+            .and_then(|o| o.contents.entries.iter().find(|e| e.id == id))
+        else {
+            return;
+        };
+        let form = EntryForm::for_edit(v.vault_ref.clone(), e);
+        self.vault.form = Some(form);
+        self.vault.error = None;
+        self.vault.info = None;
+    }
+
+    /// Close the form; what was typed is wiped.
+    pub(crate) fn vault_cancel_form(&mut self) {
+        self.vault.form = None;
+    }
+
+    /// Generate: a new password from the generator's settings replaces the
+    /// form's, which is wiped first.
+    pub(crate) fn vault_generate(&mut self) {
+        let Some(f) = self.vault.form.as_mut() else {
+            return;
+        };
+        match generate_password(&self.vault.gen) {
+            Ok(pw) => {
+                wipe(&mut f.password);
+                f.password.push_str(&pw);
+            }
+            Err(e) => f.notice = Some(as_sentence(&e.to_string())),
+        }
+    }
+
+    /// The open form's change and what it is, or `None` with the reason in
+    /// the form when it can't be saved.
+    pub(crate) fn vault_form_change(&mut self) -> Option<(VaultRef, SaveKind, Change)> {
+        let f = self.vault.form.as_mut()?;
+        match f.change(vault::now_minutes()) {
+            Err(why) => {
+                f.notice = Some(why.to_owned());
+                None
+            }
+            Ok(change) => {
+                let title = Zeroizing::new(f.title.clone());
+                let kind = match change {
+                    Change::Add(_) => SaveKind::Add { title },
+                    _ => SaveKind::Edit { title },
+                };
+                Some((f.vault.clone(), kind, change))
+            }
+        }
+    }
+
+    /// Save: the form's change goes to the key.
+    pub(crate) fn vault_save_form(&mut self) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        let Some((vault, kind, change)) = self.vault_form_change() else {
+            return;
+        };
+        self.vault_start_save(vault, kind, change);
+    }
+
+    /// What a save job takes from the session: the vault's auth (the session
+    /// holds none until the job puts it back) and a copy of the open vault.
+    /// `None`, and nothing taken, when the vault isn't open in the session or
+    /// a job holds the auth.
+    pub(crate) fn vault_take_for_save(
+        &mut self,
+        vault: &VaultRef,
+    ) -> Option<(VaultAuth, OpenVault)> {
+        let s = self.vault_session_mut()?;
+        let open = s
+            .unlocked
+            .vaults
+            .iter()
+            .find(|v| v.vault_ref.credential_id == vault.credential_id)?
+            .state
+            .as_ref()
+            .ok()?
+            .clone();
+        let auth = s.auth.take()?;
+        Some((auth, open))
+    }
+
+    /// Write `change` to `vault` on the selected key: the session's PIN and
+    /// token, no touch.
+    fn vault_start_save(&mut self, vault: VaultRef, kind: SaveKind, change: Change) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        let Some(target) = self.selected_fido_target() else {
+            return;
+        };
+        let Some((auth, open)) = self.vault_take_for_save(&vault) else {
+            // Gone from the session (a Refresh no longer lists it).
+            self.vault.info = None;
+            self.vault.error = Some(vault_error_text(&VaultKeyError::VaultGone {
+                name: vault.name.clone(),
+            }));
+            return;
+        };
+        if let Some(f) = self.vault.form.as_mut() {
+            f.notice = None;
+        }
+        self.vault.error = None;
+        self.vault.info = None;
+        let shown = self.vault.progress.clone();
+        let for_device = self.selected_device.clone();
+        let queued = self.spawn_job(SAVE_LABEL, move || {
+            let mut auth = auth;
+            let mut open = open;
+            let result = {
+                let mut touches = TouchProgress::new(shown, 0);
+                open_vault_key(&target).and_then(|mut key| {
+                    run_save(&mut key, &mut auth, &mut open, &change, &mut touches)
+                        .map_err(VaultJobError::from)
+                })
+            };
+            Box::new(move |app: &mut App| {
+                app.vault_apply_save(for_device, vault, kind, auth, open, result);
+            })
+        });
+        if !queued {
+            // The job and the auth it took are gone: lock rather than keep
+            // a session that can't save.
+            self.vault_lock(None);
+        }
+    }
+
+    /// Back into the session after a save job: the auth, and the vault as
+    /// the job left it (what was written, or on a conflict what the key
+    /// holds now).
+    fn vault_put_back(&mut self, auth: VaultAuth, open: OpenVault) {
+        let Some(s) = self.vault_session_mut() else {
+            return;
+        };
+        s.auth = Some(auth);
+        if let Some(v) = s
+            .unlocked
+            .vaults
+            .iter_mut()
+            .find(|v| v.vault_ref.credential_id == open.vault_ref.credential_id)
+        {
+            v.state = Ok(open);
+        }
+        s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
+    }
+
+    /// The end of a save. A result for another key is dropped with its
+    /// secrets. A change made elsewhere is never overwritten: a conflict
+    /// reloads the vault and leaves the form open with what was typed; a
+    /// vault gone from the key locks the session; a refused PIN locks it
+    /// too, so no retry spends another of the key's PIN tries.
+    pub(crate) fn vault_apply_save(
+        &mut self,
+        for_device: Option<DeviceId>,
+        vault: VaultRef,
+        kind: SaveKind,
+        auth: VaultAuth,
+        open: OpenVault,
+        result: Result<Saved, VaultJobError>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+            return;
+        }
+        let Some(pin_from_fido) = self.vault_session().map(|s| s.pin_from_fido) else {
+            return;
+        };
+        self.vault_put_back(auth, open);
+        let name = shown_name(vault.name.as_deref());
+        match result {
+            Err(e @ VaultJobError::Vault(VaultKeyError::VaultGone { .. })) => {
+                let text = job_error_text(&e);
+                self.log(Severity::Err, format!("Vault: {text}"));
+                self.vault_lock(Some(text));
+            }
+            Err(e) if pin_refused(&e) => {
+                self.vault_fail(&e);
+                let why = self.vault.error.take();
+                self.vault_lock(why);
+                if pin_from_fido {
+                    self.relock_fido_session();
+                }
+            }
+            Ok(saved) => {
+                if let Some(s) = self.vault_session_mut() {
+                    s.unlocked.capacity = saved.capacity;
+                }
+                let (shown, logged) = match &kind {
+                    SaveKind::Add { title } => (
+                        format!(
+                            "Entry \"{}\" added to vault \"{name}\".",
+                            sanitize_title(title)
+                        ),
+                        format!("entry added to vault \"{name}\""),
+                    ),
+                    SaveKind::Edit { title } => (
+                        format!("Entry \"{}\" updated.", sanitize_title(title)),
+                        format!("entry updated in vault \"{name}\""),
+                    ),
+                    SaveKind::Delete { .. } | SaveKind::Import { .. } => return,
+                };
+                self.vault.form = None;
+                self.vault_done(shown, logged);
+                self.space_note("Vault", &saved.capacity);
+            }
+            Err(e @ VaultJobError::Vault(VaultKeyError::Conflict))
+                if matches!(kind, SaveKind::Add { .. } | SaveKind::Edit { .. }) =>
+            {
+                self.log(Severity::Warn, format!("Vault: {}", job_error_text(&e)));
+                self.vault_rebase_form();
+            }
+            Err(e) => self.vault_fail(&e),
+        }
+    }
+
+    /// After a conflict: the form keeps what was typed and now edits the
+    /// entry as the key holds it (reloaded into the session), or adds it
+    /// again when it was deleted there.
+    fn vault_rebase_form(&mut self) {
+        self.vault.info = None;
+        let Some(f) = self.vault.form.as_ref() else {
+            self.vault.error = Some(CHANGED_ON_KEY.to_owned());
+            return;
+        };
+        let id = f.editing.as_ref().map(|e| canon_id(&e.id));
+        let cred = f.vault.credential_id.clone();
+        let current = id.as_ref().and_then(|id| {
+            self.vault_session()?
+                .unlocked
+                .vaults
+                .iter()
+                .find(|v| v.vault_ref.credential_id == cred)?
+                .state
+                .as_ref()
+                .ok()?
+                .contents
+                .entries
+                .iter()
+                .find(|e| canon_id(&e.id) == *id)
+                .cloned()
+        });
+        let Some(f) = self.vault.form.as_mut() else {
+            return;
+        };
+        let notice = match (id, current) {
+            (Some(_), None) => {
+                f.editing = None;
+                DELETED_ON_KEY
+            }
+            (Some(_), Some(e)) => {
+                f.editing = Some(e);
+                CHANGED_ON_KEY
+            }
+            (None, _) => CHANGED_ON_KEY,
+        };
+        f.notice = Some(notice.to_owned());
+    }
+
     /// A vault change that worked: `shown` in the pane, `logged` in the
     /// activity log (never an entry's title, username, URL or notes).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the vault's writes report with it (later tasks)")
-    )]
     pub(crate) fn vault_done(&mut self, shown: String, logged: String) {
         self.log(Severity::Ok, format!("Vault: {logged}"));
         self.vault.error = None;
@@ -1043,10 +1535,19 @@ impl App {
     }
 
     /// The unlocked vaults: a chip per vault, how full the key is, the
-    /// filter, a row per entry with its copy buttons (the opened one with its
-    /// password behind Show, its URL and notes), then the Backup card.
+    /// filter and Add entry, a row per entry with its copy buttons (the
+    /// opened one with its password behind Show, its URL and notes, and
+    /// Edit), then the Backup card. An open add / edit form takes the
+    /// list's place.
     fn render_vault_list(&mut self, ui: &mut egui::Ui, p: &Palette) {
         self.vault_fix_selection();
+        if self.vault_session().is_none() {
+            return;
+        }
+        if self.vault.form.is_some() {
+            self.render_entry_form(ui, p);
+            return;
+        }
         let Some(session) = self.vault_session() else {
             return;
         };
@@ -1068,6 +1569,8 @@ impl App {
         let mut toggle: Option<String> = None;
         let mut copy: Option<(String, CopyWhat)> = None;
         let mut reveal: Option<Option<String>> = None;
+        let mut add = false;
+        let mut edit: Option<String> = None;
         // The filter box edits a copy while the session is borrowed.
         let mut filter = std::mem::take(&mut self.vault.filter);
 
@@ -1110,12 +1613,17 @@ impl App {
                 );
             }
             Ok(open) => {
-                ui.add(
-                    egui::TextEdit::singleline(&mut filter)
-                        .margin(theme::TEXT_EDIT_MARGIN)
-                        .hint_text("Filter entries\u{2026}")
-                        .desired_width(f32::INFINITY),
-                );
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        add = theme::button(ui, p, BtnKind::Primary, "Add entry").clicked();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut filter)
+                                .margin(theme::TEXT_EDIT_MARGIN)
+                                .hint_text("Filter entries\u{2026}")
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                });
                 ui.add_space(6.0);
                 let rows = shown_rows(&open.contents, &filter);
                 theme::card_frame(p).show(ui, |ui| {
@@ -1158,8 +1666,12 @@ impl App {
                         }
                         if is_open {
                             let showing = self.vault.revealed.as_deref() == Some(e.id.as_str());
-                            if let Some(show) = opened_entry(ui, p, e, showing) {
+                            let clicks = opened_entry(ui, p, e, showing);
+                            if let Some(show) = clicks.reveal {
                                 reveal = Some(show.then(|| e.id.clone()));
+                            }
+                            if clicks.edit {
+                                edit = Some(e.id.clone());
                             }
                         }
                     }
@@ -1196,9 +1708,158 @@ impl App {
         if let Some((id, what)) = copy {
             self.vault_copy(ui.ctx(), &id, what, now);
         }
+        if add {
+            self.vault_add_entry();
+        }
+        if let Some(id) = edit {
+            self.vault_edit_entry(&id);
+        }
         if let Some((_, t)) = &self.vault.copied {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.05)));
+        }
+    }
+}
+
+impl App {
+    /// The add / edit form (the mockup's): Title, Username, Password with
+    /// Show and Generate, the generator's settings behind `change`, URL and
+    /// Notes, then Cancel / Save.
+    fn render_entry_form(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let waiting = self.waiting_for().map(str::to_owned);
+        let Some(mut form) = self.vault.form.take() else {
+            return;
+        };
+        let mut gen = std::mem::take(&mut self.vault.gen);
+        let mut gen_open = self.vault.gen_open;
+        let (mut generate, mut cancel, mut save) = (false, false, false);
+        let name = shown_name(form.vault.name.as_deref());
+        let heading = match form.editing {
+            Some(_) => format!("Edit entry in \"{name}\""),
+            None => format!("Add entry to \"{name}\""),
+        };
+        const LABEL_W: f32 = 90.0;
+        theme::card_frame(p).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(heading)
+                    .font(theme::f_sb(14.5))
+                    .color(p.txt),
+            );
+            ui.add_space(8.0);
+            let label = |ui: &mut egui::Ui, text: &str| {
+                ui.add_sized(
+                    [LABEL_W, 24.0],
+                    egui::Label::new(
+                        egui::RichText::new(text)
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt2),
+                    ),
+                );
+            };
+            fn line<'a>(text: &'a mut String, hint: &'static str) -> egui::TextEdit<'a> {
+                egui::TextEdit::singleline(text)
+                    .margin(theme::TEXT_EDIT_MARGIN)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(hint)
+            }
+            ui.horizontal(|ui| {
+                label(ui, "Title");
+                ui.add(line(&mut form.title, ""));
+            });
+            ui.horizontal(|ui| {
+                label(ui, "Username");
+                ui.add(line(&mut form.username, ""));
+            });
+            ui.horizontal(|ui| {
+                label(ui, "Password");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    generate = theme::button(ui, p, BtnKind::Ghost, "Generate").clicked();
+                    let show = if form.show_password { "Hide" } else { "Show" };
+                    if theme::button(ui, p, BtnKind::Ghost, show).clicked() {
+                        form.show_password = !form.show_password;
+                    }
+                    let masked = !form.show_password;
+                    let resp = ui.add(line(&mut form.password, "").password(masked));
+                    guard_secret_field(ui.ctx(), &resp);
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
+                ui.label(
+                    egui::RichText::new(gen_summary(&gen))
+                        .font(theme::f_reg(11.5))
+                        .color(p.txt3),
+                );
+                if ui
+                    .link(egui::RichText::new("change").font(theme::f_reg(11.5)))
+                    .clicked()
+                {
+                    gen_open = !gen_open;
+                }
+            });
+            if gen_open {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
+                    ui.add(
+                        egui::DragValue::new(&mut gen.length)
+                            .range(4..=128)
+                            .suffix(" characters"),
+                    );
+                    ui.checkbox(&mut gen.upper, "A\u{2013}Z");
+                    ui.checkbox(&mut gen.lower, "a\u{2013}z");
+                    ui.checkbox(&mut gen.digits, "0\u{2013}9");
+                    ui.checkbox(&mut gen.symbols, "symbols");
+                });
+            }
+            ui.horizontal(|ui| {
+                label(ui, "URL");
+                ui.add(line(&mut form.url, "optional"));
+            });
+            ui.horizontal_top(|ui| {
+                label(ui, "Notes");
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut form.notes)
+                        .margin(theme::TEXT_EDIT_MARGIN)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("optional"),
+                );
+                guard_secret_field(ui.ctx(), &resp);
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
+                ui.label(
+                    egui::RichText::new(
+                        "Saving writes the vault back to the key (PIN already entered; no \
+                         touch needed).",
+                    )
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+                );
+            });
+            if let Some(notice) = &form.notice {
+                ui.add_space(6.0);
+                ui.colored_label(p.warn, notice);
+            }
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                save = theme::key_button(ui, p, BtnKind::Primary, "Save", waiting.as_deref())
+                    .clicked();
+                cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
+            });
+        });
+        self.vault.gen = gen;
+        self.vault.gen_open = gen_open;
+        self.vault.form = Some(form);
+        if generate {
+            self.vault_generate();
+        }
+        if cancel {
+            self.vault_cancel_form();
+        } else if save {
+            self.vault_save_form();
         }
     }
 }
@@ -1324,11 +1985,18 @@ fn line_title_len(e: &Entry, line: &str) -> usize {
     }
 }
 
+/// What a click in an opened entry asks for.
+#[derive(Default)]
+struct OpenedClicks {
+    /// `Some(show)`: Show or Hide was clicked.
+    reveal: Option<bool>,
+    edit: bool,
+}
+
 /// The opened entry under its row: the password behind Show, the URL, the
-/// notes (shown, as `entry show` does), and when it last changed. Returns
-/// `Some(show)` when Show or Hide was clicked.
-fn opened_entry(ui: &mut egui::Ui, p: &Palette, e: &Entry, showing: bool) -> Option<bool> {
-    let mut clicked = None;
+/// notes (shown, as `entry show` does), Edit, and when it last changed.
+fn opened_entry(ui: &mut egui::Ui, p: &Palette, e: &Entry, showing: bool) -> OpenedClicks {
+    let mut clicks = OpenedClicks::default();
     egui::Frame::new()
         .fill(p.raised2)
         .corner_radius(egui::CornerRadius::same(8))
@@ -1393,7 +2061,7 @@ fn opened_entry(ui: &mut egui::Ui, p: &Palette, e: &Entry, showing: bool) -> Opt
                     }
                     let label = if showing { "Hide" } else { "Show" };
                     if theme::button(ui, p, BtnKind::Ghost, label).clicked() {
-                        clicked = Some(!showing);
+                        clicks.reveal = Some(!showing);
                     }
                 }
             });
@@ -1405,8 +2073,10 @@ fn opened_entry(ui: &mut egui::Ui, p: &Palette, e: &Entry, showing: bool) -> Opt
                 field(ui, "Notes");
                 value(ui, &e.notes);
             });
-            if let Some(when) = changed_ago(e.modified_minutes, vault::now_minutes()) {
-                ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                clicks.edit = theme::button(ui, p, BtnKind::Default, "Edit").clicked();
+                if let Some(when) = changed_ago(e.modified_minutes, vault::now_minutes()) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(when)
@@ -1414,10 +2084,10 @@ fn opened_entry(ui: &mut egui::Ui, p: &Palette, e: &Entry, showing: bool) -> Opt
                                 .color(p.txt3),
                         );
                     });
-                });
-            }
+                }
+            });
         });
-    clicked
+    clicks
 }
 
 #[cfg(test)]
@@ -2745,5 +3415,685 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("Copy password"));
+    }
+
+    // ----- add and edit, the generator, saving -----
+
+    use crate::blob_space_line;
+    use keyroost_transport::vault::{Change, OpenVault};
+
+    /// The shown vault's reference (Personal after `two_vaults`).
+    fn shown_ref(app: &App) -> VaultRef {
+        app.selected_vault().unwrap().vault_ref.clone()
+    }
+
+    /// The shown vault's entry titled `title`, as the session holds it.
+    fn session_entry(app: &App, title: &str) -> Entry {
+        let open = app.selected_vault().unwrap().state.as_ref().unwrap();
+        open.contents
+            .entries
+            .iter()
+            .find(|e| e.title == title)
+            .unwrap()
+            .clone()
+    }
+
+    /// Save `change` as the job does (against `key`), and land it as the
+    /// apply does.
+    fn save_into(
+        app: &mut App,
+        key: &mut FakeKey,
+        vault: VaultRef,
+        kind: SaveKind,
+        change: Change,
+    ) {
+        let (mut auth, mut open): (VaultAuth, OpenVault) = app
+            .vault_take_for_save(&vault)
+            .expect("an open vault and its auth");
+        assert!(
+            app.vault_session().unwrap().auth.is_none(),
+            "the job holds it"
+        );
+        let result = {
+            let mut touches = TouchProgress::new(Arc::new(Mutex::new(None)), 0);
+            run_save(key, &mut auth, &mut open, &change, &mut touches).map_err(VaultJobError::from)
+        };
+        app.vault_apply_save(Some(KEY.into()), vault, kind, auth, open, result);
+    }
+
+    /// Press Save on the open form, the job running against `key`.
+    fn save_form(app: &mut App, key: &mut FakeKey) {
+        let (vault, kind, change) = app.vault_form_change().expect("a form that validates");
+        save_into(app, key, vault, kind, change);
+    }
+
+    fn form(app: &mut App) -> &mut EntryForm {
+        app.vault.form.as_mut().expect("the form is open")
+    }
+
+    /// A hook that stores `vault` as credential `id`'s data: another writer.
+    fn writes_elsewhere(
+        id: Vec<u8>,
+        vault: Vault,
+    ) -> Option<(usize, keyroost_transport::vault::fake::Hook)> {
+        Some((1, Box::new(move |k: &mut FakeKey| k.put_vault(&id, &vault))))
+    }
+
+    const CONFLICT_NOTICE: &str = "This entry changed on the key since the vault was opened; \
+                                   nothing was written. Check it and save again.";
+
+    #[test]
+    fn add_saves_and_closes_the_form() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_add_entry();
+        {
+            let f = form(&mut app);
+            assert!(f.editing.is_none());
+            f.title.push_str("GitHub");
+            f.username.push_str("carol");
+            f.password.push_str("s3cret-pw");
+            f.notes.push_str("recovery: tulip");
+        }
+        save_form(&mut app, &mut key);
+
+        let on_key = key.vault_on_key(&p).unwrap();
+        assert_eq!(on_key.entries.len(), 3);
+        let added = on_key
+            .entries
+            .iter()
+            .find(|e| e.username == "carol")
+            .unwrap();
+        assert_eq!(added.title, "GitHub");
+        assert_eq!(*added.password, "s3cret-pw");
+        assert_eq!(added.notes, "recovery: tulip");
+        assert!(app.vault.form.is_none(), "the form closes");
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some("Entry \"GitHub\" added to vault \"Personal\".")
+        );
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.text == "Vault: entry added to vault \"Personal\""));
+        for l in &app.log {
+            assert!(
+                !l.text.contains("GitHub")
+                    && !l.text.contains("carol")
+                    && !l.text.contains("tulip"),
+                "{}",
+                l.text
+            );
+        }
+        // The list shows it, and the session can save again.
+        assert_eq!(app.selected_vault().unwrap().entry_count(), Some(3));
+        assert!(app.vault_session().unwrap().auth.is_some());
+        // A save asks for no touch.
+        assert!(!key
+            .log
+            .iter()
+            .skip_while(|c| **c != Call::Read)
+            .any(|c| matches!(c, Call::Assertions(_) | Call::MakeCredential)));
+    }
+
+    #[test]
+    fn edit_keeps_the_id() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let github = session_entry(&app, "GitHub");
+        app.vault_edit_entry(&github.id);
+        {
+            let f = form(&mut app);
+            assert_eq!(f.title, "GitHub");
+            assert_eq!(f.password, "hunter22");
+            f.password.clear();
+            f.password.push_str("new-pw");
+        }
+        save_form(&mut app, &mut key);
+
+        let on_key = key.vault_on_key(&p).unwrap();
+        assert_eq!(on_key.entries.len(), 2);
+        let e = on_key.entries.iter().find(|e| e.id == github.id).unwrap();
+        assert_eq!(*e.password, "new-pw");
+        assert_eq!(e.title, "GitHub");
+        assert!(app.vault.form.is_none());
+        assert_eq!(app.vault.info.as_deref(), Some("Entry \"GitHub\" updated."));
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.text == "Vault: entry updated in vault \"Personal\""));
+    }
+
+    #[test]
+    fn another_writers_change_to_a_different_entry_is_kept() {
+        let mut key = FakeKey::new();
+        let (a, b) = (
+            login("GitHub", "alice", "pw-a"),
+            login("Bank", "alice", "pw-b"),
+        );
+        let p = key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![a.clone(), b.clone()],
+            },
+        );
+        let mut b2 = b.clone();
+        b2.password = Zeroizing::new("theirs".into());
+        key.hook = writes_elsewhere(
+            p.clone(),
+            Vault {
+                entries: vec![a.clone(), b2.clone()],
+            },
+        );
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_edit_entry(&a.id);
+        form(&mut app).username.push_str("-mine");
+        save_form(&mut app, &mut key);
+
+        let on_key = key.vault_on_key(&p).unwrap();
+        let find = |id: &str| on_key.entries.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(find(&a.id).username, "alice-mine");
+        assert_eq!(
+            *find(&b.id).password,
+            "theirs",
+            "the other writer's change is kept"
+        );
+        assert!(app.vault.form.is_none());
+        // The list shows both changes.
+        assert_eq!(*session_entry(&app, "Bank").password, "theirs");
+    }
+
+    #[test]
+    fn edit_conflict_reloads_and_keeps_the_form() {
+        let mut key = FakeKey::new();
+        let (a, b) = (
+            login("GitHub", "alice", "pw-a"),
+            login("Bank", "alice", "pw-b"),
+        );
+        let p = key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![a.clone(), b.clone()],
+            },
+        );
+        let mut a2 = a.clone();
+        a2.password = Zeroizing::new("theirs".into());
+        key.hook = writes_elsewhere(
+            p.clone(),
+            Vault {
+                entries: vec![a2.clone(), b.clone()],
+            },
+        );
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_edit_entry(&a.id);
+        form(&mut app).username.push_str("-mine");
+        let stored = key.stored().to_vec();
+        save_form(&mut app, &mut key);
+
+        assert_eq!(key.stored(), &stored[..], "nothing was written");
+        // The list shows the key's copy.
+        assert_eq!(*session_entry(&app, "GitHub").password, "theirs");
+        let f = form(&mut app);
+        assert_eq!(f.username, "alice-mine", "the typed values stay");
+        assert_eq!(f.password, "pw-a");
+        assert_eq!(f.notice.as_deref(), Some(CONFLICT_NOTICE));
+        assert_eq!(
+            f.editing.as_ref().map(|e| e.password.as_str()),
+            Some("theirs"),
+            "re-based on the key's entry"
+        );
+        assert!(app.vault_session().unwrap().auth.is_some());
+
+        // Saved again, it goes through.
+        save_form(&mut app, &mut key);
+        let on_key = key.vault_on_key(&p).unwrap();
+        let e = on_key.entries.iter().find(|e| e.id == a.id).unwrap();
+        assert_eq!(e.username, "alice-mine");
+        assert!(app.vault.form.is_none());
+        assert_eq!(app.vault.info.as_deref(), Some("Entry \"GitHub\" updated."));
+    }
+
+    #[test]
+    fn edit_of_an_entry_deleted_elsewhere_offers_to_add_it() {
+        let mut key = FakeKey::new();
+        let (a, b) = (
+            login("GitHub", "alice", "pw-a"),
+            login("Bank", "alice", "pw-b"),
+        );
+        let p = key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![a.clone(), b.clone()],
+            },
+        );
+        key.hook = writes_elsewhere(
+            p.clone(),
+            Vault {
+                entries: vec![b.clone()],
+            },
+        );
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_edit_entry(&a.id);
+        form(&mut app).password.push('!');
+        save_form(&mut app, &mut key);
+
+        let f = form(&mut app);
+        assert!(f.editing.is_none());
+        assert_eq!(
+            f.notice.as_deref(),
+            Some("This entry was deleted on the key; Save adds it again.")
+        );
+        assert_eq!(f.password, "pw-a!");
+        assert_eq!(app.selected_vault().unwrap().entry_count(), Some(1));
+
+        save_form(&mut app, &mut key);
+        let on_key = key.vault_on_key(&p).unwrap();
+        assert_eq!(on_key.entries.len(), 2);
+        assert!(on_key
+            .entries
+            .iter()
+            .any(|e| e.title == "GitHub" && *e.password == "pw-a!"));
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some("Entry \"GitHub\" added to vault \"Personal\".")
+        );
+    }
+
+    #[test]
+    fn a_vault_gone_elsewhere_locks_the_session() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let lbk = key.creds.iter().find(|c| c.id == p).unwrap().lbk.unwrap();
+        key.hook = Some((
+            1,
+            Box::new(move |k: &mut FakeKey| {
+                let rest = k.array().without_credential_blob(&lbk);
+                k.set_array(&rest);
+            }),
+        ));
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_add_entry();
+        form(&mut app).title.push_str("Mail");
+        save_form(&mut app, &mut key);
+
+        assert!(app.vault.session.is_none(), "locked");
+        assert!(app.vault.form.is_none(), "the form went with it");
+        let err = app.vault.error.as_deref().unwrap();
+        assert!(
+            err.starts_with("Vault \"Personal\" is no longer on the key")
+                && err.ends_with("Unlock again to see what the key holds now."),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn full_store_refuses_and_keeps_the_form() {
+        let mut key = FakeKey::new();
+        key.set_max_bytes(1024);
+        let p = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let stored = key.stored().to_vec();
+        app.vault_add_entry();
+        // Random text, so it does not compress below the limit.
+        let notes: String = (0..250).map(|_| keyroost_vault::new_id()).collect();
+        {
+            let f = form(&mut app);
+            f.title.push_str("Recovery codes");
+            f.notes.push_str(&notes);
+        }
+        save_form(&mut app, &mut key);
+
+        assert_eq!(key.stored(), &stored[..], "nothing was written");
+        assert_eq!(key.vault_on_key(&p).unwrap().entries.len(), 2);
+        let f = form(&mut app);
+        assert_eq!(f.title, "Recovery codes");
+        assert_eq!(f.notes, notes);
+        let err = app.vault.error.as_deref().unwrap();
+        assert!(err.contains("too small") && err.contains("1024"), "{err}");
+        assert!(app.vault_session().unwrap().auth.is_some());
+    }
+
+    #[test]
+    fn a_save_leaving_under_a_quarter_free_logs_the_store_note() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let notes_of = |app: &App| {
+            app.log
+                .iter()
+                .filter(|l| l.severity == Severity::Warn && l.text.starts_with("Vault: "))
+                .count()
+        };
+        let github = session_entry(&app, "GitHub");
+        app.vault_edit_entry(&github.id);
+        form(&mut app).password.push('1');
+        save_form(&mut app, &mut key);
+        assert_eq!(notes_of(&app), 0, "room left: no note");
+
+        // The store shrinks to just over what the vault uses.
+        let used = app.vault_session().unwrap().unlocked.capacity.used_bytes;
+        key.set_max_bytes(used + 40);
+        app.vault_edit_entry(&github.id);
+        form(&mut app).password.push('2');
+        save_form(&mut app, &mut key);
+        assert!(app.vault.form.is_none(), "the save is never refused for it");
+        let cap = app.vault_session().unwrap().unlocked.capacity;
+        assert_eq!(
+            cap.max_bytes,
+            used + 40,
+            "the session's capacity is the save's"
+        );
+        let line = blob_space_line("Vault", &cap).expect("under a quarter free");
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.severity == Severity::Warn && l.text == line));
+        assert_eq!(notes_of(&app), 1);
+    }
+
+    #[test]
+    fn storage_notes_still_say_storage() {
+        let mut app = app();
+        app.space_note("Storage", &cap(3500, 4096));
+        let line = app.log.last().unwrap();
+        assert_eq!(line.severity, Severity::Warn);
+        assert_eq!(
+            line.text,
+            "Storage: the key's large-blob store is 85% full (3500 of 4096 bytes). \
+             Websites that store data with their passkeys may have no room left."
+        );
+        let n = app.log.len();
+        app.space_note("Vault", &cap(1000, 4096));
+        assert_eq!(app.log.len(), n, "room left: no line");
+    }
+
+    #[test]
+    fn empty_title_is_refused_before_the_key() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_add_entry();
+        {
+            let f = form(&mut app);
+            f.title.push_str("   ");
+            f.password.push_str("pw");
+            assert_eq!(f.change(0).unwrap_err(), "An entry needs a title.");
+        }
+        let calls = key.log.len();
+        app.vault_save_form();
+        assert_eq!(key.log.len(), calls);
+        let f = form(&mut app);
+        assert_eq!(f.notice.as_deref(), Some("An entry needs a title."));
+        assert_eq!(f.password, "pw");
+        assert!(
+            app.vault_session().unwrap().auth.is_some(),
+            "auth not taken"
+        );
+        assert!(!app.busy());
+    }
+
+    #[test]
+    fn form_dirty_tracks_changes() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let v = shown_ref(&app);
+        let mut add = EntryForm::for_add(v.clone());
+        assert!(!add.is_dirty());
+        add.show_password = true;
+        assert!(!add.is_dirty(), "Show isn't a change");
+        add.notes.push('x');
+        assert!(add.is_dirty());
+
+        let github = session_entry(&app, "GitHub");
+        let mut edit = EntryForm::for_edit(v, &github);
+        assert!(!edit.is_dirty());
+        edit.url.push_str("https://github.com");
+        assert!(edit.is_dirty());
+        edit.url.clear();
+        assert!(!edit.is_dirty(), "back to the entry as read");
+        edit.title.push(' ');
+        assert!(edit.is_dirty());
+
+        // Add and Edit build the matching change, stamped with `now`.
+        add.title.push_str("Mail");
+        match add.change(42).unwrap() {
+            Change::Add(e) => {
+                assert_eq!(e.title, "Mail");
+                assert_eq!(e.notes, "x");
+                assert_eq!(e.modified_minutes, 42);
+                assert!(!e.id.is_empty() && e.id != github.id);
+            }
+            other => panic!("{other:?}"),
+        }
+        match edit.change(43).unwrap() {
+            Change::Edit { before, after } => {
+                assert_eq!(before, github);
+                assert_eq!(after.id, github.id);
+                assert_eq!(after.title, "GitHub ");
+                assert_eq!(after.modified_minutes, 43);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn generator_summary_and_length() {
+        let mut o = keyroost_vault::GenOptions::default();
+        assert_eq!(
+            gen_summary(&o),
+            "Generate: 20 characters \u{00B7} A\u{2013}Z a\u{2013}z 0\u{2013}9 symbols"
+        );
+        o.digits = false;
+        o.length = 32;
+        assert_eq!(
+            gen_summary(&o),
+            "Generate: 32 characters \u{00B7} A\u{2013}Z a\u{2013}z symbols"
+        );
+        // With every class off the generator uses lower case; so does the line.
+        o.upper = false;
+        o.lower = false;
+        o.symbols = false;
+        assert_eq!(
+            gen_summary(&o),
+            "Generate: 32 characters \u{00B7} a\u{2013}z"
+        );
+
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        assert_eq!(app.vault.gen, keyroost_vault::GenOptions::default());
+        app.vault.gen.length = 32;
+        app.vault.gen.symbols = false;
+        app.vault_add_entry();
+        form(&mut app).password.push_str("typed");
+        app.vault_generate();
+        let pw = form(&mut app).password.clone();
+        assert_eq!(pw.chars().count(), 32);
+        assert!(pw.chars().all(|c| c.is_ascii_alphanumeric()), "{pw}");
+        app.vault_generate();
+        assert_ne!(form(&mut app).password, pw);
+        // The options outlive a lock; the form doesn't.
+        app.vault_lock(None);
+        assert_eq!(app.vault.gen.length, 32);
+        assert!(!app.vault.gen.symbols);
+        assert!(app.vault.form.is_none());
+    }
+
+    #[test]
+    fn entry_form_lists_every_text_field_as_secret() {
+        let mut f = EntryForm::for_add(VaultRef {
+            credential_id: vec![1],
+            name: Some("Personal".into()),
+        });
+        for (i, s) in [
+            &mut f.title,
+            &mut f.username,
+            &mut f.password,
+            &mut f.url,
+            &mut f.notes,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.push_str(&format!("value {i}"));
+        }
+        assert_eq!(f.secrets_mut().len(), 5);
+        f.wipe_typed();
+        for s in [&f.title, &f.username, &f.password, &f.url, &f.notes] {
+            assert!(s.is_empty());
+        }
+
+        // The tab's own list carries the open form's fields too.
+        let mut state = VaultState {
+            form: Some(EntryForm::for_add(VaultRef {
+                credential_id: vec![1],
+                name: None,
+            })),
+            ..Default::default()
+        };
+        assert_eq!(state.secrets_mut().len(), 6);
+    }
+
+    #[test]
+    fn cancel_closes_the_form_and_edit_needs_an_open_vault() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let damaged = key.add_vault("Old", &Vault::default());
+        key.put_blob(&damaged, b"not a vault at all, just bytes");
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_add_entry();
+        form(&mut app).password.push_str("pw");
+        app.vault_cancel_form();
+        assert!(app.vault.form.is_none());
+
+        app.vault_select(damaged);
+        app.vault_add_entry();
+        assert!(
+            app.vault.form.is_none(),
+            "a vault that can't be opened takes no entry"
+        );
+        app.vault_edit_entry("no-such-id");
+        assert!(app.vault.form.is_none());
+    }
+
+    #[test]
+    fn a_refused_pin_on_save_locks_the_vault() {
+        for pin_from_fido in [false, true] {
+            let mut key = FakeKey::new();
+            two_vaults(&mut key);
+            let mut app = app();
+            unlock_into(&mut app, &mut key);
+            app.vault.session.as_mut().unwrap().pin_from_fido = pin_from_fido;
+            app.security_keys.session = Some(fido_session("123456"));
+            app.vault_add_entry();
+            form(&mut app).title.push_str("Mail");
+            let (vault, kind, _) = app.vault_form_change().unwrap();
+            let (auth, open) = app.vault_take_for_save(&vault).unwrap();
+            app.vault_apply_save(
+                Some(KEY.into()),
+                vault,
+                kind,
+                auth,
+                open,
+                Err(VaultJobError::Vault(VaultKeyError::Ctap(
+                    CtapError::StatusCode(0x31),
+                ))),
+            );
+            assert!(
+                app.vault.session.is_none(),
+                "no retry spends another PIN try"
+            );
+            assert!(app.vault.error.is_some());
+            assert_eq!(
+                app.security_keys.session.is_none(),
+                pin_from_fido,
+                "the FIDO2 tab locks only when the PIN was its"
+            );
+        }
+    }
+
+    #[test]
+    fn a_save_for_another_key_is_discarded() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_add_entry();
+        form(&mut app).title.push_str("Mail");
+        let (vault, kind, change) = app.vault_form_change().unwrap();
+        let (mut auth, mut open) = app.vault_take_for_save(&vault).unwrap();
+        let mut touches = TouchProgress::new(Arc::new(Mutex::new(None)), 0);
+        let result = run_save(&mut key, &mut auth, &mut open, &change, &mut touches)
+            .map_err(VaultJobError::from);
+        app.selected_device = Some("serial:BBB".into());
+        let n = app.log.len();
+        app.vault_apply_save(Some(KEY.into()), vault, kind, auth, open, result);
+        assert_eq!(app.log.len(), n);
+        assert!(app.vault.info.is_none());
+    }
+
+    #[test]
+    fn the_form_draws_and_masks_the_password() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_add_entry();
+        form(&mut app).password.push_str("pw-typed");
+        let text = list_text(&mut app);
+        for shown in [
+            "Add entry to \"Personal\"",
+            "Title",
+            "Username",
+            "Password",
+            "Generate: 20 characters",
+            "change",
+            "optional",
+            "Saving writes the vault back to the key (PIN already entered; no touch needed).",
+            "Cancel",
+            "Save",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("pw-typed"), "masked until Show");
+        assert!(
+            !text.contains("Copy password"),
+            "the form replaces the list"
+        );
+        form(&mut app).show_password = true;
+        assert!(list_text(&mut app).contains("pw-typed"));
+        app.vault.gen_open = true;
+        let text = list_text(&mut app);
+        assert!(
+            text.contains("symbols") && text.contains("0\u{2013}9"),
+            "{text}"
+        );
+
+        app.vault_cancel_form();
+        let github = session_entry(&app, "GitHub");
+        app.vault_edit_entry(&github.id);
+        assert!(list_text(&mut app).contains("Edit entry in \"Personal\""));
+        app.vault_cancel_form();
+        app.vault_toggle_entry(&github.id);
+        let text = list_text(&mut app);
+        assert!(
+            text.contains("Add entry") && text.contains("Edit"),
+            "{text}"
+        );
     }
 }
