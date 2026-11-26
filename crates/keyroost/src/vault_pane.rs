@@ -419,6 +419,20 @@ fn as_sentence(text: &str) -> String {
 
 /// A vault error as the pane shows it: the error's own words, with the
 /// app's place to fix it where the CLI names a command.
+/// A delete refused because the entry changed on the key.
+const DELETE_CHANGED_ON_KEY: &str = "This entry changed on the key since the vault was opened; \
+                                     nothing was deleted. Check it and delete again.";
+
+/// The CLI's `entry delete` question, for the confirmation card.
+fn delete_entry_question(title: &str, vault: &str, key: &str) -> String {
+    format!(
+        "Delete entry \"{}\" from vault \"{}\" on {}?",
+        sanitize_title(title),
+        sanitize_title(vault),
+        sanitize_title(key)
+    )
+}
+
 pub(crate) fn vault_error_text(e: &VaultKeyError) -> String {
     let hint = match e {
         VaultKeyError::PinNotSet => "; set one on the FIDO2 tab",
@@ -825,18 +839,7 @@ pub(crate) enum SaveKind {
     Edit {
         title: Zeroizing<String>,
     },
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "deleting an entry saves through this too (not yet drawn)"
-        )
-    )]
     Delete {
-        #[cfg_attr(
-            test,
-            expect(dead_code, reason = "the delete's own line reads it (not yet drawn)")
-        )]
         title: Zeroizing<String>,
     },
     #[expect(
@@ -846,6 +849,18 @@ pub(crate) enum SaveKind {
     Import {
         chosen: usize,
     },
+}
+
+/// A destructive vault action waiting for its Yes. Keyed by credential ID /
+/// entry ID, never by name: two vaults or entries may share one.
+#[expect(
+    dead_code,
+    reason = "the vault delete and rotate confirmations come with their views"
+)]
+pub(crate) enum VaultConfirm {
+    DeleteEntry { vault: VaultRef, entry_id: String },
+    DeleteVault { vault: VaultRef },
+    Rotate { vault: VaultRef },
 }
 
 /// The unlocked vaults of one key. Reached only through
@@ -899,6 +914,8 @@ pub(crate) struct VaultState {
     pub(crate) gen: GenOptions,
     /// The generator's settings are shown under the password box.
     pub(crate) gen_open: bool,
+    /// The action waiting for its confirmation card.
+    pub(crate) confirm: Option<VaultConfirm>,
 }
 
 impl TypedSecrets for VaultState {
@@ -1142,6 +1159,7 @@ impl App {
     /// shown password hides.
     pub(crate) fn vault_select(&mut self, id: Vec<u8>) {
         self.vault.selected = Some(id);
+        self.vault.confirm = None;
         self.vault.open_entry = None;
         self.vault.revealed = None;
     }
@@ -1255,6 +1273,60 @@ impl App {
             return;
         };
         self.vault_start_save(vault, kind, change);
+    }
+
+    /// Ask before deleting entry `id` of the shown vault.
+    pub(crate) fn vault_ask_delete_entry(&mut self, id: &str) {
+        if !self.vault_writable() {
+            return;
+        }
+        let Some(v) = self.selected_vault() else {
+            return;
+        };
+        let vault = v.vault_ref.clone();
+        self.vault.confirm = Some(VaultConfirm::DeleteEntry {
+            vault,
+            entry_id: id.to_owned(),
+        });
+    }
+
+    /// The confirmed delete: the entry as the session holds it goes through
+    /// the one save path as `Change::Delete`, so a change made elsewhere is
+    /// refused. Refused while a job runs; the question stays for the next
+    /// try.
+    pub(crate) fn vault_confirm_delete_entry(&mut self) {
+        let Some(VaultConfirm::DeleteEntry { vault, entry_id }) = self.vault.confirm.as_ref()
+        else {
+            return;
+        };
+        let (vault, entry_id) = (vault.clone(), entry_id.clone());
+        if self.refuse_if_busy() {
+            return;
+        }
+        self.vault.confirm = None;
+        let before = self.vault_entry(&vault, &entry_id);
+        let Some(before) = before else {
+            return;
+        };
+        let title = Zeroizing::new(before.title.clone());
+        self.vault_start_save(vault, SaveKind::Delete { title }, Change::Delete { before });
+    }
+
+    /// Entry `id` of `vault` as the session holds it.
+    fn vault_entry(&self, vault: &VaultRef, id: &str) -> Option<Entry> {
+        self.vault_session()?
+            .unlocked
+            .vaults
+            .iter()
+            .find(|v| v.vault_ref.credential_id == vault.credential_id)?
+            .state
+            .as_ref()
+            .ok()?
+            .contents
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .cloned()
     }
 
     /// What a save job takes from the session: the vault's auth (the session
@@ -1402,8 +1474,16 @@ impl App {
                             format!("entry updated in vault \"{name}\""),
                         );
                     }
-                    // Their own lines come with the delete and import views.
-                    SaveKind::Delete { .. } | SaveKind::Import { .. } => {}
+                    SaveKind::Delete { title } => {
+                        self.vault.open_entry = None;
+                        self.vault.revealed = None;
+                        self.vault_done(
+                            format!("Entry \"{}\" deleted.", sanitize_title(title)),
+                            format!("entry deleted from vault \"{name}\""),
+                        );
+                    }
+                    // Its own line comes with the import view.
+                    SaveKind::Import { .. } => {}
                 }
                 // Every write that leaves the store nearly full says so,
                 // whatever it was.
@@ -1414,6 +1494,14 @@ impl App {
             {
                 self.log(Severity::Warn, format!("Vault: {}", job_error_text(&e)));
                 self.vault_rebase_form();
+            }
+            Err(e @ VaultJobError::Vault(VaultKeyError::Conflict))
+                if matches!(kind, SaveKind::Delete { .. }) =>
+            {
+                // The list already shows the key's entry (put back above).
+                self.log(Severity::Warn, format!("Vault: {}", job_error_text(&e)));
+                self.vault.info = None;
+                self.vault.error = Some(DELETE_CHANGED_ON_KEY.to_owned());
             }
             Err(e) => self.vault_fail(&e),
         }
@@ -1635,6 +1723,7 @@ impl App {
             self.render_entry_form(ui, p);
             return;
         }
+        self.render_vault_confirm(ui, p);
         let Some(session) = self.vault_session() else {
             return;
         };
@@ -1658,6 +1747,7 @@ impl App {
         let mut reveal: Option<Option<String>> = None;
         let mut add = false;
         let mut edit: Option<String> = None;
+        let mut delete: Option<String> = None;
         // The filter box edits a copy while the session is borrowed.
         let mut filter = std::mem::take(&mut self.vault.filter);
 
@@ -1760,6 +1850,9 @@ impl App {
                             if clicks.edit {
                                 edit = Some(e.id.clone());
                             }
+                            if clicks.delete {
+                                delete = Some(e.id.clone());
+                            }
                         }
                     }
                 });
@@ -1801,6 +1894,9 @@ impl App {
         if let Some(id) = edit {
             self.vault_edit_entry(&id);
         }
+        if let Some(id) = delete {
+            self.vault_ask_delete_entry(&id);
+        }
         if let Some((_, t)) = &self.vault.copied {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.05)));
@@ -1809,6 +1905,57 @@ impl App {
 }
 
 impl App {
+    /// The confirmation card of a waiting delete (ftotp's shape): the CLI's
+    /// question, no touch (the session's PIN does it).
+    fn render_vault_confirm(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(VaultConfirm::DeleteEntry { vault, entry_id }) = self.vault.confirm.as_ref()
+        else {
+            return;
+        };
+        let (vault, entry_id) = (vault.clone(), entry_id.clone());
+        let Some(entry) = self.vault_entry(&vault, &entry_id) else {
+            // Gone from the list (a Refresh): nothing left to ask about.
+            self.vault.confirm = None;
+            return;
+        };
+        let key = self.selected_device().map_or_else(
+            || "this key".to_owned(),
+            |d| crate::ui::device::DeviceView::title(d).into_owned(),
+        );
+        let question =
+            delete_entry_question(&entry.title, &shown_name(vault.name.as_deref()), &key);
+        let waiting = self.waiting_for().map(str::to_owned);
+        let mut confirm = false;
+        let mut cancel = false;
+        theme::card_frame(p).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.colored_label(p.err, question);
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("This cannot be undone.")
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if theme::key_button(ui, p, BtnKind::Danger, "Delete", waiting.as_deref()).clicked()
+                {
+                    confirm = true;
+                }
+                ui.add_space(6.0);
+                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        ui.add_space(10.0);
+        if confirm {
+            self.vault_confirm_delete_entry();
+        } else if cancel {
+            self.vault.confirm = None;
+        }
+    }
+
     /// The add / edit form (the mockup's): Title, Username, Password with
     /// Show and Generate, the generator's settings behind `change`, URL and
     /// Notes, then Cancel / Save.
@@ -2078,6 +2225,7 @@ struct OpenedClicks {
     /// `Some(show)`: Show or Hide was clicked.
     reveal: Option<bool>,
     edit: bool,
+    delete: bool,
 }
 
 /// The opened entry under its row: the password behind Show, the URL, the
@@ -2163,6 +2311,7 @@ fn opened_entry(ui: &mut egui::Ui, p: &Palette, e: &Entry, showing: bool) -> Ope
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 clicks.edit = theme::button(ui, p, BtnKind::Default, "Edit").clicked();
+                clicks.delete = theme::button(ui, p, BtnKind::Danger, "Delete").clicked();
                 if let Some(when) = changed_ago(e.modified_minutes, vault::now_minutes()) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
@@ -4264,5 +4413,124 @@ mod tests {
             .log
             .iter()
             .any(|l| l.severity == Severity::Warn && l.text == line));
+    }
+
+    // ----- delete an entry -----
+
+    fn delete_by_id(app: &mut App, key: &mut FakeKey, id: &str) {
+        app.vault_ask_delete_entry(id);
+        let Some(VaultConfirm::DeleteEntry { vault, entry_id }) = app.vault.confirm.take() else {
+            panic!("a delete was asked");
+        };
+        let before = app.vault_entry(&vault, &entry_id).unwrap();
+        save_into(
+            app,
+            key,
+            vault,
+            SaveKind::Delete {
+                title: Zeroizing::new(before.title.clone()),
+            },
+            Change::Delete { before },
+        );
+    }
+
+    #[test]
+    fn delete_removes_only_that_entry() {
+        let mut key = FakeKey::new();
+        let (p, ia, ib) = two_githubs(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault.open_entry = Some(ia.clone());
+        delete_by_id(&mut app, &mut key, &ia);
+        assert_eq!(app.vault.info.as_deref(), Some("Entry \"GitHub\" deleted."));
+        assert!(app.vault.open_entry.is_none());
+        let on_key = key.vault_on_key(&p).unwrap();
+        assert_eq!(on_key.entries.len(), 2);
+        assert!(on_key.entries.iter().any(|e| e.id == ib));
+        assert!(on_key.entries.iter().all(|e| e.id != ia));
+        assert_eq!(app.selected_vault().unwrap().entry_count(), Some(2));
+        assert!(app.log.iter().any(|l| l.severity == Severity::Ok
+            && l.text == "Vault: entry deleted from vault \"Personal\""));
+        assert!(app.log.iter().all(|l| !l.text.contains("GitHub")));
+    }
+
+    #[test]
+    fn delete_of_a_changed_entry_is_refused_and_reloaded() {
+        let mut key = FakeKey::new();
+        let (a, b) = (
+            login("GitHub", "alice", "pw-a"),
+            login("Bank", "alice", "pw-b"),
+        );
+        let p = key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![a.clone(), b.clone()],
+            },
+        );
+        let mut a2 = a.clone();
+        a2.password = Zeroizing::new("changed-elsewhere".into());
+        key.hook = writes_elsewhere(
+            p.clone(),
+            Vault {
+                entries: vec![a2, b],
+            },
+        );
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        delete_by_id(&mut app, &mut key, &a.id);
+        assert_eq!(
+            app.vault.error.as_deref(),
+            Some(
+                "This entry changed on the key since the vault was opened; nothing was \
+                 deleted. Check it and delete again."
+            )
+        );
+        assert!(app.vault.info.is_none());
+        assert_eq!(key.vault_on_key(&p).unwrap().entries.len(), 2);
+        assert_eq!(*session_entry(&app, "GitHub").password, "changed-elsewhere");
+        assert!(app.vault_session().unwrap().auth.is_some());
+    }
+
+    #[test]
+    fn delete_asks_no_touch() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let before = key.log.len();
+        let id = session_entry(&app, "Bank").id.clone();
+        delete_by_id(&mut app, &mut key, &id);
+        assert!(key.log[before..]
+            .iter()
+            .all(|c| !matches!(c, Call::Assertions(_) | Call::MakeCredential)));
+    }
+
+    #[test]
+    fn the_confirmation_is_the_cli_question() {
+        assert_eq!(
+            delete_entry_question("GitHub", "Personal", "yubi-test"),
+            "Delete entry \"GitHub\" from vault \"Personal\" on yubi-test?"
+        );
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        app.devices = vec![crate::tests::test_key(KEY, "AAA", Some("yubi-test"))];
+        unlock_into(&mut app, &mut key);
+        let id = session_entry(&app, "GitHub").id.clone();
+        assert!(!list_text(&mut app).contains("This cannot be undone."));
+        app.vault_ask_delete_entry(&id);
+        let text = list_text(&mut app);
+        assert!(
+            text.contains("Delete entry \"GitHub\" from vault \"Personal\" on yubi-test?"),
+            "{text}"
+        );
+        assert!(text.contains("This cannot be undone.") && text.contains("Cancel"));
+        // Another vault's chip closes the question.
+        let w = app.vault_session().unwrap().unlocked.vaults[1]
+            .vault_ref
+            .credential_id
+            .clone();
+        app.vault_select(w);
+        assert!(app.vault.confirm.is_none());
     }
 }
