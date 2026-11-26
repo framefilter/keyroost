@@ -650,6 +650,8 @@ enum Reread {
     LargeBlobs,
     /// The FIDO2 key's info (PIN state, options).
     FidoInfo,
+    /// The unlocked vaults, with the secrets held (no PIN, no touch).
+    Vault,
     /// Nothing to read (a password-locked Authenticator).
     Nothing,
 }
@@ -2140,6 +2142,49 @@ fn key_firmware(
     };
     let version = (init.device_major, init.device_minor, init.device_build);
     keyroost_resolve::firmware::key_firmware(path, version, serial, reader, false)
+}
+
+/// The permissions of the FIDO2 tab's session token: credential management,
+/// plus bio enrollment when the key supports it, so the one cached token
+/// authorizes both passkey management and fingerprint operations. Only
+/// advertised bits are asked for, since an unsupported permission would make
+/// the whole request fail.
+fn fido_session_permissions(info: &keyroost_ctap::AuthenticatorInfo) -> u32 {
+    let mut perms = keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT;
+    if info.option("bioEnroll").is_some() || info.option("userVerificationMgmtPreview").is_some() {
+        perms |= keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT;
+    }
+    perms
+}
+
+/// Run a FIDO2 session operation with the session's token; when the key
+/// refuses that token (`0x33`: another program, such as a vault job, took a
+/// newer one, which ends the old one), ask once for a new token with the held
+/// PIN and run it again. Returns the result and the token that worked. A
+/// second refusal is the caller's error, which locks the session.
+fn with_session_token<D, T>(
+    dev: &mut D,
+    info: &keyroost_ctap::AuthenticatorInfo,
+    token: PinUvAuthToken,
+    pin: &str,
+    mut op: impl FnMut(&mut D, &PinUvAuthToken) -> Result<T, keyroost_ctap::CtapError>,
+) -> Result<(T, PinUvAuthToken), keyroost_ctap::CtapError>
+where
+    D: keyroost_ctap::transport::CtapTransport,
+{
+    match op(dev, &token) {
+        Err(keyroost_ctap::CtapError::StatusCode(0x33)) => {
+            let fresh = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+                dev,
+                pin,
+                info,
+                fido_session_permissions(info),
+            )?;
+            let out = op(dev, &fresh)?;
+            Ok((out, fresh))
+        }
+        other => other.map(|out| (out, token)),
+    }
 }
 
 /// Shared device-binding guard for background-job completions and modal
@@ -7078,14 +7123,23 @@ impl App {
         if self.refuse_if_busy() {
             return;
         }
-        let Some(target) = self.selected_fido_target() else {
+        if self.selected_fido_target().is_none() {
             return;
-        };
+        }
         let pin = std::mem::take(&mut self.security_keys.pin_input);
         if pin.is_empty() {
             self.security_keys.error = Some("PIN is empty".into());
             return;
         }
+        self.unlock_fido_with(pin);
+    }
+
+    /// Unlock the FIDO2 tab with `pin`: the typed one, or the one the Vault
+    /// tab's unlock just had accepted (one PIN entry serves both tabs).
+    fn unlock_fido_with(&mut self, pin: zeroize::Zeroizing<String>) {
+        let Some(target) = self.selected_fido_target() else {
+            return;
+        };
         let for_device = self.selected_device.clone();
         self.spawn_job("Unlocking\u{2026}", move || {
             let result = Self::open_and_unlock(&target, &pin);
@@ -7154,18 +7208,12 @@ impl App {
         if info.force_pin_change == Some(true) {
             return Err(Box::new(ForcedPinChange));
         }
-        // Request credential-management permission, plus bio-enrollment when the
-        // key supports it, so the one cached session token authorizes both
-        // passkey management and fingerprint operations. Permissions are a
-        // bitmask; only OR in BIO_ENROLLMENT when advertised, since asking for an
-        // unsupported permission would make the whole unlock fail.
-        let mut perms = keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT;
-        if info.option("bioEnroll").is_some()
-            || info.option("userVerificationMgmtPreview").is_some()
-        {
-            perms |= keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT;
-        }
-        let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(&mut dev, pin, &info, perms)?;
+        let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+            &mut dev,
+            pin,
+            &info,
+            fido_session_permissions(&info),
+        )?;
         // Hand the manager a clone and keep `token` for the cached session; the
         // token stays valid for the device session, so this avoids a redundant
         // second PIN/ECDH exchange just to rebuild it.
@@ -7236,6 +7284,7 @@ impl App {
     /// is one list, shared with the wipe.
     fn holds_unlocked_secrets(&mut self) -> bool {
         self.security_keys.session.is_some()
+            || self.vault.session.is_some()
             || self.typed_secrets().iter().any(|s| !s.is_empty())
             || self.holds_opened_secrets()
             || self.oath.unlocked_password.is_some()
@@ -7345,6 +7394,9 @@ impl App {
         if self.security_keys.session.is_some() {
             self.lock_session();
             self.security_keys.error = Some(idle_locked_msg());
+        }
+        if self.vault.session.is_some() {
+            self.vault_lock(Some(idle_locked_msg()));
         }
         if self.security_keys.change_pin.has_pin_input() {
             // Replacing the form wipes its PINs (ChangePinDialog's Drop).
@@ -7557,21 +7609,37 @@ impl App {
         pin: zeroize::Zeroizing<String>,
     ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
         let (mut dev, _cbor, _init) = open_fido(target)?;
-        let info = keyroost_ctap::get_info(&mut dev)?;
-        let mut mgr =
-            keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token.clone(), &info)?;
-        let metadata = mgr.metadata()?;
-        let parties = mgr.list_relying_parties()?;
-        let mut rps = Vec::with_capacity(parties.len());
-        for rp in parties {
-            // A `None` hash marks an entry whose rpIdHash came back malformed:
-            // list nothing rather than query against a wrong key.
-            let creds = match rp.rp_id_hash {
-                Some(hash) => mgr.list_credentials(&hash).unwrap_or_default(),
-                None => Vec::new(),
-            };
-            rps.push((rp, creds));
-        }
+        Self::refresh_on(&mut dev, token, pin)
+    }
+
+    /// [`Self::refresh_with_token`] on an open device. A token another
+    /// program ended is replaced once ([`with_session_token`]); the session
+    /// returned keeps the token that worked.
+    fn refresh_on(
+        dev: &mut impl keyroost_ctap::transport::CtapTransport,
+        token: PinUvAuthToken,
+        pin: zeroize::Zeroizing<String>,
+    ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
+        let info = keyroost_ctap::get_info(dev)?;
+        let ((metadata, rps), token) =
+            with_session_token(dev, &info, token, &pin, |dev, token| {
+                let mut mgr =
+                    keyroost_ctap::cred_mgmt::CredentialManager::new(dev, token.clone(), &info)?;
+                let metadata = mgr.metadata()?;
+                let parties = mgr.list_relying_parties()?;
+                let mut rps = Vec::with_capacity(parties.len());
+                for rp in parties {
+                    // A `None` hash marks an entry whose rpIdHash came back
+                    // malformed: list nothing rather than query against a wrong
+                    // key.
+                    let creds = match rp.rp_id_hash {
+                        Some(hash) => mgr.list_credentials(&hash).unwrap_or_default(),
+                        None => Vec::new(),
+                    };
+                    rps.push((rp, creds));
+                }
+                Ok((metadata, rps))
+            })?;
         Ok(UnlockedSession {
             token,
             metadata,
@@ -8034,17 +8102,16 @@ impl App {
             return;
         };
         let token = session.token.clone();
-        // The refresh after delete needs its own token; clone for the chained op.
-        let token_refresh = token.clone();
-        let pin_refresh = session.pin.clone();
+        let pin = session.pin.clone();
         let for_device = self.selected_device.clone();
         self.spawn_job("Deleting credential\u{2026}", move || {
             // Delete, then re-list in the same job so the UI updates atomically.
-            // `deleted`: the passkey is gone, whatever the re-list says.
-            let deleted = Self::try_delete(&target, token, &cred_id);
+            // `deleted`: the passkey is gone, whatever the re-list says. The
+            // re-list uses the token the delete worked with.
+            let deleted = Self::try_delete(&target, token, &pin, &cred_id);
             let wrote = deleted.is_ok();
             let result = deleted
-                .and_then(|()| Self::refresh_with_token(&target, token_refresh, pin_refresh))
+                .and_then(|token| Self::refresh_with_token(&target, token, pin))
                 .map_err(SessionOpError::from_boxed);
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
@@ -8068,16 +8135,31 @@ impl App {
         });
     }
 
+    /// Delete one passkey; returns the token that worked (a token another
+    /// program ended is replaced once, [`with_session_token`]).
     fn try_delete(
         target: &FidoTarget,
         token: PinUvAuthToken,
+        pin: &str,
         cred_id: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<PinUvAuthToken, Box<dyn std::error::Error>> {
         let (mut dev, _cbor, _init) = open_fido(target)?;
-        let info = keyroost_ctap::get_info(&mut dev)?;
-        let mut mgr = keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
-        mgr.delete(cred_id)?;
-        Ok(())
+        Self::delete_on(&mut dev, token, pin, cred_id)
+    }
+
+    /// [`Self::try_delete`] on an open device.
+    fn delete_on(
+        dev: &mut impl keyroost_ctap::transport::CtapTransport,
+        token: PinUvAuthToken,
+        pin: &str,
+        cred_id: &[u8],
+    ) -> Result<PinUvAuthToken, Box<dyn std::error::Error>> {
+        let info = keyroost_ctap::get_info(dev)?;
+        let ((), token) = with_session_token(dev, &info, token, pin, |dev, token| {
+            keyroost_ctap::cred_mgmt::CredentialManager::new(dev, token.clone(), &info)?
+                .delete(cred_id)
+        })?;
+        Ok(token)
     }
 
     /// Extract and save the OpenSSH certificate stored in an SSH credential's
@@ -8196,23 +8278,30 @@ impl App {
         }
         self.spawn_job("Changing PIN\u{2026}", move || {
             let result = Self::try_change_pin(&target, &old, &new).map_err(|e| e.to_string());
-            Box::new(move |app: &mut App| match result {
-                Ok(()) => {
-                    app.log(Severity::Ok, "FIDO2 PIN changed");
-                    app.security_keys.change_pin.open = false;
-                    app.security_keys.error = None;
-                    // Force re-unlock with the new PIN, and clear a cached
-                    // forcePINChange flag so the next unlock isn't diverted
-                    // back into this form after the key has accepted the change.
-                    app.lock_session();
-                    app.fetch_selected_info();
-                }
-                Err(e) => {
-                    app.log(Severity::Err, format!("FIDO2: change PIN failed: {e}"));
-                    app.security_keys.error = Some(format!("change PIN failed: {}", e));
-                }
-            })
+            Box::new(move |app: &mut App| app.apply_pin_changed(result))
         });
+    }
+
+    /// The end of a PIN change.
+    fn apply_pin_changed(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.log(Severity::Ok, "FIDO2 PIN changed");
+                self.security_keys.change_pin.open = false;
+                self.security_keys.error = None;
+                // Force re-unlock with the new PIN, and clear a cached
+                // forcePINChange flag so the next unlock isn't diverted
+                // back into this form after the key has accepted the change.
+                // The vault was opened with the old PIN: it locks too.
+                self.lock_session();
+                self.vault_lock(None);
+                self.fetch_selected_info();
+            }
+            Err(e) => {
+                self.log(Severity::Err, format!("FIDO2: change PIN failed: {e}"));
+                self.security_keys.error = Some(format!("change PIN failed: {}", e));
+            }
+        }
     }
 
     fn try_change_pin(
@@ -8352,6 +8441,8 @@ impl App {
                 app.security_keys.session = None;
                 app.security_keys.info = None;
                 app.security_keys.error = None;
+                // The reset wiped every vault with the passkeys.
+                app.vault_lock(None);
                 // When this reset was a factory reset's finale, record it —
                 // the Overview report is where the user is looking, and the
                 // activity log, where the permanent record lives.
@@ -10299,6 +10390,12 @@ impl App {
         if self.security_keys.fp_progress.is_some() {
             return None;
         }
+        // A vault job counts its touches ("Touch your key (1 of 2)…").
+        if self.busy() {
+            if let Some(text) = self.vault.progress.lock().ok().and_then(|t| t.clone()) {
+                return Some(text);
+            }
+        }
         touch_prompt(
             self.busy_label.as_deref(),
             self.busy(),
@@ -11857,8 +11954,9 @@ impl App {
                 FidoSubview::Fingerprints if self.fido_session().is_some() => Reread::Fingerprints,
                 _ => Reread::FidoInfo,
             },
-            // The key's info decides whether a vault is offered; the
-            // vault itself is read by its own Unlock.
+            // Unlocked, the vaults are read again; locked, the key's info
+            // (which decides whether a vault is offered) is what there is.
+            CapTab::Vault if self.vault_session().is_some() => Reread::Vault,
             CapTab::Overview | CapTab::Vault => Reread::FidoInfo,
         }
     }
@@ -11879,6 +11977,7 @@ impl App {
                 self.load_large_blobs();
             }
             Reread::FidoInfo => self.fetch_selected_info(),
+            Reread::Vault => self.vault_refresh(),
             Reread::Nothing => {}
         }
     }
@@ -12203,8 +12302,9 @@ impl App {
         // Replaced whole: its typed seed, shown codes and pending delete
         // confirmation all belong to the key that was selected.
         self.ftotp = FtotpState::default();
-        // So is the Vault tab's.
-        self.vault = VaultState::default();
+        // So is the Vault tab's: locked and rebuilt, keeping only the touch
+        // prompt of a vault job still running on the key left.
+        self.vault_lock(None);
         self.molto_reset_confirm = false;
         self.molto_delete_confirm = false;
         self.close_rename();
@@ -19936,6 +20036,13 @@ impl App {
     /// Overview's own [`Self::fido_non_admin`].
     fn vault_overview_card(&mut self, ui: &mut egui::Ui, p: &Palette, non_admin: bool) {
         let offer = self.vault_offer_with(non_admin);
+        // A failed read says "Reading key…" here, as the FIDO2 card above it
+        // does; unlocked, what the vaults hold.
+        let line = vault_pane::overview_line(
+            offer,
+            false,
+            self.vault_session().map(|s| s.unlocked.vaults.as_slice()),
+        );
         theme::card_frame(p).show(ui, |ui| {
             if matches!(offer, VaultOffer::No(_)) {
                 ui.set_min_width(ui.available_width());
@@ -19950,17 +20057,13 @@ impl App {
                 theme::pill(ui, "Administrator rights needed", p.warn, p.warn_soft());
                 ui.add_space(6.0);
             }
-            ui.label(
-                // A failed read says "Reading key…" here, as the FIDO2
-                // card above it does.
-                egui::RichText::new(vault_pane::overview_line(offer, false, None))
-                    .font(theme::f_reg(13.0))
-                    .color(if offer == VaultOffer::Unknown {
-                        p.txt3
-                    } else {
-                        p.txt2
-                    }),
-            );
+            ui.label(egui::RichText::new(line).font(theme::f_reg(13.0)).color(
+                if offer == VaultOffer::Unknown {
+                    p.txt3
+                } else {
+                    p.txt2
+                },
+            ));
         });
     }
 
@@ -34575,7 +34678,7 @@ mod tests {
         assert_eq!(m.result, Some(Err("wrong admin PIN".into())));
     }
 
-    fn test_key(id: &str, serial: &str, name: Option<&str>) -> Device {
+    pub(crate) fn test_key(id: &str, serial: &str, name: Option<&str>) -> Device {
         Device {
             id: id.into(),
             name: name.map(str::to_owned),
@@ -35129,6 +35232,194 @@ mod tests {
             "Lock pressed mid-refresh stays locked"
         );
         assert!(app.security_keys.session_device.is_none());
+    }
+
+    /// A FIDO2 key for the session-token tests: getInfo, PIN tokens (PIN
+    /// protocol one) issued against the platform's key agreement, and
+    /// credential management that refuses the first `stale` calls with
+    /// `0x33`, as a key does once another program (the Vault tab) took a
+    /// newer token.
+    struct TokenKey {
+        agreement: keyroost_ctap::pin::EphemeralKey,
+        stale: usize,
+        /// Every token issued, in order.
+        issued: Vec<Vec<u8>>,
+        /// `(subcommand, pinUvAuthParam)` of every credential-management call.
+        cm_calls: Vec<(u64, Vec<u8>)>,
+    }
+
+    impl TokenKey {
+        fn new(stale: usize) -> Self {
+            TokenKey {
+                agreement: keyroost_ctap::pin::EphemeralKey::generate().unwrap(),
+                stale,
+                issued: Vec::new(),
+                cm_calls: Vec::new(),
+            }
+        }
+    }
+
+    impl keyroost_ctap::transport::CtapTransport for TokenKey {
+        fn transact(
+            &mut self,
+            _cmd: u8,
+            payload: &[u8],
+        ) -> Result<Vec<u8>, keyroost_ctap::CtapError> {
+            use keyroost_ctap::cbor::{self, Value};
+            use keyroost_ctap::pin::PinProtocol as _;
+            let ok = |v: Value| {
+                let mut r = vec![0x00];
+                r.extend(cbor::encode(&v));
+                Ok(r)
+            };
+            let req = || cbor::decode(&payload[1..]).unwrap().0;
+            let text = |s: &str| Value::Text(s.into());
+            match payload[0] {
+                // getInfo
+                0x04 => ok(Value::Map(vec![
+                    (
+                        Value::UInt(1),
+                        Value::Array(vec![text("FIDO_2_0"), text("FIDO_2_1")]),
+                    ),
+                    (Value::UInt(3), Value::Bytes(vec![0x11; 16])),
+                    (
+                        Value::UInt(4),
+                        Value::Map(vec![
+                            (text("clientPin"), Value::Bool(true)),
+                            (text("pinUvAuthToken"), Value::Bool(true)),
+                            (text("credMgmt"), Value::Bool(true)),
+                        ]),
+                    ),
+                    (Value::UInt(6), Value::Array(vec![Value::UInt(1)])),
+                ])),
+                // clientPin
+                0x06 => {
+                    let req = req();
+                    match req.get_uint_key(2).and_then(Value::as_uint) {
+                        // getKeyAgreement
+                        Some(2) => {
+                            let (x, y) = self.agreement.public_xy();
+                            ok(Value::Map(vec![(
+                                Value::UInt(1),
+                                Value::Map(vec![
+                                    (Value::UInt(1), Value::UInt(2)),
+                                    (Value::UInt(3), Value::NInt(24)),
+                                    (Value::NInt(0), Value::UInt(1)),
+                                    (Value::NInt(1), Value::Bytes(x.to_vec())),
+                                    (Value::NInt(2), Value::Bytes(y.to_vec())),
+                                ]),
+                            )]))
+                        }
+                        // getPinUvAuthTokenUsingPinWithPermissions
+                        Some(9) => {
+                            let cose = req.get_uint_key(3).unwrap().as_map().unwrap();
+                            let coord = |n: u64| -> [u8; 32] {
+                                let (_, v) =
+                                    cose.iter().find(|(k, _)| *k == Value::NInt(n)).unwrap();
+                                v.as_bytes().unwrap().try_into().unwrap()
+                            };
+                            let secret = self
+                                .agreement
+                                .shared_secret_v1(&coord(1), &coord(2))
+                                .unwrap();
+                            let token = vec![0x50 + self.issued.len() as u8; 16];
+                            let enc = keyroost_ctap::pin::ProtocolV1 { secret }
+                                .encrypt(&token)
+                                .unwrap();
+                            self.issued.push(token);
+                            ok(Value::Map(vec![(Value::UInt(2), Value::Bytes(enc))]))
+                        }
+                        other => panic!("unexpected clientPin subcommand {other:?}"),
+                    }
+                }
+                // credentialManagement
+                0x0A => {
+                    let req = req();
+                    let sub = req.get_uint_key(1).and_then(Value::as_uint).unwrap();
+                    let param = req.get_uint_key(4).and_then(Value::as_bytes).unwrap();
+                    self.cm_calls.push((sub, param.to_vec()));
+                    if self.stale > 0 {
+                        self.stale -= 1;
+                        return Ok(vec![0x33]);
+                    }
+                    match sub {
+                        // getCredsMetadata
+                        1 => ok(Value::Map(vec![
+                            (Value::UInt(1), Value::UInt(3)),
+                            (Value::UInt(2), Value::UInt(22)),
+                        ])),
+                        // enumerateRPsBegin: none
+                        2 => Ok(vec![0x2E]),
+                        // deleteCredential
+                        6 => Ok(vec![0x00]),
+                        other => panic!("unexpected credMgmt subcommand {other}"),
+                    }
+                }
+                other => panic!("unexpected command {other:#04x}"),
+            }
+        }
+    }
+
+    fn token_of(bytes: &[u8]) -> PinUvAuthToken {
+        PinUvAuthToken {
+            protocol: 1,
+            token: bytes.to_vec(),
+        }
+    }
+
+    /// A vault job takes a fresh token, which ends the FIDO2 tab's: its next
+    /// Refresh or Delete gets `0x33`. It asks for a new token with the held
+    /// PIN once and goes on; only a second refusal locks the tab.
+    #[test]
+    fn fido2_refresh_survives_a_vault_token() {
+        let old = token_of(&[0x01; 16]);
+        let mut key = TokenKey::new(1);
+        let pin = zeroize::Zeroizing::new("123456".to_owned());
+        let fresh =
+            App::refresh_on(&mut key, old.clone(), pin.clone()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(key.issued.len(), 1, "one new token");
+        assert_eq!(
+            fresh.token.token, key.issued[0],
+            "the session keeps the one that worked"
+        );
+        assert_eq!(fresh.metadata.existing_count, 3);
+        // The retried call is signed with the new token.
+        assert_eq!(key.cm_calls[0].1, old.authenticate(&[0x01]));
+        assert_eq!(
+            key.cm_calls[1].1,
+            token_of(&key.issued[0]).authenticate(&[0x01])
+        );
+
+        // Refused again with the new token: the error reaches the tab, which locks.
+        let mut key = TokenKey::new(2);
+        let err = App::refresh_on(&mut key, old.clone(), pin.clone())
+            .err()
+            .expect("a second refusal is an error");
+        let err = SessionOpError::from_boxed(err);
+        assert!(err.relock);
+        let id: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(id.clone()),
+            ..Default::default()
+        };
+        app.security_keys.session = Some(unlocked_session(1));
+        app.security_keys.session_device = Some(id.clone());
+        app.apply_refreshed_session(Some(id), Err(err));
+        assert!(app.security_keys.session.is_none());
+
+        // Delete retries the same way and hands the working token on.
+        let mut key = TokenKey::new(1);
+        let used = App::delete_on(&mut key, old.clone(), &pin, &[0xAB; 8])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(used.token, key.issued[0]);
+        assert_eq!(key.cm_calls.len(), 2);
+        assert!(key.cm_calls.iter().all(|(sub, _)| *sub == 6));
+
+        // A token that still works is kept, and no PIN is sent.
+        let mut key = TokenKey::new(0);
+        let fresh = App::refresh_on(&mut key, old.clone(), pin).unwrap_or_else(|e| panic!("{e}"));
+        assert!(key.issued.is_empty());
+        assert_eq!(fresh.token.token, old.token);
     }
 
     /// Selecting another device closes (and thereby zeroizes) the dialog.
