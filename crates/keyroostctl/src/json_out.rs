@@ -564,21 +564,23 @@ pub(crate) struct FidoCredentialJson {
 /// `keyroostctl fido --json credential compare` — resident credentials on two
 /// keys compared by (relying-party ID, user handle). Credential IDs always
 /// differ between keys, so they are not part of the comparison and not shown.
-/// The groups hold distinct identities; `a_total`/`b_total` are the readable
-/// entry counts, as `fido credential list` counts them. Relying parties whose
-/// `rpIdHash` came back malformed can't be listed, so their credentials are
-/// neither compared nor counted in the totals; per-side RP counts go in
-/// `a_unavailable_rps`/`b_unavailable_rps`.
+/// The three groups hold distinct identities (`on_both` shows key A's entry);
+/// `total_a`/`total_b` are the readable entry counts, as `fido credential
+/// list` counts them. Relying parties whose `rpIdHash` came back malformed
+/// can't be listed, so their credentials are neither compared nor counted in
+/// the totals; per-side counts go in `unavailable_relying_parties_a`/`_b`.
+/// The side is a suffix, as OpenPGP's `_sig`/`_dec`/`_aut` fields are.
 #[derive(Serialize)]
 pub(crate) struct FidoCredCompareJson {
     pub only_on_a: Vec<FidoCredCompareEntryJson>,
     pub only_on_b: Vec<FidoCredCompareEntryJson>,
-    pub a_total: usize,
-    pub b_total: usize,
+    pub on_both: Vec<FidoCredCompareEntryJson>,
+    pub total_a: usize,
+    pub total_b: usize,
     /// Relying parties skipped on each key (malformed `rpIdHash`, as
     /// `fido credential list` reports them).
-    pub a_unavailable_rps: usize,
-    pub b_unavailable_rps: usize,
+    pub unavailable_relying_parties_a: usize,
+    pub unavailable_relying_parties_b: usize,
 }
 
 /// One resident credential in the `credential compare` output.
@@ -586,7 +588,8 @@ pub(crate) struct FidoCredCompareJson {
 pub(crate) struct FidoCredCompareEntryJson {
     pub rp_id: String,
     pub rp_name: Option<String>,
-    /// The user handle, rendered as UTF-8 (lossy), as the human prints it.
+    /// The user handle as lowercase hex: most handles are random bytes, and
+    /// a lossy UTF-8 rendering could make two different handles look alike.
     pub user_id: String,
     pub user_name: Option<String>,
     pub user_display_name: Option<String>,
@@ -1406,57 +1409,46 @@ mod tests {
 
     #[test]
     fn creds_compare_shape() {
+        let entry = |rp: &str, user_id: &str| FidoCredCompareEntryJson {
+            rp_id: rp.into(),
+            rp_name: Some("Example".into()),
+            user_id: user_id.into(),
+            user_name: Some("n".into()),
+            user_display_name: None,
+        };
         let v = to_v(&FidoCredCompareJson {
-            only_on_a: vec![FidoCredCompareEntryJson {
-                rp_id: "example.com".into(),
-                rp_name: Some("Example".into()),
-                user_id: "u".into(),
-                user_name: Some("n".into()),
-                user_display_name: None,
-            }],
-            only_on_b: vec![FidoCredCompareEntryJson {
-                rp_id: "other.example".into(),
-                rp_name: None,
-                user_id: "v".into(),
-                user_name: None,
-                user_display_name: None,
-            }],
-            a_total: 2,
-            b_total: 1,
-            a_unavailable_rps: 1,
-            b_unavailable_rps: 0,
+            only_on_a: vec![entry("example.com", "75")],
+            only_on_b: vec![entry("other.example", "76")],
+            on_both: vec![entry("both.example", "77")],
+            total_a: 2,
+            total_b: 2,
+            unavailable_relying_parties_a: 1,
+            unavailable_relying_parties_b: 0,
         });
         assert_shape(
             &v,
             &[
                 ("only_on_a", "array"),
                 ("only_on_b", "array"),
-                ("a_total", "number"),
-                ("b_total", "number"),
-                ("a_unavailable_rps", "number"),
-                ("b_unavailable_rps", "number"),
+                ("on_both", "array"),
+                ("total_a", "number"),
+                ("total_b", "number"),
+                ("unavailable_relying_parties_a", "number"),
+                ("unavailable_relying_parties_b", "number"),
             ],
         );
-        assert_shape(
-            &v["only_on_a"][0],
-            &[
-                ("rp_id", "string"),
-                ("rp_name", "string|null"),
-                ("user_id", "string"),
-                ("user_name", "string|null"),
-                ("user_display_name", "string|null"),
-            ],
-        );
-        assert_shape(
-            &v["only_on_b"][0],
-            &[
-                ("rp_id", "string"),
-                ("rp_name", "string|null"),
-                ("user_id", "string"),
-                ("user_name", "string|null"),
-                ("user_display_name", "string|null"),
-            ],
-        );
+        for group in ["only_on_a", "only_on_b", "on_both"] {
+            assert_shape(
+                &v[group][0],
+                &[
+                    ("rp_id", "string"),
+                    ("rp_name", "string|null"),
+                    ("user_id", "string"),
+                    ("user_name", "string|null"),
+                    ("user_display_name", "string|null"),
+                ],
+            );
+        }
     }
 
     #[test]

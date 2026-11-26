@@ -16673,17 +16673,18 @@ fn run_fido_creds_compare(args: FidoCredCompareArgs<'_>) -> Result<(), Box<dyn s
         let entry = |c: &CompareCred| json_out::FidoCredCompareEntryJson {
             rp_id: c.rp_id.clone(),
             rp_name: c.rp_name.clone(),
-            user_id: String::from_utf8_lossy(&c.user_id).into_owned(),
+            user_id: hex_encode(&c.user_id),
             user_name: c.user_name.clone(),
             user_display_name: c.user_display_name.clone(),
         };
         emit_json(&json_out::FidoCredCompareJson {
             only_on_a: only_a.iter().map(|c| entry(c)).collect(),
             only_on_b: only_b.iter().map(|c| entry(c)).collect(),
-            a_total: creds_a.len(),
-            b_total: creds_b.len(),
-            a_unavailable_rps: unavail_a,
-            b_unavailable_rps: unavail_b,
+            on_both: on_both.iter().map(|c| entry(c)).collect(),
+            total_a: creds_a.len(),
+            total_b: creds_b.len(),
+            unavailable_relying_parties_a: unavail_a,
+            unavailable_relying_parties_b: unavail_b,
         })?;
         return Ok(());
     }
