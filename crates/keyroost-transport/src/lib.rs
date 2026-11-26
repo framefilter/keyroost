@@ -1523,46 +1523,21 @@ pub(crate) fn card_is_utrust(card: &Card) -> bool {
         .is_ok_and(|status| keyroost_piv::fingerprint::atr_names_utrust(status.atr()))
 }
 
-/// A reader's serial number as its driver gives it (PC/SC's
-/// `VENDOR_IFD_SERIAL_NO`, for a USB reader the device's USB serial number
-/// string) when it is one: the text up to the first NUL, trimmed, all
-/// printable ASCII with a letter or digit in it. `None` otherwise: Windows
-/// answers `?` for a device with no serial string.
-fn reader_serial_text(raw: &[u8]) -> Option<String> {
-    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    let text = core::str::from_utf8(&raw[..end]).ok()?.trim();
-    (text.bytes().all(|b| b.is_ascii_graphic()) && text.bytes().any(|b| b.is_ascii_alphanumeric()))
-        .then(|| text.to_owned())
-}
-
-/// The serial number of the uTrust FIDO2 key on `card`, read from the two
-/// places Identiv's own program reads one, whichever the key has:
+/// The serial number of the uTrust FIDO2 key on `card`, read from the key
+/// itself: the card manager's CPLC data
+/// ([`keyroost_piv::fingerprint::parse_utrust_serial`]). The card manager
+/// is selected and asked, both GlobalPlatform's own commands, as
+/// Identiv/Hirsch's uTrust FIDO2 Technical Manual describes; it stays
+/// selected.
 ///
-/// 1. The reader's serial number ([`reader_serial_text`]), which is the
-///    key's USB serial number string. A key that has one is known by it
-///    over its FIDO interface already, so the card side shows the same.
-///    No card command is sent for it.
-/// 2. Else the card manager's CPLC data
-///    ([`keyroost_piv::fingerprint::parse_utrust_serial`]): the card
-///    manager is selected and asked, both GlobalPlatform's own commands,
-///    and it stays selected.
+/// The reader's own serial number (PC/SC's `VENDOR_IFD_SERIAL_NO`) is never
+/// taken for it: on a separate reader (a contactless one, say) that is the
+/// reader's serial, and every uTrust key placed on it would get the same.
 ///
-/// `None` when neither gives a serial.
+/// `None` when the read gives no serial.
 fn read_utrust_serial(card: &Card, trace: bool) -> Option<String> {
     use keyroost_piv::fingerprint;
     let note = probe_note_if(trace);
-    let mut buf = [0u8; 256];
-    let usb = card
-        .get_attribute(Attribute::VendorIfdSerialNo, &mut buf)
-        .ok()
-        .and_then(reader_serial_text);
-    if let Some(sn) = usb {
-        note(&format!(
-            "utrust serial (reader's usb serial) -> {:?}",
-            abbreviate(&sn)
-        ));
-        return Some(sn);
-    }
     let select = keyroost_piv::select_by_aid(&fingerprint::GLOBAL_PLATFORM_ISD_AID);
     match transmit_apdu(card, &select) {
         Ok((_, s1, s2)) if sw_ok(s1, s2) => {}
@@ -2185,11 +2160,10 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                     probe.serial = serial;
                 }
             }
-            // An Identiv/Hirsch uTrust FIDO2 key's serial, the one Identiv's
-            // own program shows, read where that program reads it. The key
-            // measured has no USB serial string, no OATH or OpenPGP applet
-            // and a PIV applet that gives no serial, so without this it has
-            // none.
+            // An Identiv/Hirsch uTrust FIDO2 key's serial, from its card
+            // manager's CPLC data. The key measured has no USB serial
+            // string, no OATH or OpenPGP applet and a PIV applet that gives
+            // no serial, so without this it has none.
             if probe.serial.is_none() && card_is_utrust(&card) {
                 probe.serial = read_utrust_serial(&card, trace);
             }
@@ -2948,37 +2922,6 @@ mod reader_poll_tests {
             &names(&["A 00 00"]),
             &names(&["B 00 00"])
         ));
-    }
-}
-
-#[cfg(test)]
-mod reader_serial_tests {
-    use super::reader_serial_text;
-
-    #[test]
-    fn a_usb_serial_string_is_a_reader_serial() {
-        assert_eq!(
-            reader_serial_text(b"53001234567890").as_deref(),
-            Some("53001234567890")
-        );
-        // The driver may end it with a NUL and pad it.
-        assert_eq!(
-            reader_serial_text(b"AB-12 \0\0\0").as_deref(),
-            Some("AB-12")
-        );
-    }
-
-    #[test]
-    fn what_a_driver_gives_for_no_serial_is_none() {
-        // Windows' CCID driver, for a uTrust FIDO2 NFC key, which has no
-        // USB serial string.
-        assert_eq!(reader_serial_text(b"?"), None);
-        assert_eq!(reader_serial_text(b""), None);
-        assert_eq!(reader_serial_text(b"\0\0\0\0"), None);
-        assert_eq!(reader_serial_text(b"   "), None);
-        // Not text, or text with a gap in it.
-        assert_eq!(reader_serial_text(&[0xFF, 0xFE, 0x01]), None);
-        assert_eq!(reader_serial_text(b"AB 12"), None);
     }
 }
 
