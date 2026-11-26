@@ -3160,7 +3160,7 @@ const PASSPHRASES_DIFFER: &str = "the two passphrases don't match";
 const PASSPHRASE_NOTE: &str = "At least 10 characters. Without it, the backup can't be opened.";
 
 /// The button that backs the shown vault up to a file.
-const EXPORT_BUTTON: &str = "Export backup\u{2026}";
+pub(crate) const EXPORT_BUTTON: &str = "Export backup\u{2026}";
 
 /// Export backup… pressed while the save dialog of an earlier one is
 /// still open.
@@ -4350,12 +4350,9 @@ pub(crate) fn is_vault_passkey(rp_id: &str) -> bool {
     rp_id == keyroost_vault::RP_ID
 }
 
-/// The question before a vault's passkey is deleted on the FIDO2 tab.
-const PASSKEY_DELETE_QUESTION: &str = "Delete this passkey? This cannot be undone.";
-
-/// Under [`PASSKEY_DELETE_QUESTION`]: the vault the passkey unlocks (`name`
-/// when the vault session or the passkey list knows it) and what deleting
-/// it loses, in the Storage tab's words.
+/// What the FIDO2 tab's delete question adds for a vault's passkey: the
+/// vault it unlocks (`name` when the vault session or the passkey list
+/// knows it) and what deleting it loses, in the Storage tab's words.
 pub(crate) fn vault_passkey_warning(name: Option<&str>) -> String {
     let which = match name {
         Some(n) => format!("password vault \"{}\"", sanitize_title(n)),
@@ -4366,6 +4363,10 @@ pub(crate) fn vault_passkey_warning(name: Option<&str>) -> String {
          export a backup first."
     )
 }
+
+/// Export backup… on a vault passkey's question while the vault isn't
+/// unlocked here any more.
+const PASSKEY_EXPORT_LOCKED: &str = "Unlock the vault on the Vault tab to export a backup of it.";
 
 /// Why the vault locked after its passkey was deleted on the FIDO2 tab.
 fn passkey_deleted_text(name: Option<&str>) -> String {
@@ -4382,7 +4383,7 @@ fn passkey_deleted_text(name: Option<&str>) -> String {
 impl App {
     /// The name of the vault passkey `credential_id` unlocks: the unlocked
     /// vault's, else the one its user handle carries in the passkey list.
-    fn vault_passkey_name(&self, credential_id: &[u8]) -> Option<String> {
+    pub(crate) fn vault_passkey_name(&self, credential_id: &[u8]) -> Option<String> {
         let name = match self.session_vault(credential_id) {
             Some(v) => v.vault_ref.name.clone(),
             None => self
@@ -4399,81 +4400,43 @@ impl App {
         name.filter(|n| !n.is_empty())
     }
 
-    /// The confirmation card of a vault passkey's Remove, under the passkey
-    /// list: which vault it unlocks and that its entries go with it, with
-    /// Export backup… first while that vault is unlocked. The passkey to
-    /// delete once confirmed; a click refused while a job runs keeps the
-    /// question. A passkey no longer listed drops it.
-    pub(crate) fn render_vault_passkey_confirm(
-        &mut self,
-        ui: &mut egui::Ui,
-        p: &Palette,
-    ) -> Option<Vec<u8>> {
-        let id = self.security_keys.passkey_confirm_delete.clone()?;
-        let listed = self.fido_session().is_some_and(|s| {
-            s.rps
-                .iter()
-                .any(|(_, creds)| creds.iter().any(|c| c.credential_id == id))
-        });
-        if !listed {
-            self.security_keys.passkey_confirm_delete = None;
-            return None;
-        }
-        let warning = vault_passkey_warning(self.vault_passkey_name(&id).as_deref());
-        let can_export = self.session_vault(&id).is_some_and(|v| v.state.is_ok());
-        let waiting = self.waiting_for().map(str::to_owned);
-        let (mut confirm, mut cancel, mut export) = (false, false, false);
-        ui.add_space(10.0);
-        theme::card_frame(p)
-            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.colored_label(p.err, PASSKEY_DELETE_QUESTION);
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(warning)
-                        .font(theme::f_reg(12.5))
-                        .color(p.txt),
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if can_export {
-                        export = theme::button(ui, p, BtnKind::Default, EXPORT_BUTTON).clicked();
-                        ui.add_space(6.0);
-                    }
-                    confirm = theme::key_button(
-                        ui,
-                        p,
-                        BtnKind::Danger,
-                        "Delete passkey",
-                        waiting.as_deref(),
-                    )
-                    .clicked();
-                    ui.add_space(6.0);
-                    cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
-                });
-            });
-        if export {
-            self.vault_passkey_export(id);
-            None
-        } else if cancel {
-            self.security_keys.passkey_confirm_delete = None;
-            None
-        } else if confirm && !self.refuse_if_busy() {
-            self.security_keys.passkey_confirm_delete = None;
-            Some(id)
-        } else {
-            None
-        }
+    /// Whether the delete question of vault passkey `credential_id` offers
+    /// Export backup…: that vault is unlocked here and opened.
+    pub(crate) fn vault_passkey_can_export(&self, credential_id: &[u8]) -> bool {
+        self.session_vault(credential_id)
+            .is_some_and(|v| v.state.is_ok())
     }
 
-    /// Export backup… on a vault passkey's question: the Vault tab, that
-    /// vault shown, and its backup's save dialog. The question waits on the
-    /// FIDO2 tab.
-    pub(crate) fn vault_passkey_export(&mut self, credential_id: Vec<u8>) {
-        self.cap_tab = CapTab::Vault;
-        self.vault_select(credential_id);
+    /// Export backup… on a vault passkey's delete question: that vault
+    /// shown on the Vault tab, with its backup's save dialog; the question
+    /// waits on the FIDO2 tab. When the backup can't start (the vault
+    /// locked or can't be opened, or another backup's save dialog is still
+    /// open), nothing changes and `Err` says why, for the question to show.
+    pub(crate) fn vault_passkey_export(&mut self, credential_id: &[u8]) -> Result<(), String> {
+        let v = self
+            .session_vault(credential_id)
+            .ok_or_else(|| PASSKEY_EXPORT_LOCKED.to_owned())?;
+        let vault = v.vault_ref.clone();
+        if v.state.is_err() {
+            return Err(format!(
+                "Vault \"{}\" can't be opened, so it can't be backed up.",
+                shown_name(vault.name.as_deref())
+            ));
+        }
+        if let Some(pending) = self.vault.export_for.as_ref() {
+            return Err(backup_pending_text(pending));
+        }
+        self.vault_select(vault.credential_id.clone());
         self.vault_export_start();
+        if !self.vault_export_waits_for(&vault.credential_id, self.selected_device.as_ref()) {
+            return Err(self
+                .vault
+                .error
+                .clone()
+                .unwrap_or_else(|| PASSKEY_EXPORT_LOCKED.to_owned()));
+        }
+        self.cap_tab = CapTab::Vault;
+        Ok(())
     }
 
     /// Passkey `credential_id` was deleted on the FIDO2 tab. When an
@@ -9749,6 +9712,8 @@ mod tests {
     fn click_text(label: &str, mut render: impl FnMut(&mut egui::Ui, &Palette)) {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
+        // Two frames: a window's first one only sizes it.
+        frame_texts(&ctx, Vec::new(), &mut render);
         let texts = frame_texts(&ctx, Vec::new(), &mut render);
         let pos = texts
             .iter()
@@ -9803,8 +9768,8 @@ mod tests {
         assert!(app.vault.form.is_none());
     }
 
-    /// The FIDO2 tab's passkey list with every credential on `key` under
-    /// the vault's relying party.
+    /// The FIDO2 tab's passkey list: a github.com passkey, and every
+    /// credential on `key` under the vault's relying party.
     fn passkeys_of(app: &mut App, key: &FakeKey) {
         use keyroost_ctap::cred_mgmt::{Credential, CredentialUser, RelyingParty};
         let creds = key
@@ -9821,64 +9786,159 @@ mod tests {
                 large_blob_key: None,
             })
             .collect();
-        let mut session = fido_session(FakeKey::PIN);
-        session.rps = Arc::new(vec![(
-            RelyingParty {
-                id: keyroost_vault::RP_ID.to_owned(),
-                name: None,
-                rp_id_hash: None,
+        let github = Credential {
+            credential_id: GITHUB_CRED.to_vec(),
+            user: CredentialUser {
+                id: vec![7; 16],
+                name: Some("alice".into()),
+                display_name: None,
             },
-            creds,
-        )]);
+            algorithm: None,
+            large_blob_key: None,
+        };
+        let rp = |id: &str| RelyingParty {
+            id: id.to_owned(),
+            name: None,
+            rp_id_hash: None,
+        };
+        let mut session = fido_session(FakeKey::PIN);
+        session.rps = Arc::new(vec![
+            (rp("github.com"), vec![github]),
+            (rp(keyroost_vault::RP_ID), creds),
+        ]);
         app.security_keys.session = Some(session);
         app.security_keys.session_device = Some(KEY.into());
     }
 
+    /// The passkey delete question's text in one frame (after the window's
+    /// sizing frame).
+    fn passkey_question(app: &mut App) -> String {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            texts = frame_texts(&ctx, Vec::new(), |ui, p| {
+                app.render_passkey_delete_confirm(ui.ctx(), p);
+            });
+        }
+        texts.into_iter().map(|(t, _)| t + "\n").collect()
+    }
+
+    /// Click `label` in the passkey delete question; what it handed over
+    /// to delete.
+    fn answer_passkey_question(app: &mut App, label: &str) -> Option<Vec<u8>> {
+        let mut confirmed = None;
+        click_text(label, |ui, p| {
+            if let Some(id) = app.render_passkey_delete_confirm(ui.ctx(), p) {
+                confirmed = Some(id);
+            }
+        });
+        confirmed
+    }
+
+    const GITHUB_CRED: &[u8] = b"github credential";
+
     #[test]
-    fn a_vault_passkey_warns_before_it_is_deleted() {
-        assert!(is_vault_passkey("fido2-vault.token2"));
-        assert!(!is_vault_passkey("github.com"));
+    fn every_passkey_remove_asks_first() {
+        use keyroost_ctap::cred_mgmt::CredentialUser;
+        let user = |name: Option<&str>, display: Option<&str>| CredentialUser {
+            id: vec![1],
+            name: name.map(str::to_owned),
+            display_name: display.map(str::to_owned),
+        };
         assert_eq!(
-            vault_passkey_warning(Some("Personal")),
-            "This passkey unlocks password vault \"Personal\": deleting it loses every entry \
-             in it. To keep them, export a backup first."
+            crate::passkey_label("github.com", &user(Some("alice"), Some("Alice"))),
+            "github.com (alice)"
         );
         assert_eq!(
-            vault_passkey_warning(None),
-            "This passkey unlocks a password vault: deleting it loses every entry in it. To \
-             keep them, export a backup first."
+            crate::passkey_label("github.com", &user(None, Some("Alice"))),
+            "github.com (Alice)"
+        );
+        assert_eq!(
+            crate::passkey_label("github.com", &user(Some(""), None)),
+            "github.com"
         );
 
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        passkeys_of(&mut app, &key);
+        let ask = |app: &mut App| {
+            app.ask_delete_passkey(GITHUB_CRED.to_vec(), "github.com (alice)".into(), false);
+        };
+        ask(&mut app);
+        let text = passkey_question(&mut app);
+        for line in [
+            "Delete passkey?",
+            "Permanently delete \u{201c}github.com (alice)\u{201d} from this key? This cannot \
+             be undone.",
+            "Delete",
+            "Cancel",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        assert!(!text.contains("password vault"), "{text}");
+        assert!(!text.contains(EXPORT_BUTTON), "{text}");
+        // Cancel deletes nothing.
+        assert_eq!(answer_passkey_question(&mut app, "Cancel"), None);
+        assert!(app.security_keys.passkey_confirm_delete.is_none());
+        // Delete is refused while a job runs; the question stays.
+        ask(&mut app);
+        app.busy_jobs = 1;
+        assert_eq!(answer_passkey_question(&mut app, "Delete"), None);
+        assert!(app.security_keys.passkey_confirm_delete.is_some());
+        app.busy_jobs = 0;
+        assert_eq!(
+            answer_passkey_question(&mut app, "Delete"),
+            Some(GITHUB_CRED.to_vec())
+        );
+        assert!(app.security_keys.passkey_confirm_delete.is_none());
+        // Another key selected: the question is dropped, never shown over it.
+        ask(&mut app);
+        app.selected_device = Some("serial:BBB".into());
+        assert!(!passkey_question(&mut app).contains("Permanently delete"));
+        assert!(app.security_keys.passkey_confirm_delete.is_none());
+        // So is one whose passkey left the list.
+        app.selected_device = Some(KEY.into());
+        app.ask_delete_passkey(b"gone".to_vec(), "gone.example".into(), false);
+        passkey_question(&mut app);
+        assert!(app.security_keys.passkey_confirm_delete.is_none());
+    }
+
+    #[test]
+    fn a_vault_passkeys_question_adds_its_warning() {
+        assert!(is_vault_passkey("fido2-vault.token2"));
+        assert!(!is_vault_passkey("github.com"));
         let mut key = FakeKey::new();
         let personal = two_vaults(&mut key);
         let mut app = app();
         unlock_into(&mut app, &mut key);
         passkeys_of(&mut app, &key);
-        app.security_keys.passkey_confirm_delete = Some(personal.clone());
-        let ctx = egui::Context::default();
-        theme::install_fonts(&ctx);
-        let drawn = |app: &mut App| -> String {
-            frame_texts(&ctx, Vec::new(), |ui, p| {
-                app.render_vault_passkey_confirm(ui, p);
-            })
-            .into_iter()
-            .map(|(t, _)| t + "\n")
-            .collect()
-        };
-        let text = drawn(&mut app);
+        app.ask_delete_passkey(
+            personal.clone(),
+            "fido2-vault.token2 (Personal)".into(),
+            true,
+        );
+        let text = passkey_question(&mut app);
         for line in [
-            PASSKEY_DELETE_QUESTION,
+            "Permanently delete \u{201c}fido2-vault.token2 (Personal)\u{201d} from this key? \
+             This cannot be undone.",
             &vault_passkey_warning(Some("Personal")),
             EXPORT_BUTTON,
-            "Delete passkey",
+            "Delete",
             "Cancel",
         ] {
             assert!(text.contains(line), "{line}: {text}");
         }
+        assert_eq!(
+            vault_passkey_warning(None),
+            "This passkey unlocks a password vault: deleting it loses every entry in it. To \
+             keep them, export a backup first."
+        );
         // Locked, the passkey list still names the vault; there is nothing
         // to export from here.
         app.vault_lock(None);
-        let text = drawn(&mut app);
+        let text = passkey_question(&mut app);
         assert!(
             text.contains(&vault_passkey_warning(Some("Personal"))),
             "{text}"
@@ -9887,32 +9947,36 @@ mod tests {
     }
 
     #[test]
-    fn a_vault_passkeys_question_answers() {
+    fn export_from_the_passkey_question_says_when_it_cant_start() {
         let mut key = FakeKey::new();
         let personal = two_vaults(&mut key);
         let mut app = app();
         unlock_into(&mut app, &mut key);
         passkeys_of(&mut app, &key);
-        let mut confirmed = None;
-        // Cancel drops the question.
-        app.security_keys.passkey_confirm_delete = Some(personal.clone());
-        click_text("Cancel", |ui, p| {
-            confirmed = confirmed.take().or(app.render_vault_passkey_confirm(ui, p));
-        });
-        assert!(confirmed.is_none() && app.security_keys.passkey_confirm_delete.is_none());
-        // Export backup… goes to the Vault tab with that vault's save
-        // dialog; the question waits.
-        app.security_keys.passkey_confirm_delete = Some(personal.clone());
-        app.vault_select(
-            app.vault_session().unwrap().unlocked.vaults[1]
-                .vault_ref
-                .credential_id
-                .clone(),
+        let work = app.vault_session().unwrap().unlocked.vaults[1]
+            .vault_ref
+            .credential_id
+            .clone();
+        // Work's backup is still waiting for its save dialog.
+        app.vault_select(work.clone());
+        app.vault_export_start();
+        app.file_dialog_queue.clear();
+        app.ask_delete_passkey(
+            personal.clone(),
+            "fido2-vault.token2 (Personal)".into(),
+            true,
         );
-        click_text(EXPORT_BUTTON, |ui, p| {
-            confirmed = confirmed.take().or(app.render_vault_passkey_confirm(ui, p));
-        });
-        assert!(confirmed.is_none());
+        assert_eq!(answer_passkey_question(&mut app, EXPORT_BUTTON), None);
+        assert_eq!(app.cap_tab, CapTab::Overview, "no tab switch");
+        assert_eq!(app.vault.selected.as_deref(), Some(work.as_slice()));
+        let notice = backup_pending_text(app.vault.export_for.as_ref().unwrap());
+        let q = app.security_keys.passkey_confirm_delete.as_ref().unwrap();
+        assert_eq!(q.notice.as_deref(), Some(notice.as_str()));
+        assert!(passkey_question(&mut app).contains(&notice));
+        // With nothing waiting, it goes to the Vault tab with Personal's
+        // save dialog; the question waits.
+        app.vault.export_for = None;
+        assert_eq!(answer_passkey_question(&mut app, EXPORT_BUTTON), None);
         assert_eq!(app.cap_tab, CapTab::Vault);
         assert_eq!(app.vault.selected.as_deref(), Some(personal.as_slice()));
         assert_eq!(
@@ -9922,19 +9986,17 @@ mod tests {
                 .map(|v| v.credential_id.clone()),
             Some(personal.clone())
         );
-        assert!(app.security_keys.passkey_confirm_delete.is_some());
-        // Delete passkey hands the passkey over; refused while a job runs.
-        app.busy_jobs = 1;
-        click_text("Delete passkey", |ui, p| {
-            confirmed = confirmed.take().or(app.render_vault_passkey_confirm(ui, p));
-        });
-        assert!(confirmed.is_none() && app.security_keys.passkey_confirm_delete.is_some());
-        app.busy_jobs = 0;
-        click_text("Delete passkey", |ui, p| {
-            confirmed = confirmed.take().or(app.render_vault_passkey_confirm(ui, p));
-        });
-        assert_eq!(confirmed, Some(personal));
-        assert!(app.security_keys.passkey_confirm_delete.is_none());
+        assert_eq!(app.file_dialog_queue.len(), 1);
+        let q = app.security_keys.passkey_confirm_delete.as_ref().unwrap();
+        assert!(q.notice.is_none());
+        // Locked meanwhile: said, and nothing else changes.
+        app.cap_tab = CapTab::Fido2;
+        app.vault_lock(None);
+        assert_eq!(
+            app.vault_passkey_export(&personal),
+            Err(PASSKEY_EXPORT_LOCKED.to_owned())
+        );
+        assert_eq!(app.cap_tab, CapTab::Fido2);
     }
 
     #[test]

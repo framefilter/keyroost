@@ -646,9 +646,9 @@ struct SecurityKeysState {
     fp_progress: Option<std::sync::Arc<std::sync::Mutex<EnrollProgress>>>,
     /// Pending delete confirmation: the template id awaiting "Are you sure?".
     fp_confirm_delete: Option<Vec<u8>>,
-    /// The passkey of a password vault whose Remove waits for its
-    /// confirmation (its credential ID). Other passkeys are removed at once.
-    passkey_confirm_delete: Option<Vec<u8>>,
+    /// The passkey whose Remove waits for its confirmation, bound to the
+    /// key it was asked on (KEY-008).
+    passkey_confirm_delete: Option<PasskeyDelete>,
     /// Inline rename editor: (template_id, new-name buffer).
     fp_rename: Option<(Vec<u8>, String)>,
     /// Pending advanced-config action awaiting typed confirmation + PIN.
@@ -5730,6 +5730,41 @@ enum FileTarget {
     VaultImport,
 }
 
+/// A passkey's Remove waiting for its confirmation.
+#[derive(Clone)]
+struct PasskeyDelete {
+    /// The key it was asked on: another selection drops the question.
+    device: DeviceId,
+    credential_id: Vec<u8>,
+    /// The passkey as its row names it ([`passkey_label`]).
+    label: String,
+    /// A password vault's passkey: the question adds what deleting it
+    /// loses, and Export backup….
+    vault: bool,
+    /// Why Export backup… couldn't start, shown in the question.
+    notice: Option<String>,
+}
+
+/// A passkey as its row names it: the site, then the account (user name,
+/// else display name) when it has one.
+fn passkey_label(rp_id: &str, user: &keyroost_ctap::cred_mgmt::CredentialUser) -> String {
+    let account = user
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .or(user.display_name.as_deref().filter(|n| !n.is_empty()));
+    match account {
+        Some(a) => sanitize_title(&format!("{rp_id} ({a})")),
+        None => sanitize_title(rp_id),
+    }
+}
+
+/// The question before something on the key is deleted for good: the
+/// Authenticator tab's words, shared by the FIDO2 tab's passkeys.
+fn permanent_delete_question(name: &str) -> String {
+    format!("Permanently delete \u{201c}{name}\u{201d} from this key? This cannot be undone.")
+}
+
 /// An SSH certificate extracted from a credential's largeBlob, waiting for the
 /// user to pick a destination in the save dialog. `summary` is the parsed
 /// one-line description shown next to the saved path on success.
@@ -9530,10 +9565,7 @@ impl App {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Permanently delete \u{201c}{name}\u{201d} from this key? \
-                     This cannot be undone."
-                ));
+                ui.label(permanent_delete_question(&name));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if theme::key_egui_button(ui, "Delete", waiting.as_deref()).clicked() {
@@ -9551,6 +9583,91 @@ impl App {
             }
             Some(false) => self.oath.confirm_delete = None,
             None => {}
+        }
+    }
+
+    /// Remove on a passkey row: ask before deleting it, on the key selected
+    /// now.
+    fn ask_delete_passkey(&mut self, credential_id: Vec<u8>, label: String, vault: bool) {
+        if let Some(device) = self.selected_device.clone() {
+            self.security_keys.passkey_confirm_delete = Some(PasskeyDelete {
+                device,
+                credential_id,
+                label,
+                vault,
+                notice: None,
+            });
+        }
+    }
+
+    /// Modal confirmation before deleting a passkey: the Authenticator
+    /// tab's question; for a password vault's passkey, also what deleting
+    /// it loses and Export backup… while that vault is unlocked. Bound to
+    /// the key it was asked on (KEY-008): another selection, or a passkey
+    /// list that no longer holds it, drops it. Returns the passkey to
+    /// delete once confirmed; a click refused while a job runs keeps the
+    /// question.
+    fn render_passkey_delete_confirm(
+        &mut self,
+        ctx: &egui::Context,
+        p: &Palette,
+    ) -> Option<Vec<u8>> {
+        let waiting = self.waiting_for().map(str::to_owned);
+        let ask = self.security_keys.passkey_confirm_delete.clone()?;
+        let listed = completion_still_valid(Some(&ask.device), self.selected_device.as_ref())
+            && self.fido_session().is_some_and(|s| {
+                s.rps
+                    .iter()
+                    .any(|(_, creds)| creds.iter().any(|c| c.credential_id == ask.credential_id))
+            });
+        if !listed {
+            self.security_keys.passkey_confirm_delete = None;
+            return None;
+        }
+        let warning = ask.vault.then(|| {
+            vault_pane::vault_passkey_warning(
+                self.vault_passkey_name(&ask.credential_id).as_deref(),
+            )
+        });
+        let can_export = ask.vault && self.vault_passkey_can_export(&ask.credential_id);
+        let (mut confirm, mut cancel, mut export) = (false, false, false);
+        egui::Window::new("Delete passkey?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(permanent_delete_question(&ask.label));
+                if let Some(w) = &warning {
+                    ui.add_space(4.0);
+                    ui.label(w);
+                }
+                if let Some(n) = &ask.notice {
+                    ui.add_space(4.0);
+                    ui.colored_label(p.warn, n);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if can_export {
+                        export = ui.button(vault_pane::EXPORT_BUTTON).clicked();
+                    }
+                    confirm = theme::key_egui_button(ui, "Delete", waiting.as_deref()).clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if export {
+            let notice = self.vault_passkey_export(&ask.credential_id).err();
+            if let Some(q) = self.security_keys.passkey_confirm_delete.as_mut() {
+                q.notice = notice;
+            }
+            None
+        } else if cancel {
+            self.security_keys.passkey_confirm_delete = None;
+            None
+        } else if confirm && !self.refuse_if_busy() {
+            self.security_keys.passkey_confirm_delete = None;
+            Some(ask.credential_id)
+        } else {
+            None
         }
     }
 
@@ -17635,6 +17752,9 @@ impl eframe::App for App {
         if let Some(id) = self.render_fp_delete_confirm(ctx, &p) {
             self.delete_fingerprint(id);
         }
+        if let Some(id) = self.render_passkey_delete_confirm(ctx, &p) {
+            self.delete_credential(id);
+        }
         self.render_oath_delete_confirm(ctx);
         self.render_oath_reset_confirm(ctx);
         self.render_factory_reset_confirm(ctx, &p);
@@ -21208,8 +21328,8 @@ impl App {
         // --- Passkeys panel: only when unlocked and the Passkeys tab is active. ---
         if unlocked && subview == FidoSubview::Passkeys {
             ui.add_space(14.0);
-            let mut delete: Option<Vec<u8>> = None;
-            let mut ask_delete: Option<Vec<u8>> = None;
+            // Remove asks first: (credential ID, row label, a vault's).
+            let mut ask_delete: Option<(Vec<u8>, String, bool)> = None;
             // Collected in the credential loop (below), applied after the card so
             // the extract job isn't dispatched while `self` is borrowed by the
             // cloned rps list: (rp id, credential's largeBlob key).
@@ -21286,13 +21406,11 @@ impl App {
                                             )
                                             .clicked()
                                             {
-                                                // A vault's passkey asks first:
-                                                // deleting it loses the vault.
-                                                if vault_pane::is_vault_passkey(&rp.id) {
-                                                    ask_delete = Some(c.credential_id.clone());
-                                                } else {
-                                                    delete = Some(c.credential_id.clone());
-                                                }
+                                                ask_delete = Some((
+                                                    c.credential_id.clone(),
+                                                    passkey_label(&rp.id, &c.user),
+                                                    vault_pane::is_vault_passkey(&rp.id),
+                                                ));
                                             }
                                             // SSH credentials that carry a largeBlob
                                             // key can hold an OpenSSH certificate;
@@ -21396,13 +21514,8 @@ impl App {
                     });
                 }
             });
-            if let Some(id) = ask_delete {
-                self.security_keys.passkey_confirm_delete = Some(id);
-            }
-            // A vault passkey's question, under the list.
-            let confirmed = self.render_vault_passkey_confirm(ui, p);
-            if let Some(id) = delete.or(confirmed) {
-                self.delete_credential(id);
+            if let Some((credential_id, label, vault)) = ask_delete {
+                self.ask_delete_passkey(credential_id, label, vault);
             }
             if let Some((rp_id, key)) = save_cert {
                 self.save_ssh_cert(rp_id, key);
