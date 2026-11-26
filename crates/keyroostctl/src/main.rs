@@ -22,7 +22,6 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use keyroost_keyring::Keyring;
-use keyroost_resolve::private_file::write_private_file;
 use keyroost_resolve::{ccid_readers_if_needed, ccid_serials_for, Need};
 
 /// `println!`, `print!` and `eprintln!` for the CLI's own text: on Windows,
@@ -13771,6 +13770,18 @@ fn pair_of(pair: Option<SecretPair<'_>>) -> Result<SecretPair<'_>, String> {
     pair.ok_or_else(|| "internal error: this command has no secret pair".to_string())
 }
 
+/// The shared owner-only writer for secret outputs
+/// ([`keyroost_resolve::private_file::write_private_file`], KEY-014), with
+/// its errors in the CLI's words.
+fn write_private_file(
+    path: &std::path::Path,
+    data: &[u8],
+    mode: crate::prompt::OutMode,
+) -> std::io::Result<()> {
+    keyroost_resolve::private_file::write_private_file(path, data, mode.into())
+        .map_err(crate::prompt::cli_write_error)
+}
+
 /// Accept a certificate as DER or PEM, returning DER bytes.
 fn cert_to_der(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let text = std::str::from_utf8(bytes).unwrap_or("");
@@ -22834,6 +22845,22 @@ mod cli_tests {
             let msg = redacted_parse_error(&e, &argv).expect("a message");
             check(&msg, None);
         }
+    }
+
+    /// The shared writer's "a file appeared" reaches the terminal in the
+    /// CLI's words, naming --overwrite.
+    #[test]
+    fn write_private_file_names_overwrite_for_a_file_that_appeared() {
+        let dir = std::env::temp_dir().join(format!("kr-appeared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.bin");
+        std::fs::write(&path, b"there first").unwrap();
+        let e = write_private_file(&path, b"x", crate::prompt::OutMode::New).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(e.to_string(), crate::prompt::APPEARED);
+        assert!(e.to_string().contains("--overwrite"), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"there first");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

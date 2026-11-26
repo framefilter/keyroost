@@ -2906,6 +2906,15 @@ const PASSPHRASE_NOTE: &str = "At least 10 characters. Without it, the backup ca
 /// The button that backs the shown vault up to a file.
 const EXPORT_BUTTON: &str = "Export backup\u{2026}";
 
+/// Export backup… pressed while the save dialog of an earlier one is
+/// still open.
+fn backup_pending_text(vault: &VaultRef) -> String {
+    format!(
+        "A backup of vault \"{}\" is already being saved: finish or cancel its save dialog first.",
+        shown_name(vault.name.as_deref())
+    )
+}
+
 /// The busy label while a backup is encrypted and written.
 const EXPORT_LABEL: &str = "Writing backup\u{2026}";
 
@@ -2974,6 +2983,13 @@ impl App {
     /// vault that opened; the chosen file opens [`ExportDialog`].
     pub(crate) fn vault_export_start(&mut self) {
         if !self.vault_writable() {
+            return;
+        }
+        // One backup at a time: a second save dialog's file would find
+        // nothing waiting for it.
+        if let Some(pending) = self.vault.export_for.as_ref() {
+            self.vault.info = None;
+            self.vault.error = Some(backup_pending_text(pending));
             return;
         }
         let Some(v) = self.selected_vault() else {
@@ -3051,6 +3067,8 @@ impl App {
             return;
         }
         let (vault, path) = (d.vault.clone(), d.path.clone());
+        let name = shown_name(vault.name.as_deref());
+        let file = sanitize_title(&path.display().to_string());
         let passphrase = Zeroizing::new(d.passphrase.clone());
         let contents = match self.vault_export_contents(&vault) {
             Ok(c) => c,
@@ -3070,38 +3088,51 @@ impl App {
         self.spawn_job(EXPORT_LABEL, move || {
             let result = write_backup(&contents, &passphrase, &path);
             drop((contents, passphrase));
-            Box::new(move |app: &mut App| app.vault_apply_export(for_device, result))
+            Box::new(move |app: &mut App| app.vault_apply_export(for_device, name, file, result))
         });
     }
 
-    /// The end of Write backup: written closes the dialog (wiping it) with
-    /// the CLI's line; a failure keeps it open with the reason.
+    /// The end of Write backup for vault `name` (as shown) and `file`:
+    /// written closes the dialog (wiping it) with the CLI's line; a failure
+    /// keeps it open with the reason. Either way the activity log says so,
+    /// even when the dialog is gone (the vault locked, or another key was
+    /// selected, while the file was written): the file is there or not
+    /// whatever the pane shows now.
     pub(crate) fn vault_apply_export(
         &mut self,
         for_device: Option<DeviceId>,
+        name: String,
+        file: String,
         result: Result<usize, String>,
     ) {
-        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+        let (severity, logged) = match &result {
+            Ok(_) => (
+                Severity::Ok,
+                format!("Vault: backup of vault \"{name}\" written to {file}"),
+            ),
+            Err(e) => (
+                Severity::Err,
+                format!("Vault: backup of vault \"{name}\" not written: {e}"),
+            ),
+        };
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref())
+            || self.vault.export.is_none()
+        {
+            // Not under the key now selected: the backup isn't of it.
+            self.log_global(severity, crate::LogKind::User, logged);
             return;
         }
+        self.log(severity, logged);
         match result {
             Ok(n) => {
-                let Some(d) = self.vault.export.take() else {
-                    return;
-                };
-                let name = shown_name(d.vault.name.as_deref());
-                let file = sanitize_title(&d.path.display().to_string());
-                drop(d);
-                self.vault_done(
-                    format!(
-                        "Backup of vault \"{name}\" ({}) written to {file}.",
-                        entries(n)
-                    ),
-                    format!("backup of vault \"{name}\" written to {file}"),
-                );
+                self.vault.export = None;
+                self.vault.error = None;
+                self.vault.info = Some(format!(
+                    "Backup of vault \"{name}\" ({}) written to {file}.",
+                    entries(n)
+                ));
             }
             Err(e) => {
-                self.log(Severity::Err, format!("Vault: {e}"));
                 self.vault.info = None;
                 self.vault.error = Some(e);
             }
@@ -6977,13 +7008,90 @@ mod tests {
         let mut key = FakeKey::new();
         let mut app = app();
         export_dialog_for(&mut app, &mut key, &link);
-        app.vault_apply_export(Some(KEY.into()), Err(e.clone()));
+        let file = link.display().to_string();
+        app.vault_apply_export(
+            Some(KEY.into()),
+            "Personal".into(),
+            file.clone(),
+            Err(e.clone()),
+        );
         assert_eq!(app.vault.error.as_deref(), Some(e.as_str()));
         assert!(app.vault.export.is_some());
-        // A result for another key is dropped.
-        app.vault_apply_export(Some("serial:BBB".into()), Ok(2));
+        assert_eq!(
+            app.log.last().unwrap().text,
+            format!("Vault: backup of vault \"Personal\" not written: {e}")
+        );
+        // A result for another key leaves the pane alone but is logged.
+        app.vault_apply_export(
+            Some("serial:BBB".into()),
+            "Personal".into(),
+            file.clone(),
+            Ok(2),
+        );
         assert!(app.vault.export.is_some() && app.vault.info.is_none());
+        assert_eq!(
+            app.log.last().unwrap().text,
+            format!("Vault: backup of vault \"Personal\" written to {file}")
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The vault locked while its backup was written: the dialog is gone,
+    /// but the activity log still says whether the file was written.
+    #[test]
+    fn a_backup_finished_after_a_lock_is_still_logged() {
+        let dir = export_dir("locked");
+        let path = dir.join("personal.t2vault");
+        let mut key = FakeKey::new();
+        let mut app = app();
+        export_dialog_for(&mut app, &mut key, &path);
+        app.vault_lock(None);
+        let file = path.display().to_string();
+        app.vault_apply_export(Some(KEY.into()), "Personal".into(), file.clone(), Ok(2));
+        assert_eq!(
+            app.log.last().unwrap().text,
+            format!("Vault: backup of vault \"Personal\" written to {file}")
+        );
+        assert!(app.vault.info.is_none() && app.vault.export.is_none());
+        app.vault_apply_export(
+            Some(KEY.into()),
+            "Personal".into(),
+            file.clone(),
+            Err("cannot write it: disk full".into()),
+        );
+        assert_eq!(
+            app.log.last().unwrap().text,
+            "Vault: backup of vault \"Personal\" not written: cannot write it: disk full"
+        );
+        assert!(app.vault.export.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Export backup… again while the first one's save dialog is still
+    /// open says so instead of opening a second dialog whose file would go
+    /// unused.
+    #[test]
+    fn a_second_export_while_one_is_pending_says_so() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_export_start();
+        assert_eq!(app.file_dialog_queue.len(), 1);
+        app.vault_export_start();
+        assert_eq!(app.file_dialog_queue.len(), 1, "no second save dialog");
+        assert_eq!(
+            app.vault.error.as_deref(),
+            Some(
+                "A backup of vault \"Personal\" is already being saved: finish or cancel its \
+                 save dialog first."
+            )
+        );
+        // Once the first dialog is cancelled, Export backup… works again.
+        app.file_dialog_queue.clear();
+        choose_file(&mut app, None);
+        app.vault_export_start();
+        assert_eq!(app.file_dialog_queue.len(), 1);
     }
 
     #[test]

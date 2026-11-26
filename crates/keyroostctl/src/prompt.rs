@@ -190,9 +190,54 @@ pub(crate) fn confirm_typed(
     }
 }
 
-/// The shared writer's [`OutMode`] and [`APPEARED`] (a file that appeared
-/// at an output path after the overwrite check).
-pub(crate) use keyroost_resolve::private_file::{OutMode, APPEARED};
+/// A file that appeared at an output path after the overwrite check.
+pub(crate) const APPEARED: &str =
+    "a file appeared there while this command ran and was not replaced; \
+     pass --overwrite to replace it";
+
+/// The shared writer's error for a file that appeared since the check, in
+/// the CLI's words ([`APPEARED`], naming --overwrite); any other error as
+/// it is.
+pub(crate) fn cli_write_error(e: std::io::Error) -> std::io::Error {
+    if e.kind() == std::io::ErrorKind::AlreadyExists
+        && e.to_string() == keyroost_resolve::private_file::APPEARED
+    {
+        std::io::Error::new(std::io::ErrorKind::AlreadyExists, APPEARED)
+    } else {
+        e
+    }
+}
+
+/// How an output file that passed [`check_overwrite`] is written: the
+/// shared writer's mode, with its errors in the CLI's words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutMode {
+    /// Nothing was there at check time: create it, and fail rather than
+    /// replace a file that appeared while the command waited on the key.
+    New,
+    /// Something was there and replacing it was agreed (`--overwrite` or a
+    /// "yes" at the terminal).
+    Replace,
+}
+
+impl From<OutMode> for keyroost_resolve::private_file::OutMode {
+    fn from(m: OutMode) -> Self {
+        match m {
+            OutMode::New => Self::New,
+            OutMode::Replace => Self::Replace,
+        }
+    }
+}
+
+impl OutMode {
+    /// Write `data` to `path` in this mode. `New` reports a file that
+    /// appeared since the check as an error naming --overwrite.
+    pub(crate) fn write(self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+        keyroost_resolve::private_file::OutMode::from(self)
+            .write(path, data)
+            .map_err(cli_write_error)
+    }
+}
 
 /// `write PATH: ERROR` for an output written after the card was changed.
 /// When the failure is a file that appeared mid-command ([`APPEARED`]),

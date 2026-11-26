@@ -4,25 +4,25 @@
 //! [`write_private_file`] and the app writes vault backups with it, so both
 //! refuse the same things (KEY-014).
 
-/// A file that appeared at an output path after the overwrite check.
-pub const APPEARED: &str = "a file appeared there while this command ran and was not replaced; \
-     pass --overwrite to replace it";
+/// The error text of a [`OutMode::New`] write that found a file at its
+/// path: one appeared after the caller checked, and it was left as it is.
+/// A front end may match on it to add how to replace it.
+pub const APPEARED: &str = "a file appeared there after it was checked and was not replaced";
 
-/// How an output file is written once the front end has checked what is
-/// there (the CLI's overwrite check, the app's save dialog).
+/// How an output file is written once the caller has checked what is
+/// there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutMode {
-    /// Nothing was there at check time: create it, and fail rather than
-    /// replace a file that appeared while the command waited on the key.
+    /// Nothing was there at check time: create it, and fail with
+    /// [`APPEARED`] rather than replace a file that appeared since.
     New,
-    /// Something was there and replacing it was agreed (`--overwrite` or a
-    /// "yes" at the terminal).
+    /// Replacing whatever is there was agreed.
     Replace,
 }
 
 impl OutMode {
     /// Open `path` for writing in this mode. `New` reports a file that
-    /// appeared since the check as an error naming --overwrite.
+    /// appeared since the check as [`APPEARED`].
     pub fn open(self, path: &std::path::Path) -> std::io::Result<std::fs::File> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true);
@@ -194,7 +194,7 @@ fn temp_beside(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
 /// `data` is written and synced there, then the temp is renamed over
 /// `path`. A write or rename that fails removes the temp and leaves the old
 /// file whole. A symbolic link at `path` is refused, never written through.
-/// The non-Unix `--overwrite` path (Unix has its own, with owner and 0600
+/// The non-Unix replacing write (Unix has its own, with owner and 0600
 /// checks); `open` and `sync` are seams for tests.
 #[cfg_attr(all(unix, not(test)), allow(dead_code))]
 fn replace_via_temp<W: std::io::Write>(
@@ -258,7 +258,7 @@ mod tests {
         // A file that appeared after the check is not replaced in New mode.
         let err = write_private_file(&path, b"other", OutMode::New).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-        assert!(err.to_string().contains("--overwrite"), "{err}");
+        assert_eq!(err.to_string(), APPEARED);
         assert_eq!(std::fs::read(&path).unwrap(), b"secret plaintext");
 
         // Loosen perms, then re-write: the helper must tighten back to 0600.
