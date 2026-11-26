@@ -566,12 +566,37 @@ fn pin_refused(e: &VaultJobError) -> bool {
 /// What the job label and the CLI say while a vault is written.
 const SAVE_LABEL: &str = "Saving to the key\u{2026}";
 
+/// Why the vault locked when a save job couldn't be started.
+const SAVE_NOT_STARTED: &str =
+    "The save couldn't start, and nothing was written. Unlock the vault again.";
+
 /// The CLI's `an entry needs a title`, as a sentence.
 const NEEDS_TITLE: &str = "An entry needs a title.";
 
 /// The form's notice when the entry it edits changed on the key.
 const CHANGED_ON_KEY: &str = "This entry changed on the key since the vault was opened; nothing \
                               was written. Check it and save again.";
+
+/// The form's notice after a conflict: [`CHANGED_ON_KEY`], naming the
+/// fields changed both on the key and in the form, whose typed values will
+/// replace the key's at the next Save.
+fn changed_on_key(both: &[&str]) -> String {
+    let fields = match both {
+        [] => return CHANGED_ON_KEY.to_owned(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    let (verb, them) = if both.len() == 1 {
+        ("was", "it")
+    } else {
+        ("were", "them")
+    };
+    format!(
+        "This entry changed on the key since the vault was opened; nothing was written. The \
+         {fields} {verb} also changed elsewhere; yours will replace {them}. Check it and save \
+         again."
+    )
+}
 
 /// The form's notice when the entry it edits was deleted on the key.
 const DELETED_ON_KEY: &str = "This entry was deleted on the key; Save adds it again.";
@@ -681,6 +706,59 @@ impl EntryForm {
         }
     }
 
+    /// After a conflict: edit `current` (the entry as the key holds it now)
+    /// instead of the entry as first read. A field left as it was read takes
+    /// the key's value, so the next Save doesn't undo the other change; a
+    /// field typed over keeps the typed value. Returns the fields changed
+    /// both here and on the key, in the form's order.
+    pub(crate) fn rebase(&mut self, current: Entry) -> Vec<&'static str> {
+        let Some(before) = self.editing.take() else {
+            self.editing = Some(current);
+            return Vec::new();
+        };
+        let mut both = Vec::new();
+        for (name, typed, was, now) in [
+            (
+                "title",
+                &mut self.title,
+                before.title.as_str(),
+                current.title.as_str(),
+            ),
+            (
+                "username",
+                &mut self.username,
+                before.username.as_str(),
+                current.username.as_str(),
+            ),
+            (
+                "password",
+                &mut self.password,
+                before.password.as_str(),
+                current.password.as_str(),
+            ),
+            (
+                "URL",
+                &mut self.url,
+                before.url.as_str(),
+                current.url.as_str(),
+            ),
+            (
+                "notes",
+                &mut self.notes,
+                before.notes.as_str(),
+                current.notes.as_str(),
+            ),
+        ] {
+            if typed.as_str() == was {
+                replace_text(typed, now);
+            } else if was != now && typed.as_str() != now {
+                both.push(name);
+            }
+        }
+        self.editing = Some(current);
+        both
+    }
+
     /// Whether any field differs from where the form started: empty for an
     /// add, the entry as read for an edit.
     #[cfg_attr(
@@ -747,11 +825,18 @@ pub(crate) enum SaveKind {
     Edit {
         title: Zeroizing<String>,
     },
-    #[expect(
-        dead_code,
-        reason = "deleting an entry saves through this too (not yet drawn)"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "deleting an entry saves through this too (not yet drawn)"
+        )
     )]
     Delete {
+        #[cfg_attr(
+            test,
+            expect(dead_code, reason = "the delete's own line reads it (not yet drawn)")
+        )]
         title: Zeroizing<String>,
     },
     #[expect(
@@ -1166,9 +1251,6 @@ impl App {
 
     /// Save: the form's change goes to the key.
     pub(crate) fn vault_save_form(&mut self) {
-        if self.refuse_if_busy() {
-            return;
-        }
         let Some((vault, kind, change)) = self.vault_form_change() else {
             return;
         };
@@ -1238,7 +1320,8 @@ impl App {
         if !queued {
             // The job and the auth it took are gone: lock rather than keep
             // a session that can't save.
-            self.vault_lock(None);
+            self.log(Severity::Err, format!("Vault: {SAVE_NOT_STARTED}"));
+            self.vault_lock(Some(SAVE_NOT_STARTED.to_owned()));
         }
     }
 
@@ -1301,22 +1384,29 @@ impl App {
                 if let Some(s) = self.vault_session_mut() {
                     s.unlocked.capacity = saved.capacity;
                 }
-                let (shown, logged) = match &kind {
-                    SaveKind::Add { title } => (
-                        format!(
-                            "Entry \"{}\" added to vault \"{name}\".",
-                            sanitize_title(title)
-                        ),
-                        format!("entry added to vault \"{name}\""),
-                    ),
-                    SaveKind::Edit { title } => (
-                        format!("Entry \"{}\" updated.", sanitize_title(title)),
-                        format!("entry updated in vault \"{name}\""),
-                    ),
-                    SaveKind::Delete { .. } | SaveKind::Import { .. } => return,
-                };
-                self.vault.form = None;
-                self.vault_done(shown, logged);
+                match &kind {
+                    SaveKind::Add { title } => {
+                        self.vault.form = None;
+                        self.vault_done(
+                            format!(
+                                "Entry \"{}\" added to vault \"{name}\".",
+                                sanitize_title(title)
+                            ),
+                            format!("entry added to vault \"{name}\""),
+                        );
+                    }
+                    SaveKind::Edit { title } => {
+                        self.vault.form = None;
+                        self.vault_done(
+                            format!("Entry \"{}\" updated.", sanitize_title(title)),
+                            format!("entry updated in vault \"{name}\""),
+                        );
+                    }
+                    // Their own lines come with the delete and import views.
+                    SaveKind::Delete { .. } | SaveKind::Import { .. } => {}
+                }
+                // Every write that leaves the store nearly full says so,
+                // whatever it was.
                 self.space_note("Vault", &saved.capacity);
             }
             Err(e @ VaultJobError::Vault(VaultKeyError::Conflict))
@@ -1361,15 +1451,12 @@ impl App {
         let notice = match (id, current) {
             (Some(_), None) => {
                 f.editing = None;
-                DELETED_ON_KEY
+                DELETED_ON_KEY.to_owned()
             }
-            (Some(_), Some(e)) => {
-                f.editing = Some(e);
-                CHANGED_ON_KEY
-            }
-            (None, _) => CHANGED_ON_KEY,
+            (Some(_), Some(e)) => changed_on_key(&f.rebase(e)),
+            (None, _) => CHANGED_ON_KEY.to_owned(),
         };
-        f.notice = Some(notice.to_owned());
+        f.notice = Some(notice);
     }
 
     /// A vault change that worked: `shown` in the pane, `logged` in the
@@ -3641,7 +3728,10 @@ mod tests {
         assert_eq!(*session_entry(&app, "GitHub").password, "theirs");
         let f = form(&mut app);
         assert_eq!(f.username, "alice-mine", "the typed values stay");
-        assert_eq!(f.password, "pw-a");
+        assert_eq!(
+            f.password, "theirs",
+            "an untouched field takes the key's value"
+        );
         assert_eq!(f.notice.as_deref(), Some(CONFLICT_NOTICE));
         assert_eq!(
             f.editing.as_ref().map(|e| e.password.as_str()),
@@ -3650,11 +3740,13 @@ mod tests {
         );
         assert!(app.vault_session().unwrap().auth.is_some());
 
-        // Saved again, it goes through.
+        // Saved again, it goes through, and the other program's password
+        // survives.
         save_form(&mut app, &mut key);
         let on_key = key.vault_on_key(&p).unwrap();
         let e = on_key.entries.iter().find(|e| e.id == a.id).unwrap();
         assert_eq!(e.username, "alice-mine");
+        assert_eq!(*e.password, "theirs");
         assert!(app.vault.form.is_none());
         assert_eq!(app.vault.info.as_deref(), Some("Entry \"GitHub\" updated."));
     }
@@ -4095,5 +4187,82 @@ mod tests {
             text.contains("Add entry") && text.contains("Edit"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_field_changed_on_both_sides_is_named() {
+        let mut key = FakeKey::new();
+        let a = login("GitHub", "alice", "pw-a");
+        let p = key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![a.clone()],
+            },
+        );
+        let mut a2 = a.clone();
+        a2.password = Zeroizing::new("theirs".into());
+        a2.notes = "their notes".into();
+        key.hook = writes_elsewhere(p.clone(), Vault { entries: vec![a2] });
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_edit_entry(&a.id);
+        {
+            let f = form(&mut app);
+            f.password.clear();
+            f.password.push_str("mine");
+        }
+        save_form(&mut app, &mut key);
+        let f = form(&mut app);
+        assert_eq!(f.password, "mine", "the typed value stays");
+        assert_eq!(f.notes, "their notes");
+        assert_eq!(
+            f.notice.as_deref(),
+            Some(
+                "This entry changed on the key since the vault was opened; nothing was \
+                 written. The password was also changed elsewhere; yours will replace it. \
+                 Check it and save again."
+            )
+        );
+        save_form(&mut app, &mut key);
+        let on_key = key.vault_on_key(&p).unwrap();
+        assert_eq!(*on_key.entries[0].password, "mine");
+        assert_eq!(on_key.entries[0].notes, "their notes");
+
+        assert_eq!(changed_on_key(&[]), CONFLICT_NOTICE);
+        assert!(changed_on_key(&["username", "password"]).contains(
+            "The username and password were also changed elsewhere; yours will \
+                       replace them."
+        ));
+        assert!(changed_on_key(&["title", "URL", "notes"])
+            .contains("The title, URL and notes were also"));
+    }
+
+    #[test]
+    fn every_save_kind_logs_the_store_note() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let used = app.vault_session().unwrap().unlocked.capacity.used_bytes;
+        key.set_max_bytes(used + 10);
+        let bank = session_entry(&app, "Bank");
+        let vault = shown_ref(&app);
+        save_into(
+            &mut app,
+            &mut key,
+            vault,
+            SaveKind::Delete {
+                title: Zeroizing::new("Bank".into()),
+            },
+            Change::Delete { before: bank },
+        );
+        assert_eq!(app.selected_vault().unwrap().entry_count(), Some(1));
+        let cap = app.vault_session().unwrap().unlocked.capacity;
+        assert!(cap.used_bytes < used, "the delete freed room");
+        let line = blob_space_line("Vault", &cap).expect("still under a quarter free");
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.severity == Severity::Warn && l.text == line));
     }
 }
