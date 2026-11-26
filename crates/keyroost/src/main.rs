@@ -642,6 +642,10 @@ struct SecurityKeysState {
     /// Capacity snapshot computed at load/reload time (needs the device's
     /// getInfo, which only the worker thread holds).
     lb_capacity: Option<keyroost_ctap::large_blobs::BlobCapacity>,
+    /// Per entry of the cached array: the name of the unlocked vault that holds
+    /// it. Recomputed when the array loads and when the vault session changes
+    /// ([`App::refresh_storage_vault_labels`]), never per frame.
+    lb_vault_labels: Vec<Option<String>>,
     /// Index of the entry currently expanded in the hex/ASCII viewer.
     lb_selected: Option<usize>,
     /// Pending "delete entry N" confirmation in the structured editor.
@@ -12407,6 +12411,7 @@ impl App {
         // Large-blob state is per-key; drop it so the next key auto-loads fresh.
         self.security_keys.large_blobs = None;
         self.security_keys.lb_capacity = None;
+        self.security_keys.lb_vault_labels.clear();
         self.security_keys.lb_autoloaded = false;
         self.security_keys.lb_selected = None;
         self.security_keys.lb_editing = None;
@@ -21659,6 +21664,7 @@ impl App {
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
+                        app.refresh_storage_vault_labels();
                         app.security_keys.lb_new_text.clear();
                         app.security_keys.lb_show_add = false;
                         app.storage_done(format!(
@@ -21739,6 +21745,7 @@ impl App {
                     Ok((array, cap)) => {
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
+                        app.refresh_storage_vault_labels();
                         app.security_keys.lb_editing = None;
                         app.security_keys.lb_edit_text.clear();
                         app.storage_done("Note updated.".into());
@@ -21793,6 +21800,7 @@ impl App {
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
+                        app.refresh_storage_vault_labels();
                         app.security_keys.lb_selected = None;
                         app.security_keys.lb_status = Some(format!(
                             "Loaded {n} entr{}.",
@@ -21896,6 +21904,7 @@ impl App {
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
+                        app.refresh_storage_vault_labels();
                         app.security_keys.lb_selected = None;
                         app.storage_done(format!("Entry deleted. {n} remaining."));
                         app.security_keys.error = None;
@@ -21995,6 +22004,7 @@ impl App {
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
+                        app.refresh_storage_vault_labels();
                         app.security_keys.lb_selected = None;
                         app.storage_done(format!(
                             "Storage cleared. {n} entr{} remaining.",
@@ -22206,6 +22216,7 @@ impl App {
         let mut cancel_edit = false;
         let selected = self.security_keys.lb_selected;
         let editing = self.security_keys.lb_editing;
+        let app_vault_labels = self.security_keys.lb_vault_labels.clone();
         for (idx, entry) in array.entries().into_iter().enumerate() {
             theme::card_frame(p).show(ui, |ui| {
                 use keyroost_ctap::large_blobs::EntryKind;
@@ -22228,7 +22239,13 @@ impl App {
                                 .color(p.txt),
                         );
                         ui.add_space(8.0);
+                        let vault_label = app_vault_labels.get(idx).cloned().flatten();
                         let meta = match &classification {
+                            EntryKind::Opaque if vault_label.is_some() => format!(
+                                "{} \u{00b7} {} bytes",
+                                vault_pane::vault_entry_row_text(vault_label.as_deref().unwrap_or("")),
+                                entry.ciphertext.len(),
+                            ),
                             EntryKind::Note(_) => "keyroost text note".to_string(),
                             EntryKind::KeyName(l) => device::key_name_row_text(&l.label),
                             EntryKind::Opaque => format!(
@@ -22374,6 +22391,13 @@ impl App {
                             idx + 1,
                             if is_name {
                                 " This removes the key's name."
+                            } else if self
+                                .security_keys
+                                .lb_vault_labels
+                                .get(idx)
+                                .is_some_and(Option::is_some)
+                            {
+                                " This is a password vault: deleting it loses every entry in it."
                             } else {
                                 ""
                             }

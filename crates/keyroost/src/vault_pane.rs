@@ -131,6 +131,30 @@ pub(crate) fn chip_label(v: &VaultOnKey) -> String {
     }
 }
 
+/// For each conforming entry of `array.entries()`: `Some(name)` (or
+/// `(unnamed)`) when an open vault holds it, else `None`. The vault's name
+/// is the only thing taken from it; the entry itself is never decrypted.
+pub(crate) fn vault_entry_labels(
+    array: &keyroost_ctap::large_blobs::LargeBlobArray,
+    vaults: &[VaultOnKey],
+) -> Vec<Option<String>> {
+    array
+        .entries()
+        .into_iter()
+        .map(|e| {
+            vaults.iter().find_map(|v| match &v.state {
+                Ok(open) if open.holds_entry(e) => Some(shown_name(v.vault_ref.name.as_deref())),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+/// The Storage row's text for an entry an unlocked vault holds.
+pub(crate) fn vault_entry_row_text(name: &str) -> String {
+    format!("password vault \"{name}\" (encrypted)")
+}
+
 /// Upper-case the first letter of a CLI message, as a sentence starts.
 fn sentence(s: &str) -> String {
     let mut c = s.chars();
@@ -1156,6 +1180,17 @@ impl VaultState {
 }
 
 impl App {
+    /// Name the Storage entries an unlocked vault holds. Run after a Storage
+    /// load and whenever the vault session is set, changed or dropped; never
+    /// per frame.
+    pub(crate) fn refresh_storage_vault_labels(&mut self) {
+        let labels = match (&self.security_keys.large_blobs, self.vault_session()) {
+            (Some(array), Some(s)) => vault_entry_labels(array, &s.unlocked.vaults),
+            _ => Vec::new(),
+        };
+        self.security_keys.lb_vault_labels = labels;
+    }
+
     /// The vault session, only while it is bound to the selected key.
     pub(crate) fn vault_session(&self) -> Option<&VaultSession> {
         self.vault
@@ -1254,6 +1289,7 @@ impl App {
                     pin_from_fido,
                     entry_bytes,
                 });
+                self.refresh_storage_vault_labels();
                 // One PIN entry serves both tabs: the FIDO2 tab unlocks with
                 // the PIN the key just accepted (no touch).
                 if let Some(pin) = typed_pin {
@@ -1317,6 +1353,7 @@ impl App {
                     s.entry_bytes = entry_bytes_estimate(&unlocked.vaults);
                     s.unlocked = unlocked;
                 }
+                self.refresh_storage_vault_labels();
                 self.vault_fix_selection();
                 self.vault.error = None;
                 // An import preview open meanwhile compares with the vault
@@ -1347,6 +1384,7 @@ impl App {
             gen,
             ..Default::default()
         };
+        self.refresh_storage_vault_labels();
     }
 
     /// The add / edit entry form holds unsaved changes: the one thing that
@@ -1716,6 +1754,7 @@ impl App {
             v.state = Ok(open);
         }
         s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
+        self.refresh_storage_vault_labels();
     }
 
     /// The end of a save. A result for another key is dropped with its
@@ -2472,6 +2511,7 @@ impl App {
             s.unlocked.capacity = capacity;
             s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
         }
+        self.refresh_storage_vault_labels();
         self.vault_select(id);
         self.vault.new_vault = None;
         if imported.is_some() {
@@ -2591,6 +2631,7 @@ impl App {
                     s.unlocked.capacity = capacity;
                     s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
                 }
+                self.refresh_storage_vault_labels();
                 self.vault.open_entry = None;
                 self.vault.revealed = None;
                 return self.vault_fail(&e);
@@ -2604,6 +2645,7 @@ impl App {
             s.unlocked.capacity = capacity;
             s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
         }
+        self.refresh_storage_vault_labels();
         self.vault_fix_selection();
         let name = shown_name(vault.name.as_deref());
         self.vault_done(
@@ -2710,6 +2752,7 @@ impl App {
             s.unlocked.capacity = capacity;
             s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
         }
+        self.refresh_storage_vault_labels();
         if was_shown {
             // Same entries, same IDs: an opened entry stays open.
             self.vault.selected = Some(new_id);
@@ -2738,6 +2781,7 @@ impl App {
                     s.entry_bytes = entry_bytes_estimate(&unlocked.vaults);
                     s.unlocked = unlocked;
                 }
+                self.refresh_storage_vault_labels();
                 self.vault_fix_selection();
                 self.vault.info = None;
                 self.vault.error = Some(text);
@@ -4817,6 +4861,69 @@ mod tests {
         app.selected_device = Some("serial:BBB".into());
         assert!(app.vault_session().is_none());
         assert!(app.vault_session_mut().is_none());
+    }
+
+    /// A key with three foreign entries, then two vaults, and an app showing
+    /// that key's Storage list.
+    fn storage_app() -> (App, FakeKey) {
+        let mut key = FakeKey::new();
+        key.add_foreign_entries();
+        two_vaults(&mut key);
+        let mut app = app();
+        app.security_keys.large_blobs = Some(key.array());
+        (app, key)
+    }
+
+    #[test]
+    fn storage_names_an_unlocked_vaults_entry() {
+        let (mut app, mut key) = storage_app();
+        app.refresh_storage_vault_labels();
+        assert!(app.security_keys.lb_vault_labels.is_empty(), "locked");
+        unlock_into(&mut app, &mut key);
+        let labels = &app.security_keys.lb_vault_labels;
+        let array = key.array();
+        assert_eq!(labels.len(), array.entries().len());
+        let named: Vec<&str> = labels.iter().flatten().map(String::as_str).collect();
+        assert_eq!(named, ["Personal", "Work"]);
+        assert_eq!(
+            labels.iter().filter(|l| l.is_none()).count(),
+            labels.len() - 2
+        );
+        // Only the vault entries: the foreign ones (first) stay unnamed.
+        assert!(labels[..3].iter().all(Option::is_none));
+        // A vault that did not open names nothing.
+        let unnamed = unavailable(None);
+        assert!(vault_entry_labels(&array, &[unnamed])
+            .iter()
+            .all(Option::is_none));
+        assert_eq!(
+            vault_entry_row_text("Personal"),
+            "password vault \"Personal\" (encrypted)"
+        );
+    }
+
+    #[test]
+    fn labels_go_when_the_vault_locks() {
+        let (mut app, mut key) = storage_app();
+        unlock_into(&mut app, &mut key);
+        assert!(app
+            .security_keys
+            .lb_vault_labels
+            .iter()
+            .any(Option::is_some));
+        app.vault_lock(None);
+        assert!(app.security_keys.lb_vault_labels.is_empty());
+    }
+
+    #[test]
+    fn labels_reset_on_selection_change() {
+        let (mut app, mut key) = storage_app();
+        unlock_into(&mut app, &mut key);
+        assert!(!app.security_keys.lb_vault_labels.is_empty());
+        let previous = app.selected_device.take();
+        app.selected_device = Some("serial:BBB".into());
+        app.on_device_selected(previous);
+        assert!(app.security_keys.lb_vault_labels.is_empty());
     }
 
     #[test]
