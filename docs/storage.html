@@ -95,6 +95,10 @@
       save it. keyroost stores it as its own entry, marked so it can be recognized and read
       back here later. This is <strong>not encryption</strong> — the text is stored in the
       clear.</p>
+    <p><strong>Shared space.</strong> A note, like the key's name, is kept in the key's
+      shared large-blob store without belonging to a passkey, so a browser may clear it when
+      the store is full and a website needs room; adding the note again restores it. When a
+      save leaves less than a quarter of the store free, keyroost says so after the save.</p>
     <p><strong>Edit a note.</strong> keyroost's own notes have an <em>Edit</em> button that
       replaces the text in place. Relying-party entries cannot be edited.</p>
     <p><strong>The key's name.</strong> A name stored on the key (see

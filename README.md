@@ -53,7 +53,10 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   The large-blob store is shared space on the key, meant for data that
   belongs to a passkey; each vault is kept there as the data of its own
   credential. Websites may store data there too, so keep vaults small;
-  `fido vault list` shows how full the store is.
+  `fido vault list` shows how full the store is. A `fido blob` note and a
+  name on the key are kept there without belonging to a passkey, so a
+  browser may clear them when the store is full and a website needs room;
+  setting them again restores them.
 - **OATH (TOTP/HOTP)** — list, add, delete, and compute codes over PC/SC,
   including applet-password set / clear / unlock, and a factory reset of the
   applet (`oath reset`) — the recovery path for a forgotten password. In
@@ -898,11 +901,12 @@ first time this version reads it.
 - On Windows without administrator rights, keyroost can't read a key's FIDO
   side, so it shows only names saved on this computer.
 - `fido blob clear` and a FIDO reset erase the name with everything else
-  (`fido blob clear --keep-name` keeps it). The FIDO2 standard also lets
-  other software remove large-blob entries that no passkey uses; we haven't
-  seen it happen. If a key loses its name, it shows as unnamed until the name
-  is written back: `name list` prints the command to do so, and the desktop
-  app offers to.
+  (`fido blob clear --keep-name` keeps it).
+- The name is kept in the key's shared large-blob store without belonging to
+  a passkey, so a browser may clear it when the store is full and a website
+  needs room; setting the name again restores it. A key that lost its name
+  shows as unnamed until then: `name list` prints the command to do so, and
+  the desktop app offers to.
 
 The format of the name entry, with test vectors for other tools, is in
 [`docs/PROTOCOL-device-label.md`](docs/PROTOCOL-device-label.md).

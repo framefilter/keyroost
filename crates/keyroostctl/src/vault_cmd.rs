@@ -370,7 +370,7 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
             )
             .map_err(vault_error)?;
             outln!("{}", backup_hint(name));
-            print_store_note(&made.capacity);
+            crate::output::store_note(&made.capacity);
             Ok(())
         }
         FidoVaultCmd::Delete {
@@ -429,7 +429,7 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
             let new = vault::rotate(&mut key, &mut auth, old, &mut |s| touches.step(s))
                 .map_err(vault_error)?;
             outln!("{}", rotated_line(name, new.open.contents.entries.len()));
-            print_store_note(&new.capacity);
+            crate::output::store_note(&new.capacity);
             Ok(())
         }
         FidoVaultCmd::Export {
@@ -766,7 +766,7 @@ fn import_done(
     } else {
         outln!("{}", imported_line(vault, added, replaced));
     }
-    print_store_note(cap);
+    crate::output::store_note(cap);
     Ok(())
 }
 
@@ -1482,33 +1482,6 @@ pub(crate) fn list_lines(rows: &[VaultRow], cap: &BlobCapacity) -> Vec<String> {
         cap.used_bytes, cap.max_bytes, cap.free_bytes
     ));
     lines
-}
-
-/// A vault write that leaves less than 1/`STORE_NOTE_DIVISOR` of the
-/// largeBlob store free prints [`store_note`]: websites share the store to
-/// keep data with their passkeys. The write itself is never refused for it.
-const STORE_NOTE_DIVISOR: u64 = 4;
-
-/// The note a vault write prints on stderr (as `note: ...`) when the
-/// largeBlob store is nearly full after it, with the numbers `vault list`
-/// prints; `None` while there is room.
-pub(crate) fn store_note(cap: &BlobCapacity) -> Option<String> {
-    if cap.max_bytes == 0 || cap.free_bytes >= cap.max_bytes / STORE_NOTE_DIVISOR {
-        return None;
-    }
-    let percent = cap.used_bytes.min(cap.max_bytes) * 100 / cap.max_bytes;
-    Some(format!(
-        "the key's large-blob store is {percent}% full ({} of {} bytes). \
-         Websites that store data with their passkeys may have no room left.",
-        cap.used_bytes, cap.max_bytes
-    ))
-}
-
-/// Print [`store_note`] on stderr when there is one.
-fn print_store_note(cap: &BlobCapacity) {
-    if let Some(note) = store_note(cap) {
-        crate::output::note(&note);
-    }
 }
 
 /// `vault list --json`.
@@ -2306,7 +2279,7 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
                     )
                 );
             }
-            print_store_note(&cap);
+            crate::output::store_note(&cap);
             Ok(())
         }
         FidoVaultEntryCmd::Edit {
@@ -2384,7 +2357,7 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
                     )
                 );
             }
-            print_store_note(&cap);
+            crate::output::store_note(&cap);
             Ok(())
         }
         FidoVaultEntryCmd::Delete {
@@ -2418,7 +2391,7 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             )?;
             let cap = save_change(&mut k, open, &Change::Delete { before })?;
             outln!("Entry \"{}\" deleted.", sanitize_terminal(title));
-            print_store_note(&cap);
+            crate::output::store_note(&cap);
             Ok(())
         }
     }
@@ -2543,44 +2516,18 @@ mod tests {
     }
 
     #[test]
-    fn store_note_shows_once_less_than_a_quarter_is_free() {
-        let store = |used: u64| BlobCapacity {
+    fn store_note_uses_the_numbers_vault_list_prints() {
+        // The note itself is tested in keyroost_resolve::blob_space.
+        let cap = BlobCapacity {
             max_bytes: 4096,
-            used_bytes: used,
-            free_bytes: 4096 - used,
+            used_bytes: 3360,
+            free_bytes: 736,
             entry_count: 3,
         };
-        // 1024 free is exactly a quarter: no note yet.
-        assert_eq!(store_note(&store(3072)), None);
-        assert_eq!(store_note(&store(300)), None);
-        // 1023 free: the note, with `vault list`'s numbers.
-        assert_eq!(
-            store_note(&store(3073)).as_deref(),
-            Some(
-                "the key's large-blob store is 75% full (3073 of 4096 bytes). \
-                 Websites that store data with their passkeys may have no room left."
-            )
-        );
-        assert_eq!(
-            store_note(&store(3360)).as_deref(),
-            Some(
-                "the key's large-blob store is 82% full (3360 of 4096 bytes). \
-                 Websites that store data with their passkeys may have no room left."
-            )
-        );
-        let full = store_note(&store(4096)).unwrap();
-        assert!(full.contains("100% full (4096 of 4096 bytes)"), "{full}");
-        // The same numbers as the capacity line `vault list` prints.
-        let listed = list_lines(&[], &store(3360));
+        let note = keyroost_resolve::store_note(&cap).unwrap();
+        assert!(note.contains("(3360 of 4096 bytes)"), "{note}");
+        let listed = list_lines(&[], &cap);
         assert!(listed[2].starts_with("Capacity: 3360 of 4096 bytes"));
-        // A key that reports no store never gets the note.
-        let none = BlobCapacity {
-            max_bytes: 0,
-            used_bytes: 0,
-            free_bytes: 0,
-            entry_count: 0,
-        };
-        assert_eq!(store_note(&none), None);
     }
 
     #[test]

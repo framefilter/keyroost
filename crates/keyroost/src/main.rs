@@ -248,6 +248,16 @@ fn serial_refs(serials: &[String]) -> Vec<&str> {
     serials.iter().map(String::as_str).collect()
 }
 
+/// The activity-log line, under `subject`, after a write (a note, the key's
+/// name) left less than a quarter of the large-blob store free: the note the
+/// CLI prints after the same write ([`keyroost_resolve::store_note`]).
+fn blob_space_line(
+    subject: &str,
+    cap: &keyroost_ctap::large_blobs::BlobCapacity,
+) -> Option<String> {
+    keyroost_resolve::store_note(cap).map(|note| format!("{subject}: {note}"))
+}
+
 /// The naming dialog's message for a key with no storage for its own name.
 const KEY_NAME_NO_STORAGE: &str =
     "This key can't store a name on itself; save the name on this computer.";
@@ -281,7 +291,8 @@ const KEY_NAME_PIN_NEEDED: &str = "Enter the key's FIDO PIN to save the name on 
 /// What an on-key name save did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyNameWrite {
-    Written,
+    /// Written; how full the large-blob store is after it.
+    Written(keyroost_ctap::large_blobs::BlobCapacity),
     /// The key already carried what was asked; nothing was written.
     AlreadySo,
 }
@@ -386,7 +397,7 @@ fn write_key_name(
         _ => false,
     };
     if kept {
-        Ok(KeyNameWrite::Written)
+        Ok(KeyNameWrite::Written(plan.after.capacity(&info)))
     } else {
         Err("The key didn't keep the change; try again."
             .to_string()
@@ -7449,6 +7460,15 @@ impl App {
         self.security_keys.lb_status = Some(status);
     }
 
+    /// After a note saved: [`blob_space_line`] as a warning in the activity
+    /// log and on the status bar, when less than a quarter of the store is
+    /// free. The save itself is never refused for it.
+    fn storage_space_note(&mut self, cap: &keyroost_ctap::large_blobs::BlobCapacity) {
+        if let Some(line) = blob_space_line("Storage", cap) {
+            self.log(Severity::Warn, line);
+        }
+    }
+
     /// A change to the key's large-blob storage that failed.
     fn storage_failed(&mut self, status: String) {
         self.log(Severity::Err, format!("Storage: {status}"));
@@ -14461,7 +14481,7 @@ impl App {
         let queued = self.spawn_job(label, move || {
             let result =
                 write_key_name(&path, name.as_deref(), expected.as_deref(), &pin).map(|w| {
-                    let written = w == KeyNameWrite::Written;
+                    let written = matches!(w, KeyNameWrite::Written(_));
                     (
                         w,
                         record_key_name(&serials, name.as_deref(), written, meta).err(),
@@ -14475,13 +14495,7 @@ impl App {
                 );
                 match result {
                     Ok((written, record_error)) => {
-                        if written == KeyNameWrite::AlreadySo {
-                            app.log_global(
-                                Severity::Info,
-                                LogKind::User,
-                                format!("{new_display}: already so on the key; nothing changed"),
-                            );
-                        } else {
+                        if let KeyNameWrite::Written(cap) = written {
                             let what = if name.is_some() {
                                 "name saved on the key"
                             } else {
@@ -14491,6 +14505,19 @@ impl App {
                                 Severity::Ok,
                                 LogKind::User,
                                 format!("{new_display}: {what}, was {old_display}"),
+                            );
+                            // After a name saved, not one removed: removing
+                            // only frees room.
+                            if name.is_some() {
+                                if let Some(line) = blob_space_line(&new_display, &cap) {
+                                    app.log_global(Severity::Warn, LogKind::User, line);
+                                }
+                            }
+                        } else {
+                            app.log_global(
+                                Severity::Info,
+                                LogKind::User,
+                                format!("{new_display}: already so on the key; nothing changed"),
                             );
                         }
                         if let Some(e) = record_error {
@@ -21272,6 +21299,7 @@ impl App {
                             "Saved. {n} entr{} total.",
                             if n == 1 { "y" } else { "ies" }
                         ));
+                        app.storage_space_note(&cap);
                         app.security_keys.error = None;
                     }
                     Err(e) => {
@@ -21348,6 +21376,7 @@ impl App {
                         app.security_keys.lb_editing = None;
                         app.security_keys.lb_edit_text.clear();
                         app.storage_done("Note updated.".into());
+                        app.storage_space_note(&cap);
                         app.security_keys.error = None;
                     }
                     Err(e) => {
@@ -34622,6 +34651,34 @@ mod tests {
         app.rename_input = "Lab".into();
         assert!(app.rename_goes_on_key());
         assert!(app.rename_needs_pin());
+    }
+
+    #[test]
+    fn a_save_leaving_under_a_quarter_free_logs_the_cli_store_note() {
+        let store = |used: u64| keyroost_ctap::large_blobs::BlobCapacity {
+            max_bytes: 4096,
+            used_bytes: used,
+            free_bytes: 4096 - used,
+            entry_count: 2,
+        };
+        // Exactly a quarter free: nothing to say.
+        assert_eq!(blob_space_line("Storage", &store(3072)), None);
+        // One byte less: the CLI's note, under what was saved.
+        assert_eq!(
+            blob_space_line("Storage", &store(3073)).as_deref(),
+            Some(
+                "Storage: the key's large-blob store is 75% full (3073 of 4096 bytes). \
+                 Websites that store data with their passkeys may have no room left."
+            )
+        );
+        let named = blob_space_line("Work YubiKey", &store(3073)).unwrap();
+        assert_eq!(
+            named,
+            format!(
+                "Work YubiKey: {}",
+                keyroost_resolve::store_note(&store(3073)).unwrap()
+            )
+        );
     }
 
     #[test]
