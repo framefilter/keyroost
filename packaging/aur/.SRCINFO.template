@@ -13,7 +13,13 @@ pkgbase = keyroost-bin
 	conflicts = keyroost
 	source = keyroost-v@VERSION@-linux-x86_64.tar.gz::https://github.com/framefilter/keyroost/releases/download/v@VERSION@/keyroost-v@VERSION@-linux-x86_64.tar.gz
 	source = 70-keyroost-fido-@VERSION@.rules::https://raw.githubusercontent.com/framefilter/keyroost/v@VERSION@/udev/70-keyroost-fido.rules
+	source = io.github.framefilter.keyroost-@VERSION@.desktop::https://raw.githubusercontent.com/framefilter/keyroost/v@VERSION@/packaging/flatpak/io.github.framefilter.keyroost.desktop
+	source = io.github.framefilter.keyroost-@VERSION@.svg::https://raw.githubusercontent.com/framefilter/keyroost/v@VERSION@/packaging/icons/hicolor/scalable/apps/io.github.framefilter.keyroost.svg
+	source = io.github.framefilter.keyroost-@VERSION@.png::https://raw.githubusercontent.com/framefilter/keyroost/v@VERSION@/packaging/icons/hicolor/256x256/apps/io.github.framefilter.keyroost.png
 	sha256sums = @SHA_LINUX@
 	sha256sums = @SHA_UDEV@
+	sha256sums = @SHA_DESKTOP@
+	sha256sums = @SHA_ICON_SVG@
+	sha256sums = @SHA_ICON_PNG@
 
 pkgname = keyroost-bin
