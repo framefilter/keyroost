@@ -14,10 +14,12 @@ use keyroost_ctap::large_blobs::BlobCapacity;
 use keyroost_ctap::transport::CtapTransport;
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
 use keyroost_transport::vault::{
-    self, Change, CtapVaultKey, LeftOver, OpenVault, Saved, Unlocked, VaultAuth, VaultKey,
-    VaultKeyError, VaultOnKey, VaultRef, VaultStep,
+    self, Change, Created, CtapVaultKey, LeftOver, OldVault, OpenVault, Saved, Unlocked, VaultAuth,
+    VaultKey, VaultKeyError, VaultOnKey, VaultRef, VaultStep,
 };
-use keyroost_vault::{canon_id, generate_password, new_id, seal, Entry, GenOptions, Vault};
+use keyroost_vault::{
+    canon_id, generate_password, new_id, seal, user_handle, Entry, GenOptions, Vault,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::ui::device::{CapTab, DeviceId};
@@ -96,13 +98,6 @@ pub(crate) fn with_vault_tab(mut tabs: Vec<CapTab>, offer: VaultOffer) -> Vec<Ca
 }
 
 /// `1 entry` / `N entries`: the app's copy of the CLI's helper.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the vault's messages count entries with it (later tasks)"
-    )
-)]
 pub(crate) fn entries(n: usize) -> String {
     if n == 1 {
         "1 entry".to_owned()
@@ -120,13 +115,16 @@ fn shown_name(name: Option<&str>) -> String {
     }
 }
 
-/// A vault as its chip names it: `Personal · 12`, or
-/// `Personal · (unavailable)` when it did not open.
+/// A vault as its chip names it: `Personal · 12`; `Personal · (none)` when
+/// the key holds no data for it (the copy a failed create or rotate leaves,
+/// as the CLI lists it); `Personal · (unavailable)` when it did not open.
+/// Two vaults that share a name are told apart this way.
 pub(crate) fn chip_label(v: &VaultOnKey) -> String {
     let name = shown_name(v.vault_ref.name.as_deref());
-    match v.entry_count() {
-        Some(n) => format!("{name} \u{00B7} {n}"),
-        None => format!("{name} \u{00B7} (unavailable)"),
+    match &v.state {
+        Ok(open) if !open.stored => format!("{name} \u{00B7} (none)"),
+        Ok(open) => format!("{name} \u{00B7} {}", open.contents.entries.len()),
+        Err(_) => format!("{name} \u{00B7} (unavailable)"),
     }
 }
 
@@ -445,7 +443,7 @@ pub(crate) fn vault_error_text(e: &VaultKeyError) -> String {
             LeftOver {
                 credential: true,
                 data: false,
-            } => "; delete the copy with no data with Delete vault\u{2026}",
+            } => "; delete the copy listed as (none) with Delete vault\u{2026}",
             LeftOver {
                 credential: true,
                 data: true,
@@ -462,11 +460,8 @@ pub(crate) fn vault_error_text(e: &VaultKeyError) -> String {
                 data: false,
             } => "",
         },
-        VaultKeyError::OldNotDeleted { .. } => {
-            return format!(
-                "{} Unlock the vault again to see both copies.",
-                as_sentence(&e.to_string())
-            );
+        VaultKeyError::OldNotDeleted { name, cause, old } => {
+            return old_not_deleted_text(name.as_deref(), cause, *old);
         }
         VaultKeyError::VaultGone { .. } => {
             return format!(
@@ -477,6 +472,37 @@ pub(crate) fn vault_error_text(e: &VaultKeyError) -> String {
         _ => "",
     };
     as_sentence(&format!("{e}{hint}"))
+}
+
+/// A rotate made and checked the new vault but the old one is still on the
+/// key: which copy to delete, and when the one left needs another rotate
+/// to end up on a fresh key (the CLI's words, with the app's buttons).
+/// Never "delete either" without that second rotate.
+fn old_not_deleted_text(name: Option<&str>, cause: &VaultKeyError, old: OldVault) -> String {
+    let which = match name {
+        Some(n) if !n.is_empty() => format!("vault \"{n}\""),
+        _ => "vault".to_owned(),
+    };
+    let both_copies = "both copies hold the same checked entries, but one still uses the old \
+                       key: delete either with Delete vault\u{2026}, then rotate the one left \
+                       again with Rotate vault key\u{2026} so it gets a fresh key";
+    let next = match old {
+        OldVault::Emptied => "the old copy is left with no data: delete the copy listed as \
+                              (none) with Delete vault\u{2026}"
+            .to_owned(),
+        OldVault::Kept => both_copies.to_owned(),
+        OldVault::Unknown => format!(
+            "whether the old copy still holds its data is not known: if a copy is listed as \
+             (none), delete that one with Delete vault\u{2026}; otherwise {both_copies}"
+        ),
+    };
+    format!(
+        "{} Unlock the vault again to see both copies.",
+        as_sentence(&format!(
+            "the new {which} is in place with every entry checked, but deleting the old one \
+             failed: {cause}; {next}"
+        ))
+    )
 }
 
 /// A vault job's error as the pane shows it, as a sentence like the rest.
@@ -569,6 +595,90 @@ pub(crate) fn run_save<K: VaultKey>(
 ) -> Result<Saved, VaultKeyError> {
     vault::save(key, auth, open, change, &mut |s| touches.step(s))
 }
+
+/// Create a vault named `name` holding `initial` on `key`: two touches,
+/// counted into `touches`. Refused before any touch when the name is taken
+/// or the store has no room.
+pub(crate) fn run_create<K: VaultKey>(
+    key: &mut K,
+    auth: &mut VaultAuth,
+    name: &str,
+    initial: &Vault,
+    touches: &mut TouchProgress,
+) -> Result<Created, VaultKeyError> {
+    vault::create(key, auth, name, initial, &mut |s| touches.step(s))
+}
+
+/// Delete the vault `target` (found by its credential ID, so a vault of the
+/// same name is never touched): no touch unless the key lists no
+/// largeBlobKey for it. Returns how full the store is afterwards.
+pub(crate) fn run_delete_vault<K: VaultKey>(
+    key: &mut K,
+    auth: &mut VaultAuth,
+    target: &VaultRef,
+    touches: &mut TouchProgress,
+) -> Result<BlobCapacity, VaultKeyError> {
+    let cred = vault::list_credentials(key, auth)?
+        .into_iter()
+        .find(|c| c.vault.credential_id == target.credential_id)
+        .ok_or_else(|| VaultKeyError::VaultGone {
+            name: target.name.clone(),
+        })?;
+    vault::delete(key, auth, &cred, &mut |s| touches.step(s))?;
+    Ok(key.read_blobs()?.capacity(key.info()))
+}
+
+/// Give the open vault `old` a new key: a new vault of the same name with
+/// the same entries, then the old one deleted. Two touches.
+pub(crate) fn run_rotate<K: VaultKey>(
+    key: &mut K,
+    auth: &mut VaultAuth,
+    old: &OpenVault,
+    touches: &mut TouchProgress,
+) -> Result<Created, VaultKeyError> {
+    vault::rotate(key, auth, old, &mut |s| touches.step(s))
+}
+
+/// What the pane says once a vault is made: the CLI's backup reminder,
+/// with the app's Export backup… for its command.
+pub(crate) fn backup_reminder(name: &str) -> String {
+    format!(
+        "Vault \"{}\" created on this key. If the key is lost or reset, the vault goes with \
+         it. Keep a backup with Export backup\u{2026} below.",
+        sanitize_title(name)
+    )
+}
+
+/// The CLI's `vault delete` question.
+fn delete_vault_question(name: &str, key: &str) -> String {
+    format!(
+        "Delete vault \"{}\" on {}?",
+        sanitize_title(name),
+        sanitize_title(key)
+    )
+}
+
+/// The CLI's `vault delete` note, with the app's export for its command.
+const DELETE_VAULT_NOTE: &str = "Its entries go with it. To keep them, export a backup first.";
+
+/// The CLI's `vault rotate` question, word for word.
+fn rotate_question(name: &str, key: &str) -> String {
+    format!(
+        "Rotate the key of vault \"{}\" on {}? A new vault replaces it; the old one is \
+         deleted after every entry is checked.",
+        sanitize_title(name),
+        sanitize_title(key)
+    )
+}
+
+/// What Rotate vault key… is for, under its button.
+const ROTATE_EXPLAINED: &str = "Gives this vault a new key. Use it after unlocking the vault on \
+                                a computer you no longer trust, then change the passwords that \
+                                matter.";
+
+/// Why the vault locked when a create, delete or rotate couldn't start.
+const JOB_NOT_STARTED: &str =
+    "That couldn't start, and nothing was changed. Unlock the vault again.";
 
 /// Whether the key refused the vault's PIN (or locked it): every retry
 /// would spend another of the key's PIN tries, so the vault locks.
@@ -856,10 +966,6 @@ pub(crate) enum SaveKind {
 
 /// A destructive vault action waiting for its Yes. Keyed by credential ID /
 /// entry ID, never by name: two vaults or entries may share one.
-#[expect(
-    dead_code,
-    reason = "the vault delete and rotate confirmations come with their views"
-)]
 pub(crate) enum VaultConfirm {
     DeleteEntry { vault: VaultRef, entry_id: String },
     DeleteVault { vault: VaultRef },
@@ -919,6 +1025,9 @@ pub(crate) struct VaultState {
     pub(crate) gen_open: bool,
     /// The action waiting for its confirmation card.
     pub(crate) confirm: Option<VaultConfirm>,
+    /// The New vault box's name, while it is open. Not a secret: vault
+    /// names are listed without unlocking.
+    pub(crate) new_vault: Option<String>,
 }
 
 impl TypedSecrets for VaultState {
@@ -1741,12 +1850,18 @@ impl App {
             return;
         };
         let vaults = &session.unlocked.vaults;
+        let waiting = self.waiting_for().map(str::to_owned);
         if vaults.is_empty() {
             ui.label(
                 egui::RichText::new("No vaults on this key yet.")
                     .font(theme::f_reg(13.0))
                     .color(p.txt2),
             );
+            ui.add_space(8.0);
+            let name = self.vault.new_vault.get_or_insert_with(String::new);
+            if new_vault_row(ui, p, name, waiting.as_deref(), false).create {
+                self.vault_create();
+            }
             return;
         }
         let now = now_secs_f64();
@@ -1761,8 +1876,13 @@ impl App {
         let mut add = false;
         let mut edit: Option<String> = None;
         let mut delete: Option<String> = None;
-        // The filter box edits a copy while the session is borrowed.
+        let mut new_chip = false;
+        let mut new_row = NewVaultClicks::default();
+        let (mut rotate, mut delete_vault) = (false, false);
+        // The filter and name boxes edit copies while the session is
+        // borrowed.
         let mut filter = std::mem::take(&mut self.vault.filter);
+        let mut new_name = self.vault.new_vault.take();
 
         let session = self.vault_session().expect("checked above");
         let vaults = &session.unlocked.vaults;
@@ -1777,7 +1897,12 @@ impl App {
                     select = Some(v.vault_ref.credential_id.clone());
                 }
             }
+            new_chip = chip(ui, p, "+ New vault", new_name.is_some()).clicked();
         });
+        if let Some(name) = new_name.as_mut() {
+            ui.add_space(6.0);
+            new_row = new_vault_row(ui, p, name, waiting.as_deref(), true);
+        }
         ui.add_space(6.0);
         let cap = &session.unlocked.capacity;
         ui.horizontal(|ui| {
@@ -1888,7 +2013,49 @@ impl App {
             );
         });
 
+        // The shown vault as a whole. Delete vault… reaches a vault that
+        // can't be opened too; Rotate needs one that opened.
+        let writable = vaults[shown].state.is_ok();
+        ui.add_space(12.0);
+        theme::card_frame(p).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new("This vault")
+                    .font(theme::f_sb(13.5))
+                    .color(p.txt),
+            );
+            ui.add_space(6.0);
+            if writable {
+                rotate =
+                    theme::button(ui, p, BtnKind::Default, "Rotate vault key\u{2026}").clicked();
+            } else {
+                theme::button_disabled(ui, p, "Rotate vault key\u{2026}");
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(ROTATE_EXPLAINED)
+                    .font(theme::f_reg(12.0))
+                    .color(p.txt3),
+            );
+            ui.add_space(10.0);
+            delete_vault = theme::button(ui, p, BtnKind::Danger, "Delete vault\u{2026}").clicked();
+        });
+
         self.vault.filter = filter;
+        self.vault.new_vault = new_name;
+        if new_chip {
+            self.vault_new_vault();
+        } else if new_row.cancel {
+            self.vault.new_vault = None;
+        } else if new_row.create {
+            self.vault_create();
+        }
+        if rotate {
+            self.vault_ask_rotate();
+        }
+        if delete_vault {
+            self.vault_ask_delete_vault();
+        }
         if let Some(id) = select {
             self.vault_select(id);
         }
@@ -1914,10 +2081,459 @@ impl App {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.05)));
         }
+        self.render_vault_action_confirm(ui, p);
+    }
+}
+
+/// New vault, Delete vault and Rotate vault key: the jobs and their ends.
+impl App {
+    /// The selected key as a question names it.
+    fn vault_key_title(&self) -> String {
+        self.selected_device().map_or_else(
+            || "this key".to_owned(),
+            |d| crate::ui::device::DeviceView::title(d).into_owned(),
+        )
+    }
+
+    /// The session's PIN and token, for a job that holds them until its end
+    /// puts them back. `None` while another job holds them.
+    pub(crate) fn vault_take_auth(&mut self) -> Option<VaultAuth> {
+        self.vault_session_mut()?.auth.take()
+    }
+
+    /// Back into the session at a job's end.
+    fn vault_give_back_auth(&mut self, auth: VaultAuth) {
+        if let Some(s) = self.vault_session_mut() {
+            s.auth = Some(auth);
+        }
+    }
+
+    /// A job that took the session's auth couldn't be queued: the auth went
+    /// with it, so lock rather than keep a session that can't write.
+    fn vault_not_started(&mut self) {
+        self.log(Severity::Err, format!("Vault: {JOB_NOT_STARTED}"));
+        self.vault_lock(Some(JOB_NOT_STARTED.to_owned()));
+    }
+
+    /// The `+ New vault` chip: open the name box, or close it again.
+    pub(crate) fn vault_new_vault(&mut self) {
+        self.vault.new_vault = match self.vault.new_vault {
+            Some(_) => None,
+            None => Some(String::new()),
+        };
+    }
+
+    /// What Create vault takes: the typed name (spaces around it dropped)
+    /// and the session's auth. A name the format refuses, or one a vault on
+    /// the key already has, is refused here, before any job, with nothing
+    /// taken; the box keeps the name.
+    pub(crate) fn vault_take_for_create(&mut self) -> Option<(String, VaultAuth)> {
+        let name = self.vault.new_vault.as_deref()?.trim().to_owned();
+        let taken = self
+            .vault_session()?
+            .unlocked
+            .vaults
+            .iter()
+            .any(|v| v.vault_ref.name.as_deref() == Some(name.as_str()));
+        let refused = match user_handle(&name) {
+            Err(e) => Some(VaultKeyError::Vault(e)),
+            Ok(_) if taken => Some(VaultKeyError::DuplicateName(name.clone())),
+            Ok(_) => None,
+        };
+        if let Some(e) = refused {
+            self.vault.info = None;
+            self.vault.error = Some(vault_error_text(&e));
+            return None;
+        }
+        let auth = self.vault_take_auth()?;
+        Some((name, auth))
+    }
+
+    /// Create vault: an empty vault of the typed name on the selected key,
+    /// two touches.
+    pub(crate) fn vault_create(&mut self) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        let Some((name, auth)) = self.vault_take_for_create() else {
+            return;
+        };
+        let Some(target) = self.selected_fido_target() else {
+            self.vault_give_back_auth(auth);
+            return;
+        };
+        self.vault.error = None;
+        self.vault.info = None;
+        let shown = self.vault.progress.clone();
+        let for_device = self.selected_device.clone();
+        let queued = self.spawn_job("Creating the vault\u{2026}", move || {
+            let mut auth = auth;
+            let result = {
+                let mut touches = TouchProgress::new(shown, 2);
+                open_vault_key(&target).and_then(|mut key| {
+                    run_create(&mut key, &mut auth, &name, &Vault::default(), &mut touches)
+                        .map_err(VaultJobError::from)
+                })
+            };
+            Box::new(move |app: &mut App| {
+                app.vault_apply_create(for_device, auth, None, result);
+            })
+        });
+        if !queued {
+            self.vault_not_started();
+        }
+    }
+
+    /// The end of a create. The new vault joins the list, selected, with
+    /// the backup reminder (after an import into a new vault, `imported`
+    /// entries, the import's line first). A create that failed keeps the
+    /// typed name; one that left something on the key locks, since only a
+    /// new unlock lists it.
+    pub(crate) fn vault_apply_create(
+        &mut self,
+        for_device: Option<DeviceId>,
+        auth: VaultAuth,
+        imported: Option<usize>,
+        result: Result<Created, VaultJobError>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+            return;
+        }
+        let Some(pin_from_fido) = self.vault_session().map(|s| s.pin_from_fido) else {
+            return;
+        };
+        self.vault_give_back_auth(auth);
+        let Created { open, capacity } = match result {
+            Ok(created) => created,
+            Err(e) => return self.vault_job_failed(&e, pin_from_fido),
+        };
+        let name = shown_name(open.vault_ref.name.as_deref());
+        let id = open.vault_ref.credential_id.clone();
+        if let Some(s) = self.vault_session_mut() {
+            s.unlocked.vaults.push(VaultOnKey {
+                vault_ref: open.vault_ref.clone(),
+                state: Ok(open),
+            });
+            s.unlocked.capacity = capacity;
+            s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
+        }
+        self.vault_select(id);
+        self.vault.new_vault = None;
+        let reminder = backup_reminder(&name);
+        let shown = match imported {
+            None => reminder,
+            Some(n) => {
+                format!("Imported into vault \"{name}\": {n} added, 0 replaced. {reminder}")
+            }
+        };
+        self.vault_done(shown, format!("vault \"{name}\" created"));
+        self.space_note("Vault", &capacity);
+    }
+
+    /// Ask before deleting the shown vault. A vault that can't be opened can
+    /// be deleted too: it is the one way to clear it.
+    pub(crate) fn vault_ask_delete_vault(&mut self) {
+        let Some(v) = self.selected_vault() else {
+            return;
+        };
+        let vault = v.vault_ref.clone();
+        self.vault.confirm = Some(VaultConfirm::DeleteVault { vault });
+    }
+
+    /// Ask before rotating the shown vault's key; only a vault that opened.
+    pub(crate) fn vault_ask_rotate(&mut self) {
+        if !self.vault_writable() {
+            return;
+        }
+        let Some(v) = self.selected_vault() else {
+            return;
+        };
+        let vault = v.vault_ref.clone();
+        self.vault.confirm = Some(VaultConfirm::Rotate { vault });
+    }
+
+    /// The waiting Delete vault or Rotate, taken once its Yes can run.
+    /// `None` while a job runs: the question stays for the next try.
+    pub(crate) fn vault_take_confirmed(&mut self) -> Option<VaultConfirm> {
+        if !matches!(
+            self.vault.confirm,
+            Some(VaultConfirm::DeleteVault { .. } | VaultConfirm::Rotate { .. })
+        ) {
+            return None;
+        }
+        if self.refuse_if_busy() {
+            return None;
+        }
+        self.vault.confirm.take()
+    }
+
+    /// Delete `vault` from the selected key: the session's PIN, no touch.
+    pub(crate) fn vault_delete_vault(&mut self, vault: VaultRef) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        let Some(target) = self.selected_fido_target() else {
+            return;
+        };
+        let Some(auth) = self.vault_take_auth() else {
+            return;
+        };
+        self.vault.error = None;
+        self.vault.info = None;
+        let shown = self.vault.progress.clone();
+        let for_device = self.selected_device.clone();
+        let queued = self.spawn_job("Deleting the vault\u{2026}", move || {
+            let mut auth = auth;
+            let result = {
+                // A touch only on a key that lists no largeBlobKey for it.
+                let mut touches = TouchProgress::new(shown, 1);
+                open_vault_key(&target).and_then(|mut key| {
+                    run_delete_vault(&mut key, &mut auth, &vault, &mut touches)
+                        .map_err(VaultJobError::from)
+                })
+            };
+            Box::new(move |app: &mut App| {
+                app.vault_apply_delete_vault(for_device, auth, vault, result);
+            })
+        });
+        if !queued {
+            self.vault_not_started();
+        }
+    }
+
+    /// The end of a vault delete: it leaves the list, the selection falls
+    /// back to the first vault, and the space line takes the new numbers.
+    pub(crate) fn vault_apply_delete_vault(
+        &mut self,
+        for_device: Option<DeviceId>,
+        auth: VaultAuth,
+        vault: VaultRef,
+        result: Result<BlobCapacity, VaultJobError>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+            return;
+        }
+        let Some(pin_from_fido) = self.vault_session().map(|s| s.pin_from_fido) else {
+            return;
+        };
+        self.vault_give_back_auth(auth);
+        let capacity = match result {
+            Ok(capacity) => capacity,
+            Err(e) => return self.vault_job_failed(&e, pin_from_fido),
+        };
+        if let Some(s) = self.vault_session_mut() {
+            s.unlocked
+                .vaults
+                .retain(|v| v.vault_ref.credential_id != vault.credential_id);
+            s.unlocked.capacity = capacity;
+            s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
+        }
+        self.vault_fix_selection();
+        let name = shown_name(vault.name.as_deref());
+        self.vault_done(
+            format!("Vault \"{name}\" deleted."),
+            format!("vault \"{name}\" deleted"),
+        );
+    }
+
+    /// Rotate `vault`'s key on the selected key: the session's PIN, two
+    /// touches.
+    pub(crate) fn vault_rotate(&mut self, vault: VaultRef) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        let Some(target) = self.selected_fido_target() else {
+            return;
+        };
+        let Some((auth, old)) = self.vault_take_for_save(&vault) else {
+            // Gone from the session (a Refresh no longer lists it).
+            self.vault.info = None;
+            self.vault.error = Some(vault_error_text(&VaultKeyError::VaultGone {
+                name: vault.name.clone(),
+            }));
+            return;
+        };
+        self.vault.error = None;
+        self.vault.info = None;
+        let shown = self.vault.progress.clone();
+        let for_device = self.selected_device.clone();
+        let queued = self.spawn_job("Rotating the vault key\u{2026}", move || {
+            let mut auth = auth;
+            let result = {
+                let mut touches = TouchProgress::new(shown, 2);
+                open_vault_key(&target).and_then(|mut key| {
+                    run_rotate(&mut key, &mut auth, &old, &mut touches).map_err(VaultJobError::from)
+                })
+            };
+            Box::new(move |app: &mut App| {
+                app.vault_apply_rotate(for_device, auth, vault, result);
+            })
+        });
+        if !queued {
+            self.vault_not_started();
+        }
+    }
+
+    /// The end of a rotate: the new vault takes the old one's place in the
+    /// list, and the selection follows it when the old one was shown. A
+    /// rotate that left two copies on the key locks with which to delete.
+    pub(crate) fn vault_apply_rotate(
+        &mut self,
+        for_device: Option<DeviceId>,
+        auth: VaultAuth,
+        old: VaultRef,
+        result: Result<Created, VaultJobError>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+            return;
+        }
+        let Some(pin_from_fido) = self.vault_session().map(|s| s.pin_from_fido) else {
+            return;
+        };
+        self.vault_give_back_auth(auth);
+        let Created { open, capacity } = match result {
+            Ok(created) => created,
+            Err(e) => return self.vault_job_failed(&e, pin_from_fido),
+        };
+        let n = open.contents.entries.len();
+        let new_id = open.vault_ref.credential_id.clone();
+        let was_shown = self
+            .selected_vault()
+            .is_some_and(|v| v.vault_ref.credential_id == old.credential_id);
+        if let Some(s) = self.vault_session_mut() {
+            let new = VaultOnKey {
+                vault_ref: open.vault_ref.clone(),
+                state: Ok(open),
+            };
+            match s
+                .unlocked
+                .vaults
+                .iter()
+                .position(|v| v.vault_ref.credential_id == old.credential_id)
+            {
+                Some(i) => s.unlocked.vaults[i] = new,
+                None => s.unlocked.vaults.push(new),
+            }
+            s.unlocked.capacity = capacity;
+            s.entry_bytes = entry_bytes_estimate(&s.unlocked.vaults);
+        }
+        if was_shown {
+            // Same entries, same IDs: an opened entry stays open.
+            self.vault.selected = Some(new_id);
+        }
+        let name = shown_name(old.name.as_deref());
+        self.vault_done(
+            format!(
+                "Vault \"{name}\" rotated: a new vault holds its {} and the old one is deleted.",
+                entries(n)
+            ),
+            format!("vault \"{name}\" rotated"),
+        );
+        self.space_note("Vault", &capacity);
+    }
+
+    /// A create, delete or rotate that failed. What left the list stale
+    /// locks the vault (only a new unlock lists what the key holds now): a
+    /// vault gone elsewhere, a failed create that left something behind, a
+    /// rotate that left two copies. A refused PIN locks it too, so no retry
+    /// spends another of the key's PIN tries. Anything else is said, and
+    /// the session stays.
+    fn vault_job_failed(&mut self, e: &VaultJobError, pin_from_fido: bool) {
+        let stale = matches!(
+            e,
+            VaultJobError::Vault(
+                VaultKeyError::VaultGone { .. } | VaultKeyError::OldNotDeleted { .. }
+            )
+        ) || matches!(
+            e,
+            VaultJobError::Vault(VaultKeyError::CreateUndone { left_over, .. }) if left_over.any()
+        );
+        if stale {
+            let text = job_error_text(e);
+            self.log(Severity::Err, format!("Vault: {text}"));
+            self.vault_lock(Some(text));
+        } else if pin_refused(e) {
+            self.vault_fail(e);
+            let why = self.vault.error.take();
+            self.vault_lock(why);
+            if pin_from_fido {
+                self.relock_fido_session();
+            }
+        } else {
+            self.vault_fail(e);
+        }
     }
 }
 
 impl App {
+    /// The confirmation card of a waiting Delete vault or Rotate, under the
+    /// card its button is on: the CLI's question. A vault no longer listed
+    /// (a Refresh) drops it.
+    fn render_vault_action_confirm(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let (vault, rotate) = match &self.vault.confirm {
+            Some(VaultConfirm::DeleteVault { vault }) => (vault.clone(), false),
+            Some(VaultConfirm::Rotate { vault }) => (vault.clone(), true),
+            _ => return,
+        };
+        let listed = self.vault_session().is_some_and(|s| {
+            s.unlocked
+                .vaults
+                .iter()
+                .any(|v| v.vault_ref.credential_id == vault.credential_id)
+        });
+        if !listed {
+            self.vault.confirm = None;
+            return;
+        }
+        let key = self.vault_key_title();
+        let name = shown_name(vault.name.as_deref());
+        let (question, note, yes, kind, color) = if rotate {
+            (
+                rotate_question(&name, &key),
+                "This asks for two touches.",
+                "Rotate vault key",
+                BtnKind::Primary,
+                p.txt,
+            )
+        } else {
+            (
+                delete_vault_question(&name, &key),
+                DELETE_VAULT_NOTE,
+                "Delete vault",
+                BtnKind::Danger,
+                p.err,
+            )
+        };
+        let waiting = self.waiting_for().map(str::to_owned);
+        let (mut confirm, mut cancel) = (false, false);
+        ui.add_space(10.0);
+        theme::card_frame(p).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.colored_label(color, question);
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(note)
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                confirm = theme::key_button(ui, p, kind, yes, waiting.as_deref()).clicked();
+                ui.add_space(6.0);
+                cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
+            });
+        });
+        if confirm {
+            match self.vault_take_confirmed() {
+                Some(VaultConfirm::DeleteVault { vault }) => self.vault_delete_vault(vault),
+                Some(VaultConfirm::Rotate { vault }) => self.vault_rotate(vault),
+                Some(VaultConfirm::DeleteEntry { .. }) | None => {}
+            }
+        } else if cancel {
+            self.vault.confirm = None;
+        }
+    }
+
     /// The confirmation card of a waiting delete (ftotp's shape): the CLI's
     /// question, no touch (the session's PIN does it).
     fn render_vault_confirm(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1931,10 +2547,7 @@ impl App {
             self.vault.confirm = None;
             return;
         };
-        let key = self.selected_device().map_or_else(
-            || "this key".to_owned(),
-            |d| crate::ui::device::DeviceView::title(d).into_owned(),
-        );
+        let key = self.vault_key_title();
         let question =
             delete_entry_question(&entry.title, &shown_name(vault.name.as_deref()), &key);
         let waiting = self.waiting_for().map(str::to_owned);
@@ -2115,6 +2728,49 @@ impl App {
 const COPIED_FLASH_SECS: f64 = 1.2;
 
 /// A vault chip: a rounded, selectable label.
+/// What the New vault row's buttons asked for this frame.
+#[derive(Default)]
+struct NewVaultClicks {
+    create: bool,
+    cancel: bool,
+}
+
+/// The New vault row: the name box, Create vault (Enter too) and, when
+/// there is a list to go back to, Cancel; under it, the touches it takes.
+fn new_vault_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    name: &mut String,
+    waiting: Option<&str>,
+    can_cancel: bool,
+) -> NewVaultClicks {
+    let mut clicks = NewVaultClicks::default();
+    ui.horizontal(|ui| {
+        let resp = ui.add_sized(
+            [220.0, 32.0],
+            egui::TextEdit::singleline(name)
+                .margin(theme::TEXT_EDIT_MARGIN)
+                .align(egui::Align2::LEFT_CENTER)
+                .hint_text("Vault name"),
+        );
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        clicks.create = theme::key_button(ui, p, BtnKind::Primary, "Create vault", waiting)
+            .clicked()
+            || (enter && waiting.is_none());
+        if can_cancel {
+            ui.add_space(6.0);
+            clicks.cancel = theme::button(ui, p, BtnKind::Default, "Cancel").clicked();
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("Creating asks for two touches.")
+            .font(theme::f_reg(11.5))
+            .color(p.txt3),
+    );
+    clicks
+}
+
 fn chip(ui: &mut egui::Ui, p: &Palette, label: &str, on: bool) -> egui::Response {
     let (fill, fg, stroke) = if on {
         (p.accent_soft(), p.txt, egui::Stroke::new(1.0, p.accent))
@@ -2971,7 +3627,7 @@ mod tests {
             (VaultKeyError::NoVaults, "; create one with New vault."),
             (
                 undone(true, false),
-                "; delete the copy with no data with Delete vault\u{2026}.",
+                "; delete the copy listed as (none) with Delete vault\u{2026}.",
             ),
             (
                 undone(true, true),
@@ -4594,5 +5250,853 @@ mod tests {
             .clone();
         app.vault_select(w);
         assert!(app.vault.confirm.is_none());
+    }
+
+    // ----- new vault, delete vault, rotate the vault key -----
+
+    use keyroost_ctap::client_pin::PinUvAuthToken as Token;
+    use keyroost_transport::vault::{Created, VaultCredential};
+
+    /// The fake key, noting what the touch banner says each time a touch
+    /// is asked for (makeCredential, getAssertion).
+    struct Watched<'a> {
+        key: &'a mut FakeKey,
+        banner: Arc<Mutex<Option<String>>>,
+        at_touch: Vec<Option<String>>,
+    }
+
+    impl VaultKey for Watched<'_> {
+        fn info(&self) -> &AuthenticatorInfo {
+            self.key.info()
+        }
+        fn pin_token(
+            &mut self,
+            pin: &str,
+            permissions: u32,
+            rp_id: Option<&str>,
+        ) -> Result<Token, CtapError> {
+            self.key.pin_token(pin, permissions, rp_id)
+        }
+        fn make_credential(
+            &mut self,
+            token: &Token,
+            user_id: &[u8],
+            name: &str,
+        ) -> Result<keyroost_ctap::make_credential::MadeCredential, CtapError> {
+            self.at_touch.push(shown(&self.banner));
+            self.key.make_credential(token, user_id, name)
+        }
+        fn assertions(
+            &mut self,
+            token: &Token,
+            allow: Option<&[u8]>,
+        ) -> Result<Vec<keyroost_ctap::get_assertion::Assertion>, CtapError> {
+            self.at_touch.push(shown(&self.banner));
+            self.key.assertions(token, allow)
+        }
+        fn credentials(&mut self, token: &Token) -> Result<Vec<VaultCredential>, CtapError> {
+            self.key.credentials(token)
+        }
+        fn delete_credential(&mut self, token: &Token, id: &[u8]) -> Result<(), CtapError> {
+            self.key.delete_credential(token, id)
+        }
+        fn read_blobs(&mut self) -> Result<keyroost_ctap::large_blobs::LargeBlobArray, CtapError> {
+            self.key.read_blobs()
+        }
+        fn write_blobs(&mut self, token: &Token, serialized: &[u8]) -> Result<(), CtapError> {
+            self.key.write_blobs(token, serialized)
+        }
+    }
+
+    /// Type `name` in the New vault box and press Create vault, the job
+    /// running against `key`; what the banner said at each touch.
+    fn create_into(app: &mut App, key: &mut FakeKey, name: &str) -> Vec<Option<String>> {
+        app.vault.new_vault = Some(name.to_owned());
+        let (name, mut auth) = app.vault_take_for_create().expect("a name that passes");
+        assert!(
+            app.vault_session().unwrap().auth.is_none(),
+            "the job holds it"
+        );
+        let banner = Arc::new(Mutex::new(None));
+        let mut watched = Watched {
+            key,
+            banner: banner.clone(),
+            at_touch: Vec::new(),
+        };
+        let result = {
+            let mut touches = TouchProgress::new(banner.clone(), 2);
+            run_create(
+                &mut watched,
+                &mut auth,
+                &name,
+                &Vault::default(),
+                &mut touches,
+            )
+            .map_err(VaultJobError::from)
+        };
+        assert_eq!(shown(&banner), None, "the prompt is down after the job");
+        let seen = watched.at_touch;
+        app.vault_apply_create(Some(KEY.into()), auth, None, result);
+        seen
+    }
+
+    /// Confirm the waiting Delete vault (the real confirm logic) and run it
+    /// against `key`.
+    fn delete_vault_into(app: &mut App, key: &mut FakeKey) {
+        let Some(VaultConfirm::DeleteVault { vault }) = app.vault_take_confirmed() else {
+            panic!("a confirmed vault delete");
+        };
+        let mut auth = app.vault_take_auth().expect("the session's auth");
+        let result = {
+            let mut touches = TouchProgress::new(Arc::new(Mutex::new(None)), 1);
+            run_delete_vault(key, &mut auth, &vault, &mut touches).map_err(VaultJobError::from)
+        };
+        app.vault_apply_delete_vault(Some(KEY.into()), auth, vault, result);
+    }
+
+    /// Confirm the waiting rotate and run it against `key`; what the
+    /// banner said at each touch.
+    fn rotate_into(app: &mut App, key: &mut FakeKey) -> Vec<Option<String>> {
+        let Some(VaultConfirm::Rotate { vault }) = app.vault_take_confirmed() else {
+            panic!("a confirmed rotate");
+        };
+        let (mut auth, old) = app.vault_take_for_save(&vault).expect("an open vault");
+        let banner = Arc::new(Mutex::new(None));
+        let mut watched = Watched {
+            key,
+            banner: banner.clone(),
+            at_touch: Vec::new(),
+        };
+        let result = {
+            let mut touches = TouchProgress::new(banner.clone(), 2);
+            run_rotate(&mut watched, &mut auth, &old, &mut touches).map_err(VaultJobError::from)
+        };
+        let seen = watched.at_touch;
+        app.vault_apply_rotate(Some(KEY.into()), auth, vault, result);
+        seen
+    }
+
+    fn touched_since(key: &FakeKey, from: usize) -> bool {
+        key.log[from..]
+            .iter()
+            .any(|c| matches!(c, Call::Assertions(_) | Call::MakeCredential))
+    }
+
+    fn chip_labels(app: &App) -> Vec<String> {
+        app.vault_session()
+            .unwrap()
+            .unlocked
+            .vaults
+            .iter()
+            .map(chip_label)
+            .collect()
+    }
+
+    /// The shown vault's entry IDs, in the vault's order.
+    fn session_entry_ids(app: &App) -> Vec<String> {
+        let open = app.selected_vault().unwrap().state.as_ref().unwrap();
+        open.contents.entries.iter().map(|e| e.id.clone()).collect()
+    }
+
+    /// The store's size for `array` with one more vault holding `v`.
+    fn room_for(key: &FakeKey, v: &Vault) -> u64 {
+        let stand_in = [0u8; 32];
+        key.array()
+            .with_credential_blob(&stand_in, &seal(v, &stand_in).unwrap())
+            .unwrap()
+            .serialize_with_checksum()
+            .unwrap()
+            .len() as u64
+    }
+
+    #[test]
+    fn create_adds_a_selected_vault_with_two_touches() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_new_vault();
+        assert_eq!(app.vault.new_vault.as_deref(), Some(""));
+        let seen = create_into(&mut app, &mut key, "Travel");
+        assert_eq!(
+            seen,
+            vec![
+                Some("Touch your key (1 of 2)\u{2026}".to_owned()),
+                Some("Touch your key (2 of 2)\u{2026}".to_owned()),
+            ]
+        );
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some(
+                "Vault \"Travel\" created on this key. If the key is lost or reset, the vault \
+                 goes with it. Keep a backup with Export backup\u{2026} below."
+            )
+        );
+        assert_eq!(app.vault.info, Some(backup_reminder("Travel")));
+        assert!(app.vault.new_vault.is_none(), "the form closes");
+        let s = app.vault_session().unwrap();
+        assert!(s.auth.is_some(), "the auth is back");
+        assert_eq!(s.unlocked.vaults.len(), 3);
+        let new = s.unlocked.vaults[2].vault_ref.clone();
+        assert_eq!(new.name.as_deref(), Some("Travel"));
+        assert_eq!(app.vault.selected.as_deref(), Some(&new.credential_id[..]));
+        assert_eq!(
+            chip_label(app.selected_vault().unwrap()),
+            "Travel \u{00B7} 0"
+        );
+        assert_eq!(key.vault_on_key(&new.credential_id), Some(Vault::default()));
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.severity == Severity::Ok && l.text == "Vault: vault \"Travel\" created"));
+    }
+
+    #[test]
+    fn create_refused_for_room_asks_no_touch() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let used = app.vault_session().unwrap().unlocked.capacity.used_bytes;
+        key.set_max_bytes(used + 8);
+        let stored = key.stored().to_vec();
+        let before = key.log.len();
+        let seen = create_into(&mut app, &mut key, "Travel");
+        assert!(seen.is_empty(), "no touch asked for");
+        assert!(!touched_since(&key, before));
+        assert_eq!(key.stored(), &stored[..], "nothing written");
+        let err = app.vault.error.clone().unwrap();
+        assert!(err.contains("large-blob store is too small"), "{err}");
+        assert_eq!(
+            app.vault.new_vault.as_deref(),
+            Some("Travel"),
+            "the name stays"
+        );
+        let s = app.vault_session().unwrap();
+        assert!(s.auth.is_some());
+        assert_eq!(s.unlocked.vaults.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_name_is_refused_before_the_job() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let before = key.log.len();
+        app.vault.new_vault = Some("Work".into());
+        assert!(app.vault_take_for_create().is_none());
+        assert_eq!(
+            app.vault.error.as_deref(),
+            Some("This key already holds a vault named \"Work\".")
+        );
+        assert_eq!(app.vault.new_vault.as_deref(), Some("Work"));
+        assert!(app.vault_session().unwrap().auth.is_some(), "nothing taken");
+        assert_eq!(key.log.len(), before, "nothing sent");
+        // The real entry point stops at the same place, with no job.
+        app.vault.error = None;
+        app.vault_create();
+        assert!(app.vault.error.is_some() && !app.busy());
+        // Spaces around a name are not part of it.
+        app.vault.new_vault = Some("  Work ".into());
+        assert!(app.vault_take_for_create().is_none());
+    }
+
+    #[test]
+    fn too_long_name_is_refused_before_the_job() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        for bad in ["\u{e9}".repeat(17), String::new(), "   ".into()] {
+            app.vault.new_vault = Some(bad);
+            assert!(app.vault_take_for_create().is_none());
+            assert_eq!(
+                app.vault.error.as_deref(),
+                Some(
+                    "A vault name must be 1 to 32 bytes long (accented and non-Latin letters \
+                     take 2 to 4 bytes each)."
+                )
+            );
+            assert!(app.vault_session().unwrap().auth.is_some());
+        }
+        // 16 accented letters are 32 bytes: allowed.
+        app.vault.new_vault = Some("\u{e9}".repeat(16));
+        assert!(app.vault_take_for_create().is_some());
+    }
+
+    #[test]
+    fn a_key_with_no_vault_shows_the_form() {
+        let mut key = FakeKey::new();
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let text = list_text(&mut app);
+        for shown in [
+            "No vaults on this key yet.",
+            "Create vault",
+            "Creating asks for two touches.",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("Cancel"), "nothing to go back to");
+        create_into(&mut app, &mut key, "Personal");
+        let text = list_text(&mut app);
+        assert!(text.contains("Personal \u{00B7} 0"), "{text}");
+        assert!(text.contains("+ New vault") && !text.contains("Create vault"));
+        app.vault_new_vault();
+        let text = list_text(&mut app);
+        assert!(
+            text.contains("Create vault") && text.contains("Cancel"),
+            "{text}"
+        );
+        app.vault_new_vault();
+        assert!(app.vault.new_vault.is_none(), "the chip closes it again");
+    }
+
+    #[test]
+    fn create_undone_locks_and_says_what_to_delete() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        // The write fails, and so does removing the new credential.
+        key.write_refusals.push_back(0x30);
+        key.delete_fails = true;
+        create_into(&mut app, &mut key, "Travel");
+        assert!(app.vault.session.is_none(), "the list was stale: locked");
+        let err = app.vault.error.clone().unwrap();
+        assert!(err.starts_with("The vault was not created"), "{err}");
+        assert!(
+            err.ends_with("; delete the copy listed as (none) with Delete vault\u{2026}."),
+            "{err}"
+        );
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.severity == Severity::Err && l.text == format!("Vault: {err}")));
+        // Unlocking again lists that copy as (none).
+        unlock_into(&mut app, &mut key);
+        assert!(
+            chip_labels(&app).contains(&"Travel \u{00B7} (none)".to_owned()),
+            "{:?}",
+            chip_labels(&app)
+        );
+    }
+
+    #[test]
+    fn delete_vault_asks_no_touch_and_keeps_other_entries() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        key.add_foreign_entries();
+        let work = key.creds[1].id.clone();
+        let lbk = key.creds[0].lbk.unwrap();
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let expected = key
+            .array()
+            .without_credential_blob(&lbk)
+            .serialize_with_checksum()
+            .unwrap();
+        let before = key.log.len();
+        app.vault_ask_delete_vault();
+        assert!(matches!(
+            app.vault.confirm,
+            Some(VaultConfirm::DeleteVault { .. })
+        ));
+        delete_vault_into(&mut app, &mut key);
+        assert!(!touched_since(&key, before), "no touch");
+        assert_eq!(key.stored(), &expected[..], "every other entry as it was");
+        assert!(key.creds.iter().all(|c| c.id != p));
+        assert_eq!(key.vault_on_key(&work), Some(Vault::default()));
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some("Vault \"Personal\" deleted.")
+        );
+        let s = app.vault_session().unwrap();
+        assert!(s.auth.is_some());
+        assert_eq!(s.unlocked.vaults.len(), 1);
+        assert_eq!(
+            s.unlocked.capacity.used_bytes,
+            key.array().capacity(&key.info).used_bytes
+        );
+        assert_eq!(app.selected_vault().unwrap().vault_ref.credential_id, work);
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.severity == Severity::Ok && l.text == "Vault: vault \"Personal\" deleted"));
+    }
+
+    /// An interrupted rotate's two "Personal": one with an entry, one with
+    /// no data. Their credential IDs, in that order.
+    fn two_copies(key: &mut FakeKey) -> (Vec<u8>, Vec<u8>) {
+        let full = key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![entry("GitHub")],
+            },
+        );
+        let empty = key.add_credential(
+            keyroost_vault::user_handle("Personal").unwrap(),
+            Some("Personal"),
+        );
+        (full, empty)
+    }
+
+    #[test]
+    fn delete_of_a_duplicate_named_vault_takes_the_chosen_copy() {
+        let mut key = FakeKey::new();
+        let (full, empty) = two_copies(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        // Told apart by what each stores.
+        assert_eq!(
+            chip_labels(&app),
+            ["Personal \u{00B7} 1", "Personal \u{00B7} (none)"]
+        );
+        app.vault_select(empty.clone());
+        app.vault_ask_delete_vault();
+        delete_vault_into(&mut app, &mut key);
+        assert!(key.creds.iter().all(|c| c.id != empty));
+        assert_eq!(key.vault_on_key(&full).unwrap().entries.len(), 1);
+        assert_eq!(chip_labels(&app), ["Personal \u{00B7} 1"]);
+        assert_eq!(app.selected_vault().unwrap().vault_ref.credential_id, full);
+
+        // And the copy with the entry, when that is the one chosen.
+        let mut key = FakeKey::new();
+        let (full, empty) = two_copies(&mut key);
+        let mut app = self::app();
+        unlock_into(&mut app, &mut key);
+        app.vault_select(full.clone());
+        app.vault_ask_delete_vault();
+        delete_vault_into(&mut app, &mut key);
+        assert_eq!(
+            key.creds.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            [empty]
+        );
+        assert_eq!(chip_labels(&app), ["Personal \u{00B7} (none)"]);
+    }
+
+    #[test]
+    fn an_unavailable_vault_can_still_be_deleted() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let damaged = key.add_vault("Old", &Vault::default());
+        key.put_unreadable(&damaged);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_select(damaged.clone());
+        assert!(!app.vault_writable());
+        app.vault_ask_rotate();
+        assert!(app.vault.confirm.is_none(), "no rotate for it");
+        let text = list_text(&mut app);
+        assert!(text.contains("Delete vault\u{2026}"), "{text}");
+        app.vault_ask_delete_vault();
+        delete_vault_into(&mut app, &mut key);
+        assert_eq!(app.vault.info.as_deref(), Some("Vault \"Old\" deleted."));
+        assert!(key.creds.iter().all(|c| c.id != damaged));
+        assert_eq!(key.vault_on_key(&p).unwrap().entries.len(), 2);
+        assert_eq!(app.vault_session().unwrap().unlocked.vaults.len(), 2);
+    }
+
+    #[test]
+    fn a_vault_gone_before_its_delete_locks() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_ask_delete_vault();
+        // Another program deletes it first.
+        key.creds.retain(|c| c.id != p);
+        delete_vault_into(&mut app, &mut key);
+        assert!(app.vault.session.is_none());
+        let err = app.vault.error.clone().unwrap();
+        assert!(
+            err.starts_with("Vault \"Personal\" is no longer on the key"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rotate_replaces_the_vault_with_the_same_entries() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let ids = session_entry_ids(&app);
+        app.vault.open_entry = Some(ids[0].clone());
+        app.vault_ask_rotate();
+        assert!(matches!(
+            app.vault.confirm,
+            Some(VaultConfirm::Rotate { .. })
+        ));
+        let seen = rotate_into(&mut app, &mut key);
+        assert_eq!(
+            seen,
+            vec![
+                Some("Touch your key (1 of 2)\u{2026}".to_owned()),
+                Some("Touch your key (2 of 2)\u{2026}".to_owned()),
+            ]
+        );
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some(
+                "Vault \"Personal\" rotated: a new vault holds its 2 entries and the old one is \
+                 deleted."
+            )
+        );
+        let s = app.vault_session().unwrap();
+        assert!(s.auth.is_some());
+        assert_eq!(s.unlocked.vaults.len(), 2);
+        let new = s.unlocked.vaults[0].vault_ref.clone();
+        assert_ne!(new.credential_id, p);
+        assert_eq!(new.name.as_deref(), Some("Personal"));
+        assert_eq!(app.vault.selected.as_deref(), Some(&new.credential_id[..]));
+        assert_eq!(session_entry_ids(&app), ids, "the same entries");
+        assert_eq!(
+            app.vault.open_entry.as_deref(),
+            Some(&*ids[0]),
+            "still open"
+        );
+        assert!(
+            key.creds.iter().all(|c| c.id != p),
+            "the old one is deleted"
+        );
+        assert_eq!(
+            key.vault_on_key(&new.credential_id).unwrap().entries.len(),
+            2
+        );
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.severity == Severity::Ok && l.text == "Vault: vault \"Personal\" rotated"));
+    }
+
+    #[test]
+    fn rotate_logs_the_store_note() {
+        let mut key = FakeKey::new();
+        let p = key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![entry("GitHub")],
+            },
+        );
+        // Another vault fills most of the store.
+        key.add_vault(
+            "Work",
+            &Vault {
+                entries: (0..30).map(|i| entry(&format!("Site {i}"))).collect(),
+            },
+        );
+        let personal = key.vault_on_key(&p).unwrap();
+        key.set_max_bytes(room_for(&key, &personal));
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_ask_rotate();
+        rotate_into(&mut app, &mut key);
+        assert!(app.vault.info.as_deref().unwrap().contains("rotated"));
+        let cap = app.vault_session().unwrap().unlocked.capacity;
+        assert!(cap.free_bytes * 4 < cap.max_bytes, "{cap:?}");
+        let note = blob_space_line("Vault", &cap).expect("under a quarter free");
+        assert_eq!(
+            app.log
+                .iter()
+                .filter(|l| l.severity == Severity::Warn && l.text == note)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn create_logs_the_store_note() {
+        let mut key = FakeKey::new();
+        key.add_vault(
+            "Work",
+            &Vault {
+                entries: (0..30).map(|i| entry(&format!("Site {i}"))).collect(),
+            },
+        );
+        key.set_max_bytes(room_for(&key, &Vault::default()) + 4);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        create_into(&mut app, &mut key, "Travel");
+        let cap = app.vault_session().unwrap().unlocked.capacity;
+        assert_eq!(app.vault_session().unwrap().unlocked.vaults.len(), 2);
+        let note = blob_space_line("Vault", &cap).expect("under a quarter free");
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.severity == Severity::Warn && l.text == note));
+    }
+
+    #[test]
+    fn old_not_deleted_locks_with_the_whole_message() {
+        // Emptied: the old data went, its credential didn't.
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        key.delete_fails = true;
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_ask_rotate();
+        rotate_into(&mut app, &mut key);
+        assert!(app.vault.session.is_none(), "locked");
+        let err = app.vault.error.clone().unwrap();
+        assert!(err.starts_with("The new vault \"Personal\""), "{err}");
+        assert!(
+            err.contains("is in place with every entry checked"),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "the old copy is left with no data: delete the copy listed as (none) with \
+                 Delete vault\u{2026}"
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("delete either"), "{err}");
+        assert!(
+            err.ends_with("Unlock the vault again to see both copies."),
+            "{err}"
+        );
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.severity == Severity::Err && l.text == format!("Vault: {err}")));
+        // Unlocking again shows both copies, the old one as (none).
+        unlock_into(&mut app, &mut key);
+        let labels = chip_labels(&app);
+        assert!(
+            labels.contains(&"Personal \u{00B7} (none)".to_owned()),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"Personal \u{00B7} 2".to_owned()),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn old_kept_says_delete_either_then_rotate_again() {
+        // Removing the old data is refused: the old copy keeps its data.
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        key.after_write = Some((
+            1,
+            Box::new(|k: &mut FakeKey| k.write_refusals.push_back(0x30)),
+        ));
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_ask_rotate();
+        rotate_into(&mut app, &mut key);
+        assert!(app.vault.session.is_none());
+        let err = app.vault.error.clone().unwrap();
+        assert!(
+            err.contains("is in place with every entry checked"),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "both copies hold the same checked entries, but one still uses the old key: \
+                 delete either with Delete vault\u{2026}, then rotate the one left again with \
+                 Rotate vault key\u{2026} so it gets a fresh key"
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("(none)"), "{err}");
+        assert!(
+            err.ends_with("Unlock the vault again to see both copies."),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn old_unknown_says_which_copy_or_rotate_again() {
+        // The reply to the old data's removal is lost: whether it went is
+        // not known.
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        key.after_write = Some((
+            1,
+            Box::new(|k: &mut FakeKey| {
+                k.after_write = Some((2, Box::new(|k: &mut FakeKey| k.lost_write_replies = 1)));
+            }),
+        ));
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_ask_rotate();
+        rotate_into(&mut app, &mut key);
+        assert!(app.vault.session.is_none());
+        let err = app.vault.error.clone().unwrap();
+        assert!(
+            err.contains("is in place with every entry checked"),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "whether the old copy still holds its data is not known: if a copy is listed \
+                 as (none), delete that one with Delete vault\u{2026}; otherwise both copies"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains("then rotate the one left again with Rotate vault key\u{2026}"),
+            "{err}"
+        );
+        assert!(
+            err.ends_with("Unlock the vault again to see both copies."),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_rotate_undone_cleanly_keeps_the_session() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        // The new vault's write is refused: it is removed again, and
+        // nothing is left that the list doesn't show.
+        key.write_refusals.push_back(0x30);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_ask_rotate();
+        rotate_into(&mut app, &mut key);
+        let s = app.vault_session().expect("still unlocked");
+        assert!(s.auth.is_some());
+        assert_eq!(s.unlocked.vaults[0].vault_ref.credential_id, p);
+        assert_eq!(key.creds.len(), 2, "the new credential was removed");
+        let err = app.vault.error.clone().unwrap();
+        assert!(err.starts_with("The vault was not created"), "{err}");
+        assert!(
+            err.ends_with("its new credential was removed again."),
+            "{err}"
+        );
+        assert_eq!(
+            key.vault_on_key(&p).unwrap().entries.len(),
+            2,
+            "old untouched"
+        );
+    }
+
+    #[test]
+    fn rotate_and_delete_questions_are_the_cli_words() {
+        assert_eq!(
+            rotate_question("Personal", "yubi-test"),
+            "Rotate the key of vault \"Personal\" on yubi-test? A new vault replaces it; the \
+             old one is deleted after every entry is checked."
+        );
+        assert_eq!(
+            delete_vault_question("Personal", "yubi-test"),
+            "Delete vault \"Personal\" on yubi-test?"
+        );
+        assert_eq!(
+            ROTATE_EXPLAINED,
+            "Gives this vault a new key. Use it after unlocking the vault on a computer you no \
+             longer trust, then change the passwords that matter."
+        );
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        app.devices = vec![crate::tests::test_key(KEY, "AAA", Some("yubi-test"))];
+        unlock_into(&mut app, &mut key);
+        let text = list_text(&mut app);
+        for shown in [
+            "This vault",
+            "Rotate vault key\u{2026}",
+            "Gives this vault a new key.",
+            "unlocking the vault",
+            "Delete vault\u{2026}",
+            "+ New vault",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        app.vault_ask_rotate();
+        let text = list_text(&mut app);
+        for shown in [
+            "Rotate the key of vault \"Personal\" on yubi-test?",
+            "This asks for two touches.",
+            "Cancel",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        app.vault.confirm = None;
+        app.vault_ask_delete_vault();
+        let text = list_text(&mut app);
+        for shown in [
+            "Delete vault \"Personal\" on yubi-test?",
+            "Its entries go with it. To keep them, export a backup first.",
+            "Cancel",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        // Another vault's chip closes the question.
+        let w = app.vault_session().unwrap().unlocked.vaults[1]
+            .vault_ref
+            .credential_id
+            .clone();
+        app.vault_select(w);
+        assert!(app.vault.confirm.is_none());
+    }
+
+    #[test]
+    fn a_vault_question_stays_while_another_job_runs() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault_ask_delete_vault();
+        app.busy_jobs = 1;
+        app.busy_label = Some("Reading\u{2026}".into());
+        assert!(app.vault_take_confirmed().is_none());
+        assert!(matches!(
+            app.vault.confirm,
+            Some(VaultConfirm::DeleteVault { .. })
+        ));
+        app.busy_jobs = 0;
+        assert!(app.vault_take_confirmed().is_some());
+        assert!(app.vault.confirm.is_none());
+    }
+
+    #[test]
+    fn vault_results_for_another_key_are_discarded() {
+        let mut key = FakeKey::new();
+        let p = two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let vault = app.selected_vault().unwrap().vault_ref.clone();
+        let other: Option<DeviceId> = Some("serial:BBB".into());
+        let failed = || VaultJobError::Vault(VaultKeyError::NoVaults);
+        app.vault_apply_delete_vault(other.clone(), pin_auth(), vault.clone(), Err(failed()));
+        app.vault_apply_rotate(other.clone(), pin_auth(), vault, Err(failed()));
+        app.vault_apply_create(other, pin_auth(), None, Err(failed()));
+        assert!(app.vault.error.is_none() && app.log.is_empty());
+        assert_eq!(
+            app.vault_session().unwrap().unlocked.vaults[0]
+                .vault_ref
+                .credential_id,
+            p
+        );
+    }
+
+    #[test]
+    fn an_import_into_a_new_vault_says_both() {
+        let mut key = FakeKey::new();
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        app.vault.new_vault = Some("Travel".into());
+        let (name, mut auth) = app.vault_take_for_create().unwrap();
+        let initial = Vault {
+            entries: vec![entry("GitHub"), entry("Bank")],
+        };
+        let result: Result<Created, VaultJobError> = {
+            let mut touches = TouchProgress::new(Arc::new(Mutex::new(None)), 2);
+            run_create(&mut key, &mut auth, &name, &initial, &mut touches)
+                .map_err(VaultJobError::from)
+        };
+        app.vault_apply_create(Some(KEY.into()), auth, Some(2), result);
+        assert_eq!(
+            app.vault.info,
+            Some(format!(
+                "Imported into vault \"Travel\": 2 added, 0 replaced. {}",
+                backup_reminder("Travel")
+            ))
+        );
     }
 }
