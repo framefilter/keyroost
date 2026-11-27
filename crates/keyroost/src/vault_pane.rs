@@ -375,6 +375,18 @@ const BACKUP_TEXT: &str = "A vault lives only on this key: if the key is lost or
 
 /// The "Experimental" pill and the line asking for reports and a backup.
 pub(crate) fn experimental_note(ui: &mut egui::Ui, p: &Palette) {
+    experimental_line(ui, p, " and keep a backup.");
+}
+
+/// The "Experimental" pill and the line asking for reports, beside every
+/// offer of a fingerprint unlock.
+pub(crate) fn fingerprint_experimental_note(ui: &mut egui::Ui, p: &Palette) {
+    experimental_line(ui, p, ".");
+}
+
+/// The "Experimental" pill, then "Please report problems" (a link) and
+/// `tail`, which ends the sentence.
+pub(crate) fn experimental_line(ui: &mut egui::Ui, p: &Palette, tail: &str) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         theme::pill(ui, "Experimental", p.warn, p.warn_soft());
@@ -392,7 +404,7 @@ pub(crate) fn experimental_note(ui: &mut egui::Ui, p: &Palette) {
             egui::RichText::new("report problems").font(theme::f_reg(11.5)),
             ISSUES_URL,
         );
-        ui.add(text(" and keep a backup."));
+        ui.add(text(tail));
     });
 }
 
@@ -1263,9 +1275,10 @@ impl App {
     /// this key (`true`), else the one typed in the Vault tab's box, which
     /// empties.
     pub(crate) fn unlock_pin(&mut self) -> Result<(Zeroizing<String>, bool), &'static str> {
-        if let Some(s) = self.fido_session() {
-            if !s.pin.is_empty() {
-                return Ok((s.pin.clone(), true));
+        // A fingerprint session holds no PIN: the vault takes its own.
+        if let Some(pin) = self.fido_session().and_then(|s| s.unlock.pin()) {
+            if !pin.is_empty() {
+                return Ok((pin.clone(), true));
             }
         }
         let pin = std::mem::take(&mut self.vault.pin_input);
@@ -1986,10 +1999,14 @@ impl App {
     }
 
     /// The card that unlocks the vault: the FIDO2 tab's PIN when that tab is
-    /// unlocked, else a PIN box.
+    /// unlocked with one, else a PIN box (a fingerprint unlock of the FIDO2
+    /// tab holds no PIN to share).
     fn vault_unlock_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let waiting = self.waiting_for().map(str::to_owned);
-        let shared = self.fido_session().is_some_and(|s| !s.pin.is_empty());
+        let shared = self
+            .fido_session()
+            .and_then(|s| s.unlock.pin())
+            .is_some_and(|pin| !pin.is_empty());
         let mut unlock = false;
         theme::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -5020,7 +5037,7 @@ mod tests {
 
     // ----- unlock, lock, Refresh -----
 
-    use crate::{App, UnlockedSession};
+    use crate::{App, SessionUnlock, UnlockedSession};
     use keyroost_ctap::client_pin::PinUvAuthToken;
     use keyroost_ctap::CtapError;
     use keyroost_transport::vault::fake::Call;
@@ -5070,7 +5087,7 @@ mod tests {
             metadata: keyroost_ctap::cred_mgmt::CredsMetadata::default(),
             rps: Arc::new(Vec::new()),
             fingerprints: None,
-            pin: Zeroizing::new(pin.to_owned()),
+            unlock: SessionUnlock::Pin(Zeroizing::new(pin.to_owned())),
         }
     }
 

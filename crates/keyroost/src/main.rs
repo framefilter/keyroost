@@ -278,22 +278,39 @@ type OpenFido = (
     Option<InitResponse>,
 );
 
-/// A large-blob-write token for `pin`, obtained only after the change was
-/// planned (and any certain refusal raised) from `before`. Getting the token
-/// talks to the key, so the array is read again afterwards and the write is
-/// refused unless it is still exactly `before`.
+/// A new large-blob-write token from `unlock`, obtained only after the
+/// change was planned (and any certain refusal raised) from `before`. The
+/// PIN gets a large-blob-write token, as it always did. A fingerprint is
+/// asked only once the session's held token was refused
+/// ([`write_large_blobs`]), so it asks again, saying why, for a whole new
+/// session token. Getting the token talks to the key, so the array is read
+/// again afterwards and the write is refused unless it is still exactly
+/// `before`.
 fn large_blob_write_token(
     dev: &mut impl keyroost_ctap::transport::CtapTransport,
     info: &keyroost_ctap::AuthenticatorInfo,
-    pin: &str,
+    unlock: &SessionUnlock,
+    prompt: &FingerPrompt,
     before: &keyroost_ctap::large_blobs::LargeBlobArray,
 ) -> Result<keyroost_ctap::client_pin::PinUvAuthToken, String> {
-    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
-        dev,
-        pin,
-        info,
-        keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
-    )
+    let token = match unlock {
+        SessionUnlock::Pin(_) => session_token(
+            dev,
+            info,
+            unlock,
+            keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+            prompt,
+            keyroost_ctap::client_pin::FingerAsk::Unlock,
+        ),
+        SessionUnlock::Fingerprint => session_token(
+            dev,
+            info,
+            unlock,
+            session_permissions_for(info, unlock),
+            prompt,
+            keyroost_ctap::client_pin::FingerAsk::Again,
+        ),
+    }
     .map_err(|e| e.to_string())?;
     let now = keyroost_ctap::large_blobs::read(dev, info).map_err(|e| e.to_string())?;
     if now.raw_array() != before.raw_array() {
@@ -304,6 +321,42 @@ fn large_blob_write_token(
         );
     }
     Ok(token)
+}
+
+/// Write `serialized` over `before` (the array just read and planned from)
+/// with the FIDO2 session's unlock. A PIN session takes a new large-blob-write
+/// token from its PIN, as it always did. A fingerprint session writes with
+/// its `held` token, which carries large-blob write, so a note costs no new
+/// touch; only when the key refuses it (`0x33`) is the finger asked again,
+/// for a new session token. Returns that new token, which the session keeps
+/// from then on (it ends the old one).
+fn write_large_blobs<D: keyroost_ctap::transport::CtapTransport>(
+    dev: &mut D,
+    info: &keyroost_ctap::AuthenticatorInfo,
+    unlock: &SessionUnlock,
+    held: &PinUvAuthToken,
+    prompt: &FingerPrompt,
+    before: &keyroost_ctap::large_blobs::LargeBlobArray,
+    serialized: &[u8],
+) -> Result<Option<PinUvAuthToken>, String> {
+    // Names read from keys before or during the write are stale.
+    let write = |dev: &mut D, token: &PinUvAuthToken| {
+        keyroost_resolve::with_key_names_forgotten(|| {
+            keyroost_ctap::large_blobs::write(dev, info, token, serialized)
+        })
+    };
+    let renew = |dev: &mut D| -> Result<PinUvAuthToken, String> {
+        let token = large_blob_write_token(dev, info, unlock, prompt, before)?;
+        write(dev, &token).map_err(|e| e.to_string())?;
+        Ok(token)
+    };
+    match unlock {
+        SessionUnlock::Pin(_) => renew(dev).map(|_| None),
+        SessionUnlock::Fingerprint => match write(dev, held) {
+            Err(keyroost_ctap::CtapError::StatusCode(0x33)) => renew(dev).map(Some),
+            other => other.map(|()| None).map_err(|e| e.to_string()),
+        },
+    }
 }
 
 /// Borrow owned serials for the `keyroost_resolve` naming helpers.
@@ -407,20 +460,26 @@ fn key_name_failure(e: keyroost_ctap::device_label::LabelError, used: u64) -> Ke
 /// Set (`Some`) or clear (`None`) the name stored on the key at `path`, the
 /// way `keyroostctl name set --store key` does: open, getInfo, read, plan
 /// (refusing what can't work before the PIN is used), PIN token, write only
-/// over the array planned from, then read the name back. An empty `pin`
-/// refuses only once planning found a write is needed. `expected` is the
-/// name the dialog showed: a different name found now refuses, since the
-/// question asked was about that one. Names read from keys are forgotten
-/// around the write.
+/// over the array planned from, then read the name back. No `unlock` (or an
+/// empty PIN) refuses only once planning found a write is needed. A PIN
+/// takes a large-blob-write token, as `name set` does. A fingerprint session
+/// writes with its `held` token and asks the finger again only when the key
+/// refuses it (`0x33`); the new token comes back for the session to keep.
+/// A fingerprint with no held token asks the finger for a write token.
+/// `expected` is the name the dialog showed: a different name found now
+/// refuses, since the question asked was about that one. Names read from
+/// keys are forgotten around the write.
 fn write_key_name(
     path: &std::path::Path,
     name: Option<&str>,
     expected: Option<&str>,
-    pin: &str,
-) -> Result<KeyNameWrite, KeyNameFailure> {
+    unlock: Option<&SessionUnlock>,
+    held: Option<&PinUvAuthToken>,
+    prompt: &FingerPrompt,
+) -> Result<(KeyNameWrite, Option<PinUvAuthToken>), KeyNameFailure> {
     use keyroost_ctap::device_label::{
-        apply_label_plan, plan_label_change, random_nonce, read_label, DeviceLabel, LabelState,
-        WRITER_KEYROOST,
+        apply_label_plan, plan_label_change, random_nonce, read_label, DeviceLabel, LabelError,
+        LabelState, WRITER_KEYROOST,
     };
     let (mut dev, init) = open_ctap_hid(path).map_err(|e| e.to_string())?;
     if !init.supports_cbor() {
@@ -454,21 +513,53 @@ fn write_key_name(
         return Err(KeyNameFailure::Stale);
     }
     if previous == name {
-        return Ok(KeyNameWrite::AlreadySo); // nothing to write
+        return Ok((KeyNameWrite::AlreadySo, None)); // nothing to write
     }
     // Asked for only now, so the certain refusals above come first.
-    if pin.is_empty() {
+    let Some(unlock) = unlock.filter(|u| u.pin().is_none_or(|p| !p.is_empty())) else {
         return Err(KEY_NAME_PIN_NEEDED.into());
-    }
-    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
-        &mut dev,
-        pin,
-        &info,
-        keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
-    )
-    .map_err(|e| format!("Couldn't unlock the key: {e}"))?;
-    keyroost_resolve::with_key_names_forgotten(|| apply_label_plan(&mut dev, &info, &token, &plan))
-        .map_err(|e| key_name_failure(e, used))?;
+    };
+    let unlock_failed = |e: keyroost_ctap::CtapError| -> KeyNameFailure {
+        format!("Couldn't unlock the key: {e}").into()
+    };
+    let apply = |dev: &mut CtapHidDevice, token: &PinUvAuthToken| {
+        keyroost_resolve::with_key_names_forgotten(|| apply_label_plan(dev, &info, token, &plan))
+    };
+    let failed = |e| key_name_failure(e, used);
+    let renewed = match (unlock, held) {
+        (SessionUnlock::Fingerprint, Some(held)) => match apply(&mut dev, held) {
+            Err(LabelError::Ctap(keyroost_ctap::CtapError::StatusCode(0x33))) => {
+                let token = session_token(
+                    &mut dev,
+                    &info,
+                    unlock,
+                    session_permissions_for(&info, unlock),
+                    prompt,
+                    keyroost_ctap::client_pin::FingerAsk::Again,
+                )
+                .map_err(unlock_failed)?;
+                apply(&mut dev, &token).map_err(failed)?;
+                Some(token)
+            }
+            other => {
+                other.map_err(failed)?;
+                None
+            }
+        },
+        _ => {
+            let token = session_token(
+                &mut dev,
+                &info,
+                unlock,
+                keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+                prompt,
+                keyroost_ctap::client_pin::FingerAsk::Unlock,
+            )
+            .map_err(unlock_failed)?;
+            apply(&mut dev, &token).map_err(failed)?;
+            None
+        }
+    };
     let now = read_label(&mut dev, &info).map_err(|e| e.to_string())?;
     let kept = match (&now, name) {
         (LabelState::Present(l), Some(n)) => l.label == n,
@@ -476,7 +567,7 @@ fn write_key_name(
         _ => false,
     };
     if kept {
-        Ok(KeyNameWrite::Written(plan.after.capacity(&info)))
+        Ok((KeyNameWrite::Written(plan.after.capacity(&info)), renewed))
     } else {
         Err("The key didn't keep the change; try again."
             .to_string()
@@ -564,10 +655,13 @@ impl SessionOpError {
     }
 
     /// Classify a CTAP error: PIN / PIN-auth codes (`0x31` / `0x33` / `0x34`)
-    /// mark the session as invalidated so the caller re-locks.
+    /// mark the session as invalidated so the caller re-locks. A refused or
+    /// unavailable fingerprint never does: the session (and the PIN box)
+    /// stays, and the message says to use the PIN.
     fn from_ctap(err: keyroost_ctap::CtapError) -> Self {
         Self {
-            relock: err.is_pin_auth_error(),
+            relock: !matches!(err, keyroost_ctap::CtapError::Fingerprint(_))
+                && err.is_pin_auth_error(),
             message: err.to_string(),
         }
     }
@@ -627,11 +721,16 @@ struct SecurityKeysState {
     pin_input: zeroize::Zeroizing<String>,
     /// Active unlocked session: token + cached resident credentials.
     session: Option<UnlockedSession>,
+    /// What a running FIDO2 job's finger request shows on the touch banner
+    /// ([`session_token`]). Kept across a lock, so a job still running keeps
+    /// its prompt.
+    finger_prompt: FingerPrompt,
     /// The device `session` was unlocked on. Follow-on operations (reload,
     /// delete, bio, large-blob writes) must obtain the session through
     /// `App::fido_session()`, which refuses it when this no longer matches
-    /// the selection (KEY-012): the session retains the PIN, and a PIN
-    /// cached for one key must never authorize work on another.
+    /// the selection (KEY-012): the session retains the PIN (or, unlocked
+    /// by a fingerprint, its token), and what was cached for one key must
+    /// never authorize work on another.
     session_device: Option<DeviceId>,
     /// Change-PIN modal state.
     change_pin: ChangePinDialog,
@@ -1225,12 +1324,46 @@ struct UnlockedSession {
     /// Enrolled fingerprints read at unlock (when the key supports bio), so the
     /// list shows immediately. `None` when bio is unsupported or the read failed.
     fingerprints: Option<Vec<keyroost_ctap::Enrollment>>,
-    /// PIN retained for the unlocked session (wiped on lock). Bio writes
-    /// (enroll/rename/delete) re-derive a fresh pinUvAuthToken per operation —
-    /// the authenticator can invalidate a token after a UV-gated bio write, so
-    /// reusing one across operations fails with PIN_AUTH_INVALID (0x33).
-    pin: zeroize::Zeroizing<String>,
+    /// How the session was unlocked: the PIN retained for it (wiped on lock),
+    /// or a fingerprint, which keeps no PIN. Bio writes (enroll/rename/delete)
+    /// take a fresh pinUvAuthToken per operation — the authenticator can
+    /// invalidate a token after a UV-gated bio write, so reusing one across
+    /// operations fails with PIN_AUTH_INVALID (0x33). On a fingerprint session
+    /// that fresh token is a new finger touch.
+    unlock: SessionUnlock,
 }
+
+/// How the FIDO2 tab's session was unlocked, and so how it gets another
+/// token: from the PIN it keeps, or by asking for the finger again. A
+/// fingerprint session never holds a PIN.
+#[derive(Clone)]
+enum SessionUnlock {
+    Pin(zeroize::Zeroizing<String>),
+    Fingerprint,
+}
+
+impl SessionUnlock {
+    /// The PIN a PIN session keeps; `None` for a fingerprint session.
+    fn pin(&self) -> Option<&zeroize::Zeroizing<String>> {
+        match self {
+            SessionUnlock::Pin(pin) => Some(pin),
+            SessionUnlock::Fingerprint => None,
+        }
+    }
+
+    /// Where [`keyroost_ctap::client_pin::get_token`] takes a token from.
+    fn source(&self) -> keyroost_ctap::client_pin::TokenSource<'_> {
+        match self {
+            SessionUnlock::Pin(pin) => keyroost_ctap::client_pin::TokenSource::Pin(pin),
+            SessionUnlock::Fingerprint => keyroost_ctap::client_pin::TokenSource::Fingerprint,
+        }
+    }
+}
+
+/// The line a FIDO2 job shows on the touch banner while the key waits for a
+/// finger ([`session_token`]); `None` the rest of the time. Shared with the
+/// worker, like the Vault tab's progress cell.
+type FingerPrompt = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
 /// Internal unlock outcome: getInfo says the authenticator must complete a PIN
 /// change before it will issue any pinUvAuthToken. This is not a bad-PIN error
@@ -2246,16 +2379,75 @@ fn fido_session_permissions(info: &keyroost_ctap::AuthenticatorInfo) -> u32 {
     perms
 }
 
+/// The permissions of the session token `unlock` asks for. The PIN asks
+/// [`fido_session_permissions`]. A fingerprint asks credential management,
+/// plus bio enrollment only where the key lets a finger grant it
+/// ([`keyroost_ctap::client_pin::uv_grants`]: otherwise the key refuses the
+/// whole request), plus large-blob write when the key has large blobs, so
+/// notes and the on-key name reuse the one touch instead of asking again.
+fn session_permissions_for(info: &keyroost_ctap::AuthenticatorInfo, unlock: &SessionUnlock) -> u32 {
+    use keyroost_ctap::client_pin::{permissions, uv_grants};
+    match unlock {
+        SessionUnlock::Pin(_) => fido_session_permissions(info),
+        SessionUnlock::Fingerprint => {
+            let mut perms = permissions::CREDENTIAL_MANAGEMENT;
+            let be = fido_session_permissions(info) & permissions::BIO_ENROLLMENT;
+            if be != 0 && uv_grants(info, be) {
+                perms |= be;
+            }
+            if info.option("largeBlobs") == Some(true) {
+                perms |= permissions::LARGE_BLOB_WRITE;
+            }
+            perms
+        }
+    }
+}
+
+/// A token for `permissions` from `unlock`. For a fingerprint, `ask`'s line
+/// is on the touch banner (through `prompt`) while the key waits for the
+/// finger, and taken down after, whatever the outcome. The PIN path never
+/// touches `prompt`.
+fn session_token<D: keyroost_ctap::transport::CtapTransport>(
+    dev: &mut D,
+    info: &keyroost_ctap::AuthenticatorInfo,
+    unlock: &SessionUnlock,
+    permissions: u32,
+    prompt: &FingerPrompt,
+    ask: keyroost_ctap::client_pin::FingerAsk,
+) -> Result<PinUvAuthToken, keyroost_ctap::CtapError> {
+    let set = |line: Option<String>| {
+        if let Ok(mut shown) = prompt.lock() {
+            *shown = line;
+        }
+    };
+    let mut on_finger = || set(Some(ask.prompt().to_owned()));
+    let out = keyroost_ctap::client_pin::get_token(
+        dev,
+        info,
+        unlock.source(),
+        permissions,
+        None,
+        &mut on_finger,
+    );
+    if matches!(unlock, SessionUnlock::Fingerprint) {
+        set(None);
+    }
+    out.map(|(token, _)| token)
+}
+
 /// Run a FIDO2 session operation with the session's token; when the key
 /// refuses that token (`0x33`: another program, such as a vault job, took a
-/// newer one, which ends the old one), ask once for a new token with the held
-/// PIN and run it again. Returns the result and the token that worked. A
-/// second refusal is the caller's error, which locks the session.
+/// newer one, which ends the old one), ask once for a new token and run it
+/// again: silently from the held PIN, or by asking for the finger again and
+/// saying why ([`FingerAsk::Again`](keyroost_ctap::client_pin::FingerAsk)).
+/// Returns the result and the token that worked. A second refusal is the
+/// caller's error, which locks the session.
 fn with_session_token<D, T>(
     dev: &mut D,
     info: &keyroost_ctap::AuthenticatorInfo,
     token: PinUvAuthToken,
-    pin: &str,
+    unlock: &SessionUnlock,
+    prompt: &FingerPrompt,
     mut op: impl FnMut(&mut D, &PinUvAuthToken) -> Result<T, keyroost_ctap::CtapError>,
 ) -> Result<(T, PinUvAuthToken), keyroost_ctap::CtapError>
 where
@@ -2263,11 +2455,13 @@ where
 {
     match op(dev, &token) {
         Err(keyroost_ctap::CtapError::StatusCode(0x33)) => {
-            let fresh = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+            let fresh = session_token(
                 dev,
-                pin,
                 info,
-                fido_session_permissions(info),
+                unlock,
+                session_permissions_for(info, unlock),
+                prompt,
+                keyroost_ctap::client_pin::FingerAsk::Again,
             )?;
             let out = op(dev, &fresh)?;
             Ok((out, fresh))
@@ -7309,25 +7503,60 @@ impl App {
             return;
         };
         let for_device = self.selected_device.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
         self.spawn_job("Unlocking\u{2026}", move || {
-            let result = Self::open_and_unlock(&target, &pin);
-            Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    return; // selection changed mid-unlock; discard (drops the PIN)
-                }
-                match result {
-                    Ok(sess) => {
-                        // Surface fingerprints read during unlock so the list shows
-                        // without a separate Reload.
-                        app.security_keys.fingerprints = sess.fingerprints.clone();
-                        app.security_keys.session = Some(sess);
-                        app.security_keys.session_device = for_device.clone();
-                        app.security_keys.error = None;
-                    }
-                    Err(e) => app.fail_unlock(e, pin),
-                }
-            })
+            let result = Self::open_and_unlock(&target, SessionUnlock::Pin(pin.clone()), &prompt);
+            Box::new(move |app: &mut App| app.apply_fido_unlock(for_device, result, pin))
         });
+    }
+
+    /// Unlock the FIDO2 tab with a fingerprint touch: the key's own sensor
+    /// gives the session token, and the session keeps no PIN. Only this tab
+    /// unlocks; the Vault tab takes its own touch.
+    fn unlock_fido_fingerprint(&mut self) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        let Some(target) = self.selected_fido_target() else {
+            return;
+        };
+        let for_device = self.selected_device.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
+        self.spawn_job(
+            keyroost_ctap::client_pin::FingerAsk::Unlock.prompt(),
+            move || {
+                let result = Self::open_and_unlock(&target, SessionUnlock::Fingerprint, &prompt);
+                Box::new(move |app: &mut App| {
+                    app.apply_fido_unlock(for_device, result, zeroize::Zeroizing::default());
+                })
+            },
+        );
+    }
+
+    /// The end of a FIDO2 tab unlock begun on `for_device`. A result for a
+    /// key no longer selected is dropped with its secrets. `pin` is the PIN
+    /// the unlock used (empty for a fingerprint): a key that wants its PIN
+    /// changed moves it into the change form.
+    fn apply_fido_unlock(
+        &mut self,
+        for_device: Option<DeviceId>,
+        result: Result<UnlockedSession, Box<dyn std::error::Error + Send + Sync>>,
+        pin: zeroize::Zeroizing<String>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+            return; // selection changed mid-unlock; discard (drops the PIN)
+        }
+        match result {
+            Ok(sess) => {
+                // Surface fingerprints read during unlock so the list shows
+                // without a separate Reload.
+                self.security_keys.fingerprints = sess.fingerprints.clone();
+                self.security_keys.session = Some(sess);
+                self.security_keys.session_device = for_device;
+                self.security_keys.error = None;
+            }
+            Err(e) => self.fail_unlock(e, pin),
+        }
     }
 
     fn fail_unlock(
@@ -7364,29 +7593,44 @@ impl App {
         self.security_keys.error = Some(format!("unlock failed: {}", error));
     }
 
+    /// Open `target` and unlock it ([`Self::unlock_on`]).
     fn open_and_unlock(
         target: &FidoTarget,
-        pin: &str,
+        unlock: SessionUnlock,
+        prompt: &FingerPrompt,
     ) -> Result<UnlockedSession, Box<dyn std::error::Error + Send + Sync>> {
         let (mut dev, cbor, _init) = open_fido(target)?;
         if !cbor {
             return Err("device is U2F-only".into());
         }
-        let info = keyroost_ctap::get_info(&mut dev)?;
+        Self::unlock_on(&mut dev, unlock, prompt)
+    }
+
+    /// Take the session token from `unlock` (the PIN, or a finger touch the
+    /// touch banner asks for) and read the passkeys, plus the fingerprints
+    /// when the token may manage them.
+    fn unlock_on<D: keyroost_ctap::transport::CtapTransport>(
+        dev: &mut D,
+        unlock: SessionUnlock,
+        prompt: &FingerPrompt,
+    ) -> Result<UnlockedSession, Box<dyn std::error::Error + Send + Sync>> {
+        let info = keyroost_ctap::get_info(dev)?;
         if info.force_pin_change == Some(true) {
             return Err(Box::new(ForcedPinChange));
         }
-        let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
-            &mut dev,
-            pin,
+        let perms = session_permissions_for(&info, &unlock);
+        let token = session_token(
+            dev,
             &info,
-            fido_session_permissions(&info),
+            &unlock,
+            perms,
+            prompt,
+            keyroost_ctap::client_pin::FingerAsk::Unlock,
         )?;
         // Hand the manager a clone and keep `token` for the cached session; the
         // token stays valid for the device session, so this avoids a redundant
         // second PIN/ECDH exchange just to rebuild it.
-        let mut mgr =
-            keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token.clone(), &info)?;
+        let mut mgr = keyroost_ctap::cred_mgmt::CredentialManager::new(dev, token.clone(), &info)?;
         let metadata = mgr.metadata()?;
         let parties = mgr.list_relying_parties()?;
         let mut rps = Vec::with_capacity(parties.len());
@@ -7402,8 +7646,10 @@ impl App {
         // While the session is fresh, also read enrolled fingerprints (when the
         // key supports bio) so the Fingerprints list appears immediately without
         // a separate Reload. Best-effort: a failure here doesn't block unlock.
-        let fingerprints = if info.option("bioEnroll").is_some()
-            || info.option("userVerificationMgmtPreview").is_some()
+        let may_bio = perms & keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT != 0;
+        let fingerprints = if may_bio
+            && (info.option("bioEnroll").is_some()
+                || info.option("userVerificationMgmtPreview").is_some())
         {
             let cmd_code = if info.option("bioEnroll").is_some() {
                 keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT
@@ -7411,7 +7657,7 @@ impl App {
                 keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT_PREVIEW
             };
             let mut bio =
-                keyroost_ctap::bio_enroll::BioEnrollment::new(&mut dev, token.clone(), cmd_code);
+                keyroost_ctap::bio_enroll::BioEnrollment::new(dev, token.clone(), cmd_code);
             bio.enumerate().ok()
         } else {
             None
@@ -7421,7 +7667,7 @@ impl App {
             metadata,
             rps: std::sync::Arc::new(rps),
             fingerprints,
-            pin: zeroize::Zeroizing::new(pin.to_owned()),
+            unlock,
         })
     }
 
@@ -7447,6 +7693,21 @@ impl App {
         self.security_keys.error = Some(FIDO_RELOCKED.into());
     }
 
+    /// A FIDO2 job on `for_device` had to take a new session token (a
+    /// fingerprint session asked the finger again): the session keeps it, as
+    /// the new one ended the old. Nothing changes when the session went or
+    /// moved to another key meanwhile.
+    fn keep_session_token(&mut self, for_device: Option<&DeviceId>, token: PinUvAuthToken) {
+        if !completion_still_valid(for_device, self.security_keys.session_device.as_ref()) {
+            return;
+        }
+        if let Some(session) = self.security_keys.session.as_mut() {
+            session.token = token;
+        }
+    }
+
+    /// Drop the FIDO2 tab's session, PIN or fingerprint alike: its token,
+    /// and the PIN a PIN session kept.
     fn lock_session(&mut self) {
         self.security_keys.session = None;
         self.security_keys.session_device = None;
@@ -7456,10 +7717,11 @@ impl App {
     }
 
     /// Whether the app holds anything [`Self::idle_lock`] would clear: an
-    /// unlocked FIDO session (with its PIN), an unlocked vault, a typed
-    /// secret not yet sent to a key ([`Self::typed_secrets_with`]), a retained
-    /// OATH password or OTP PIN, or displayed OATH / OTP codes. `&mut` only
-    /// because the typed-secret list is one list, shared with the wipe.
+    /// unlocked FIDO session (with its PIN or token), an unlocked vault, a
+    /// typed secret not yet sent to a key ([`Self::typed_secrets_with`]), a
+    /// retained OATH password or OTP PIN, or displayed OATH / OTP codes.
+    /// `&mut` only because the typed-secret list is one list, shared with
+    /// the wipe.
     fn holds_unlocked_secrets(&mut self) -> bool {
         self.holds_secrets_outside_vault() || self.vault_holds_secrets()
     }
@@ -7853,11 +8115,12 @@ impl App {
             return; // no session, or one bound to a different device (KEY-012)
         };
         let token = session.token.clone();
-        let pin = session.pin.clone();
+        let unlock = session.unlock.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
         let for_device = self.selected_device.clone();
         self.spawn_job("Refreshing credentials\u{2026}", move || {
-            let result =
-                Self::refresh_with_token(&target, token, pin).map_err(SessionOpError::from_boxed);
+            let result = Self::refresh_with_token(&target, token, unlock, &prompt)
+                .map_err(SessionOpError::from_boxed);
             Box::new(move |app: &mut App| app.apply_refreshed_session(for_device, result))
         });
     }
@@ -7891,10 +8154,11 @@ impl App {
     fn refresh_with_token(
         target: &FidoTarget,
         token: PinUvAuthToken,
-        pin: zeroize::Zeroizing<String>,
+        unlock: SessionUnlock,
+        prompt: &FingerPrompt,
     ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
         let (mut dev, _cbor, _init) = open_fido(target)?;
-        Self::refresh_on(&mut dev, token, pin)
+        Self::refresh_on(&mut dev, token, unlock, prompt)
     }
 
     /// [`Self::refresh_with_token`] on an open device. A token another
@@ -7903,11 +8167,12 @@ impl App {
     fn refresh_on(
         dev: &mut impl keyroost_ctap::transport::CtapTransport,
         token: PinUvAuthToken,
-        pin: zeroize::Zeroizing<String>,
+        unlock: SessionUnlock,
+        prompt: &FingerPrompt,
     ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
         let info = keyroost_ctap::get_info(dev)?;
         let ((metadata, rps), token) =
-            with_session_token(dev, &info, token, &pin, |dev, token| {
+            with_session_token(dev, &info, token, &unlock, prompt, |dev, token| {
                 let mut mgr =
                     keyroost_ctap::cred_mgmt::CredentialManager::new(dev, token.clone(), &info)?;
                 let metadata = mgr.metadata()?;
@@ -7930,7 +8195,7 @@ impl App {
             metadata,
             rps: std::sync::Arc::new(rps),
             fingerprints: None,
-            pin,
+            unlock,
         })
     }
 
@@ -7948,13 +8213,18 @@ impl App {
         }
     }
 
-    /// Open the device, derive a FRESH bio pinUvAuthToken from the PIN, and run
-    /// `f` with an armed BioEnrollment. A fresh token per operation is required:
-    /// the authenticator can invalidate a token after a UV-gated bio write, so
-    /// reusing the unlock token across operations fails with 0x33.
+    /// Open the device, take a FRESH bio pinUvAuthToken from the session's
+    /// unlock, and run `f` with an armed BioEnrollment. A fresh token per
+    /// operation is required: the authenticator can invalidate a token after
+    /// a UV-gated bio write, so reusing the unlock token across operations
+    /// fails with 0x33. On a fingerprint session that is a new touch, and the
+    /// banner says why ([`FingerAsk::Again`](keyroost_ctap::client_pin::FingerAsk));
+    /// a key that lets no finger manage fingerprints refuses it with no I/O,
+    /// in plain words, and the session stays.
     fn with_fresh_bio<T>(
         target: &FidoTarget,
-        pin: &str,
+        unlock: &SessionUnlock,
+        prompt: &FingerPrompt,
         f: impl FnOnce(
             &mut keyroost_ctap::bio_enroll::BioEnrollment<
                 Box<dyn keyroost_ctap::transport::CtapTransport>,
@@ -7975,11 +8245,13 @@ impl App {
                 "key does not support fingerprint enrollment",
             ));
         };
-        let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        let token = session_token(
             &mut dev,
-            pin,
             &info,
+            unlock,
             keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
+            prompt,
+            keyroost_ctap::client_pin::FingerAsk::Again,
         )
         .map_err(SessionOpError::from_ctap)?;
         let mut bio = keyroost_ctap::bio_enroll::BioEnrollment::new(&mut dev, token, cmd_code);
@@ -7998,10 +8270,11 @@ impl App {
             self.security_keys.error = Some("unlock the key first".into());
             return;
         };
-        let pin = session.pin.clone();
+        let unlock = session.unlock.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading fingerprints\u{2026}", move || {
-            let result = Self::with_fresh_bio(&target, &pin, |bio| {
+            let result = Self::with_fresh_bio(&target, &unlock, &prompt, |bio| {
                 bio.enumerate().map_err(SessionOpError::from_ctap)
             });
             Box::new(move |app: &mut App| {
@@ -8033,7 +8306,8 @@ impl App {
             self.security_keys.error = Some("unlock the key first".into());
             return;
         };
-        let pin = session.pin.clone();
+        let unlock = session.unlock.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
         let name = self.security_keys.fp_new_name.trim().to_owned();
         let name = if name.is_empty() { None } else { Some(name) };
 
@@ -8065,12 +8339,15 @@ impl App {
                 } else {
                     keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT_PREVIEW
                 };
-                // Fresh bio token per enroll, derived from the session PIN.
-                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+                // Fresh bio token per enroll, from the session's PIN or a
+                // new finger touch.
+                let token = session_token(
                     &mut dev,
-                    &pin,
                     &info,
+                    &unlock,
                     keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
+                    &prompt,
+                    keyroost_ctap::client_pin::FingerAsk::Again,
                 )
                 .map_err(SessionOpError::from_ctap)?;
                 let mut bio =
@@ -8187,10 +8464,11 @@ impl App {
         let Some(session) = self.fido_session() else {
             return;
         };
-        let pin = session.pin.clone();
+        let unlock = session.unlock.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
         let for_device = self.selected_device.clone();
         self.spawn_job("Deleting fingerprint\u{2026}", move || {
-            let result = Self::with_fresh_bio(&target, &pin, |bio| {
+            let result = Self::with_fresh_bio(&target, &unlock, &prompt, |bio| {
                 bio.remove_enrollment(&template_id)
                     .map_err(SessionOpError::from_ctap)?;
                 bio.enumerate().map_err(SessionOpError::from_ctap)
@@ -8222,10 +8500,11 @@ impl App {
         let Some(session) = self.fido_session() else {
             return;
         };
-        let pin = session.pin.clone();
+        let unlock = session.unlock.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
         let for_device = self.selected_device.clone();
         self.spawn_job("Renaming fingerprint\u{2026}", move || {
-            let result = Self::with_fresh_bio(&target, &pin, |bio| {
+            let result = Self::with_fresh_bio(&target, &unlock, &prompt, |bio| {
                 bio.set_friendly_name(&template_id, &new_name)
                     .map_err(SessionOpError::from_ctap)?;
                 bio.enumerate().map_err(SessionOpError::from_ctap)
@@ -8252,7 +8531,8 @@ impl App {
     /// token, so they always take a PIN at action time.
     fn with_config<T>(
         target: &FidoTarget,
-        pin: &str,
+        unlock: &SessionUnlock,
+        prompt: &FingerPrompt,
         f: impl FnOnce(
             &mut keyroost_ctap::config::Configurator<
                 Box<dyn keyroost_ctap::transport::CtapTransport>,
@@ -8269,11 +8549,13 @@ impl App {
                 "this key does not support authenticatorConfig",
             ));
         }
-        let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        let token = session_token(
             &mut dev,
-            pin,
             &info,
+            unlock,
             keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
+            prompt,
+            keyroost_ctap::client_pin::FingerAsk::Unlock,
         )
         .map_err(SessionOpError::from_ctap)?;
         let mut cfg = keyroost_ctap::config::Configurator::new(&mut dev, token, &info)
@@ -8338,8 +8620,10 @@ impl App {
             _ => "Enterprise attestation enabled",
         };
         let for_device = self.selected_device.clone();
+        let unlock = SessionUnlock::Pin(pin);
+        let prompt = self.security_keys.finger_prompt.clone();
         self.spawn_job(label, move || {
-            let result = Self::with_config(&target, &pin, |cfg| match action {
+            let result = Self::with_config(&target, &unlock, &prompt, |cfg| match action {
                 AdvancedAction::ToggleAlwaysUv => {
                     cfg.toggle_always_uv().map_err(SessionOpError::from_ctap)
                 }
@@ -8387,16 +8671,17 @@ impl App {
             return;
         };
         let token = session.token.clone();
-        let pin = session.pin.clone();
+        let unlock = session.unlock.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
         let for_device = self.selected_device.clone();
         self.spawn_job("Deleting credential\u{2026}", move || {
             // Delete, then re-list in the same job so the UI updates atomically.
             // `deleted`: the passkey is gone, whatever the re-list says. The
             // re-list uses the token the delete worked with.
-            let deleted = Self::try_delete(&target, token, &pin, &cred_id);
+            let deleted = Self::try_delete(&target, token, &unlock, &prompt, &cred_id);
             let wrote = deleted.is_ok();
             let result = deleted
-                .and_then(|token| Self::refresh_with_token(&target, token, pin))
+                .and_then(|token| Self::refresh_with_token(&target, token, unlock, &prompt))
                 .map_err(SessionOpError::from_boxed);
             Box::new(move |app: &mut App| {
                 app.apply_passkey_deleted(for_device, &cred_id, wrote, result);
@@ -8439,22 +8724,24 @@ impl App {
     fn try_delete(
         target: &FidoTarget,
         token: PinUvAuthToken,
-        pin: &str,
+        unlock: &SessionUnlock,
+        prompt: &FingerPrompt,
         cred_id: &[u8],
     ) -> Result<PinUvAuthToken, Box<dyn std::error::Error>> {
         let (mut dev, _cbor, _init) = open_fido(target)?;
-        Self::delete_on(&mut dev, token, pin, cred_id)
+        Self::delete_on(&mut dev, token, unlock, prompt, cred_id)
     }
 
     /// [`Self::try_delete`] on an open device.
     fn delete_on(
         dev: &mut impl keyroost_ctap::transport::CtapTransport,
         token: PinUvAuthToken,
-        pin: &str,
+        unlock: &SessionUnlock,
+        prompt: &FingerPrompt,
         cred_id: &[u8],
     ) -> Result<PinUvAuthToken, Box<dyn std::error::Error>> {
         let info = keyroost_ctap::get_info(dev)?;
-        let ((), token) = with_session_token(dev, &info, token, pin, |dev, token| {
+        let ((), token) = with_session_token(dev, &info, token, unlock, prompt, |dev, token| {
             keyroost_ctap::cred_mgmt::CredentialManager::new(dev, token.clone(), &info)?
                 .delete(cred_id)
         })?;
@@ -10780,6 +11067,20 @@ impl App {
     }
 
     fn touch_banner_text(&self) -> Option<String> {
+        // A FIDO2 job waiting for a finger says so, and why when the key
+        // asked again; ahead of the enroll wizard, which shows only once
+        // the token is in.
+        if self.busy() {
+            if let Some(text) = self
+                .security_keys
+                .finger_prompt
+                .lock()
+                .ok()
+                .and_then(|t| t.clone())
+            {
+                return Some(text);
+            }
+        }
         if self.security_keys.fp_progress.is_some() {
             return None;
         }
@@ -14949,14 +15250,21 @@ impl App {
         if self.refuse_if_busy() {
             return;
         }
-        let pin = if self.rename_needs_pin() {
-            zeroize::Zeroizing::new(self.rename_pin.clone())
+        // The PIN typed here, or the FIDO2 tab's unlock and its token.
+        let (unlock, held) = if self.rename_needs_pin() {
+            (
+                Some(SessionUnlock::Pin(zeroize::Zeroizing::new(
+                    self.rename_pin.clone(),
+                ))),
+                None,
+            )
         } else {
             match self.fido_session() {
-                Some(s) => s.pin.clone(),
-                None => zeroize::Zeroizing::new(String::new()),
+                Some(s) => (Some(s.unlock.clone()), Some(s.token.clone())),
+                None => (None, None),
             }
         };
+        let prompt = self.security_keys.finger_prompt.clone();
         wipe(&mut self.rename_pin);
         let Some(path) = target.hid_path.clone() else {
             self.rename_failed(KEY_NAME_NO_STORAGE);
@@ -14983,22 +15291,33 @@ impl App {
             "Removing the name from the key\u{2026}"
         };
         let queued = self.spawn_job(label, move || {
-            let result =
-                write_key_name(&path, name.as_deref(), expected.as_deref(), &pin).map(|w| {
-                    let written = matches!(w, KeyNameWrite::Written(_));
-                    (
-                        w,
-                        record_key_name(&serials, name.as_deref(), written, meta).err(),
-                    )
-                });
-            drop(pin);
+            let result = write_key_name(
+                &path,
+                name.as_deref(),
+                expected.as_deref(),
+                unlock.as_ref(),
+                held.as_ref(),
+                &prompt,
+            )
+            .map(|(w, renewed)| {
+                let written = matches!(w, KeyNameWrite::Written(_));
+                (
+                    w,
+                    record_key_name(&serials, name.as_deref(), written, meta).err(),
+                    renewed,
+                )
+            });
+            drop(unlock);
             Box::new(move |app: &mut App| {
                 let open_here = completion_still_valid(
                     Some(&device_id),
                     app.rename_target.as_ref().map(|t| &t.device_id),
                 );
                 match result {
-                    Ok((written, record_error)) => {
+                    Ok((written, record_error, renewed)) => {
+                        if let Some(token) = renewed {
+                            app.keep_session_token(Some(&device_id), token);
+                        }
                         if let KeyNameWrite::Written(cap) = written {
                             let what = if name.is_some() {
                                 "name saved on the key"
@@ -21171,6 +21490,13 @@ impl App {
         if pin == PinSupport::Set && !unlocked {
             ui.add_space(14.0);
             let mut unlock = false;
+            let mut unlock_finger = false;
+            // A key whose own sensor can unlock it offers the touch beside
+            // the PIN (experimental: no such key was on hand to try).
+            let finger = self.security_keys.info.as_ref().is_some_and(|i| {
+                keyroost_ctap::client_pin::built_in_uv(i)
+                    == keyroost_ctap::client_pin::BuiltInUv::Ready
+            });
             theme::card_frame(p).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -21200,6 +21526,18 @@ impl App {
                     {
                         unlock = true;
                     }
+                    if finger
+                        && theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Default,
+                            "Touch fingerprint",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                    {
+                        unlock_finger = true;
+                    }
                 });
                 let extras = match (has_bio, settings_available) {
                     (true, true) => "passkeys, fingerprints, and settings",
@@ -21208,14 +21546,27 @@ impl App {
                     (false, false) => "passkeys",
                 };
                 ui.add_space(4.0);
+                let line = if finger {
+                    format!(
+                        "Touch the fingerprint sensor, or enter the FIDO2 PIN, to manage {extras}."
+                    )
+                } else {
+                    format!("Unlock to manage {extras}.")
+                };
                 ui.label(
-                    egui::RichText::new(format!("Unlock to manage {extras}."))
+                    egui::RichText::new(line)
                         .font(theme::f_reg(11.5))
                         .color(p.txt3),
                 );
+                if finger {
+                    ui.add_space(6.0);
+                    vault_pane::fingerprint_experimental_note(ui, p);
+                }
             });
             if unlock {
                 self.try_unlock();
+            } else if unlock_finger {
+                self.unlock_fido_fingerprint();
             }
 
             // Read-only "Security policy" summary. getInfo is unauthenticated,
@@ -21815,7 +22166,9 @@ impl App {
                 Some("Unlock the key with your PIN first to add data.".into());
             return;
         };
-        let pin = session.pin.clone();
+        let unlock = session.unlock.clone();
+        let held = session.token.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
         // Start from the currently-loaded array if we have one, else an empty
         // array (read fresh inside the worker to avoid clobbering RP entries we
         // never loaded).
@@ -21827,6 +22180,7 @@ impl App {
                 (
                     keyroost_ctap::large_blobs::LargeBlobArray,
                     keyroost_ctap::large_blobs::BlobCapacity,
+                    Option<PinUvAuthToken>,
                 ),
                 String,
             > {
@@ -21848,17 +22202,14 @@ impl App {
                 let serialized = updated
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
-                let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
-                // Names read from keys before or during the write are stale.
-                keyroost_resolve::with_key_names_forgotten(|| {
-                    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
-                })
-                    .map_err(|e| e.to_string())?;
+                let renewed = write_large_blobs(
+                    &mut dev, &info, &unlock, &held, &prompt, &current, &serialized,
+                )?;
 
                 let array =
                     keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
                 let cap = array.capacity(&info);
-                Ok((array, cap))
+                Ok((array, cap, renewed))
             })();
 
             Box::new(move |app: &mut App| {
@@ -21867,7 +22218,10 @@ impl App {
                     return; // selection changed mid-op; discard the stale completion
                 }
                 match result {
-                    Ok((array, cap)) => {
+                    Ok((array, cap, renewed)) => {
+                        if let Some(token) = renewed {
+                            app.keep_session_token(for_device.as_ref(), token);
+                        }
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
@@ -21901,7 +22255,9 @@ impl App {
                 Some("Unlock the key with your PIN first to edit notes.".into());
             return;
         };
-        let pin = session.pin.clone();
+        let unlock = session.unlock.clone();
+        let held = session.token.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
 
         let for_device = self.selected_device.clone();
         self.spawn_job("Saving edit to large blobs\u{2026}", move || {
@@ -21909,6 +22265,7 @@ impl App {
                 (
                     keyroost_ctap::large_blobs::LargeBlobArray,
                     keyroost_ctap::large_blobs::BlobCapacity,
+                    Option<PinUvAuthToken>,
                 ),
                 String,
             > {
@@ -21930,17 +22287,14 @@ impl App {
                 let serialized = updated
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
-                let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
-                // Names read from keys before or during the write are stale.
-                keyroost_resolve::with_key_names_forgotten(|| {
-                    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
-                })
-                    .map_err(|e| e.to_string())?;
+                let renewed = write_large_blobs(
+                    &mut dev, &info, &unlock, &held, &prompt, &current, &serialized,
+                )?;
 
                 let array =
                     keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
                 let cap = array.capacity(&info);
-                Ok((array, cap))
+                Ok((array, cap, renewed))
             })();
 
             Box::new(move |app: &mut App| {
@@ -21949,7 +22303,10 @@ impl App {
                     return; // selection changed mid-op; discard the stale completion
                 }
                 match result {
-                    Ok((array, cap)) => {
+                    Ok((array, cap, renewed)) => {
+                        if let Some(token) = renewed {
+                            app.keep_session_token(for_device.as_ref(), token);
+                        }
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
                         app.refresh_storage_vault_labels();
@@ -22042,7 +22399,9 @@ impl App {
         let Some(target_entry) = array.entry(idx).cloned() else {
             return;
         };
-        let pin = session.pin.clone();
+        let unlock = session.unlock.clone();
+        let held = session.token.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
         // Deleting the key's name entry: the hero then offers to write it
         // back, which needs a fresh scan.
         let removes_name = matches!(
@@ -22062,6 +22421,7 @@ impl App {
                 (
                     keyroost_ctap::large_blobs::LargeBlobArray,
                     keyroost_ctap::large_blobs::BlobCapacity,
+                    Option<PinUvAuthToken>,
                 ),
                 String,
             > {
@@ -22087,18 +22447,15 @@ impl App {
                 let serialized = updated
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
-                let token = large_blob_write_token(&mut dev, &info, &pin, &live)?;
-                // Names read from keys before or during the write are stale.
-                keyroost_resolve::with_key_names_forgotten(|| {
-                    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
-                })
-                    .map_err(|e| e.to_string())?;
+                let renewed = write_large_blobs(
+                    &mut dev, &info, &unlock, &held, &prompt, &live, &serialized,
+                )?;
 
                 // Read back so the view reflects the authenticator's actual state.
                 let array =
                     keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
                 let cap = array.capacity(&info);
-                Ok((array, cap))
+                Ok((array, cap, renewed))
             })();
 
             Box::new(move |app: &mut App| {
@@ -22107,7 +22464,10 @@ impl App {
                     return; // selection changed mid-op; discard the stale completion
                 }
                 match result {
-                    Ok((array, cap)) => {
+                    Ok((array, cap, renewed)) => {
+                        if let Some(token) = renewed {
+                            app.keep_session_token(for_device.as_ref(), token);
+                        }
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
@@ -22148,7 +22508,9 @@ impl App {
                 Some("Unlock the key with your PIN first to modify large blobs.".into());
             return;
         };
-        let pin = session.pin.clone();
+        let unlock = session.unlock.clone();
+        let held = session.token.clone();
+        let prompt = self.security_keys.finger_prompt.clone();
         // The name goes when it isn't kept: the hero then offers to write it
         // back, which needs a fresh scan.
         let removes_name = shown.label().is_some() && !keep_name;
@@ -22159,6 +22521,7 @@ impl App {
                 (
                     keyroost_ctap::large_blobs::LargeBlobArray,
                     keyroost_ctap::large_blobs::BlobCapacity,
+                    Option<PinUvAuthToken>,
                 ),
                 String,
             > {
@@ -22187,18 +22550,15 @@ impl App {
                         .map_err(|e| e.to_string())?,
                     None => keyroost_ctap::large_blobs::empty_array_serialized(),
                 };
-                let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
-                // Names read from keys before or during the write are stale.
-                keyroost_resolve::with_key_names_forgotten(|| {
-                    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
-                })
-                .map_err(|e| e.to_string())?;
+                let renewed = write_large_blobs(
+                    &mut dev, &info, &unlock, &held, &prompt, &current, &serialized,
+                )?;
 
                 // Read back so the view reflects the authenticator's actual state.
                 let array =
                     keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
                 let cap = array.capacity(&info);
-                Ok((array, cap))
+                Ok((array, cap, renewed))
             })();
 
             Box::new(move |app: &mut App| {
@@ -22207,7 +22567,10 @@ impl App {
                     return; // selection changed mid-op; discard the stale completion
                 }
                 match result {
-                    Ok((array, cap)) => {
+                    Ok((array, cap, renewed)) => {
+                        if let Some(token) = renewed {
+                            app.keep_session_token(for_device.as_ref(), token);
+                        }
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
@@ -35609,7 +35972,7 @@ mod tests {
             },
             rps: std::sync::Arc::new(Vec::new()),
             fingerprints: None,
-            pin: zeroize::Zeroizing::new(String::new()),
+            unlock: SessionUnlock::Pin(zeroize::Zeroizing::new(String::new())),
         }
     }
 
@@ -35647,12 +36010,31 @@ mod tests {
     /// protocol one) issued against the platform's key agreement, and
     /// credential management that refuses the first `stale` calls with
     /// `0x33`, as a key does once another program (the Vault tab) took a
-    /// newer token.
+    /// newer token. With `uv`, getInfo offers a fingerprint (`uv`,
+    /// `bioEnroll`) and the key answers getUVRetries and fingerprint tokens
+    /// (refusing with the queued `uv_refusals` first); with `blobs`, it has
+    /// large-blob storage whose first `blob_stale` writes are refused with
+    /// `0x33`.
     struct TokenKey {
         agreement: keyroost_ctap::pin::EphemeralKey,
         stale: usize,
+        uv: bool,
+        uv_retries: u32,
+        uv_refusals: std::collections::VecDeque<u8>,
+        blobs: bool,
+        blob: Vec<u8>,
+        blob_stale: usize,
+        blob_writes: usize,
+        /// The banner cell, read when a fingerprint token is asked.
+        watch: Option<FingerPrompt>,
+        /// What the banner cell held at each fingerprint token request.
+        seen_prompts: Vec<Option<String>>,
         /// Every token issued, in order.
         issued: Vec<Vec<u8>>,
+        /// Every clientPin subcommand, in order.
+        subs: Vec<u64>,
+        /// The permissions of every token request (PIN or fingerprint).
+        perms: Vec<u64>,
         /// `(subcommand, pinUvAuthParam)` of every credential-management call.
         cm_calls: Vec<(u64, Vec<u8>)>,
     }
@@ -35662,9 +36044,59 @@ mod tests {
             TokenKey {
                 agreement: keyroost_ctap::pin::EphemeralKey::generate().unwrap(),
                 stale,
+                uv: false,
+                uv_retries: 5,
+                uv_refusals: Default::default(),
+                blobs: false,
+                blob: keyroost_ctap::large_blobs::empty_array_serialized(),
+                blob_stale: 0,
+                blob_writes: 0,
+                watch: None,
+                seen_prompts: Vec::new(),
                 issued: Vec::new(),
+                subs: Vec::new(),
+                perms: Vec::new(),
                 cm_calls: Vec::new(),
             }
+        }
+
+        /// [`Self::new`] with a fingerprint ready, its prompts watched in
+        /// `prompt`.
+        fn with_finger(stale: usize, prompt: &FingerPrompt) -> Self {
+            TokenKey {
+                uv: true,
+                watch: Some(prompt.clone()),
+                ..Self::new(stale)
+            }
+        }
+
+        /// A token for the request `req`, encrypted to its key agreement.
+        fn issue(
+            &mut self,
+            req: &keyroost_ctap::cbor::Value,
+        ) -> Result<Vec<u8>, keyroost_ctap::CtapError> {
+            use keyroost_ctap::cbor::{self, Value};
+            use keyroost_ctap::pin::PinProtocol as _;
+            let cose = req.get_uint_key(3).unwrap().as_map().unwrap();
+            let coord = |n: u64| -> [u8; 32] {
+                let (_, v) = cose.iter().find(|(k, _)| *k == Value::NInt(n)).unwrap();
+                v.as_bytes().unwrap().try_into().unwrap()
+            };
+            let secret = self
+                .agreement
+                .shared_secret_v1(&coord(1), &coord(2))
+                .unwrap();
+            let token = vec![0x50 + self.issued.len() as u8; 16];
+            let enc = keyroost_ctap::pin::ProtocolV1 { secret }
+                .encrypt(&token)
+                .unwrap();
+            self.issued.push(token);
+            let mut r = vec![0x00];
+            r.extend(cbor::encode(&Value::Map(vec![(
+                Value::UInt(2),
+                Value::Bytes(enc),
+            )])));
+            Ok(r)
         }
     }
 
@@ -35675,7 +36107,6 @@ mod tests {
             payload: &[u8],
         ) -> Result<Vec<u8>, keyroost_ctap::CtapError> {
             use keyroost_ctap::cbor::{self, Value};
-            use keyroost_ctap::pin::PinProtocol as _;
             let ok = |v: Value| {
                 let mut r = vec![0x00];
                 r.extend(cbor::encode(&v));
@@ -35685,28 +36116,37 @@ mod tests {
             let text = |s: &str| Value::Text(s.into());
             match payload[0] {
                 // getInfo
-                0x04 => ok(Value::Map(vec![
-                    (
-                        Value::UInt(1),
-                        Value::Array(vec![text("FIDO_2_0"), text("FIDO_2_1")]),
-                    ),
-                    (Value::UInt(3), Value::Bytes(vec![0x11; 16])),
-                    (
-                        Value::UInt(4),
-                        Value::Map(vec![
-                            (text("clientPin"), Value::Bool(true)),
-                            (text("pinUvAuthToken"), Value::Bool(true)),
-                            (text("credMgmt"), Value::Bool(true)),
-                        ]),
-                    ),
-                    (Value::UInt(6), Value::Array(vec![Value::UInt(1)])),
-                ])),
+                0x04 => {
+                    let mut options = vec![
+                        (text("clientPin"), Value::Bool(true)),
+                        (text("pinUvAuthToken"), Value::Bool(true)),
+                        (text("credMgmt"), Value::Bool(true)),
+                    ];
+                    if self.uv {
+                        options.push((text("uv"), Value::Bool(true)));
+                        options.push((text("bioEnroll"), Value::Bool(true)));
+                    }
+                    if self.blobs {
+                        options.push((text("largeBlobs"), Value::Bool(true)));
+                    }
+                    ok(Value::Map(vec![
+                        (
+                            Value::UInt(1),
+                            Value::Array(vec![text("FIDO_2_0"), text("FIDO_2_1")]),
+                        ),
+                        (Value::UInt(3), Value::Bytes(vec![0x11; 16])),
+                        (Value::UInt(4), Value::Map(options)),
+                        (Value::UInt(6), Value::Array(vec![Value::UInt(1)])),
+                    ]))
+                }
                 // clientPin
                 0x06 => {
                     let req = req();
-                    match req.get_uint_key(2).and_then(Value::as_uint) {
+                    let sub = req.get_uint_key(2).and_then(Value::as_uint).unwrap();
+                    self.subs.push(sub);
+                    match sub {
                         // getKeyAgreement
-                        Some(2) => {
+                        2 => {
                             let (x, y) = self.agreement.public_xy();
                             ok(Value::Map(vec![(
                                 Value::UInt(1),
@@ -35719,28 +36159,34 @@ mod tests {
                                 ]),
                             )]))
                         }
-                        // getPinUvAuthTokenUsingPinWithPermissions
-                        Some(9) => {
-                            let cose = req.get_uint_key(3).unwrap().as_map().unwrap();
-                            let coord = |n: u64| -> [u8; 32] {
-                                let (_, v) =
-                                    cose.iter().find(|(k, _)| *k == Value::NInt(n)).unwrap();
-                                v.as_bytes().unwrap().try_into().unwrap()
-                            };
-                            let secret = self
-                                .agreement
-                                .shared_secret_v1(&coord(1), &coord(2))
-                                .unwrap();
-                            let token = vec![0x50 + self.issued.len() as u8; 16];
-                            let enc = keyroost_ctap::pin::ProtocolV1 { secret }
-                                .encrypt(&token)
-                                .unwrap();
-                            self.issued.push(token);
-                            ok(Value::Map(vec![(Value::UInt(2), Value::Bytes(enc))]))
+                        // getPinUvAuthTokenUsingUvWithPermissions
+                        6 => {
+                            assert!(self.uv, "a fingerprint token on a key without one");
+                            let seen = self.watch.as_ref().and_then(|w| w.lock().unwrap().clone());
+                            self.seen_prompts.push(seen);
+                            self.perms
+                                .push(req.get_uint_key(9).and_then(Value::as_uint).unwrap());
+                            if let Some(code) = self.uv_refusals.pop_front() {
+                                return Ok(vec![code]);
+                            }
+                            self.issue(&req)
                         }
-                        other => panic!("unexpected clientPin subcommand {other:?}"),
+                        // getUVRetries
+                        7 => ok(Value::Map(vec![(
+                            Value::UInt(5),
+                            Value::UInt(u64::from(self.uv_retries)),
+                        )])),
+                        // getPinUvAuthTokenUsingPinWithPermissions
+                        9 => {
+                            self.perms
+                                .push(req.get_uint_key(9).and_then(Value::as_uint).unwrap());
+                            self.issue(&req)
+                        }
+                        other => panic!("unexpected clientPin subcommand {other}"),
                     }
                 }
+                // bioEnrollment: not read in these tests
+                0x09 => Ok(vec![0x01]),
                 // credentialManagement
                 0x0A => {
                     let req = req();
@@ -35764,6 +36210,25 @@ mod tests {
                         other => panic!("unexpected credMgmt subcommand {other}"),
                     }
                 }
+                // largeBlobs: get (key 1) at offset (key 3), or set (key 2)
+                0x0C => {
+                    assert!(self.blobs, "large blobs on a key without them");
+                    let req = req();
+                    if let Some(len) = req.get_uint_key(1).and_then(Value::as_uint) {
+                        let at = req.get_uint_key(3).and_then(Value::as_uint).unwrap() as usize;
+                        let end = (at + len as usize).min(self.blob.len());
+                        let chunk = self.blob[at.min(end)..end].to_vec();
+                        return ok(Value::Map(vec![(Value::UInt(1), Value::Bytes(chunk))]));
+                    }
+                    self.blob_writes += 1;
+                    if self.blob_stale > 0 {
+                        self.blob_stale -= 1;
+                        return Ok(vec![0x33]);
+                    }
+                    let data = req.get_uint_key(2).and_then(Value::as_bytes).unwrap();
+                    self.blob = data.to_vec();
+                    Ok(vec![0x00])
+                }
                 other => panic!("unexpected command {other:#04x}"),
             }
         }
@@ -35778,15 +36243,27 @@ mod tests {
 
     /// A vault job takes a fresh token, which ends the FIDO2 tab's: its next
     /// Refresh or Delete gets `0x33`. It asks for a new token with the held
-    /// PIN once and goes on; only a second refusal locks the tab.
+    /// PIN once and goes on; only a second refusal locks the tab. The PIN
+    /// path never asks for a finger.
     #[test]
     fn fido2_refresh_survives_a_vault_token() {
         let old = token_of(&[0x01; 16]);
+        let prompt = FingerPrompt::default();
         let mut key = TokenKey::new(1);
-        let pin = zeroize::Zeroizing::new("123456".to_owned());
-        let fresh =
-            App::refresh_on(&mut key, old.clone(), pin.clone()).unwrap_or_else(|e| panic!("{e}"));
+        key.watch = Some(prompt.clone());
+        let pin = SessionUnlock::Pin(zeroize::Zeroizing::new("123456".to_owned()));
+        let fresh = App::refresh_on(&mut key, old.clone(), pin.clone(), &prompt)
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(key.issued.len(), 1, "one new token");
+        assert_eq!(key.subs, [2, 9], "from the PIN, as before");
+        assert_eq!(
+            key.perms,
+            [u64::from(
+                keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT
+            )]
+        );
+        assert!(prompt.lock().unwrap().is_none(), "no finger asked");
+        assert!(matches!(fresh.unlock, SessionUnlock::Pin(ref p) if p.as_str() == "123456"));
         assert_eq!(
             fresh.token.token, key.issued[0],
             "the session keeps the one that worked"
@@ -35801,7 +36278,7 @@ mod tests {
 
         // Refused again with the new token: the error reaches the tab, which locks.
         let mut key = TokenKey::new(2);
-        let err = App::refresh_on(&mut key, old.clone(), pin.clone())
+        let err = App::refresh_on(&mut key, old.clone(), pin.clone(), &prompt)
             .err()
             .expect("a second refusal is an error");
         let err = SessionOpError::from_boxed(err);
@@ -35818,7 +36295,7 @@ mod tests {
 
         // Delete retries the same way and hands the working token on.
         let mut key = TokenKey::new(1);
-        let used = App::delete_on(&mut key, old.clone(), &pin, &[0xAB; 8])
+        let used = App::delete_on(&mut key, old.clone(), &pin, &prompt, &[0xAB; 8])
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(used.token, key.issued[0]);
         assert_eq!(key.cm_calls.len(), 2);
@@ -35826,9 +36303,484 @@ mod tests {
 
         // A token that still works is kept, and no PIN is sent.
         let mut key = TokenKey::new(0);
-        let fresh = App::refresh_on(&mut key, old.clone(), pin).unwrap_or_else(|e| panic!("{e}"));
+        let fresh =
+            App::refresh_on(&mut key, old.clone(), pin, &prompt).unwrap_or_else(|e| panic!("{e}"));
         assert!(key.issued.is_empty());
         assert_eq!(fresh.token.token, old.token);
+        assert!(prompt.lock().unwrap().is_none());
+    }
+
+    /// The FIDO2 tab unlocked by a finger: one fingerprint token (0x06),
+    /// never a PIN token, and the session keeps no PIN. The touch banner
+    /// asked for the finger while the key waited, and is down after.
+    #[test]
+    fn a_fingerprint_unlock_takes_a_uv_token_and_keeps_no_pin() {
+        let prompt = FingerPrompt::default();
+        let mut key = TokenKey::with_finger(0, &prompt);
+        let s = App::unlock_on(&mut key, SessionUnlock::Fingerprint, &prompt)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(s.unlock, SessionUnlock::Fingerprint));
+        assert!(s.unlock.pin().is_none());
+        assert!(
+            key.subs.contains(&6) && !key.subs.contains(&9),
+            "{:?}",
+            key.subs
+        );
+        assert_eq!(key.subs, [7, 2, 6], "tries left, key agreement, finger");
+        assert_eq!(
+            key.seen_prompts,
+            [Some(
+                keyroost_ctap::client_pin::FingerAsk::Unlock
+                    .prompt()
+                    .to_owned()
+            )]
+        );
+        assert!(prompt.lock().unwrap().is_none(), "the banner line went");
+        // A bio key that lets no finger manage fingerprints: credential
+        // management only, so the key grants the request.
+        assert_eq!(
+            key.perms,
+            [u64::from(
+                keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT
+            )]
+        );
+        assert_eq!(s.token.token, key.issued[0]);
+        assert_eq!(s.metadata.existing_count, 3);
+        assert!(
+            s.fingerprints.is_none(),
+            "no bio read without the permission"
+        );
+    }
+
+    /// A fingerprint session's token asks only what a finger may grant:
+    /// bio enrollment only with `uvBioEnroll`, and large-blob write when the
+    /// key has large blobs. The PIN session asks what it always did.
+    #[test]
+    fn a_fingerprint_session_asks_what_the_finger_may_grant() {
+        use keyroost_ctap::client_pin::permissions::{
+            BIO_ENROLLMENT as BE, CREDENTIAL_MANAGEMENT as CM, LARGE_BLOB_WRITE as LBW,
+        };
+        let info = |opts: &[&str]| AuthenticatorInfo {
+            options: opts.iter().map(|o| ((*o).to_owned(), true)).collect(),
+            ..Default::default()
+        };
+        let pin = SessionUnlock::Pin(zeroize::Zeroizing::new("1234".into()));
+        let finger = SessionUnlock::Fingerprint;
+        for opts in [
+            &["uv"][..],
+            &["uv", "bioEnroll"],
+            &["uv", "bioEnroll", "uvBioEnroll"],
+            &["uv", "largeBlobs"],
+        ] {
+            let i = info(opts);
+            assert_eq!(
+                session_permissions_for(&i, &pin),
+                fido_session_permissions(&i),
+                "{opts:?}"
+            );
+        }
+        assert_eq!(session_permissions_for(&info(&["uv"]), &finger), CM);
+        assert_eq!(
+            session_permissions_for(&info(&["uv", "bioEnroll"]), &finger),
+            CM
+        );
+        assert_eq!(
+            session_permissions_for(&info(&["uv", "bioEnroll", "uvBioEnroll"]), &finger),
+            CM | BE
+        );
+        assert_eq!(
+            session_permissions_for(&info(&["uv", "largeBlobs"]), &finger),
+            CM | LBW
+        );
+        assert_eq!(
+            session_permissions_for(&info(&["uv", "largeBlobs"]), &pin),
+            CM,
+            "the PIN path is unchanged"
+        );
+    }
+
+    /// A fingerprint session whose token another program ended: Refresh
+    /// asks the finger again and says why, then goes on with the new token.
+    #[test]
+    fn a_fingerprint_refresh_asks_again_and_says_why() {
+        let prompt = FingerPrompt::default();
+        let mut key = TokenKey::with_finger(0, &prompt);
+        let s = App::unlock_on(&mut key, SessionUnlock::Fingerprint, &prompt)
+            .unwrap_or_else(|e| panic!("{e}"));
+        key.stale = 1;
+        let fresh = App::refresh_on(&mut key, s.token.clone(), s.unlock.clone(), &prompt)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(key.subs.iter().filter(|s| **s == 6).count(), 2);
+        assert!(!key.subs.contains(&9), "never the PIN");
+        assert_eq!(
+            key.seen_prompts[1].as_deref(),
+            Some(keyroost_ctap::client_pin::FingerAsk::Again.prompt())
+        );
+        assert!(prompt.lock().unwrap().is_none());
+        assert_eq!(fresh.token.token, key.issued[1]);
+        assert!(matches!(fresh.unlock, SessionUnlock::Fingerprint));
+    }
+
+    /// Notes on a fingerprint session reuse its token (it carries large-blob
+    /// write): no new touch. Only a refused token asks the finger again, and
+    /// the new token goes back to the session. The PIN session takes a new
+    /// large-blob-write token from its PIN, as it always did.
+    #[test]
+    fn a_fingerprint_note_reuses_the_session_token() {
+        use keyroost_ctap::client_pin::permissions::{
+            CREDENTIAL_MANAGEMENT as CM, LARGE_BLOB_WRITE as LBW,
+        };
+        let prompt = FingerPrompt::default();
+        let mut key = TokenKey::with_finger(0, &prompt);
+        key.blobs = true;
+        let s = App::unlock_on(&mut key, SessionUnlock::Fingerprint, &prompt)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(key.perms, [u64::from(CM | LBW)]);
+        let note = |key: &mut TokenKey| {
+            let info = keyroost_ctap::get_info(key).unwrap();
+            let before = keyroost_ctap::large_blobs::read(key, &info).unwrap();
+            let after = before.with_text_note("hello");
+            let bytes = after.serialize_with_checksum().unwrap();
+            (info, before, bytes)
+        };
+
+        let (info, before, bytes) = note(&mut key);
+        let subs = key.subs.len();
+        let renewed = write_large_blobs(
+            &mut key, &info, &s.unlock, &s.token, &prompt, &before, &bytes,
+        )
+        .unwrap();
+        assert!(renewed.is_none());
+        assert_eq!(key.subs.len(), subs, "no token asked");
+        assert_eq!(key.blob_writes, 1);
+        assert_eq!(key.blob, bytes);
+
+        key.blob_stale = 1;
+        let (info, before, bytes) = note(&mut key);
+        let renewed = write_large_blobs(
+            &mut key, &info, &s.unlock, &s.token, &prompt, &before, &bytes,
+        )
+        .unwrap()
+        .expect("a new session token");
+        assert_eq!(&key.subs[subs..], [7, 2, 6]);
+        assert_eq!(
+            key.seen_prompts.last().unwrap().as_deref(),
+            Some(keyroost_ctap::client_pin::FingerAsk::Again.prompt())
+        );
+        assert_eq!(key.perms.last(), Some(&u64::from(CM | LBW)));
+        assert_eq!(&renewed.token, key.issued.last().unwrap());
+        assert_eq!(key.blob, bytes);
+
+        // The session keeps it; a session gone or moved keeps nothing.
+        let id: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(id.clone()),
+            ..Default::default()
+        };
+        app.security_keys.session = Some(unlocked_session(1));
+        app.security_keys.session_device = Some(id.clone());
+        app.keep_session_token(Some(&"serial:BBB".into()), renewed.clone());
+        assert_ne!(
+            app.security_keys.session.as_ref().unwrap().token.token,
+            renewed.token
+        );
+        app.keep_session_token(Some(&id), renewed.clone());
+        assert_eq!(
+            app.security_keys.session.as_ref().unwrap().token.token,
+            renewed.token
+        );
+
+        // The PIN: a new large-blob-write token, the finger never asked.
+        let mut key = TokenKey::new(0);
+        key.blobs = true;
+        key.watch = Some(prompt.clone());
+        let (info, before, bytes) = note(&mut key);
+        let pin = SessionUnlock::Pin(zeroize::Zeroizing::new("1234".into()));
+        let renewed = write_large_blobs(
+            &mut key,
+            &info,
+            &pin,
+            &token_of(&[0x01; 16]),
+            &prompt,
+            &before,
+            &bytes,
+        )
+        .unwrap();
+        assert!(renewed.is_none());
+        assert_eq!(key.subs, [2, 9]);
+        assert_eq!(key.perms, [u64::from(LBW)]);
+        assert!(key.seen_prompts.is_empty());
+    }
+
+    /// A refused fingerprint ends the unlock with the reason, in plain
+    /// words: the tab stays as it was (no relock line), the PIN box and
+    /// Unlock still there for the PIN.
+    #[test]
+    fn a_refused_fingerprint_keeps_the_pin_box_and_does_not_relock() {
+        let id: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(id.clone()),
+            ..Default::default()
+        };
+        app.security_keys.info = Some(finger_info(&["uv"]));
+        let refused = || {
+            keyroost_ctap::CtapError::Fingerprint(keyroost_ctap::FingerprintError::Refused(0x3F))
+        };
+        let err = refused();
+        let text = err.to_string();
+        assert!(!SessionOpError::from_ctap(refused()).relock);
+        app.apply_fido_unlock(Some(id), Err(Box::new(err)), zeroize::Zeroizing::default());
+        assert!(app.security_keys.session.is_none());
+        let shown = app
+            .security_keys
+            .error
+            .clone()
+            .expect("the reason is shown");
+        assert!(shown.contains(&text), "{shown}");
+        assert_ne!(shown, FIDO_RELOCKED);
+        assert!(!app.security_keys.change_pin.open);
+
+        let texts = fido2_texts(&mut app);
+        assert!(texts.iter().any(|(t, _)| t == "Unlock"), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|(t, _)| t == "Enter PIN to unlock this key"),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|(t, _)| t.contains(&text)), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t == FIDO_RELOCKED));
+    }
+
+    /// A key that wants its PIN changed opens the change form, with the
+    /// current PIN left for the person to type (a finger gave none).
+    #[test]
+    fn a_fingerprint_unlock_on_a_forced_pin_change_opens_the_form_empty() {
+        let id: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(id.clone()),
+            ..Default::default()
+        };
+        app.security_keys.info = Some(finger_info(&["uv"]));
+        app.apply_fido_unlock(
+            Some(id),
+            Err(Box::new(keyroost_ctap::CtapError::PinChangeRequired)),
+            zeroize::Zeroizing::default(),
+        );
+        assert!(app.security_keys.change_pin.open);
+        assert!(app.security_keys.change_pin.old.is_empty());
+        assert!(app.security_keys.error.is_none());
+        assert!(app.security_keys.session.is_none());
+    }
+
+    /// Fingerprint management on a session whose finger may not grant it:
+    /// the plain refusal, and the session stays.
+    #[test]
+    fn a_fingerprint_refusal_mid_session_keeps_the_session() {
+        let id: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(id.clone()),
+            ..Default::default()
+        };
+        let mut s = unlocked_session(1);
+        s.unlock = SessionUnlock::Fingerprint;
+        app.security_keys.session = Some(s);
+        app.security_keys.session_device = Some(id);
+        let err = SessionOpError::from_ctap(keyroost_ctap::CtapError::Fingerprint(
+            keyroost_ctap::FingerprintError::NotForThis,
+        ));
+        assert!(!err.relock);
+        app.fail_session_op(&err, "fingerprint list failed");
+        assert!(app.security_keys.session.is_some());
+        let shown = app.security_keys.error.clone().unwrap();
+        assert!(shown.contains("use the PIN instead"), "{shown}");
+    }
+
+    /// A fingerprint unlock that lands after the selection moved is dropped:
+    /// nothing unlocks, on either key.
+    #[test]
+    fn a_fingerprint_unlock_for_another_key_is_discarded() {
+        let mut app = App {
+            selected_device: Some("serial:BBB".into()),
+            ..Default::default()
+        };
+        let mut s = unlocked_session(1);
+        s.unlock = SessionUnlock::Fingerprint;
+        app.apply_fido_unlock(
+            Some("serial:AAA".into()),
+            Ok(s),
+            zeroize::Zeroizing::default(),
+        );
+        assert!(app.security_keys.session.is_none());
+        assert!(app.security_keys.session_device.is_none());
+        assert!(app.vault.session.is_none());
+    }
+
+    /// A fingerprint unlock lands on the FIDO2 tab only: the vault stays
+    /// locked, and its card still asks for a PIN.
+    #[test]
+    fn a_fingerprint_unlock_does_not_unlock_the_vault() {
+        let id: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(id.clone()),
+            ..Default::default()
+        };
+        let mut s = unlocked_session(1);
+        s.unlock = SessionUnlock::Fingerprint;
+        app.apply_fido_unlock(Some(id.clone()), Ok(s), zeroize::Zeroizing::default());
+        assert!(app.security_keys.session.is_some());
+        assert_eq!(app.security_keys.session_device, Some(id));
+        assert!(app.vault.session.is_none());
+        assert_eq!(app.unlock_pin().err(), Some("PIN is empty"));
+    }
+
+    /// The idle lock ends a fingerprint session like a PIN one.
+    #[test]
+    fn idle_lock_drops_a_fingerprint_session() {
+        let mut app = App::default();
+        let mut s = unlocked_session(1);
+        s.unlock = SessionUnlock::Fingerprint;
+        app.security_keys.session = Some(s);
+        app.security_keys.session_device = Some("serial:AAA".into());
+        assert!(app.holds_unlocked_secrets());
+        app.idle_lock(true);
+        assert!(app.security_keys.session.is_none());
+        assert!(app.security_keys.session_device.is_none());
+    }
+
+    /// The finger prompt a FIDO2 job set is on the touch banner while the
+    /// job runs, ahead of the enroll wizard and of the job's label.
+    #[test]
+    fn the_touch_banner_shows_the_finger_prompt() {
+        let mut app = App::default();
+        let again = keyroost_ctap::client_pin::FingerAsk::Again.prompt();
+        *app.security_keys.finger_prompt.lock().unwrap() = Some(again.to_owned());
+        assert_eq!(app.touch_banner_text(), None, "only while a job runs");
+        app.busy_jobs = 1;
+        app.busy_label = Some("Reading fingerprints\u{2026}".into());
+        app.security_keys.fp_progress = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            EnrollProgress::default(),
+        )));
+        assert_eq!(app.touch_banner_text().as_deref(), Some(again));
+        *app.security_keys.finger_prompt.lock().unwrap() = None;
+        assert_eq!(app.touch_banner_text(), None, "the wizard shows instead");
+    }
+
+    /// getInfo of a FIDO2 key with a PIN set and the options `extra`.
+    fn finger_info(extra: &[&str]) -> AuthenticatorInfo {
+        let mut options: Vec<(String, bool)> = vec![
+            ("clientPin".into(), true),
+            ("pinUvAuthToken".into(), true),
+            ("credMgmt".into(), true),
+        ];
+        options.extend(extra.iter().map(|o| ((*o).to_owned(), true)));
+        AuthenticatorInfo {
+            options,
+            ..Default::default()
+        }
+    }
+
+    /// Every text of one headless frame of the FIDO2 tab, at the smallest
+    /// window with the sidebar full width, with where it was drawn.
+    fn fido2_texts(app: &mut App) -> Vec<(String, egui::Rect)> {
+        fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    out.push((t.galley.text().to_owned(), shape.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx);
+        let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::from(WINDOW_MIN_SIZE),
+            )),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        // Two frames: the first lays out the rows.
+        for _ in 0..2 {
+            let output = ctx.test_frame(input(), |ui| {
+                egui::Panel::left("test_sidebar")
+                    .exact_size(SIDEBAR_FULL_W)
+                    .show(ui, |_| {});
+                egui::CentralPanel::default().show(ui, |ui| app.cap_fido2(ui, &palette));
+            });
+            out.clear();
+            for clipped in output.shapes {
+                collect(&clipped.shape, &mut out);
+            }
+        }
+        out
+    }
+
+    /// The unlock card offers the fingerprint only on a key whose sensor
+    /// can unlock it, with the experimental note; otherwise it is as before.
+    #[test]
+    fn the_unlock_card_offers_the_fingerprint_only_when_ready() {
+        let line = "Touch the fingerprint sensor, or enter the FIDO2 PIN, to manage passkeys.";
+        for (uv, ready) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let mut info = finger_info(&[]);
+            if let Some(v) = uv {
+                info.options.push(("uv".into(), v));
+            }
+            assert_eq!(
+                keyroost_ctap::client_pin::built_in_uv(&info)
+                    == keyroost_ctap::client_pin::BuiltInUv::Ready,
+                ready
+            );
+            let mut app = App::default();
+            app.security_keys.info = Some(info);
+            let texts = fido2_texts(&mut app);
+            let has = |s: &str| texts.iter().any(|(t, _)| t == s);
+            assert!(has("Unlock"), "{uv:?}: {texts:?}");
+            assert_eq!(has("Touch fingerprint"), ready, "{uv:?}: {texts:?}");
+            assert_eq!(has("Experimental"), ready, "{uv:?}: {texts:?}");
+            assert_eq!(has(line), ready, "{uv:?}: {texts:?}");
+            assert_eq!(
+                has("Unlock to manage passkeys."),
+                !ready,
+                "{uv:?}: {texts:?}"
+            );
+        }
+    }
+
+    /// Unlock and Touch fingerprint sit side by side, apart, inside the
+    /// pane at the smallest window.
+    #[test]
+    fn unlock_and_touch_fingerprint_do_not_overlap() {
+        let mut app = App::default();
+        app.security_keys.info = Some(finger_info(&["uv"]));
+        let texts = fido2_texts(&mut app);
+        let rect = |s: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t == s)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{s} drawn: {texts:?}"))
+        };
+        let unlock = rect("Unlock");
+        let finger = rect("Touch fingerprint");
+        assert!(!unlock.intersects(finger), "{unlock:?} {finger:?}");
+        assert!(finger.left() > unlock.right(), "right of Unlock");
+        let pane = SIDEBAR_FULL_W..WINDOW_MIN_SIZE[0];
+        for r in [unlock, finger] {
+            assert!(
+                pane.contains(&r.left()) && pane.contains(&r.right()),
+                "{r:?} inside {pane:?}"
+            );
+        }
+        // So does the whole card: nothing it draws runs past the window.
+        for (t, r) in &texts {
+            if !t.is_empty() {
+                assert!(r.right() <= WINDOW_MIN_SIZE[0], "{t}: {r:?}");
+            }
+        }
     }
 
     /// Selecting another device closes (and thereby zeroizes) the dialog.
