@@ -1735,14 +1735,20 @@ mod tests {
     }
 
     /// How a key lists the vault RP's credentials.
-    #[derive(Clone, Copy, PartialEq)]
+    #[derive(Clone, Copy, PartialEq, Debug)]
     enum Listing {
         /// CTAP 2.1: under a token bound to the vault RP too.
         Lenient,
-        /// A pre-2.2 key that lists only under an unbound token.
+        /// A key reporting nothing past CTAP 2.1 that lists only under an
+        /// unbound token: a 2.1 key that enforces 2.2's rule, or a 2.2 key
+        /// (2.3's §6.4 has it list no `FIDO_2_2`).
         Strict21,
-        /// A key reporting CTAP 2.2 that lists as its 6.8.4 is written.
+        /// A key that lists `FIDO_2_2` although 2.3's §6.4 says it MUST
+        /// not be present, and lists as 2.2's §6.8.4 is written.
         Ctap22,
+        /// A key reporting CTAP 2.3 (`FIDO_2_3`, no `FIDO_2_2`) that lists
+        /// as 2.3's §6.8.4 is written.
+        Ctap23,
     }
 
     /// [`fingers_for`] on a key that lists as `listing` says.
@@ -1753,6 +1759,7 @@ mod tests {
             Listing::Lenient => {}
             Listing::Strict21 => key.strict_listing = true,
             Listing::Ctap22 => key.as_ctap22(),
+            Listing::Ctap23 => key.as_ctap23(),
         }
         key.add_vault("Personal", &two_entries());
         let (asked, ask) = asks();
@@ -1818,12 +1825,13 @@ mod tests {
         assert!(!key.log.iter().any(|c| matches!(c, Call::Assertions(_))));
     }
 
-    /// A key reporting CTAP 2.2 lists under an unbound token from the
+    /// A key reporting CTAP 2.3 or later (`FIDO_2_3` with no `FIDO_2_2`, or
+    /// a `FIDO_2_2` listed anyway) lists under an unbound token from the
     /// start: no bound attempt is wasted and no reason line is needed, and
     /// the step after the listing takes its own bound token (a new token
     /// replaces the one held, 6.5.5.7.3). `list` is 2 fingers.
     #[test]
-    fn a_ctap22_key_lists_under_an_unbound_token_from_the_start() {
+    fn a_ctap_2_3_or_later_key_lists_under_an_unbound_token_from_the_start() {
         use FingerAsk::{Again as G, Unlock as U};
         let bound = Call::UvToken {
             perms: FINGER,
@@ -1833,73 +1841,108 @@ mod tests {
             perms: CM | LBW,
             rp: None,
         };
-        for (command, expected) in [
-            (Command::List, vec![(U, &unbound), (U, &bound)]),
-            (Command::EntryAdd, vec![(U, &unbound), (U, &bound)]),
-            (Command::Add, vec![(U, &unbound), (U, &bound), (U, &bound)]),
-            (Command::Delete, vec![(U, &unbound)]),
-            (
-                Command::Rotate,
-                vec![
-                    (U, &unbound),
-                    (U, &bound),
-                    (U, &bound),
-                    (U, &bound),
-                    (U, &bound),
-                ],
-            ),
-            (Command::ImportExisting, vec![(U, &unbound), (U, &bound)]),
-            (
-                Command::ImportNew,
-                vec![(U, &unbound), (U, &bound), (U, &bound)],
-            ),
-        ] {
-            let (asked, requests) = fingers_on(command, false, Listing::Ctap22);
-            let got: Vec<(FingerAsk, &Call)> = asked.into_iter().zip(&requests).collect();
-            assert_eq!(got, expected, "{command:?}");
-            assert_eq!(requests.len(), expected.len(), "{command:?}");
-        }
+        for listing in [Listing::Ctap22, Listing::Ctap23] {
+            for (command, expected) in [
+                (Command::List, vec![(U, &unbound), (U, &bound)]),
+                (Command::EntryAdd, vec![(U, &unbound), (U, &bound)]),
+                (Command::Add, vec![(U, &unbound), (U, &bound), (U, &bound)]),
+                (Command::Delete, vec![(U, &unbound)]),
+                (
+                    Command::Rotate,
+                    vec![
+                        (U, &unbound),
+                        (U, &bound),
+                        (U, &bound),
+                        (U, &bound),
+                        (U, &bound),
+                    ],
+                ),
+                (Command::ImportExisting, vec![(U, &unbound), (U, &bound)]),
+                (
+                    Command::ImportNew,
+                    vec![(U, &unbound), (U, &bound), (U, &bound)],
+                ),
+            ] {
+                let (asked, requests) = fingers_on(command, false, listing);
+                let got: Vec<(FingerAsk, &Call)> = asked.into_iter().zip(&requests).collect();
+                assert_eq!(got, expected, "{command:?}, {listing:?}");
+                assert_eq!(requests.len(), expected.len(), "{command:?}, {listing:?}");
+            }
 
-        // A key that also drops the token after a touch: one "asked again",
-        // bound, where a write follows the touch.
-        for (command, expected) in [
-            (Command::List, vec![(U, &unbound), (U, &bound)]),
-            (
-                Command::EntryAdd,
-                vec![(U, &unbound), (U, &bound), (G, &bound)],
-            ),
-            (
-                Command::Add,
-                vec![(U, &unbound), (U, &bound), (U, &bound), (G, &bound)],
-            ),
-            (Command::Delete, vec![(U, &unbound)]),
-            (
-                Command::Rotate,
-                vec![
-                    (U, &unbound),
-                    (U, &bound),
-                    (U, &bound),
-                    (U, &bound),
-                    (G, &bound),
-                ],
-            ),
-            (
-                Command::ImportExisting,
-                vec![(U, &unbound), (U, &bound), (G, &bound)],
-            ),
-            (
-                Command::ImportNew,
-                vec![(U, &unbound), (U, &bound), (U, &bound), (G, &bound)],
-            ),
-        ] {
-            let (asked, requests) = fingers_on(command, true, Listing::Ctap22);
-            let got: Vec<(FingerAsk, &Call)> = asked.into_iter().zip(&requests).collect();
-            assert_eq!(got, expected, "{command:?}, drops");
-            assert_eq!(requests.len(), expected.len(), "{command:?}, drops");
+            // A key that also drops the token after a touch: one "asked
+            // again", bound, where a write follows the touch.
+            for (command, expected) in [
+                (Command::List, vec![(U, &unbound), (U, &bound)]),
+                (
+                    Command::EntryAdd,
+                    vec![(U, &unbound), (U, &bound), (G, &bound)],
+                ),
+                (
+                    Command::Add,
+                    vec![(U, &unbound), (U, &bound), (U, &bound), (G, &bound)],
+                ),
+                (Command::Delete, vec![(U, &unbound)]),
+                (
+                    Command::Rotate,
+                    vec![
+                        (U, &unbound),
+                        (U, &bound),
+                        (U, &bound),
+                        (U, &bound),
+                        (G, &bound),
+                    ],
+                ),
+                (
+                    Command::ImportExisting,
+                    vec![(U, &unbound), (U, &bound), (G, &bound)],
+                ),
+                (
+                    Command::ImportNew,
+                    vec![(U, &unbound), (U, &bound), (U, &bound), (G, &bound)],
+                ),
+            ] {
+                let (asked, requests) = fingers_on(command, true, listing);
+                let got: Vec<(FingerAsk, &Call)> = asked.into_iter().zip(&requests).collect();
+                assert_eq!(got, expected, "{command:?}, {listing:?}, drops");
+                assert_eq!(
+                    requests.len(),
+                    expected.len(),
+                    "{command:?}, {listing:?}, drops"
+                );
+            }
         }
     }
 
-    /// A pre-2.2 key that lists only under an unbound token refuses the
+    /// A key whose getInfo `versions` has `FIDO_2_3` and no `FIDO_2_2`
+    /// takes the unbound listing token first: `list` is 2 fingers, not the
+    /// 3 of a key reporting nothing past 2.1 that refuses the bound token
+    /// first ([`FingerAsk::ListVaults`] never asked).
+    #[test]
+    fn a_ctap23_key_needs_no_extra_finger_for_the_listing() {
+        let mut key = FakeKey::with_fingerprint();
+        key.as_ctap23();
+        assert!(key.info().versions.iter().any(|v| v == "FIDO_2_3"));
+        assert!(!key.info().versions.iter().any(|v| v == "FIDO_2_2"));
+
+        let (asked, requests) = fingers_on(Command::List, false, Listing::Ctap23);
+        assert_eq!(asked, [FingerAsk::Unlock, FingerAsk::Unlock]);
+        assert_eq!(
+            requests.first(),
+            Some(&Call::UvToken {
+                perms: CM | LBW,
+                rp: None
+            }),
+            "the first token is the unbound listing one"
+        );
+        let (strict, _) = fingers_on(Command::List, false, Listing::Strict21);
+        assert_eq!(
+            strict,
+            [FingerAsk::Unlock, FingerAsk::ListVaults, FingerAsk::Unlock]
+        );
+    }
+
+    /// A key reporting nothing past CTAP 2.1 (a 2.2 key among them) that
+    /// lists only under an unbound token refuses the
     /// vault-RP-bound token for the listing: the flow asks once more for an
     /// unbound listing token, saying why, and every later listing of the
     /// same auth takes an unbound token straight away. Every command works;

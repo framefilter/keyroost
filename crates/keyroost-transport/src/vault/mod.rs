@@ -369,8 +369,21 @@ impl From<VaultError> for VaultKeyError {
 const FINGER_PERMISSIONS: u32 =
     CREDENTIAL_MANAGEMENT | GET_ASSERTION | MAKE_CREDENTIAL | LARGE_BLOB_WRITE;
 
-/// The getInfo `versions` entry of a CTAP 2.2 key.
-const CTAP_2_2: &str = "FIDO_2_2";
+/// Whether getInfo `versions` reports CTAP 2.3 or later: a `FIDO_2_<minor>`
+/// entry, digits only after `FIDO_2_`, with a minor of 2 or more. CTAP
+/// 2.3's §6.4 says the string `FIDO_2_2` was not defined for CTAP 2.2 and
+/// MUST not be present, so a 2.3 key lists `FIDO_2_3` and a 2.2 key lists
+/// nothing past `FIDO_2_1`: a 2.2 key cannot be told apart here. A key
+/// that lists `FIDO_2_2` anyway counts as 2.3, and so does a later 2.x.
+/// `FIDO_2_0`, `FIDO_2_1`, `FIDO_2_1_PRE` and `U2F_V2` are older.
+fn speaks_ctap_2_3_or_later(versions: &[String]) -> bool {
+    versions.iter().any(|v| {
+        v.strip_prefix("FIDO_2_")
+            .filter(|minor| !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|minor| minor.parse::<u32>().ok())
+            .is_some_and(|minor| minor >= 2)
+    })
+}
 
 /// How a vault flow proves the person may use the key. Holds the secret
 /// (or the way to ask for a finger) and the pinUvAuthToken it last
@@ -390,9 +403,9 @@ pub struct VaultAuth {
     /// How the last token obtained was obtained.
     verified: Option<Verified>,
     /// Credential listings take a fingerprint token bound to no RP: the key
-    /// reports CTAP 2.2 (whose 6.8.4 lists only under such a token), or it
-    /// refused the vault-RP-bound token for a listing. Every later listing
-    /// of this auth then takes an unbound one.
+    /// reports CTAP 2.3 or later (whose §6.8.4 lists only under such a
+    /// token), or it refused the vault-RP-bound token for a listing. Every
+    /// later listing of this auth then takes an unbound one.
     unbound_listing: bool,
 }
 
@@ -585,14 +598,17 @@ impl VaultAuth {
     /// makeCredential that follows needs no other finger (CTAP 2.1 6.8.4
     /// takes a token bound to the RP listed).
     ///
-    /// CTAP 2.2's 6.8.4 is written to list only under a token bound to no
-    /// RP, so on a key whose getInfo `versions` has `FIDO_2_2` the listing
-    /// takes an unbound token with `permissions` from the start, and the
-    /// step after it its own bound one: two fingers, none wasted. A pre-2.2
-    /// key may enforce that rule too: when it refuses a bound token it just
-    /// gave (`PIN_AUTH_INVALID`), that is no dropped token, so one unbound
-    /// token is asked for, saying why ([`FingerAsk::ListVaults`]). Either
-    /// way every later listing of this auth takes an unbound token straight
+    /// CTAP 2.2's and 2.3's §6.8.3 and §6.8.4 are written to list only
+    /// under a token with the cm permission and no permissions RP ID, so
+    /// on a key whose getInfo `versions` reports 2.3 or later
+    /// ([`speaks_ctap_2_3_or_later`]) the listing takes an unbound token
+    /// with `permissions` from the start, and the step after it its own
+    /// bound one: two fingers, none wasted. A key that reports nothing past
+    /// 2.1 may enforce that rule too: a 2.2 key is written to, and lists no
+    /// `FIDO_2_2` (2.3's §6.4). When it refuses a bound token it just gave
+    /// (`PIN_AUTH_INVALID`), that is no dropped token, so one unbound token
+    /// is asked for, saying why ([`FingerAsk::ListVaults`]). Either way
+    /// every later listing of this auth takes an unbound token straight
     /// away. A held token refused as dropped or expired is renewed once
     /// first ([`FingerAsk::Again`]). At most those two more tokens, never a
     /// loop: on a key that takes the bound token, a held token refused and
@@ -609,7 +625,7 @@ impl VaultAuth {
             let token = self.fresh_token(key, permissions, None)?;
             return Ok(call(key, token)?);
         }
-        if key.info().versions.iter().any(|v| v == CTAP_2_2) {
+        if speaks_ctap_2_3_or_later(&key.info().versions) {
             self.unbound_listing = true;
         }
         let held = match &self.token {
@@ -834,6 +850,38 @@ mod tests {
         rp: Option<&str>,
     ) -> PinUvAuthToken {
         fresh(auth, key, perms, rp).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// `FIDO_2_<minor>` with a minor of 2 or more reads as CTAP 2.3 or
+    /// later (`FIDO_2_2`, which 2.3's §6.4 says MUST not be present, too);
+    /// anything else (older, a preview, not digits) does not.
+    #[test]
+    fn ctap_2_3_or_later_reads_the_minor_version() {
+        let v = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).to_owned()).collect() };
+        for later in ["FIDO_2_2", "FIDO_2_3", "FIDO_2_10"] {
+            assert!(speaks_ctap_2_3_or_later(&v(&[later])), "{later}");
+        }
+        assert!(speaks_ctap_2_3_or_later(&v(&[
+            "U2F_V2", "FIDO_2_0", "FIDO_2_1", "FIDO_2_3"
+        ])));
+        for older in [
+            "FIDO_2_0",
+            "FIDO_2_1",
+            "FIDO_2_1_PRE",
+            "U2F_V2",
+            "FIDO_2_x",
+            "FIDO_2_",
+            "FIDO_2_+3",
+        ] {
+            assert!(!speaks_ctap_2_3_or_later(&v(&[older])), "{older}");
+        }
+        assert!(!speaks_ctap_2_3_or_later(&v(&[
+            "U2F_V2",
+            "FIDO_2_0",
+            "FIDO_2_1_PRE",
+            "FIDO_2_1"
+        ])));
+        assert!(!speaks_ctap_2_3_or_later(&[]));
     }
 
     #[test]
