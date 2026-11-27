@@ -270,6 +270,10 @@ fn has_vault_credential(
     auth: &mut VaultAuth,
 ) -> Result<bool, VaultKeyError> {
     let perms = CREDENTIAL_MANAGEMENT | LARGE_BLOB_WRITE;
+    if auth.is_fingerprint() {
+        let creds = auth.with_listing(key, perms, |k, t| k.credentials(t))?;
+        return Ok(!creds.is_empty());
+    }
     let token = match auth.current_for(CREDENTIAL_MANAGEMENT).cloned() {
         None => auth.fresh_token(key, perms, None)?.clone(),
         Some(token) => match key.credentials(&token) {
@@ -410,8 +414,9 @@ pub(crate) fn apply_change(
     }
 }
 
-/// `CTAP2_ERR_PIN_AUTH_INVALID`: the key no longer accepts the token.
-const PIN_AUTH_INVALID: u8 = 0x33;
+/// `CTAP2_ERR_PIN_AUTH_INVALID`: the key no longer accepts the token, or
+/// not for this call.
+pub(super) const PIN_AUTH_INVALID: u8 = 0x33;
 /// `CTAP2_ERR_PIN_TOKEN_EXPIRED`.
 const PIN_TOKEN_EXPIRED: u8 = 0x38;
 

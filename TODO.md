@@ -137,13 +137,17 @@ items marked *(no hardware)* need a device the maintainer does not have.
   new vault 2 and two touches; `rotate` 4 and three touches. A key that
   clears the token after the touch adds 1 ("asked again") to `entry
   add|edit|delete`, `add` and `import`. The app's Vault tab: unlock 1, save
-  none, create 2, rotate 3, delete 1. Confirm on the key that it takes the
-  RP-bound token for credential management of the vault RP
-  (enumerateCredentialsBegin with its rpIdHash, deleteCredential), as CTAP
-  2.1 §6.8.4 and §6.8.5 allow; CTAP 2.2's §6.8.4 asks for a token with no RP
-  for enumerateCredentialsBegin, so a key that follows that text would
-  refuse the listing (0x33) and every fingerprint vault command would fail
-  after its first finger. Then drop "experimental" from `--unlock`'s help
+  none, create 2, rotate 3, delete 1. Confirm on the key which way it lists
+  the vault RP's credentials (enumerateCredentialsBegin): CTAP 2.1 §6.8.4
+  takes the RP-bound token (the counts above); CTAP 2.2's §6.8.4 as written
+  takes only a token bound to no RP, and then the listing is refused (0x33)
+  and keyroost asks once more for an unbound listing token ("This key needs
+  a second fingerprint to list its vaults"), remembered for the rest of that
+  command or app session. On such a key: `list`, `export`, the `entry`
+  commands and `import` into a vault on the key 3, `delete` 2, `add` and
+  `import` into a new vault 4, `rotate` 6; the app's unlock 3, a later
+  delete 1. Check the command still works and the reason line shows, and
+  that deleteCredential takes the RP-bound token on both kinds. Then drop "experimental" from `--unlock`'s help
   (`FIDO_UNLOCK_HELP`), the README, `docs/fido2.html`, `docs/vault.html` and
   the app (`vault_pane::fingerprint_experimental_note`).
 

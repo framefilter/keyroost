@@ -11081,6 +11081,37 @@ mod tests {
         check(&app, &key, 2, "delete");
     }
 
+    /// A key that lists its vaults only under a token bound to no relying
+    /// party (CTAP 2.2's 6.8.4 as written): the unlock asks for a second
+    /// finger to list, saying why, and opens the vaults; the session
+    /// remembers, so a later delete lists with one finger and no reason
+    /// line.
+    #[test]
+    fn a_strict_listing_key_opens_with_a_second_finger_and_says_why() {
+        let mut key = FakeKey::with_fingerprint();
+        key.strict_listing = true;
+        two_vaults(&mut key);
+        let mut app = finger_app();
+        let seen = finger_unlock_into(&mut app, &mut key);
+        assert!(app.vault.error.is_none(), "{:?}", app.vault.error);
+        assert_eq!(app.vault_session().unwrap().unlocked.vaults.len(), 2);
+        assert_eq!(
+            seen,
+            vec![
+                unlock_prompt(),
+                Some(FingerAsk::ListVaults.prompt().to_owned()),
+                unlock_prompt(),
+                Some("Touch your key\u{2026}".to_owned()),
+            ]
+        );
+        assert_eq!(key.fingers, 3);
+        app.vault_ask_delete_vault();
+        delete_vault_into(&mut app, &mut key);
+        assert!(app.vault.error.is_none(), "{:?}", app.vault.error);
+        assert_eq!(key.fingers, 4, "one finger, unbound straight away");
+        assert!(!key.log.iter().any(|c| matches!(c, Call::Token { .. })));
+    }
+
     /// The key refuses the session's token and the one it gave after the
     /// finger was asked again: the vault locks in the finger's words, never
     /// the PIN's, and the FIDO2 tab's PIN session stays. A PIN session

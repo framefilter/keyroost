@@ -13,7 +13,10 @@
 //! credentials, and makeCredential / getAssertion for it, are refused under a
 //! token bound to another RP, and a token with none is bound to the vault RP
 //! by its first makeCredential or getAssertion; largeBlobWrite ignores the RP
-//! (CTAP 2.1 §6.5.5.7, §6.8.4, §6.8.5). A key made [`FakeKey::with_fingerprint`] also gives
+//! (CTAP 2.1 §6.5.5.7, §6.8.4, §6.8.5); with
+//! [`strict_listing`](FakeKey::strict_listing) it lists only under a token
+//! bound to no RP, as CTAP 2.2's §6.8.4 is written. A key made
+//! [`FakeKey::with_fingerprint`] also gives
 //! tokens for a finger, with scripted refusals and tries left, and can drop
 //! a token entirely after a touch, as some keys do.
 //!
@@ -176,6 +179,12 @@ pub struct FakeKey {
     /// all, not even largeBlobWrite: a key that drops the token after a
     /// touch.
     pub drops_token_after_presence: bool,
+    /// Credential listing (enumerateCredentialsBegin) refuses any token
+    /// bound to an RP, as CTAP 2.2's 6.8.4 is written ("the cm permission
+    /// and no associated permissions RP ID"); deleteCredential still takes
+    /// one bound to the vault RP. Off: CTAP 2.1, which takes a token bound
+    /// to the RP listed.
+    pub strict_listing: bool,
     /// How many times a finger was asked for.
     pub fingers: usize,
     /// The serialized array with its checksum.
@@ -234,6 +243,7 @@ impl FakeKey {
             uv_retries: UV_TRIES,
             uv_refusals: VecDeque::new(),
             drops_token_after_presence: false,
+            strict_listing: false,
             fingers: 0,
             stored: empty_array_serialized(),
             issued: Vec::new(),
@@ -561,6 +571,9 @@ impl VaultKey for FakeKey {
     fn credentials(&mut self, token: &PinUvAuthToken) -> Result<Vec<VaultCredential>, CtapError> {
         self.log.push(Call::Credentials);
         self.check(token, CREDENTIAL_MANAGEMENT, RpUse::VaultCredentials)?;
+        if self.strict_listing && self.rp_of(token).is_some() {
+            return Err(CtapError::StatusCode(PIN_AUTH_INVALID));
+        }
         Ok(self
             .creds
             .iter()
@@ -1028,6 +1041,27 @@ mod tests {
             assert_eq!(key.assertions(&unbound, None).unwrap().len(), 1);
             assert_eq!(key.rp_of(&unbound).as_deref(), Some(RP_ID));
         }
+    }
+
+    /// CTAP 2.2's 6.8.4 as written: no listing under a token bound to an
+    /// RP, the vault RP's included; an unbound one lists, and a bound one
+    /// still deletes (6.8.5).
+    #[test]
+    fn a_strict_key_lists_only_under_an_unbound_token() {
+        let mut key = FakeKey::with_fingerprint();
+        key.strict_listing = true;
+        let id = key.add_vault("Personal", &Vault::default());
+        let cm = CREDENTIAL_MANAGEMENT;
+        let bound = key.uv_token(cm, Some(RP_ID), &mut || {}).unwrap();
+        assert!(matches!(
+            key.credentials(&bound),
+            Err(CtapError::StatusCode(PIN_AUTH_INVALID))
+        ));
+        let unbound = key.uv_token(cm, None, &mut || {}).unwrap();
+        assert_eq!(key.credentials(&unbound).unwrap().len(), 1);
+        let bound = key.uv_token(cm, Some(RP_ID), &mut || {}).unwrap();
+        key.delete_credential(&bound, &id).unwrap();
+        assert!(key.creds.is_empty());
     }
 
     #[test]

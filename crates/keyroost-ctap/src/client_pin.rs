@@ -555,12 +555,17 @@ pub enum Verified {
     Fingerprint,
 }
 
-/// Why the user is asked for a finger: the first unlock, or again because
-/// the key dropped the token it gave.
+/// Why the user is asked for a finger: the first unlock, again because
+/// the key dropped the token it gave, or again because the key lists its
+/// vaults only under a second token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FingerAsk {
     Unlock,
     Again,
+    /// The key refused the vault-bound token for listing the vaults (it
+    /// lists only under a token bound to no relying party), so a second
+    /// token is asked for, for the listing.
+    ListVaults,
 }
 
 impl FingerAsk {
@@ -570,6 +575,10 @@ impl FingerAsk {
             FingerAsk::Unlock => "Touch the fingerprint sensor\u{2026}",
             FingerAsk::Again => {
                 "The key asked for a new unlock: touch the fingerprint sensor again\u{2026}"
+            }
+            FingerAsk::ListVaults => {
+                "This key needs a second fingerprint to list its vaults: touch the fingerprint \
+                 sensor again\u{2026}"
             }
         }
     }
@@ -2034,6 +2043,11 @@ mod tests {
         assert_eq!(
             FingerAsk::Again.prompt(),
             "The key asked for a new unlock: touch the fingerprint sensor again\u{2026}"
+        );
+        assert_eq!(
+            FingerAsk::ListVaults.prompt(),
+            "This key needs a second fingerprint to list its vaults: touch the fingerprint \
+             sensor again\u{2026}"
         );
     }
 }

@@ -96,11 +96,12 @@
       unlock still asks for its touch. <strong>Lock</strong> locks only the tab it is on.</p>
     <p>On a key with a fingerprint sensor, <strong>Touch fingerprint</strong> beside Unlock
       opens the vaults with a finger instead of the PIN (experimental;
-      <a href="fido2.html#fingerprint-unlock">see FIDO2</a>). Opening the vaults asks for
-      the sensor once, and saving an entry needs no finger. Each touch of the key ends what
-      one finger allowed, so creating a vault asks for the sensor twice, rotating a vault's
-      key three times, and deleting a vault at most once; when the key asks for a new
-      unlock partway through, the sensor is asked again. A fingerprint unlock opens only the
+      <a href="fido2.html#fingerprint-unlock">see FIDO2</a>). Opening the vaults usually
+      asks for the sensor once, and saving an entry needs no finger. Each touch of the key
+      ends what one finger allowed, so creating a vault asks for the sensor twice, rotating a
+      vault's key three times, and deleting a vault at most once. The sensor is asked again
+      when the key asks for a new unlock partway through, and on a key that needs a second
+      fingerprint to list its vaults; keyroost says why. A fingerprint unlock opens only the
       Vault tab, and the tab says <em>Unlocked with a fingerprint</em>.</p>
     <p>The top bar's <strong>Refresh</strong> reads the open vaults again with no PIN and no
       touch, so a change made by another program shows. A vault made elsewhere appears after
@@ -213,7 +214,7 @@
   <section class="kr-section" id="cli">
     <h2>Command line</h2>
 <pre><code>keyroostctl fido vault list                    # asks for the PIN (hidden), then a touch
-keyroostctl fido vault list --unlock fingerprint   # the sensor once, then a touch
+keyroostctl fido vault list --unlock fingerprint   # usually the sensor once, then a touch
 keyroostctl fido vault add Personal            # a new vault (two touches)
 keyroostctl fido vault entry add GitHub --username alice --generate-password
 keyroostctl fido vault entry show GitHub --reveal
