@@ -38,6 +38,7 @@
       <a href="mds.html">Device metadata</a>
       <a href="settings.html">Settings</a>
       <a href="storage.html">Storage</a>
+      <a href="vault.html">Vault</a>
       <a href="openpgp.html">OpenPGP</a>
       <a href="piv.html">PIV</a>
       <a href="molto2.html">Molto2</a>
@@ -185,7 +186,8 @@ keyroostctl fido ssh export --rp ssh:demo --out id_ecdsa_sk-cert.pub</code></pre
     <h2>Cautions</h2>
     <p class="kr-muted"><strong>Nothing here is secret.</strong> Anyone who plugs in the key
       can read the array, including your notes. <strong>Don't store passwords, recovery
-      codes, or anything sensitive.</strong> If a write is rejected, the key may be out of
+      codes, or anything sensitive.</strong> For passwords, the
+      <a href="vault.html">password vault</a> keeps them encrypted in this same store. If a write is rejected, the key may be out of
       large-blob storage or busy; keyroost reports the CTAP status with a readable hint, and
       the array is left unchanged.</p>
   </section>

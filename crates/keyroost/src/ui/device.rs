@@ -25,6 +25,10 @@ pub enum CapTab {
     Otp,
     /// The Feitian OTP applet.
     Ftotp,
+    /// The FIDO2 password vault. Offered beside Authenticator on keys that
+    /// can hold one (`vault_pane::with_vault_tab`), not by
+    /// [`DeviceView::tabs`], since that takes the key's getInfo.
+    Vault,
 }
 
 /// The capability a tab manages, if it maps to one (`Overview` does not).
@@ -37,6 +41,7 @@ pub fn tab_cap(t: CapTab) -> Option<Caps> {
         CapTab::Piv => Some(Caps::PIV),
         CapTab::Otp => Some(Caps::OTP),
         CapTab::Ftotp => Some(Caps::FEITIAN_OTP),
+        CapTab::Vault => Some(Caps::FIDO2),
     }
 }
 

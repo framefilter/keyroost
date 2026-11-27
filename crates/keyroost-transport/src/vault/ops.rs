@@ -17,7 +17,7 @@ use std::fmt;
 use keyroost_ctap::client_pin::permissions::{
     CREDENTIAL_MANAGEMENT, GET_ASSERTION, LARGE_BLOB_WRITE,
 };
-use keyroost_ctap::large_blobs::{BlobCapacity, CredentialData, LargeBlobArray};
+use keyroost_ctap::large_blobs::{BlobCapacity, CredentialData, LargeBlobArray, LargeBlobEntry};
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
 use keyroost_vault::{apply_import, canon_id, open, seal, Entry, Vault, VaultError};
 use zeroize::Zeroizing;
@@ -27,7 +27,9 @@ use super::{
     VaultStep,
 };
 
-/// What a vault is sealed with and found by.
+/// What a vault is sealed with and found by. A clone is wiped on drop like
+/// the original.
+#[derive(Clone)]
 struct VaultSecrets {
     /// The credential's hmac-secret output: seals the vault.
     hmac: Zeroizing<[u8; 32]>,
@@ -36,6 +38,9 @@ struct VaultSecrets {
 }
 
 /// A vault that opened: its contents and what it takes to write it back.
+/// A clone carries the same secrets (wiped on drop) and saves like the
+/// original; each copy's `contents` changes only with its own saves.
+#[derive(Clone)]
 pub struct OpenVault {
     pub vault_ref: VaultRef,
     /// The entries, as read at unlock (or as last saved).
@@ -66,6 +71,14 @@ impl OpenVault {
     /// The hmac-secret output and the largeBlobKey, in that order.
     pub(super) fn secrets(&self) -> (&[u8; 32], &[u8; 32]) {
         (&self.secrets.hmac, &self.secrets.lbk)
+    }
+
+    /// Whether `entry` of the key's largeBlob array is this vault's data:
+    /// sealed under its largeBlobKey. A front end that lists the store uses
+    /// it to tell a vault's entry from other entries, without decrypting
+    /// anything.
+    pub fn holds_entry(&self, entry: &LargeBlobEntry) -> bool {
+        entry.is_sealed_under(&self.secrets.lbk)
     }
 }
 
@@ -102,7 +115,7 @@ pub(crate) fn vault_state(
 }
 
 /// One vault credential on the key, open or with the reason it isn't.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VaultOnKey {
     pub vault_ref: VaultRef,
     pub state: Result<OpenVault, VaultProblem>,
@@ -131,7 +144,7 @@ impl VaultOnKey {
 
 /// Every vault on a key after one unlock, in the key's order, and how full
 /// its largeBlob store is.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Unlocked {
     pub vaults: Vec<VaultOnKey>,
     pub capacity: BlobCapacity,
@@ -192,6 +205,57 @@ pub fn unlock(
         })
         .collect();
     Ok(Unlocked { vaults, capacity })
+}
+
+/// Read every unlocked vault again from the key: no PIN and no touch, one
+/// read of the largeBlob array, opened with the secrets the unlock kept.
+///
+/// Each vault that is open takes what the key holds for it now: another
+/// writer's change shows, and data that no longer opens (damaged, or saved
+/// by a newer app) turns that vault into a [`VaultProblem`] whose secrets
+/// are dropped. A vault that did not open stays as it is. `capacity` is
+/// updated to the array as read.
+///
+/// A vault whose data was there and is gone now (another writer deleted or
+/// rotated it) is [`VaultKeyError::VaultGone`], and then `unlocked` is left
+/// exactly as it was: every vault is checked before any is changed. Unlock
+/// again to see what the key holds then.
+///
+/// Only the vaults this unlock found are read: one created elsewhere since,
+/// or the new vault a rotate elsewhere made, appears only after a new
+/// [`unlock`].
+pub fn reload(key: &mut impl VaultKey, unlocked: &mut Unlocked) -> Result<(), VaultKeyError> {
+    let array = key.read_blobs()?;
+    // Read every vault first, so a vanished one leaves `unlocked` untouched.
+    let mut read = Vec::with_capacity(unlocked.vaults.len());
+    for vault in &unlocked.vaults {
+        let Ok(open) = &vault.state else {
+            read.push(None);
+            continue;
+        };
+        let (hmac, lbk) = open.secrets();
+        let state = vault_state(array.credential_data(lbk), hmac);
+        if matches!(state, Ok((_, false))) && open.stored {
+            return Err(VaultKeyError::VaultGone {
+                name: open.vault_ref.name.clone(),
+            });
+        }
+        read.push(Some(state));
+    }
+    for (vault, state) in unlocked.vaults.iter_mut().zip(read) {
+        match state {
+            None => {}
+            Some(Ok((contents, stored))) => {
+                if let Ok(open) = &mut vault.state {
+                    open.contents = contents;
+                    open.stored = stored;
+                }
+            }
+            Some(Err(problem)) => vault.state = Err(problem),
+        }
+    }
+    unlocked.capacity = array.capacity(key.info());
+    Ok(())
 }
 
 /// Whether credential management lists any vault credential: no touch.
@@ -1704,6 +1768,210 @@ mod tests {
             key.vault_on_key(&id).unwrap().entries,
             vec![edited(&a, "backup"), b_theirs]
         );
+    }
+
+    // ----- which entry is a vault's, clones, reloading -----
+
+    #[test]
+    fn holds_entry_finds_only_its_own_entry() {
+        let mut key = FakeKey::new();
+        key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![entry("GitHub")],
+            },
+        );
+        key.add_foreign_entries();
+        key.add_vault("Work", &Vault::default());
+        let u = unlocked(&mut key);
+        let array = key.array();
+        let entries = array.entries();
+        assert_eq!(entries.len(), 5, "two vaults and three foreign entries");
+        let mut held_by = vec![Vec::new(); entries.len()];
+        for (v, vault) in u.vaults.iter().enumerate() {
+            let open = opened(vault);
+            let held: Vec<usize> = (0..entries.len())
+                .filter(|&i| open.holds_entry(entries[i]))
+                .collect();
+            assert_eq!(held.len(), 1, "{:?}: {held:?}", vault.vault_ref.name);
+            held_by[held[0]].push(v);
+        }
+        // Personal's entry first, then the three foreign ones, then Work's.
+        assert_eq!(
+            held_by,
+            vec![vec![0], vec![], vec![], vec![], vec![1]],
+            "never a foreign entry"
+        );
+    }
+
+    #[test]
+    fn a_cloned_open_vault_saves_like_the_original() {
+        let mut key = FakeKey::new();
+        let a = entry("GitHub");
+        let id = key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![a.clone()],
+            },
+        );
+        let (mut auth, open) = open_first(&mut key);
+        let mut copy = open.clone();
+        let b = entry("Mail");
+        let s = saved(&mut key, &mut auth, &mut copy, &Change::Add(b.clone()));
+        assert_eq!(s.added, 1);
+        let both = Vault {
+            entries: vec![a.clone(), b],
+        };
+        assert_eq!(key.vault_on_key(&id), Some(both.clone()));
+        assert_eq!(copy.contents, both);
+        assert_eq!(open.contents.entries, vec![a], "the original is unchanged");
+        // A whole unlock clones too, secrets and all.
+        let mut u = unlocked(&mut key);
+        let again = u.clone();
+        assert_eq!(
+            opened(&again.vaults[0]).secrets(),
+            opened(&u.vaults[0]).secrets()
+        );
+        u.vaults.clear();
+        assert_eq!(again.vaults.len(), 1);
+    }
+
+    /// What a reload may change, for comparing before and after.
+    type View = (Vec<Result<(Vault, bool), VaultProblem>>, BlobCapacity);
+
+    fn view(u: &Unlocked) -> View {
+        let vaults = u
+            .vaults
+            .iter()
+            .map(|v| match &v.state {
+                Ok(o) => Ok((o.contents.clone(), o.stored)),
+                Err(p) => Err(p.clone()),
+            })
+            .collect();
+        (vaults, u.capacity)
+    }
+
+    /// Personal (with GitHub) and Work (with Mail), and their IDs.
+    fn two_vaults(key: &mut FakeKey) -> (Vec<u8>, Vec<u8>) {
+        let p = key.add_vault(
+            "Personal",
+            &Vault {
+                entries: vec![entry("GitHub")],
+            },
+        );
+        let w = key.add_vault(
+            "Work",
+            &Vault {
+                entries: vec![entry("Mail")],
+            },
+        );
+        (p, w)
+    }
+
+    #[test]
+    fn reload_reads_another_writers_change_without_pin_or_touch() {
+        let mut key = FakeKey::new();
+        let (p, _) = two_vaults(&mut key);
+        other_writer(&mut key, &p, |v| {
+            v.entries[0].username = "bob".into();
+        });
+        let mut u = unlocked(&mut key);
+        assert_eq!(opened(&u.vaults[0]).contents.entries[0].username, "alice");
+        let work = opened(&u.vaults[1]).contents.clone();
+        key.log.clear();
+
+        reload(&mut key, &mut u).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(key.log, vec![Call::Read], "no token, no assertion");
+        assert_eq!(opened(&u.vaults[0]).contents.entries[0].username, "bob");
+        assert_eq!(
+            Some(&opened(&u.vaults[0]).contents),
+            key.vault_on_key(&p).as_ref()
+        );
+        assert_eq!(opened(&u.vaults[1]).contents, work);
+    }
+
+    #[test]
+    fn reload_reports_a_vanished_vault_and_changes_nothing() {
+        let mut key = FakeKey::new();
+        let (p, w) = two_vaults(&mut key);
+        // After the unlock's read: Personal is edited, Work deleted
+        // elsewhere. Personal comes first, so a reload that changed vaults
+        // as it went would already have taken the edit.
+        let lbk = lbk_of(&key, &w);
+        key.hook = Some((
+            1,
+            Box::new(move |k: &mut FakeKey| {
+                let mut v = k.vault_on_key(&p).expect("the vault opens");
+                v.entries[0].username = "bob".into();
+                k.put_vault(&p, &v);
+                let rest = k.array().without_credential_blob(&lbk);
+                k.set_array(&rest);
+            }),
+        ));
+        let mut u = unlocked(&mut key);
+        let before = view(&u);
+        key.log.clear();
+
+        let r = reload(&mut key, &mut u);
+        assert!(
+            matches!(&r, Err(VaultKeyError::VaultGone { name: Some(n) }) if n == "Work"),
+            "{r:?}"
+        );
+        assert_eq!(key.log, vec![Call::Read]);
+        assert_eq!(view(&u), before, "nothing changed");
+    }
+
+    #[test]
+    fn reload_marks_a_damaged_vault() {
+        let mut key = FakeKey::new();
+        let (p, w) = two_vaults(&mut key);
+        // A newer app saves Work in a format version this one can't read.
+        let target = w.clone();
+        key.hook = Some((
+            1,
+            Box::new(move |k: &mut FakeKey| {
+                let hmac = k.creds.iter().find(|c| c.id == target).unwrap().hmac;
+                let mut blob = seal(&Vault::default(), &hmac).unwrap();
+                blob[5] = 2;
+                k.put_blob(&target, &blob);
+            }),
+        ));
+        let mut u = unlocked(&mut key);
+        let personal = opened(&u.vaults[0]).contents.clone();
+
+        reload(&mut key, &mut u).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(opened(&u.vaults[0]).contents, personal);
+        assert_eq!(key.vault_on_key(&p), Some(personal));
+        assert_eq!(
+            u.vaults[1].state.as_ref().err(),
+            Some(&VaultProblem::Damaged(VaultError::UnsupportedVersion(2)))
+        );
+        // A vault that is already a problem stays one.
+        reload(&mut key, &mut u).unwrap_or_else(|e| panic!("{e}"));
+        assert!(u.vaults[0].state.is_ok());
+        assert_eq!(
+            u.vaults[1].state.as_ref().err(),
+            Some(&VaultProblem::Damaged(VaultError::UnsupportedVersion(2)))
+        );
+    }
+
+    #[test]
+    fn reload_updates_capacity() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        key.hook = Some((
+            1,
+            Box::new(|k: &mut FakeKey| {
+                k.add_foreign_entries();
+            }),
+        ));
+        let mut u = unlocked(&mut key);
+        assert_eq!(u.capacity.entry_count, 2);
+
+        reload(&mut key, &mut u).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(u.capacity, key.array().capacity(&key.info));
+        assert_eq!(u.capacity.entry_count, 5);
+        assert!(u.vaults.iter().all(|v| v.state.is_ok()));
     }
 
     #[test]

@@ -50,6 +50,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   encrypted password vault on FIDO2 keys with a large-blob store, opened with
   the PIN and a touch (`fido vault`, experimental); it uses Token2 FidoParole's vault and
   backup formats, checked against FidoParole's own vault code and libfido2.
+  The app has a Vault tab on each FIDO2 key that can hold one (experimental),
+  with the same features.
   The large-blob store is shared space on the key, meant for data that
   belongs to a passkey; each vault is kept there as the data of its own
   credential. Websites may store data there too, so keep vaults small;

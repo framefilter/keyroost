@@ -62,6 +62,11 @@ miniz_oxide = "0.9"
 # Forces the hidapi backend on Linux for building/testing the Token2 OTP USB-HID
 # transport there; the default Linux build uses the dependency-free hidraw path.
 hidapi-backend = ["dep:hidapi", "keyroost-hid/hidapi-backend", "keyroost-ctap/hidapi-backend"]
+# Test builds only: exposes `vault::fake`, the in-memory key the vault flow
+# tests run against, so a front end's tests can drive the same flows with no
+# hardware. Dependents enable it from `[dev-dependencies]`; never enable it in
+# a normal dependency.
+vault-fake = []
 
 # Auto-select the hidapi I/O backend on macOS / Windows for the Token2 OTP HID
 # transport (Linux keeps the dependency-free hidraw File backend).

@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Password vault — keyroost</title>
+<meta name="description" content="Keep passwords in an encrypted vault on a FIDO2 key, opened with the key's PIN and a touch: unlocking, entries, copying, backups, import, rotating a vault's key, and the shared large-blob store.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="keyroost">
+<meta property="og:title" content="Password vault — keyroost">
+<meta property="og:description" content="Keep passwords in an encrypted vault on a FIDO2 key, opened with the key's PIN and a touch: unlocking, entries, copying, backups, import, rotating a vault's key, and the shared large-blob store.">
+<meta property="og:url" content="https://framefilter.github.io/keyroost/vault.html">
+<meta property="og:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Password vault — keyroost">
+<meta name="twitter:description" content="Keep passwords in an encrypted vault on a FIDO2 key, opened with the key's PIN and a touch: unlocking, entries, copying, backups, import, rotating a vault's key, and the shared large-blob store.">
+<meta name="twitter:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
+
+<link rel="icon" type="image/png" href="assets/keyroost-logo.png">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="devices.html">Devices</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="otp.html">On-device OTP</a>
+      <a href="fingerprint.html">Fingerprints</a>
+      <a href="mds.html">Device metadata</a>
+      <a href="settings.html">Settings</a>
+      <a href="storage.html">Storage</a>
+      <a href="vault.html">Vault</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="naming.html">Naming</a>
+      <a href="reset.html">Reset</a>
+      <a href="migration.html">Migration</a>
+      <a href="cli.html">Command line</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · Password vault</p>
+    <h1>Password vault</h1>
+    <p class="kr-lede">Keep passwords in an encrypted vault on a FIDO2 key, opened with the
+      key's PIN and a touch — in the desktop app's <strong>Vault</strong> tab, or with
+      <code>keyroostctl fido vault</code>.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <div class="kr-callout note">
+    <div class="kr-callout-title note">Experimental</div>
+    <p>Please <a href="https://github.com/framefilter/keyroost/issues">report problems</a>
+      and keep a backup.</p>
+  </div>
+
+  <section class="kr-section" id="what">
+    <h2>What it is</h2>
+    <p>A vault is a FIDO2 credential on the key, for the relying party
+      <code>fido2-vault.token2</code>. Its entries each hold a title, a username, a web
+      address, notes and a password. They are sealed with a secret the key gives out only
+      after the PIN and a touch, and stored in the key's
+      <a href="storage.html">large-blob store</a>. A key can hold several vaults, each with
+      its own name.</p>
+    <p>A vault lives only on its key: if the key is lost or reset, the vault goes with it.
+      Keep a backup file (<a href="#backup">below</a>).</p>
+    <p>A key can hold a vault when it has a large-blob store, the <code>hmac-secret</code>,
+      <code>largeBlobKey</code> and <code>credProtect</code> extensions, credential
+      management, CTAP 2.1 permission tokens, and a PIN that is set. In the app, a key
+      without them gets no Vault tab, and the <strong>Password vault</strong> card on its
+      Overview says why. A key with no PIN yet can set one on the FIDO2 tab.</p>
+  </section>
+
+  <section class="kr-section" id="unlock">
+    <h2>Unlocking</h2>
+    <p>Open the <strong>Vault</strong> tab, next to Authenticator, or <strong>Manage</strong>
+      on the Overview's Password vault card. Enter the key's FIDO2 PIN, then touch the key
+      once. On a key that holds no vault yet, no touch is needed.</p>
+    <p>One PIN entry serves both tabs. When the FIDO2 tab is already unlocked, the Vault tab
+      uses its PIN; a PIN typed in the Vault tab also unlocks the FIDO2 tab. Each vault
+      unlock still asks for its touch. <strong>Lock</strong> locks only the tab it is on.</p>
+    <p>The top bar's <strong>Refresh</strong> reads the open vaults again with no PIN and no
+      touch, so a change made by another program shows. A vault made elsewhere appears after
+      Lock and Unlock.</p>
+    <p>The vault locks with the rest of the app after 5 minutes without use. While an entry
+      form has unsaved changes, the vault alone stays open for up to 15 minutes, so a
+      half-typed entry isn't lost; every other tab still locks at 5 minutes.</p>
+    <p class="kr-muted">A vault that can't be opened is listed as
+      <code>NAME · (unavailable)</code>, and the tab says why. It can't be changed, but it
+      can still be deleted; the key's other vaults work as usual.</p>
+  </section>
+
+  <section class="kr-section" id="entries">
+    <h2>Entries</h2>
+    <p>Each vault is listed with its name and how many entries it holds. Pick one to see its
+      entries; <em>Filter entries…</em> narrows a long list.</p>
+    <p><strong>Add entry</strong> opens a form with <em>Title</em>, <em>Username</em>,
+      <em>Password</em>, <em>URL</em> and <em>Notes</em>. <em>Generate</em> makes up a
+      password: 20 characters from A–Z, a–z, 0–9 and symbols, unless you change the length
+      or the character sets. <strong>Save</strong> writes the vault back to the key with no
+      touch; the PIN is already entered.</p>
+    <p>An opened entry shows its web address and notes, and when it last changed.
+      The password stays hidden until <strong>Show</strong>. <strong>Edit</strong> opens the
+      same form; <strong>Delete</strong> asks first, and needs no touch.</p>
+    <p>Two entries may share a title. The list tells them apart by username and web
+      address.</p>
+    <p class="kr-muted">Every write reads the key first. If an entry changed on the key since
+      the vault was opened (from the command line, say), nothing is written: the list shows
+      the entry as the key now holds it, and the form keeps what you typed so you can check
+      it and save again. A change made elsewhere is never overwritten without you seeing
+      it.</p>
+  </section>
+
+  <section class="kr-section" id="copy">
+    <h2>Copying a username or password</h2>
+    <p><strong>Copy username</strong> and <strong>Copy password</strong> put it on the
+      clipboard. keyroost clears it after 45 seconds if the clipboard still holds it, and at
+      once when the vault locks; text you copied since is left alone.</p>
+    <p class="kr-muted">The copy is marked to stay out of clipboard history on macOS, Windows
+      and X11. A native Wayland window copies it unmarked, and where the app can't read the
+      clipboard it leaves it as it is rather than risk clearing something else.</p>
+  </section>
+
+  <section class="kr-section" id="backup">
+    <h2>Backups</h2>
+    <p>Because a vault lives only on its key, keep a backup file, protected by a
+      passphrase. <strong>Export backup…</strong> asks where to save the file, then for the
+      passphrase twice. It needs at least 10 characters. Without it, the backup can't be
+      opened.</p>
+    <p>The file opens with its passphrase alone, without the key: keep the two apart. The
+      backup is written from the unlocked vault, with no touch. Bring it back with
+      <strong>Import backup…</strong>, on the same key or another.</p>
+  </section>
+
+  <section class="kr-section" id="import">
+    <h2>Importing a backup</h2>
+    <p><strong>Import backup…</strong> asks for the file and its passphrase, then for the
+      vault to bring the entries into: one on the key, or <em>A new vault named…</em>. Each
+      entry in the backup becomes a row:</p>
+    <ul>
+      <li><strong>add</strong> — the vault doesn't have it. Ticked.</li>
+      <li><strong>replace</strong> — the backup's copy is newer. Ticked. A row whose copy
+        on the key is newer replaces it only if you tick it.</li>
+      <li><strong>exists</strong> — already in the vault; left as is. It has no box.</li>
+      <li><strong>skip</strong> — not ticked, the key's copy is newer, or this build can't
+        tell how it compares.</li>
+    </ul>
+    <p>Any row with a box can be ticked or unticked, or use <em>Tick all</em> and
+      <em>Untick all</em>; the line under the list counts what will happen. Importing into a vault on the key
+      needs no touch. Into a new vault, the button says it creates the vault: that takes two
+      touches, then the entries go in.</p>
+    <p class="kr-muted">The rows and reasons are the same as <code>fido vault import</code>
+      on the command line, which uses <code>--replace</code> and <code>--entry</code> where
+      the app uses ticks.</p>
+  </section>
+
+  <section class="kr-section" id="manage">
+    <h2>Creating, rotating and deleting vaults</h2>
+    <p><strong>+ New vault</strong> asks for a name; <strong>Create vault</strong> takes two
+      touches.</p>
+    <p><strong>Rotate vault key…</strong> gives this vault a new key. Use it after unlocking
+      the vault on a computer you no longer trust, then change the passwords that matter. A
+      new vault of the same name takes the entries, and the old one is deleted after every
+      entry is checked. It takes two touches. If the vault changes on the key meanwhile,
+      nothing is rotated and the list shows the vault as it is now.</p>
+    <p><strong>Delete vault…</strong> deletes the vault and its entries, and can't be
+      undone. It asks first and offers <strong>Export backup…</strong> before you confirm.
+      It uses the PIN already entered and needs no touch on most keys; a key that doesn't
+      list the vault's key asks for one.</p>
+  </section>
+
+  <section class="kr-section" id="space">
+    <h2>Space on the key</h2>
+    <p>The large-blob store is shared space on the key, meant for data that belongs to a
+      passkey; each vault is kept there as the data of its own credential. Websites may
+      store data there too, so keep vaults small.</p>
+    <p>A save, create, rotate or import that doesn't fit is refused before any touch, with
+      the numbers, and nothing is written. One that fits but leaves less than a quarter of
+      the store free still goes ahead, and the activity log and status bar say how full the
+      store is.</p>
+    <p>A name or note kept on the key belongs to no passkey, so a browser may clear it when
+      the store is full and a website needs room (<a href="storage.html">see Storage</a>).
+      A vault belongs to its own credential, so that doesn't apply to it.</p>
+    <p class="kr-muted">The store can be read without the PIN. Anyone holding the key can see
+      roughly how large the vault is, not what is in it. Once a vault is unlocked, the
+      <a href="storage.html">Storage</a> tab names its entry
+      <code>password vault "NAME" (encrypted)</code>.</p>
+  </section>
+
+  <section class="kr-section" id="cli">
+    <h2>Command line</h2>
+<pre><code>keyroostctl fido vault list                    # asks for the PIN (hidden), then a touch
+keyroostctl fido vault add Personal            # a new vault (two touches)
+keyroostctl fido vault entry add GitHub --username alice --generate-password
+keyroostctl fido vault entry show GitHub --reveal
+keyroostctl fido vault export Personal -o personal.t2vault
+keyroostctl fido vault import -i personal.t2vault --dry-run   # preview; writes nothing
+keyroostctl fido vault rotate Personal         # asks y/N</code></pre>
+    <p class="kr-muted">The app and the command line use the same words for the same thing.
+      Every <code>fido vault</code> command is listed in the
+      <a href="cli.html#ref-fido">command reference</a>.</p>
+  </section>
+
+  <section class="kr-section" id="format">
+    <h2>Where the format comes from</h2>
+    <p>The vault design and its formats (the vault data on the key and the backup file) come
+      from Token2's <a href="https://github.com/token2/fidoparole">FidoParole</a>. Token2
+      approved their reuse in keyroost in
+      <a href="https://github.com/framefilter/keyroost/discussions/74#discussioncomment-19674707">discussion
+      #74</a>; thank you, Token2. keyroost is an independent implementation that reads and
+      writes the same bytes, checked against FidoParole's own vault code and libfido2.</p>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://github.com/token2/fidoparole"><span class="who">Token2</span>FidoParole</a>
+      <a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#sctn-hmac-secret-extension"><span class="who">FIDO</span>CTAP2 hmac-secret extension</a>
+      <a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#sctn-largeBlobKey-extension"><span class="who">FIDO</span>CTAP2 largeBlobKey extension</a>
+      <a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#authenticatorLargeBlobs"><span class="who">FIDO</span>CTAP2 authenticatorLargeBlobs</a>
+    </div>
+    <p class="kr-muted">From the command line: see <code>fido vault</code> in the
+      <a href="cli.html#ref-fido">command reference</a>.</p>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="openpgp.html">Next: OpenPGP →</a> <a class="kr-btn kr-btn-ghost" href="storage.html">Storage</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

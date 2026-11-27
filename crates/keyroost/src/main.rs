@@ -19,11 +19,13 @@ mod qrscan;
 mod screengrab;
 mod settings;
 mod ui;
+mod vault_pane;
 use ftotp_pane::FtotpState;
 use otp_pane::OtpState;
 use settings::{Settings, SidebarSetting};
 use ui::device::{self, CapState, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
 use ui::theme::{self, BtnKind, Mode, Palette};
+use vault_pane::{VaultOffer, VaultState};
 
 use eframe::egui;
 use keyroost_import::parse_otpauth;
@@ -43,16 +45,63 @@ use keyroost_ctap::{AuthenticatorInfo, CtapHidDevice, InitResponse};
 /// the workspace version, so it can never drift from the release.
 const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
-/// How long the app keeps an unlocked FIDO session, a retained OATH password
-/// or OTP PIN, and displayed codes without a click, key press or scroll
-/// before locking them (see `App::idle_lock`). The lock messages below take
-/// their wording from it, so they can't name a different duration.
+/// How long a copied secret (a code, a vault username or password) stays on
+/// the clipboard before the app clears it, if the clipboard still holds it.
+const CLIPBOARD_CLEAR_AFTER_SECS: f64 = 45.0;
+
+/// A secret the app put on the clipboard, to clear once `at` (unix seconds)
+/// passes if the clipboard still holds it. The remembered copy is wiped when
+/// this is dropped: cleared, or replaced by the next copy.
+struct ClipboardClear {
+    text: zeroize::Zeroizing<String>,
+    at: f64,
+    /// Copied from the vault: a vault Lock clears it at once.
+    from_vault: bool,
+}
+
+/// The clear for `text` copied at `now`: [`CLIPBOARD_CLEAR_AFTER_SECS`] out.
+fn clipboard_clear_for(text: String, now: f64, from_vault: bool) -> ClipboardClear {
+    ClipboardClear {
+        text: zeroize::Zeroizing::new(text),
+        at: now + CLIPBOARD_CLEAR_AFTER_SECS,
+        from_vault,
+    }
+}
+
+/// Clear the clipboard through `clear` only when `read` says it still holds
+/// `held`: text copied elsewhere since, or a clipboard that can't be read,
+/// is left alone. Returns whether it cleared.
+fn clear_if_still_held(
+    held: &str,
+    read: impl FnOnce() -> Option<String>,
+    clear: impl FnOnce(),
+) -> bool {
+    let current = read().map(zeroize::Zeroizing::new);
+    if current.is_some_and(|c| c.as_str() == held) {
+        clear();
+        true
+    } else {
+        false
+    }
+}
+
+/// How long the app keeps an unlocked FIDO session, an unlocked vault, a
+/// retained OATH password or OTP PIN, and displayed codes without a click,
+/// key press or scroll before locking them (see `App::idle_lock`). The lock
+/// messages below take their wording from it, so they can't name a
+/// different duration.
 const IDLE_LOCK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-/// [`IDLE_LOCK_AFTER`] in words: "5 minutes", "1 minute", or "75 seconds"
-/// when it isn't a whole number of minutes.
-fn idle_lock_span() -> String {
-    let secs = IDLE_LOCK_AFTER.as_secs();
+/// How long the vault alone stays unlocked without input while its add /
+/// edit entry form holds unsaved changes, so a half-typed entry isn't lost
+/// to the 5-minute lock. Everything outside the vault still locks after
+/// [`IDLE_LOCK_AFTER`].
+const VAULT_EDIT_IDLE_LOCK_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// `d` in words: "5 minutes", "1 minute", or "75 seconds" when it isn't a
+/// whole number of minutes.
+fn span_words(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
     let (n, unit) = if secs.is_multiple_of(60) {
         (secs / 60, "minute")
     } else {
@@ -61,12 +110,23 @@ fn idle_lock_span() -> String {
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
+/// [`IDLE_LOCK_AFTER`] in words ([`span_words`]).
+fn idle_lock_span() -> String {
+    span_words(IDLE_LOCK_AFTER)
+}
+
 /// Shown where the idle lock dropped something the user has to unlock again:
 /// the FIDO session, a password-protected OATH applet, the OTP PIN.
 fn idle_locked_msg() -> String {
+    idle_locked_msg_for(IDLE_LOCK_AFTER)
+}
+
+/// [`idle_locked_msg`] for a lock after `d`: the vault's, which waits
+/// [`VAULT_EDIT_IDLE_LOCK_AFTER`] while its form holds unsaved changes.
+fn idle_locked_msg_for(d: std::time::Duration) -> String {
     format!(
         "Locked after {} of inactivity \u{2014} unlock again to continue.",
-        idle_lock_span()
+        span_words(d)
     )
 }
 
@@ -167,6 +227,9 @@ fn copy_concealed(slot: &mut Option<arboard::Clipboard>, text: &str) -> bool {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         return false;
     }
+    // Tests never open the real clipboard: with no handle, the copy takes
+    // egui's path, which only records it in the frame's output.
+    #[cfg(not(test))]
     if slot.is_none() {
         *slot = arboard::Clipboard::new().ok();
     }
@@ -256,6 +319,22 @@ fn blob_space_line(
     cap: &keyroost_ctap::large_blobs::BlobCapacity,
 ) -> Option<String> {
     keyroost_resolve::store_note(cap).map(|note| format!("{subject}: {note}"))
+}
+
+/// The Storage tab's question before entry `idx` (0-based) is deleted, with
+/// what deleting it loses: the key's name, or a password vault's entries.
+fn lb_delete_question(idx: usize, is_name: bool, is_vault: bool) -> String {
+    let loses = if is_name {
+        " This removes the key's name."
+    } else if is_vault {
+        " This is a password vault: deleting it loses every entry in it."
+    } else {
+        ""
+    };
+    format!(
+        "Delete entry {} and rewrite the array? Requires your PIN.{loses}",
+        idx + 1
+    )
 }
 
 /// The naming dialog's message for a key with no storage for its own name.
@@ -567,6 +646,9 @@ struct SecurityKeysState {
     fp_progress: Option<std::sync::Arc<std::sync::Mutex<EnrollProgress>>>,
     /// Pending delete confirmation: the template id awaiting "Are you sure?".
     fp_confirm_delete: Option<Vec<u8>>,
+    /// The passkey whose Remove waits for its confirmation, bound to the
+    /// key it was asked on (KEY-008).
+    passkey_confirm_delete: Option<PasskeyDelete>,
     /// Inline rename editor: (template_id, new-name buffer).
     fp_rename: Option<(Vec<u8>, String)>,
     /// Pending advanced-config action awaiting typed confirmation + PIN.
@@ -579,6 +661,10 @@ struct SecurityKeysState {
     /// Capacity snapshot computed at load/reload time (needs the device's
     /// getInfo, which only the worker thread holds).
     lb_capacity: Option<keyroost_ctap::large_blobs::BlobCapacity>,
+    /// Per entry of the cached array: the name of the unlocked vault that holds
+    /// it. Recomputed when the array loads and when the vault session changes
+    /// ([`App::refresh_storage_vault_labels`]), never per frame.
+    lb_vault_labels: Vec<Option<String>>,
     /// Index of the entry currently expanded in the hex/ASCII viewer.
     lb_selected: Option<usize>,
     /// Pending "delete entry N" confirmation in the structured editor.
@@ -648,6 +734,8 @@ enum Reread {
     LargeBlobs,
     /// The FIDO2 key's info (PIN state, options).
     FidoInfo,
+    /// The unlocked vaults, with the secrets held (no PIN, no touch).
+    Vault,
     /// Nothing to read (a password-locked Authenticator).
     Nothing,
 }
@@ -2107,7 +2195,7 @@ fn wipe(s: &mut String) {
 /// A form or pane state that holds secrets typed or pasted into it: PINs,
 /// PUKs, passwords, passphrases, management keys, seeds. `secrets_mut` is the
 /// one list of those fields. The state's own wipe (on drop, on close) and the
-/// idle lock ([`App::typed_secrets`]) both use it, so a field can't be wiped
+/// idle lock ([`App::typed_secrets_with`]) both use it, so a field can't be wiped
 /// in one place and missed in the other. A small form names every field
 /// there, secret or not, so a field added to it doesn't compile until
 /// someone says which it is.
@@ -2138,6 +2226,54 @@ fn key_firmware(
     };
     let version = (init.device_major, init.device_minor, init.device_build);
     keyroost_resolve::firmware::key_firmware(path, version, serial, reader, false)
+}
+
+/// What the FIDO2 tab says when the key refused its PIN or token and the
+/// tab locked ([`App::relock_fido_session`]).
+const FIDO_RELOCKED: &str =
+    "the key re-locked (PIN or session changed) \u{2014} unlock again to continue.";
+
+/// The permissions of the FIDO2 tab's session token: credential management,
+/// plus bio enrollment when the key supports it, so the one cached token
+/// authorizes both passkey management and fingerprint operations. Only
+/// advertised bits are asked for, since an unsupported permission would make
+/// the whole request fail.
+fn fido_session_permissions(info: &keyroost_ctap::AuthenticatorInfo) -> u32 {
+    let mut perms = keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT;
+    if info.option("bioEnroll").is_some() || info.option("userVerificationMgmtPreview").is_some() {
+        perms |= keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT;
+    }
+    perms
+}
+
+/// Run a FIDO2 session operation with the session's token; when the key
+/// refuses that token (`0x33`: another program, such as a vault job, took a
+/// newer one, which ends the old one), ask once for a new token with the held
+/// PIN and run it again. Returns the result and the token that worked. A
+/// second refusal is the caller's error, which locks the session.
+fn with_session_token<D, T>(
+    dev: &mut D,
+    info: &keyroost_ctap::AuthenticatorInfo,
+    token: PinUvAuthToken,
+    pin: &str,
+    mut op: impl FnMut(&mut D, &PinUvAuthToken) -> Result<T, keyroost_ctap::CtapError>,
+) -> Result<(T, PinUvAuthToken), keyroost_ctap::CtapError>
+where
+    D: keyroost_ctap::transport::CtapTransport,
+{
+    match op(dev, &token) {
+        Err(keyroost_ctap::CtapError::StatusCode(0x33)) => {
+            let fresh = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+                dev,
+                pin,
+                info,
+                fido_session_permissions(info),
+            )?;
+            let out = op(dev, &fresh)?;
+            Ok((out, fresh))
+        }
+        other => other.map(|out| (out, token)),
+    }
 }
 
 /// Shared device-binding guard for background-job completions and modal
@@ -5261,11 +5397,11 @@ struct App {
     cap_tab_by_device: std::collections::HashMap<DeviceId, CapTab>,
     /// Error from the last device enumeration, surfaced in the sidebar.
     devices_error: Option<String>,
-    /// When set: the OTP code we placed on the clipboard and the time
-    /// (now_secs_f64 epoch) to clear it — codes shouldn't sit in
-    /// clipboard-manager history forever. Cleared conditionally: only if the
-    /// clipboard still holds that exact code.
-    clipboard_clear_at: Option<(String, f64)>,
+    /// When set: the secret we placed on the clipboard and the time
+    /// (now_secs_f64 epoch) to clear it — codes and passwords shouldn't sit
+    /// in clipboard-manager history forever. Cleared conditionally: only if
+    /// the clipboard still holds that exact text.
+    clipboard_clear_at: Option<ClipboardClear>,
     /// The clipboard handle secrets are copied through (see
     /// [`App::copy_secret`]), created on first use. Kept alive rather than
     /// made per copy: on X11 the copying app serves the clipboard's contents,
@@ -5339,6 +5475,8 @@ struct App {
     otp: OtpState,
     /// Feitian OTP (TOTP/HOTP) view state.
     ftotp: FtotpState,
+    /// The Vault tab's state for the selected key.
+    vault: VaultState,
     /// Dark / light theme (persisted via eframe storage).
     mode: Mode,
     /// Accent index into `Palette::ACCENTS` (persisted).
@@ -5579,6 +5717,67 @@ enum FileTarget {
     /// "Import file…" in a key's view: the picked file joins the import
     /// queue, remembering which view asked.
     ImportCodes(import_flow::Origin),
+    /// Vault tab "Export backup…" destination: the chosen file opens the
+    /// passphrase dialog for the vault in `vault.export_for`. Carries the
+    /// vault's credential ID and the key it is on, so a file chosen for one
+    /// vault is never used for another's backup.
+    VaultExport {
+        credential_id: Vec<u8>,
+        device: Option<DeviceId>,
+    },
+    /// Vault tab "Import backup…" source: the chosen file opens the import
+    /// dialog, while `vault.import_asked` says one was asked for.
+    VaultImport,
+}
+
+/// A passkey's Remove waiting for its confirmation.
+#[derive(Clone)]
+struct PasskeyDelete {
+    /// The key it was asked on: another selection drops the question.
+    device: DeviceId,
+    credential_id: Vec<u8>,
+    /// The passkey as its row names it ([`passkey_label`]).
+    label: String,
+    /// A password vault's passkey: the question adds what deleting it
+    /// loses, and Export backup….
+    vault: bool,
+    /// Why Export backup… couldn't start, shown in the question.
+    notice: Option<String>,
+}
+
+/// `s` (from a key) safe to show: control, zero-width and text-direction
+/// characters ([`keyroost_keyring::is_spoofing_char`]) become spaces, as the
+/// CLI's `sanitize_terminal` does.
+fn sanitize_shown(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if keyroost_keyring::is_spoofing_char(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// A passkey as its row names it: the site, then the account (user name,
+/// else display name) when it has one.
+fn passkey_label(rp_id: &str, user: &keyroost_ctap::cred_mgmt::CredentialUser) -> String {
+    let account = user
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .or(user.display_name.as_deref().filter(|n| !n.is_empty()));
+    match account {
+        Some(a) => sanitize_shown(&format!("{rp_id} ({a})")),
+        None => sanitize_shown(rp_id),
+    }
+}
+
+/// The question before something on the key is deleted for good: the
+/// Authenticator tab's words, shared by the FIDO2 tab's passkeys.
+fn permanent_delete_question(name: &str) -> String {
+    format!("Permanently delete \u{201c}{name}\u{201d} from this key? This cannot be undone.")
 }
 
 /// An SSH certificate extracted from a credential's largeBlob, waiting for the
@@ -5801,6 +6000,11 @@ impl App {
                             FileTarget::ImportCodes(origin) => {
                                 self.import_flow.enqueue([path], &origin);
                             }
+                            FileTarget::VaultExport {
+                                credential_id,
+                                device,
+                            } => self.vault_export_chosen(path, &credential_id, device.as_ref()),
+                            FileTarget::VaultImport => self.vault_import_chosen(path),
                         }
                     } else {
                         // Cancelled: drop whatever payload was waiting on this
@@ -5818,12 +6022,25 @@ impl App {
     }
 
     /// Drop the payload a dialog was holding when it produced no path — the
-    /// user cancelled, or the helper thread went away. Only save-certificate
-    /// dialogs park anything; without this a cancelled save would leave the
-    /// extracted certificate in the map for the rest of the session.
+    /// user cancelled, or the helper thread went away. A save-certificate
+    /// dialog parks its certificate; without this a cancelled save would
+    /// leave it in the map for the rest of the session. A vault backup's
+    /// dialog forgets which vault it was for, and an import's that a file
+    /// was asked for.
     fn discard_file_target(&mut self, target: FileTarget) {
-        if let FileTarget::SshCertSave(id) = target {
-            self.security_keys.ssh_cert_pending.remove(&id);
+        match target {
+            FileTarget::SshCertSave(id) => {
+                self.security_keys.ssh_cert_pending.remove(&id);
+            }
+            // No file: the backup this dialog was for no longer waits (one
+            // for another vault still does).
+            FileTarget::VaultExport {
+                credential_id,
+                device,
+            } => self.vault_export_dismissed(&credential_id, device.as_ref()),
+            // No file: no import is waiting for one.
+            FileTarget::VaultImport => self.vault.import_asked = false,
+            _ => {}
         }
     }
 }
@@ -7074,14 +7291,23 @@ impl App {
         if self.refuse_if_busy() {
             return;
         }
-        let Some(target) = self.selected_fido_target() else {
+        if self.selected_fido_target().is_none() {
             return;
-        };
+        }
         let pin = std::mem::take(&mut self.security_keys.pin_input);
         if pin.is_empty() {
             self.security_keys.error = Some("PIN is empty".into());
             return;
         }
+        self.unlock_fido_with(pin);
+    }
+
+    /// Unlock the FIDO2 tab with `pin`: the typed one, or the one the Vault
+    /// tab's unlock just had accepted (one PIN entry serves both tabs).
+    fn unlock_fido_with(&mut self, pin: zeroize::Zeroizing<String>) {
+        let Some(target) = self.selected_fido_target() else {
+            return;
+        };
         let for_device = self.selected_device.clone();
         self.spawn_job("Unlocking\u{2026}", move || {
             let result = Self::open_and_unlock(&target, &pin);
@@ -7150,18 +7376,12 @@ impl App {
         if info.force_pin_change == Some(true) {
             return Err(Box::new(ForcedPinChange));
         }
-        // Request credential-management permission, plus bio-enrollment when the
-        // key supports it, so the one cached session token authorizes both
-        // passkey management and fingerprint operations. Permissions are a
-        // bitmask; only OR in BIO_ENROLLMENT when advertised, since asking for an
-        // unsupported permission would make the whole unlock fail.
-        let mut perms = keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT;
-        if info.option("bioEnroll").is_some()
-            || info.option("userVerificationMgmtPreview").is_some()
-        {
-            perms |= keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT;
-        }
-        let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(&mut dev, pin, &info, perms)?;
+        let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+            &mut dev,
+            pin,
+            &info,
+            fido_session_permissions(&info),
+        )?;
         // Hand the manager a clone and keep `token` for the cached session; the
         // token stays valid for the device session, so this avoids a redundant
         // second PIN/ECDH exchange just to rebuild it.
@@ -7219,21 +7439,40 @@ impl App {
         }
     }
 
+    /// Lock the FIDO2 tab because the key refused its PIN or token, and say
+    /// so there: [`Self::fail_session_op`], and the Vault tab's unlock when
+    /// the shared PIN was refused.
+    fn relock_fido_session(&mut self) {
+        self.lock_session();
+        self.security_keys.error = Some(FIDO_RELOCKED.into());
+    }
+
     fn lock_session(&mut self) {
         self.security_keys.session = None;
         self.security_keys.session_device = None;
+        // A passkey's delete question is about the list that just went.
+        self.security_keys.passkey_confirm_delete = None;
         wipe(&mut self.security_keys.pin_input);
     }
 
     /// Whether the app holds anything [`Self::idle_lock`] would clear: an
-    /// unlocked FIDO session (with its PIN), a typed secret not yet sent to a
-    /// key ([`Self::typed_secrets`]), a retained OATH password or OTP PIN, or
-    /// displayed OATH / OTP codes. `&mut` only because the typed-secret list
-    /// is one list, shared with the wipe.
+    /// unlocked FIDO session (with its PIN), an unlocked vault, a typed
+    /// secret not yet sent to a key ([`Self::typed_secrets_with`]), a retained
+    /// OATH password or OTP PIN, or displayed OATH / OTP codes. `&mut` only
+    /// because the typed-secret list is one list, shared with the wipe.
     fn holds_unlocked_secrets(&mut self) -> bool {
+        self.holds_secrets_outside_vault() || self.vault_holds_secrets()
+    }
+
+    /// [`Self::holds_unlocked_secrets`] outside the Vault tab: what locks
+    /// after [`IDLE_LOCK_AFTER`] whatever the vault's form holds.
+    fn holds_secrets_outside_vault(&mut self) -> bool {
         self.security_keys.session.is_some()
-            || self.typed_secrets().iter().any(|s| !s.is_empty())
-            || self.holds_opened_secrets()
+            || self
+                .typed_secrets_outside_vault()
+                .iter()
+                .any(|s| !s.is_empty())
+            || self.holds_opened_secrets_outside_vault()
             || self.oath.unlocked_password.is_some()
             || self.oath.creds.iter().any(|r| r.code.is_some())
             || self.otp.pin.is_some()
@@ -7244,8 +7483,16 @@ impl App {
 
     /// Whether a dialog holds what a typed password opened: the entries of a
     /// file read for import (seeds, decrypted or not), an OpenPGP key set
-    /// made or read from a backup, or the key from a .p12 file.
+    /// made or read from a backup, the key from a .p12 file, or the entries
+    /// of a vault backup opened for import.
+    #[cfg(test)]
     fn holds_opened_secrets(&self) -> bool {
+        self.holds_opened_secrets_outside_vault() || self.vault.holds_opened()
+    }
+
+    /// `holds_opened_secrets` without the vault's import preview (that one
+    /// is [`vault_pane::VaultState::holds_opened`]).
+    fn holds_opened_secrets_outside_vault(&self) -> bool {
         self.import_flow
             .dialog
             .as_ref()
@@ -7255,16 +7502,36 @@ impl App {
             || self.piv.key_import.contents.is_some()
     }
 
+    /// Every typed secret, the vault's included: what the tests check the
+    /// idle lock against. The lock itself takes the list in two parts
+    /// ([`Self::typed_secrets_outside_vault`] and the vault's own), since a
+    /// vault form with unsaved changes may outlast the rest.
+    #[cfg(test)]
+    fn typed_secrets(&mut self) -> Vec<&mut String> {
+        self.typed_secrets_with(true)
+    }
+
+    /// The typed secrets outside the Vault tab, which the idle lock wipes
+    /// after [`IDLE_LOCK_AFTER`] even while the vault's form keeps the vault
+    /// open longer.
+    fn typed_secrets_outside_vault(&mut self) -> Vec<&mut String> {
+        self.typed_secrets_with(false)
+    }
+
     /// Every field holding a secret typed or pasted and not yet sent to a
     /// key: PINs, PUKs, passwords, passphrases, management keys, seeds and
     /// otpauth:// URIs, in every pane and dialog, from each state's
-    /// [`TypedSecrets`] list. The idle lock wipes them all, so a form left
-    /// half-filled doesn't keep its secret.
+    /// [`TypedSecrets`] list; the vault's ([`vault_pane::VaultState`])
+    /// appended when `vault` is set. The idle lock wipes the list outside
+    /// the vault through it, so a form left half-filled doesn't keep its
+    /// secret. An unlocked vault is wiped by [`Self::vault_lock`] rebuilding
+    /// its state; the vault's own list is wiped on its own only for a PIN
+    /// typed into a locked Vault tab.
     ///
     /// Left out on purpose: the Molto2 customer key. Empty there means the
     /// factory default key, so wiping it would quietly switch the next
     /// sign-in to the default key.
-    fn typed_secrets(&mut self) -> Vec<&mut String> {
+    fn typed_secrets_with(&mut self, vault: bool) -> Vec<&mut String> {
         // Each state's own list (TypedSecrets), the one its wipe uses too;
         // only the few boxes kept on `App` itself are named here.
         let mut out = self.security_keys.secrets_mut();
@@ -7281,6 +7548,9 @@ impl App {
         if let Some(d) = self.import_flow.dialog.as_mut() {
             out.extend(d.secrets_mut());
         }
+        if vault {
+            out.extend(self.vault.secrets_mut());
+        }
         out
     }
 
@@ -7293,23 +7563,40 @@ impl App {
     /// under it, but doesn't restart the clock: the panes' own periodic
     /// refreshes would otherwise keep the codes up for good. Returns how long
     /// until the next check is due, or `None` when nothing is held.
+    ///
+    /// Everything locks after [`IDLE_LOCK_AFTER`], except the vault while its
+    /// add / edit form holds unsaved changes: the vault alone then waits up
+    /// to [`VAULT_EDIT_IDLE_LOCK_AFTER`] from the same last input. A lock
+    /// fires only while what it locks is held, so none repeats per frame.
     fn idle_lock_tick(
         &mut self,
         now: std::time::Instant,
         user_input: bool,
     ) -> Option<std::time::Duration> {
         let operating = self.busy() || self.import_busy() || self.reset_arm.is_some();
-        let held = self.holds_unlocked_secrets();
         // Judge the time idle before this frame's input counts. Where the
         // platform stops drawing a minimized window, the timer's frame never
         // comes; the first frame back can carry the click that restored the
         // window, and counting that first would restart the clock and show
         // the secrets again.
         let idle = self.last_activity.map(|t| now.saturating_duration_since(t));
-        if held && !operating && idle.is_some_and(|d| d >= IDLE_LOCK_AFTER) {
-            self.idle_lock();
-            return None;
+        if let (false, Some(idle)) = (operating, idle) {
+            let outside_due = idle >= IDLE_LOCK_AFTER && self.holds_secrets_outside_vault();
+            let vault_due = idle >= self.vault_idle_limit() && self.vault_holds_secrets();
+            if outside_due || (vault_due && !self.vault_form_dirty()) {
+                // A job that held off both deadlines can leave a dirty form
+                // past its own: the vault then locks here, after 15 minutes,
+                // and the log says so as the Vault tab does.
+                let vault_extended = vault_due && self.vault_form_dirty();
+                self.idle_lock(vault_due);
+                if vault_extended {
+                    self.vault_idle_log(VAULT_EDIT_IDLE_LOCK_AFTER);
+                }
+            } else if vault_due {
+                self.vault_idle_lock_alone();
+            }
         }
+        let held = self.holds_unlocked_secrets();
         // While nothing is held the clock follows the frame, so it starts
         // when something is unlocked rather than at the last click before.
         if user_input || !held || idle.is_none() {
@@ -7318,8 +7605,15 @@ impl App {
         if !held {
             return None;
         }
+        // The nearest deadline: the app's while anything outside the vault
+        // is held, else the vault's own.
+        let limit = if self.holds_secrets_outside_vault() {
+            IDLE_LOCK_AFTER
+        } else {
+            self.vault_idle_limit()
+        };
         let idle = now.saturating_duration_since(self.last_activity.unwrap_or(now));
-        let due = IDLE_LOCK_AFTER.saturating_sub(idle);
+        let due = limit.saturating_sub(idle);
         // Past due but postponed by an operation: check again shortly rather
         // than asking for a repaint loop.
         Some(if operating {
@@ -7329,17 +7623,22 @@ impl App {
         })
     }
 
-    /// Lock what [`Self::holds_unlocked_secrets`] reports, after
+    /// Lock what [`Self::holds_secrets_outside_vault`] reports, after
     /// [`IDLE_LOCK_AFTER`] without input: the FIDO session through the same
-    /// path as the Lock button, every typed secret ([`Self::typed_secrets`];
-    /// the change-PIN form also closes), the retained OATH password and OTP
-    /// PIN (a protected applet goes back to its unlock prompt, as after a
-    /// rejected password), and every displayed code. Local only — no device
-    /// I/O.
-    fn idle_lock(&mut self) {
+    /// path as the Lock button, every typed secret
+    /// ([`Self::typed_secrets_outside_vault`]; the change-PIN form also
+    /// closes), the retained OATH password and OTP PIN (a protected applet
+    /// goes back to its unlock prompt, as after a rejected password), and
+    /// every displayed code. With `include_vault`, the vault too
+    /// ([`Self::vault_idle_lock`]); without, a vault whose form holds unsaved
+    /// changes stays open. Local only — no device I/O.
+    fn idle_lock(&mut self, include_vault: bool) {
         if self.security_keys.session.is_some() {
             self.lock_session();
             self.security_keys.error = Some(idle_locked_msg());
+        }
+        if include_vault {
+            self.vault_idle_lock();
         }
         if self.security_keys.change_pin.has_pin_input() {
             // Replacing the form wipes its PINs (ChangePinDialog's Drop).
@@ -7378,7 +7677,7 @@ impl App {
             self.piv.notice = Some(idle_closed_msg());
         }
         // Every other typed secret: the boxes empty, their forms stay open.
-        for secret in self.typed_secrets() {
+        for secret in self.typed_secrets_outside_vault() {
             wipe(secret);
         }
         // A box that still has keyboard focus keeps egui's undo history,
@@ -7444,10 +7743,57 @@ impl App {
     /// Falls back to egui's own clipboard path when the marked copy can't be
     /// made, so copying never silently stops working.
     fn copy_secret(&mut self, ctx: &egui::Context, text: String) {
+        self.copy_secret_from(ctx, text, false);
+    }
+
+    /// [`App::copy_secret`], with where the secret came from: a vault copy
+    /// (`from_vault`) is also cleared when the vault locks.
+    pub(crate) fn copy_secret_from(&mut self, ctx: &egui::Context, text: String, from_vault: bool) {
         if !copy_concealed(&mut self.secret_clipboard, &text) {
             ctx.copy_text(text.clone());
         }
-        self.clipboard_clear_at = Some((text, now_secs_f64() + 45.0));
+        self.clipboard_clear_at = Some(clipboard_clear_for(text, now_secs_f64(), from_vault));
+    }
+
+    /// Clear the clipboard now if it still holds the secret we copied, and
+    /// forget that secret either way. The read and the clear go through the
+    /// same long-lived handle the secret was copied with (`copy_secret`)
+    /// when there is one. If the clipboard can't be read (e.g. some Wayland
+    /// setups), it fails open and clears nothing rather than risk destroying
+    /// foreign content.
+    fn clear_clipboard_if_ours(&mut self) {
+        let Some(held) = self.clipboard_clear_at.take() else {
+            return;
+        };
+        // Tests never open the real clipboard: with no handle, the read
+        // below finds nothing and nothing is cleared.
+        #[cfg(not(test))]
+        if self.secret_clipboard.is_none() {
+            self.secret_clipboard = arboard::Clipboard::new().ok();
+        }
+        let handle = std::cell::RefCell::new(self.secret_clipboard.as_mut());
+        clear_if_still_held(
+            &held.text,
+            || handle.borrow_mut().as_mut()?.get_text().ok(),
+            || {
+                if let Some(cb) = handle.borrow_mut().as_mut() {
+                    let _ = cb.clear();
+                }
+            },
+        );
+    }
+
+    /// A vault Lock: a username or password copied from the vault and still
+    /// on the clipboard is cleared at once, not after its 45 s. Any other
+    /// copy keeps its own timer.
+    pub(crate) fn clear_vault_clipboard_now(&mut self) {
+        if self
+            .clipboard_clear_at
+            .as_ref()
+            .is_some_and(|c| c.from_vault)
+        {
+            self.clear_clipboard_if_ours();
+        }
     }
 
     /// A change to the key's large-blob storage that worked: the tab's
@@ -7460,11 +7806,12 @@ impl App {
         self.security_keys.lb_status = Some(status);
     }
 
-    /// After a note saved: [`blob_space_line`] as a warning in the activity
-    /// log and on the status bar, when less than a quarter of the store is
-    /// free. The save itself is never refused for it.
-    fn storage_space_note(&mut self, cap: &keyroost_ctap::large_blobs::BlobCapacity) {
-        if let Some(line) = blob_space_line("Storage", cap) {
+    /// After a write to the large-blob store (a note on the Storage tab, a
+    /// vault): [`blob_space_line`] under `subject` as a warning in the
+    /// activity log and on the status bar, when less than a quarter of the
+    /// store is free. The write itself is never refused for it.
+    fn space_note(&mut self, subject: &str, cap: &keyroost_ctap::large_blobs::BlobCapacity) {
+        if let Some(line) = blob_space_line(subject, cap) {
             self.log(Severity::Warn, line);
         }
     }
@@ -7485,12 +7832,7 @@ impl App {
     fn fail_session_op(&mut self, err: &SessionOpError, context: &str) {
         self.log(Severity::Err, format!("FIDO2: {context}: {err}"));
         if err.relock {
-            self.lock_session();
-            self.security_keys.error = Some(
-                "the key re-locked (PIN or session changed) \u{2014} \
-                 unlock again to continue."
-                    .into(),
-            );
+            self.relock_fido_session();
         } else {
             self.security_keys.error = Some(format!("{context}: {err}"));
         }
@@ -7552,21 +7894,37 @@ impl App {
         pin: zeroize::Zeroizing<String>,
     ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
         let (mut dev, _cbor, _init) = open_fido(target)?;
-        let info = keyroost_ctap::get_info(&mut dev)?;
-        let mut mgr =
-            keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token.clone(), &info)?;
-        let metadata = mgr.metadata()?;
-        let parties = mgr.list_relying_parties()?;
-        let mut rps = Vec::with_capacity(parties.len());
-        for rp in parties {
-            // A `None` hash marks an entry whose rpIdHash came back malformed:
-            // list nothing rather than query against a wrong key.
-            let creds = match rp.rp_id_hash {
-                Some(hash) => mgr.list_credentials(&hash).unwrap_or_default(),
-                None => Vec::new(),
-            };
-            rps.push((rp, creds));
-        }
+        Self::refresh_on(&mut dev, token, pin)
+    }
+
+    /// [`Self::refresh_with_token`] on an open device. A token another
+    /// program ended is replaced once ([`with_session_token`]); the session
+    /// returned keeps the token that worked.
+    fn refresh_on(
+        dev: &mut impl keyroost_ctap::transport::CtapTransport,
+        token: PinUvAuthToken,
+        pin: zeroize::Zeroizing<String>,
+    ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
+        let info = keyroost_ctap::get_info(dev)?;
+        let ((metadata, rps), token) =
+            with_session_token(dev, &info, token, &pin, |dev, token| {
+                let mut mgr =
+                    keyroost_ctap::cred_mgmt::CredentialManager::new(dev, token.clone(), &info)?;
+                let metadata = mgr.metadata()?;
+                let parties = mgr.list_relying_parties()?;
+                let mut rps = Vec::with_capacity(parties.len());
+                for rp in parties {
+                    // A `None` hash marks an entry whose rpIdHash came back
+                    // malformed: list nothing rather than query against a wrong
+                    // key.
+                    let creds = match rp.rp_id_hash {
+                        Some(hash) => mgr.list_credentials(&hash).unwrap_or_default(),
+                        None => Vec::new(),
+                    };
+                    rps.push((rp, creds));
+                }
+                Ok((metadata, rps))
+            })?;
         Ok(UnlockedSession {
             token,
             metadata,
@@ -8029,50 +8387,78 @@ impl App {
             return;
         };
         let token = session.token.clone();
-        // The refresh after delete needs its own token; clone for the chained op.
-        let token_refresh = token.clone();
-        let pin_refresh = session.pin.clone();
+        let pin = session.pin.clone();
         let for_device = self.selected_device.clone();
         self.spawn_job("Deleting credential\u{2026}", move || {
             // Delete, then re-list in the same job so the UI updates atomically.
-            // `deleted`: the passkey is gone, whatever the re-list says.
-            let deleted = Self::try_delete(&target, token, &cred_id);
+            // `deleted`: the passkey is gone, whatever the re-list says. The
+            // re-list uses the token the delete worked with.
+            let deleted = Self::try_delete(&target, token, &pin, &cred_id);
             let wrote = deleted.is_ok();
             let result = deleted
-                .and_then(|()| Self::refresh_with_token(&target, token_refresh, pin_refresh))
+                .and_then(|token| Self::refresh_with_token(&target, token, pin))
                 .map_err(SessionOpError::from_boxed);
             Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    let outcome = if wrote { Ok(()) } else { result.map(|_| ()) };
-                    app.log_moved_on(for_device.as_ref(), "deleting a passkey", &outcome);
-                    return; // selection changed mid-delete; drop the refresh
-                }
-                if wrote {
-                    app.log(Severity::Ok, "Passkey deleted");
-                }
-                match result {
-                    Ok(fresh) => {
-                        app.security_keys.session = Some(fresh);
-                        app.security_keys.session_device = for_device.clone();
-                        app.security_keys.error = None;
-                    }
-                    Err(e) if wrote => app.fail_session_op(&e, "passkey list not read again"),
-                    Err(e) => app.fail_session_op(&e, "delete failed"),
-                }
+                app.apply_passkey_deleted(for_device, &cred_id, wrote, result);
             })
         });
     }
 
+    /// The end of a passkey delete: `wrote` whether passkey `cred_id` is
+    /// gone, `result` the list read again after it. A vault unlocked with
+    /// that passkey goes with it ([`Self::vault_passkey_deleted`]).
+    fn apply_passkey_deleted(
+        &mut self,
+        for_device: Option<DeviceId>,
+        cred_id: &[u8],
+        wrote: bool,
+        result: Result<UnlockedSession, SessionOpError>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+            let outcome = if wrote { Ok(()) } else { result.map(|_| ()) };
+            self.log_moved_on(for_device.as_ref(), "deleting a passkey", &outcome);
+            return; // selection changed mid-delete; drop the refresh
+        }
+        if wrote {
+            self.log(Severity::Ok, "Passkey deleted");
+            self.vault_passkey_deleted(cred_id);
+        }
+        match result {
+            Ok(fresh) => {
+                self.security_keys.session = Some(fresh);
+                self.security_keys.session_device = for_device;
+                self.security_keys.error = None;
+            }
+            Err(e) if wrote => self.fail_session_op(&e, "passkey list not read again"),
+            Err(e) => self.fail_session_op(&e, "delete failed"),
+        }
+    }
+
+    /// Delete one passkey; returns the token that worked (a token another
+    /// program ended is replaced once, [`with_session_token`]).
     fn try_delete(
         target: &FidoTarget,
         token: PinUvAuthToken,
+        pin: &str,
         cred_id: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<PinUvAuthToken, Box<dyn std::error::Error>> {
         let (mut dev, _cbor, _init) = open_fido(target)?;
-        let info = keyroost_ctap::get_info(&mut dev)?;
-        let mut mgr = keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
-        mgr.delete(cred_id)?;
-        Ok(())
+        Self::delete_on(&mut dev, token, pin, cred_id)
+    }
+
+    /// [`Self::try_delete`] on an open device.
+    fn delete_on(
+        dev: &mut impl keyroost_ctap::transport::CtapTransport,
+        token: PinUvAuthToken,
+        pin: &str,
+        cred_id: &[u8],
+    ) -> Result<PinUvAuthToken, Box<dyn std::error::Error>> {
+        let info = keyroost_ctap::get_info(dev)?;
+        let ((), token) = with_session_token(dev, &info, token, pin, |dev, token| {
+            keyroost_ctap::cred_mgmt::CredentialManager::new(dev, token.clone(), &info)?
+                .delete(cred_id)
+        })?;
+        Ok(token)
     }
 
     /// Extract and save the OpenSSH certificate stored in an SSH credential's
@@ -8191,23 +8577,30 @@ impl App {
         }
         self.spawn_job("Changing PIN\u{2026}", move || {
             let result = Self::try_change_pin(&target, &old, &new).map_err(|e| e.to_string());
-            Box::new(move |app: &mut App| match result {
-                Ok(()) => {
-                    app.log(Severity::Ok, "FIDO2 PIN changed");
-                    app.security_keys.change_pin.open = false;
-                    app.security_keys.error = None;
-                    // Force re-unlock with the new PIN, and clear a cached
-                    // forcePINChange flag so the next unlock isn't diverted
-                    // back into this form after the key has accepted the change.
-                    app.lock_session();
-                    app.fetch_selected_info();
-                }
-                Err(e) => {
-                    app.log(Severity::Err, format!("FIDO2: change PIN failed: {e}"));
-                    app.security_keys.error = Some(format!("change PIN failed: {}", e));
-                }
-            })
+            Box::new(move |app: &mut App| app.apply_pin_changed(result))
         });
+    }
+
+    /// The end of a PIN change.
+    fn apply_pin_changed(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.log(Severity::Ok, "FIDO2 PIN changed");
+                self.security_keys.change_pin.open = false;
+                self.security_keys.error = None;
+                // Force re-unlock with the new PIN, and clear a cached
+                // forcePINChange flag so the next unlock isn't diverted
+                // back into this form after the key has accepted the change.
+                // The vault was opened with the old PIN: it locks too.
+                self.lock_session();
+                self.vault_lock(Some(vault_pane::pin_changed_text()));
+                self.fetch_selected_info();
+            }
+            Err(e) => {
+                self.log(Severity::Err, format!("FIDO2: change PIN failed: {e}"));
+                self.security_keys.error = Some(format!("change PIN failed: {}", e));
+            }
+        }
     }
 
     fn try_change_pin(
@@ -8347,6 +8740,8 @@ impl App {
                 app.security_keys.session = None;
                 app.security_keys.info = None;
                 app.security_keys.error = None;
+                // The reset wiped every vault with the passkeys.
+                app.vault_lock(Some(vault_pane::FIDO_RESET_LOCKED.to_owned()));
                 // When this reset was a factory reset's finale, record it —
                 // the Overview report is where the user is looking, and the
                 // activity log, where the permanent record lives.
@@ -9185,10 +9580,7 @@ impl App {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Permanently delete \u{201c}{name}\u{201d} from this key? \
-                     This cannot be undone."
-                ));
+                ui.label(permanent_delete_question(&name));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if theme::key_egui_button(ui, "Delete", waiting.as_deref()).clicked() {
@@ -9206,6 +9598,103 @@ impl App {
             }
             Some(false) => self.oath.confirm_delete = None,
             None => {}
+        }
+    }
+
+    /// Remove on a passkey row: ask before deleting it, on the key selected
+    /// now.
+    fn ask_delete_passkey(&mut self, credential_id: Vec<u8>, label: String, vault: bool) {
+        if let Some(device) = self.selected_device.clone() {
+            self.security_keys.passkey_confirm_delete = Some(PasskeyDelete {
+                device,
+                credential_id,
+                label,
+                vault,
+                notice: None,
+            });
+        }
+    }
+
+    /// Modal confirmation before deleting a passkey: the Authenticator
+    /// tab's question; for a password vault's passkey, also what deleting
+    /// it loses and Export backup… while that vault is unlocked (which
+    /// closes the question). Shown only on the FIDO2 tab's passkey list and
+    /// bound to the key it was asked on (KEY-008): another tab, another
+    /// selection, or a passkey list that no longer holds it, drops it. Returns the passkey to
+    /// delete once confirmed; a click refused while a job runs keeps the
+    /// question.
+    fn render_passkey_delete_confirm(
+        &mut self,
+        ctx: &egui::Context,
+        p: &Palette,
+    ) -> Option<Vec<u8>> {
+        let waiting = self.waiting_for().map(str::to_owned);
+        let ask = self.security_keys.passkey_confirm_delete.clone()?;
+        // Only over the passkey list it was asked from: a question floating
+        // over another tab (the Vault tab's backup form) could delete there.
+        let showing =
+            self.cap_tab == CapTab::Fido2 && self.security_keys.subview == FidoSubview::Passkeys;
+        let listed = showing
+            && completion_still_valid(Some(&ask.device), self.selected_device.as_ref())
+            && self.fido_session().is_some_and(|s| {
+                s.rps
+                    .iter()
+                    .any(|(_, creds)| creds.iter().any(|c| c.credential_id == ask.credential_id))
+            });
+        if !listed {
+            self.security_keys.passkey_confirm_delete = None;
+            return None;
+        }
+        let warning = ask.vault.then(|| {
+            vault_pane::vault_passkey_warning(
+                self.vault_passkey_name(&ask.credential_id).as_deref(),
+            )
+        });
+        let can_export = ask.vault && self.vault_passkey_can_export(&ask.credential_id);
+        let (mut confirm, mut cancel, mut export) = (false, false, false);
+        egui::Window::new("Delete passkey?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(permanent_delete_question(&ask.label));
+                if let Some(w) = &warning {
+                    ui.add_space(4.0);
+                    ui.label(w);
+                }
+                if let Some(n) = &ask.notice {
+                    ui.add_space(4.0);
+                    ui.colored_label(p.warn, n);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if can_export {
+                        export = ui.button(vault_pane::EXPORT_BUTTON).clicked();
+                    }
+                    confirm = theme::key_egui_button(ui, "Delete", waiting.as_deref()).clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if export {
+            // Backing up first closes the question: nothing is deleted, and
+            // Remove asks again once the backup is saved.
+            match self.vault_passkey_export(&ask.credential_id) {
+                Ok(()) => self.security_keys.passkey_confirm_delete = None,
+                Err(why) => {
+                    if let Some(q) = self.security_keys.passkey_confirm_delete.as_mut() {
+                        q.notice = Some(why);
+                    }
+                }
+            }
+            None
+        } else if cancel {
+            self.security_keys.passkey_confirm_delete = None;
+            None
+        } else if confirm && !self.refuse_if_busy() {
+            self.security_keys.passkey_confirm_delete = None;
+            Some(ask.credential_id)
+        } else {
+            None
         }
     }
 
@@ -10293,6 +10782,12 @@ impl App {
     fn touch_banner_text(&self) -> Option<String> {
         if self.security_keys.fp_progress.is_some() {
             return None;
+        }
+        // A vault job counts its touches ("Touch your key (1 of 2)…").
+        if self.busy() {
+            if let Some(text) = self.vault.progress.lock().ok().and_then(|t| t.clone()) {
+                return Some(text);
+            }
         }
         touch_prompt(
             self.busy_label.as_deref(),
@@ -11852,7 +12347,10 @@ impl App {
                 FidoSubview::Fingerprints if self.fido_session().is_some() => Reread::Fingerprints,
                 _ => Reread::FidoInfo,
             },
-            CapTab::Overview => Reread::FidoInfo,
+            // Unlocked, the vaults are read again; locked, the key's info
+            // (which decides whether a vault is offered) is what there is.
+            CapTab::Vault if self.vault_session().is_some() => Reread::Vault,
+            CapTab::Overview | CapTab::Vault => Reread::FidoInfo,
         }
     }
 
@@ -11872,6 +12370,7 @@ impl App {
                 self.load_large_blobs();
             }
             Reread::FidoInfo => self.fetch_selected_info(),
+            Reread::Vault => self.vault_refresh(),
             Reread::Nothing => {}
         }
     }
@@ -12103,6 +12602,7 @@ impl App {
         // Large-blob state is per-key; drop it so the next key auto-loads fresh.
         self.security_keys.large_blobs = None;
         self.security_keys.lb_capacity = None;
+        self.security_keys.lb_vault_labels.clear();
         self.security_keys.lb_autoloaded = false;
         self.security_keys.lb_selected = None;
         self.security_keys.lb_editing = None;
@@ -12124,6 +12624,7 @@ impl App {
         self.security_keys.fp_autoloaded = false;
         self.security_keys.fp_new_name.clear();
         self.security_keys.fp_confirm_delete = None;
+        self.security_keys.passkey_confirm_delete = None;
         self.security_keys.fp_rename = None;
         if let Some(p) = self.security_keys.fp_progress.take() {
             if let Ok(g) = p.lock() {
@@ -12196,6 +12697,9 @@ impl App {
         // Replaced whole: its typed seed, shown codes and pending delete
         // confirmation all belong to the key that was selected.
         self.ftotp = FtotpState::default();
+        // So is the Vault tab's: locked and rebuilt, keeping only the touch
+        // prompt of a vault job still running on the key left.
+        self.vault_lock(None);
         self.molto_reset_confirm = false;
         self.molto_delete_confirm = false;
         self.close_rename();
@@ -15194,6 +15698,7 @@ fn cap_tab_label(t: CapTab) -> &'static str {
         CapTab::Piv => "PIV",
         CapTab::Otp => "On-device OTP",
         CapTab::Ftotp => "Feitian OTP",
+        CapTab::Vault => "Vault",
     }
 }
 
@@ -17091,27 +17596,15 @@ impl eframe::App for App {
         // take `&Context`) use this cheap `Context` handle cloned from it.
         let ctx_owned = root_ui.ctx().clone();
         let ctx = &ctx_owned;
-        // Clipboard hygiene: ~45s after an OTP code was copied, clear the
-        // clipboard so the code doesn't live on in clipboard-manager history —
-        // but only if the clipboard still holds that exact code. Content the
-        // user copied elsewhere in the meantime is never clobbered. arboard is
-        // already in the tree via eframe's clipboard integration; if the
-        // clipboard can't be read (e.g. some Wayland setups), fail open and
-        // clear nothing rather than risk destroying foreign content.
-        // The read and the clear go through the same long-lived handle the
-        // secret was copied with (`copy_secret`) when there is one.
-        if let Some((ref code, t)) = self.clipboard_clear_at {
+        // Clipboard hygiene: ~45s after a secret was copied, clear the
+        // clipboard so it doesn't live on in clipboard-manager history — but
+        // only if the clipboard still holds that exact text. Content the user
+        // copied elsewhere in the meantime is never clobbered (see
+        // `clear_clipboard_if_ours`).
+        if let Some(t) = self.clipboard_clear_at.as_ref().map(|c| c.at) {
             let now = now_secs_f64();
             if now >= t {
-                if self.secret_clipboard.is_none() {
-                    self.secret_clipboard = arboard::Clipboard::new().ok();
-                }
-                if let Some(cb) = self.secret_clipboard.as_mut() {
-                    if cb.get_text().is_ok_and(|current| current == *code) {
-                        let _ = cb.clear();
-                    }
-                }
-                self.clipboard_clear_at = None;
+                self.clear_clipboard_if_ours();
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.1)));
             }
@@ -17245,8 +17738,10 @@ impl eframe::App for App {
         }
 
         // Inactivity lock: after IDLE_LOCK_AFTER without input, drop the
-        // unlocked FIDO session, retained OATH password / OTP PIN, shown
-        // codes and typed secrets. The timer wakes the frame loop even when nothing else draws.
+        // unlocked FIDO session, the vault, retained OATH password / OTP PIN,
+        // shown codes and typed secrets; a vault form with unsaved changes
+        // keeps the vault alone open up to VAULT_EDIT_IDLE_LOCK_AFTER. The
+        // timer wakes the frame loop even when nothing else draws.
         let user_input = ctx.input(|i| i.events.iter().any(is_user_activity));
         self.user_acted = ctx.input(|i| {
             i.pointer.any_click()
@@ -17283,6 +17778,9 @@ impl eframe::App for App {
         self.render_enroll_dialog(ctx, &p);
         if let Some(id) = self.render_fp_delete_confirm(ctx, &p) {
             self.delete_fingerprint(id);
+        }
+        if let Some(id) = self.render_passkey_delete_confirm(ctx, &p) {
+            self.delete_credential(id);
         }
         self.render_oath_delete_confirm(ctx);
         self.render_oath_reset_confirm(ctx);
@@ -19125,6 +19623,7 @@ impl App {
                                             CapTab::Piv => self.cap_piv(ui, p),
                                             CapTab::Otp => self.cap_otp(ui, p),
                                             CapTab::Ftotp => self.cap_ftotp(ui, p),
+                                            CapTab::Vault => self.cap_vault(ui, p),
                                         }
                                         // Breathing room below the last card.
                                         ui.add_space(18.0);
@@ -19617,7 +20116,15 @@ impl App {
     fn cap_tabs(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
         // A per-device remembered pick (or a device swap under an unchanged
         // selection) can be stale for this device — see `snap_cap_tab`'s doc.
-        self.cap_tab = snap_cap_tab(self.cap_tab, &dev.tabs());
+        // Unknown and NeedsAdmin place the Vault tab alike, so the Windows
+        // rights check (a device enumeration) isn't run here on every frame.
+        let offer = vault_pane::vault_offer(
+            self.security_keys.info.as_ref(),
+            self.security_keys.u2f_only,
+            false,
+        );
+        let tabs = vault_pane::with_vault_tab(dev.tabs(), offer);
+        self.cap_tab = snap_cap_tab(self.cap_tab, &tabs);
         ui.add_space(12.0);
         let mut next = None;
         // Tabs flow onto a second line when the row runs out of room, so
@@ -19625,7 +20132,7 @@ impl App {
         // The line gap leaves room for the active tab's underline.
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(20.0, 16.0);
-            for t in dev.tabs() {
+            for t in tabs {
                 let active = self.cap_tab == t;
                 let color = if active { p.txt } else { p.txt3 };
                 // A capability keyroost could not check against the device
@@ -19881,10 +20388,79 @@ impl App {
         }
     }
 
+    /// Windows without administrator rights: a FIDO key is there but its
+    /// HID interface is gated, so getInfo never loads. Always false
+    /// elsewhere.
+    fn fido_non_admin(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.security_keys.info.is_none()
+                && !keyroost_proto::devices_hidden()
+                && keyroost_winwebauthn::fido_key_present()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Whether the selected key is offered a password vault.
+    fn vault_offer(&self) -> VaultOffer {
+        self.vault_offer_with(self.fido_non_admin())
+    }
+
+    /// [`Self::vault_offer`] with the Windows rights check already made.
+    fn vault_offer_with(&self, non_admin: bool) -> VaultOffer {
+        vault_pane::vault_offer(
+            self.security_keys.info.as_ref(),
+            self.security_keys.u2f_only,
+            non_admin,
+        )
+    }
+
+    /// The Overview's "Password vault" card, under the FIDO2 card: Manage
+    /// opens the Vault tab when it is offered; a key that can't hold a
+    /// vault gets no Manage, and the line says why. `non_admin` is the
+    /// Overview's own [`Self::fido_non_admin`].
+    fn vault_overview_card(&mut self, ui: &mut egui::Ui, p: &Palette, non_admin: bool) {
+        let offer = self.vault_offer_with(non_admin);
+        // A failed read says "Reading key…" here, as the FIDO2 card above it
+        // does; unlocked, what the vaults hold.
+        let line = vault_pane::overview_line(
+            offer,
+            false,
+            self.vault_session().map(|s| s.unlocked.vaults.as_slice()),
+        );
+        theme::card_frame(p).show(ui, |ui| {
+            if matches!(offer, VaultOffer::No(_)) {
+                ui.set_min_width(ui.available_width());
+                self.card_head_plain(ui, p, "Password vault", "vault");
+            } else if self.card_head(ui, p, "Password vault", "vault") {
+                self.cap_tab = CapTab::Vault;
+            }
+            ui.add_space(6.0);
+            vault_pane::experimental_note(ui, p);
+            ui.add_space(6.0);
+            if offer == VaultOffer::NeedsAdmin {
+                theme::pill(ui, "Administrator rights needed", p.warn, p.warn_soft());
+                ui.add_space(6.0);
+            }
+            ui.label(egui::RichText::new(line).font(theme::f_reg(13.0)).color(
+                if offer == VaultOffer::Unknown {
+                    p.txt3
+                } else {
+                    p.txt2
+                },
+            ));
+        });
+    }
+
     /// Overview tab: one summary card per capability, each with a `Manage →` jump.
     /// Scrolling comes from the shared capability-pane scroller in `central`.
     fn overview(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
         let waiting = self.waiting_for().map(str::to_owned);
+        // Once per frame: on Windows it enumerates HID devices.
+        let non_admin = self.fido_non_admin();
         ui.vertical(|ui| {
             self.mds_card(ui, p, dev);
             if dev.caps.has(Caps::U2F_ONLY) {
@@ -19916,12 +20492,6 @@ impl App {
                     // Windows non-admin: FIDO access is gated, so `info` never
                     // loads; show an admin-needed hint instead of a perpetual
                     // "Reading key…". The Manage → jump opens the full card.
-                    #[cfg(windows)]
-                    let non_admin = self.security_keys.info.is_none()
-                        && !keyroost_proto::devices_hidden()
-                        && keyroost_winwebauthn::fido_key_present();
-                    #[cfg(not(windows))]
-                    let non_admin = false;
                     if non_admin {
                         theme::pill(ui, "Administrator rights needed", p.warn, p.warn_soft());
                         ui.add_space(6.0);
@@ -19969,6 +20539,8 @@ impl App {
                         }
                     }
                 });
+                ui.add_space(14.0);
+                self.vault_overview_card(ui, p, non_admin);
                 ui.add_space(14.0);
             }
             if dev.caps.has(Caps::OATH) {
@@ -20361,15 +20933,9 @@ impl App {
         // link to Windows' settings and an elevate button, instead of the normal
         // — and here non-functional — management UI.
         #[cfg(windows)]
-        {
-            let no_access = self.security_keys.info.is_none();
-            if no_access
-                && !keyroost_proto::devices_hidden()
-                && keyroost_winwebauthn::fido_key_present()
-            {
-                self.fido2_non_admin_card(ui, p);
-                return;
-            }
+        if self.fido_non_admin() {
+            self.fido2_non_admin_card(ui, p);
+            return;
         }
 
         let pin = pin_support(self.security_keys.info.as_ref());
@@ -20789,7 +21355,8 @@ impl App {
         // --- Passkeys panel: only when unlocked and the Passkeys tab is active. ---
         if unlocked && subview == FidoSubview::Passkeys {
             ui.add_space(14.0);
-            let mut delete: Option<Vec<u8>> = None;
+            // Remove asks first: (credential ID, row label, a vault's).
+            let mut ask_delete: Option<(Vec<u8>, String, bool)> = None;
             // Collected in the credential loop (below), applied after the card so
             // the extract job isn't dispatched while `self` is borrowed by the
             // cloned rps list: (rp id, credential's largeBlob key).
@@ -20866,7 +21433,11 @@ impl App {
                                             )
                                             .clicked()
                                             {
-                                                delete = Some(c.credential_id.clone());
+                                                ask_delete = Some((
+                                                    c.credential_id.clone(),
+                                                    passkey_label(&rp.id, &c.user),
+                                                    vault_pane::is_vault_passkey(&rp.id),
+                                                ));
                                             }
                                             // SSH credentials that carry a largeBlob
                                             // key can hold an OpenSSH certificate;
@@ -20930,13 +21501,20 @@ impl App {
                                                 row(
                                                     ui,
                                                     "User Name",
-                                                    c.user.name.clone().unwrap_or_default(),
+                                                    sanitize_shown(
+                                                        c.user.name.as_deref().unwrap_or_default(),
+                                                    ),
                                                     false,
                                                 );
                                                 row(
                                                     ui,
                                                     "Display Name",
-                                                    c.user.display_name.clone().unwrap_or_default(),
+                                                    sanitize_shown(
+                                                        c.user
+                                                            .display_name
+                                                            .as_deref()
+                                                            .unwrap_or_default(),
+                                                    ),
                                                     false,
                                                 );
                                                 // User ID: text if printable ASCII,
@@ -20970,8 +21548,8 @@ impl App {
                     });
                 }
             });
-            if let Some(id) = delete {
-                self.delete_credential(id);
+            if let Some((credential_id, label, vault)) = ask_delete {
+                self.ask_delete_passkey(credential_id, label, vault);
             }
             if let Some((rp_id, key)) = save_cert {
                 self.save_ssh_cert(rp_id, key);
@@ -21293,13 +21871,14 @@ impl App {
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
+                        app.refresh_storage_vault_labels();
                         app.security_keys.lb_new_text.clear();
                         app.security_keys.lb_show_add = false;
                         app.storage_done(format!(
                             "Saved. {n} entr{} total.",
                             if n == 1 { "y" } else { "ies" }
                         ));
-                        app.storage_space_note(&cap);
+                        app.space_note("Storage", &cap);
                         app.security_keys.error = None;
                     }
                     Err(e) => {
@@ -21373,10 +21952,11 @@ impl App {
                     Ok((array, cap)) => {
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
+                        app.refresh_storage_vault_labels();
                         app.security_keys.lb_editing = None;
                         app.security_keys.lb_edit_text.clear();
                         app.storage_done("Note updated.".into());
-                        app.storage_space_note(&cap);
+                        app.space_note("Storage", &cap);
                         app.security_keys.error = None;
                     }
                     Err(e) => {
@@ -21427,6 +22007,7 @@ impl App {
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
+                        app.refresh_storage_vault_labels();
                         app.security_keys.lb_selected = None;
                         app.security_keys.lb_status = Some(format!(
                             "Loaded {n} entr{}.",
@@ -21530,6 +22111,7 @@ impl App {
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
+                        app.refresh_storage_vault_labels();
                         app.security_keys.lb_selected = None;
                         app.storage_done(format!("Entry deleted. {n} remaining."));
                         app.security_keys.error = None;
@@ -21629,6 +22211,7 @@ impl App {
                         let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
+                        app.refresh_storage_vault_labels();
                         app.security_keys.lb_selected = None;
                         app.storage_done(format!(
                             "Storage cleared. {n} entr{} remaining.",
@@ -21840,6 +22423,7 @@ impl App {
         let mut cancel_edit = false;
         let selected = self.security_keys.lb_selected;
         let editing = self.security_keys.lb_editing;
+        let app_vault_labels = self.security_keys.lb_vault_labels.clone();
         for (idx, entry) in array.entries().into_iter().enumerate() {
             theme::card_frame(p).show(ui, |ui| {
                 use keyroost_ctap::large_blobs::EntryKind;
@@ -21862,7 +22446,13 @@ impl App {
                                 .color(p.txt),
                         );
                         ui.add_space(8.0);
+                        let vault_label = app_vault_labels.get(idx).cloned().flatten();
                         let meta = match &classification {
+                            EntryKind::Opaque if vault_label.is_some() => format!(
+                                "{} \u{00b7} {} bytes",
+                                vault_pane::vault_entry_row_text(vault_label.as_deref().unwrap_or("")),
+                                entry.ciphertext.len(),
+                            ),
                             EntryKind::Note(_) => "keyroost text note".to_string(),
                             EntryKind::KeyName(l) => device::key_name_row_text(&l.label),
                             EntryKind::Opaque => format!(
@@ -21998,22 +22588,19 @@ impl App {
                     keyroost_ctap::large_blobs::EntryKind::KeyName(_)
                 )
             });
+            let is_vault = self
+                .security_keys
+                .lb_vault_labels
+                .get(idx)
+                .is_some_and(Option::is_some);
             ui.add_space(6.0);
             theme::card_frame(p)
                 .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Delete entry {} and rewrite the array? Requires your PIN.{}",
-                            idx + 1,
-                            if is_name {
-                                " This removes the key's name."
-                            } else {
-                                ""
-                            }
-                        ))
-                        .font(theme::f_reg(12.5))
-                        .color(p.txt),
+                        egui::RichText::new(lb_delete_question(idx, is_name, is_vault))
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt),
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -29029,7 +29616,7 @@ mod tests {
     /// One headless egui frame for a test. The frame's texture changes are
     /// cleared, as a renderer would apply them: egui 0.37 asserts (in debug
     /// builds) that a frame's output never drops them unapplied.
-    trait TestFrame {
+    pub(crate) trait TestFrame {
         fn test_frame(
             &self,
             input: egui::RawInput,
@@ -31552,6 +32139,35 @@ mod tests {
         let previous = app.selected_device.replace("serial:AAA".into());
         app.on_device_selected(previous);
         assert_eq!(app.cap_tab, CapTab::Piv);
+    }
+
+    /// The Vault tab's state belongs to the key it was read from: another
+    /// key starts with none of it.
+    #[test]
+    fn selecting_another_key_resets_the_vault_state() {
+        let mut app = App {
+            selected_device: Some("serial:AAA".into()),
+            ..Default::default()
+        };
+        app.vault.error = Some("The PIN was refused.".into());
+        app.vault.info = Some("Vault \"Personal\" deleted.".into());
+        let previous = app.selected_device.replace("serial:BBB".into());
+        app.on_device_selected(previous);
+        assert!(app.vault.error.is_none());
+        assert!(app.vault.info.is_none());
+    }
+
+    /// Vault is labeled as in the mockup, and Refresh on it reads the key's
+    /// info (what decides whether a vault is offered).
+    #[test]
+    fn the_vault_tab_is_labeled_and_refreshes_the_info() {
+        assert_eq!(cap_tab_label(CapTab::Vault), "Vault");
+        assert!(device::tab_cap(CapTab::Vault) == Some(Caps::FIDO2));
+        let app = App {
+            cap_tab: CapTab::Vault,
+            ..Default::default()
+        };
+        assert!(matches!(app.reread_choice(), Reread::FidoInfo));
     }
 
     /// A key that showed no CTAP2 interface gets the CLI's `fido info` line
@@ -34471,7 +35087,7 @@ mod tests {
         assert_eq!(m.result, Some(Err("wrong admin PIN".into())));
     }
 
-    fn test_key(id: &str, serial: &str, name: Option<&str>) -> Device {
+    pub(crate) fn test_key(id: &str, serial: &str, name: Option<&str>) -> Device {
         Device {
             id: id.into(),
             name: name.map(str::to_owned),
@@ -35025,6 +35641,194 @@ mod tests {
             "Lock pressed mid-refresh stays locked"
         );
         assert!(app.security_keys.session_device.is_none());
+    }
+
+    /// A FIDO2 key for the session-token tests: getInfo, PIN tokens (PIN
+    /// protocol one) issued against the platform's key agreement, and
+    /// credential management that refuses the first `stale` calls with
+    /// `0x33`, as a key does once another program (the Vault tab) took a
+    /// newer token.
+    struct TokenKey {
+        agreement: keyroost_ctap::pin::EphemeralKey,
+        stale: usize,
+        /// Every token issued, in order.
+        issued: Vec<Vec<u8>>,
+        /// `(subcommand, pinUvAuthParam)` of every credential-management call.
+        cm_calls: Vec<(u64, Vec<u8>)>,
+    }
+
+    impl TokenKey {
+        fn new(stale: usize) -> Self {
+            TokenKey {
+                agreement: keyroost_ctap::pin::EphemeralKey::generate().unwrap(),
+                stale,
+                issued: Vec::new(),
+                cm_calls: Vec::new(),
+            }
+        }
+    }
+
+    impl keyroost_ctap::transport::CtapTransport for TokenKey {
+        fn transact(
+            &mut self,
+            _cmd: u8,
+            payload: &[u8],
+        ) -> Result<Vec<u8>, keyroost_ctap::CtapError> {
+            use keyroost_ctap::cbor::{self, Value};
+            use keyroost_ctap::pin::PinProtocol as _;
+            let ok = |v: Value| {
+                let mut r = vec![0x00];
+                r.extend(cbor::encode(&v));
+                Ok(r)
+            };
+            let req = || cbor::decode(&payload[1..]).unwrap().0;
+            let text = |s: &str| Value::Text(s.into());
+            match payload[0] {
+                // getInfo
+                0x04 => ok(Value::Map(vec![
+                    (
+                        Value::UInt(1),
+                        Value::Array(vec![text("FIDO_2_0"), text("FIDO_2_1")]),
+                    ),
+                    (Value::UInt(3), Value::Bytes(vec![0x11; 16])),
+                    (
+                        Value::UInt(4),
+                        Value::Map(vec![
+                            (text("clientPin"), Value::Bool(true)),
+                            (text("pinUvAuthToken"), Value::Bool(true)),
+                            (text("credMgmt"), Value::Bool(true)),
+                        ]),
+                    ),
+                    (Value::UInt(6), Value::Array(vec![Value::UInt(1)])),
+                ])),
+                // clientPin
+                0x06 => {
+                    let req = req();
+                    match req.get_uint_key(2).and_then(Value::as_uint) {
+                        // getKeyAgreement
+                        Some(2) => {
+                            let (x, y) = self.agreement.public_xy();
+                            ok(Value::Map(vec![(
+                                Value::UInt(1),
+                                Value::Map(vec![
+                                    (Value::UInt(1), Value::UInt(2)),
+                                    (Value::UInt(3), Value::NInt(24)),
+                                    (Value::NInt(0), Value::UInt(1)),
+                                    (Value::NInt(1), Value::Bytes(x.to_vec())),
+                                    (Value::NInt(2), Value::Bytes(y.to_vec())),
+                                ]),
+                            )]))
+                        }
+                        // getPinUvAuthTokenUsingPinWithPermissions
+                        Some(9) => {
+                            let cose = req.get_uint_key(3).unwrap().as_map().unwrap();
+                            let coord = |n: u64| -> [u8; 32] {
+                                let (_, v) =
+                                    cose.iter().find(|(k, _)| *k == Value::NInt(n)).unwrap();
+                                v.as_bytes().unwrap().try_into().unwrap()
+                            };
+                            let secret = self
+                                .agreement
+                                .shared_secret_v1(&coord(1), &coord(2))
+                                .unwrap();
+                            let token = vec![0x50 + self.issued.len() as u8; 16];
+                            let enc = keyroost_ctap::pin::ProtocolV1 { secret }
+                                .encrypt(&token)
+                                .unwrap();
+                            self.issued.push(token);
+                            ok(Value::Map(vec![(Value::UInt(2), Value::Bytes(enc))]))
+                        }
+                        other => panic!("unexpected clientPin subcommand {other:?}"),
+                    }
+                }
+                // credentialManagement
+                0x0A => {
+                    let req = req();
+                    let sub = req.get_uint_key(1).and_then(Value::as_uint).unwrap();
+                    let param = req.get_uint_key(4).and_then(Value::as_bytes).unwrap();
+                    self.cm_calls.push((sub, param.to_vec()));
+                    if self.stale > 0 {
+                        self.stale -= 1;
+                        return Ok(vec![0x33]);
+                    }
+                    match sub {
+                        // getCredsMetadata
+                        1 => ok(Value::Map(vec![
+                            (Value::UInt(1), Value::UInt(3)),
+                            (Value::UInt(2), Value::UInt(22)),
+                        ])),
+                        // enumerateRPsBegin: none
+                        2 => Ok(vec![0x2E]),
+                        // deleteCredential
+                        6 => Ok(vec![0x00]),
+                        other => panic!("unexpected credMgmt subcommand {other}"),
+                    }
+                }
+                other => panic!("unexpected command {other:#04x}"),
+            }
+        }
+    }
+
+    fn token_of(bytes: &[u8]) -> PinUvAuthToken {
+        PinUvAuthToken {
+            protocol: 1,
+            token: bytes.to_vec(),
+        }
+    }
+
+    /// A vault job takes a fresh token, which ends the FIDO2 tab's: its next
+    /// Refresh or Delete gets `0x33`. It asks for a new token with the held
+    /// PIN once and goes on; only a second refusal locks the tab.
+    #[test]
+    fn fido2_refresh_survives_a_vault_token() {
+        let old = token_of(&[0x01; 16]);
+        let mut key = TokenKey::new(1);
+        let pin = zeroize::Zeroizing::new("123456".to_owned());
+        let fresh =
+            App::refresh_on(&mut key, old.clone(), pin.clone()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(key.issued.len(), 1, "one new token");
+        assert_eq!(
+            fresh.token.token, key.issued[0],
+            "the session keeps the one that worked"
+        );
+        assert_eq!(fresh.metadata.existing_count, 3);
+        // The retried call is signed with the new token.
+        assert_eq!(key.cm_calls[0].1, old.authenticate(&[0x01]));
+        assert_eq!(
+            key.cm_calls[1].1,
+            token_of(&key.issued[0]).authenticate(&[0x01])
+        );
+
+        // Refused again with the new token: the error reaches the tab, which locks.
+        let mut key = TokenKey::new(2);
+        let err = App::refresh_on(&mut key, old.clone(), pin.clone())
+            .err()
+            .expect("a second refusal is an error");
+        let err = SessionOpError::from_boxed(err);
+        assert!(err.relock);
+        let id: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(id.clone()),
+            ..Default::default()
+        };
+        app.security_keys.session = Some(unlocked_session(1));
+        app.security_keys.session_device = Some(id.clone());
+        app.apply_refreshed_session(Some(id), Err(err));
+        assert!(app.security_keys.session.is_none());
+
+        // Delete retries the same way and hands the working token on.
+        let mut key = TokenKey::new(1);
+        let used = App::delete_on(&mut key, old.clone(), &pin, &[0xAB; 8])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(used.token, key.issued[0]);
+        assert_eq!(key.cm_calls.len(), 2);
+        assert!(key.cm_calls.iter().all(|(sub, _)| *sub == 6));
+
+        // A token that still works is kept, and no PIN is sent.
+        let mut key = TokenKey::new(0);
+        let fresh = App::refresh_on(&mut key, old.clone(), pin).unwrap_or_else(|e| panic!("{e}"));
+        assert!(key.issued.is_empty());
+        assert_eq!(fresh.token.token, old.token);
     }
 
     /// Selecting another device closes (and thereby zeroizes) the dialog.

@@ -200,6 +200,15 @@ impl LargeBlobEntry {
         self.ciphertext.starts_with(KR_NOTE_MAGIC)
     }
 
+    /// Whether this entry is sealed under `key`, a credential's
+    /// largeBlobKey: its AES-256-GCM tag verifies. It is then that
+    /// credential's data, whether or not it inflates (the entry
+    /// [`LargeBlobArray::credential_data`] reads or reports unreadable).
+    /// Nothing decrypted is kept.
+    pub fn is_sealed_under(&self, key: &[u8; 32]) -> bool {
+        open_entry(key, self).is_some()
+    }
+
     /// Classify this entry. Conservative by construction: a name entry must
     /// pass its AEAD tag under the published name key, the keyroost note
     /// magic wins over everything else, and everything else is opaque.
@@ -566,7 +575,7 @@ fn open_entry(key: &[u8; 32], e: &LargeBlobEntry) -> Option<Zeroizing<Vec<u8>>> 
 
 /// Whether `item` is a conforming entry sealed under `key` (tag verifies).
 fn is_sealed_under(item: &Item, key: &[u8; 32]) -> bool {
-    matches!(item, Item::Entry(e) if open_entry(key, e).is_some())
+    matches!(item, Item::Entry(e) if e.is_sealed_under(key))
 }
 
 /// Whether `item` is a name entry ([`device_label`]).
@@ -1738,6 +1747,34 @@ mod tests {
                 .map(|v| v.len()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn is_sealed_under_matches_credential_data() {
+        let arr = array_of(Vec::new())
+            .with_credential_blob(&VAULT_KEY, b"a vault")
+            .unwrap()
+            .with_text_note("a keyroost note");
+        let (sealed, note) = (arr.entry(0).unwrap(), arr.entry(1).unwrap());
+        assert!(sealed.is_sealed_under(&VAULT_KEY));
+        assert!(!sealed.is_sealed_under(&RP_KEY));
+        assert!(!note.is_sealed_under(&VAULT_KEY));
+        assert!(!note.is_sealed_under(&RP_KEY));
+        // The same answer credential_data gives: data for the key that holds
+        // it, none for another.
+        assert!(matches!(
+            arr.credential_data(&VAULT_KEY),
+            CredentialData::Present(_)
+        ));
+        assert!(matches!(
+            arr.credential_data(&RP_KEY),
+            CredentialData::Absent
+        ));
+        // An entry whose tag verifies but whose data won't inflate is still
+        // sealed under its key.
+        let broken = sealed_compressed(&RP_KEY, b"\xff\xff not deflate", 32);
+        assert!(broken.is_sealed_under(&RP_KEY));
+        assert!(!broken.is_sealed_under(&VAULT_KEY));
     }
 
     #[test]

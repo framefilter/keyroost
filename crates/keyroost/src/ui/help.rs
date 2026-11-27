@@ -26,7 +26,7 @@ pub struct Help {
 ///   pgp-expiry, pgp-card-details, piv,
 ///   molto, custkey, reset, piv-generate, piv-certificate,
 ///   piv-import-key, piv-import-export, piv-delete, piv-test, piv-admin, piv-move,
-///   piv-retired
+///   piv-retired, vault
 pub fn help(topic: &str) -> Option<&'static Help> {
     Some(match topic {
         "device" => &Help {
@@ -188,6 +188,11 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             title: "Security policy",
             body: "Change how this key enforces verification and PINs over CTAP 2.1 authenticatorConfig: always require user verification, raise the minimum PIN length, force a PIN change, or enable enterprise attestation. Some of these are one-way and can only be undone by a full reset, so keyroost confirms before applying them.",
             slug: "/settings",
+        },
+        "vault" => &Help {
+            title: "Password vault",
+            body: "Passwords kept in an encrypted vault on this key, opened with the key's PIN and a touch. If the key is lost or reset, the vault goes with it, so keep a backup file. Refresh reads the vault again without a touch; vaults made elsewhere appear after Lock and Unlock.",
+            slug: "/vault",
         },
         "large_blobs" => &Help {
             title: "Large blob storage",

@@ -39,6 +39,9 @@ keyroost-import = { path = "../keyroost-import", version = "0.16.0", features = 
 # keyroostctl). Owns the scoped `rsa` dependency exception.
 keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.16.0" }
 keyroost-pgpkey = { path = "../keyroost-pgpkey", version = "0.16.0", features = ["card"] }
+# The FIDO2 password vault's data model (entries, backups) for the Vault tab;
+# the key-side flows come through keyroost-transport's `vault` module.
+keyroost-vault = { path = "../keyroost-vault", version = "0.16.0" }
 eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow", "links", "wayland", "x11"] }
 # egui 0.37 moved its two emoji fonts out of `default_fonts` into a feature of
 # their own. The app draws three glyphs only they have (the narrow top bar's
@@ -117,6 +120,9 @@ keyroost-keyring = { path = "../keyroost-keyring", version = "0.16.0", features 
 # duplicate_serial_note) that the libfuzzer workspace can't reach inside a
 # binary crate.
 proptest = "1"
+# Test builds only: the in-memory vault key (`vault::fake`) the Vault tab's
+# tests run against, never in release builds (the `test-isolation` precedent).
+keyroost-transport = { path = "../keyroost-transport", version = "0.16.0", features = ["vault-fake"] }
 
 [features]
 # Scan a TOTP QR shown on screen to fill a seed/profile form. Adds only the

@@ -14,6 +14,10 @@
 //! `iSerialNumber` or a CCID-read YubiKey serial ([`ccid_serial_for`]) is one
 //! input into that merge, not a resolver of its own — this module no longer
 //! exposes a HID-only name lookup; use the device model instead.
+//!
+//! It also holds what both front ends write secret files with
+//! ([`private_file::write_private_file`]), so the CLI and the app refuse the
+//! same unsafe destinations.
 
 use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey};
 use keyroost_transport::YubiKeyCcid;
@@ -25,6 +29,7 @@ pub mod firmware;
 pub mod identity;
 pub mod mds;
 pub mod names;
+pub mod private_file;
 pub mod select;
 pub use blob_space::store_note;
 pub use device::{
