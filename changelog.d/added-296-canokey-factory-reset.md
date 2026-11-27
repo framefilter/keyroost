@@ -5,4 +5,4 @@
   applet, PIN and setting goes back to its default once the key gets a
   quick tap each of the five times it blinks (holding it down doesn't
   count). This is also the way back for a forgotten CanoKey Admin PIN.
-  ([#0])
+  ([#296])

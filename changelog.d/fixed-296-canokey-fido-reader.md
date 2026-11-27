@@ -7,4 +7,4 @@
   lists FIDO2 as confirmed rather than `FIDO2?`. A FIDO2 reset is not sent
   through that reader, since power-cycling it doesn't restart the key:
   keyroost refuses it before asking anything and says to reset over FIDO
-  HID or with `factory-reset`. ([#0])
+  HID or with `factory-reset`. ([#296])

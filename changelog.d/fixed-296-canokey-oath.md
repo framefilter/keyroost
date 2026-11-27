@@ -8,4 +8,4 @@
   a name it already holds with `6985`, which keyroost took as a password
   request). `oath reset` and the app's Reset ask for the CanoKey Admin PIN
   (`--canokey-admin-pin`), since a CanoKey resets OATH through its Admin applet.
-  ([#0])
+  ([#296])

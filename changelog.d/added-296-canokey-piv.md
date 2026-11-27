@@ -10,4 +10,4 @@
   with Le, so `piv test` and the slot list see those keys. The IDs the
   key uses for Ed25519, X25519, RSA-3072/4096 and P-521 are read from
   the key, so a table changed with CanoKey's tools is followed. Firmware
-  before 3.1 is handled as before. ([#0])
+  before 3.1 is handled as before. ([#296])

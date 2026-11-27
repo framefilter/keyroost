@@ -4,4 +4,4 @@
   gives the decimal one. A name set for a CanoKey earlier still applies.
   A CanoKey whose serial was never written (all zeros or all `F`) is
   treated as having no serial. The overview now shortens a serial only
-  past ten characters. ([#0])
+  past ten characters. ([#296])
