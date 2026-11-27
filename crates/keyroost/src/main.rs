@@ -323,13 +323,84 @@ fn large_blob_write_token(
     Ok(token)
 }
 
+/// Why a write with a fingerprint session's held token failed
+/// ([`write_with_held_token`]).
+#[derive(Debug)]
+enum HeldWriteError<W, R> {
+    /// The write failed, other than by a refused token.
+    Write(W),
+    /// Asking the finger again for a new token failed.
+    Renew(R),
+    /// The key refused the held token, then the new one too: the session's
+    /// unlock no longer works on this key.
+    SessionEnded,
+}
+
+/// `write` with a fingerprint session's `held` token, which carries
+/// large-blob write, so a write costs no new touch. Only when the key refuses
+/// it (`refused`: a `0x33`) does `renew` ask the finger again, saying why
+/// ([`FingerAsk::Again`](keyroost_ctap::client_pin::FingerAsk)), and the
+/// write is tried once more with the new token, which comes back for the
+/// session to keep (it ended the old one). Refused again, the write stops
+/// there with no third token: [`HeldWriteError::SessionEnded`], which the
+/// caller says as [`vault_pane::FINGER_UNLOCK_REFUSED`] and the FIDO2 tab
+/// locks. The Storage tab's writes ([`write_large_blobs`]) and the on-key
+/// name ([`write_key_name_on`]) both write through here.
+fn write_with_held_token<D, T, W, R>(
+    dev: &mut D,
+    held: &PinUvAuthToken,
+    mut write: impl FnMut(&mut D, &PinUvAuthToken) -> Result<T, W>,
+    refused: impl Fn(&W) -> bool,
+    renew: impl FnOnce(&mut D) -> Result<PinUvAuthToken, R>,
+) -> Result<(T, Option<PinUvAuthToken>), HeldWriteError<W, R>> {
+    match write(dev, held) {
+        Err(e) if refused(&e) => {}
+        other => return other.map(|t| (t, None)).map_err(HeldWriteError::Write),
+    }
+    let token = renew(dev).map_err(HeldWriteError::Renew)?;
+    match write(dev, &token) {
+        Ok(t) => Ok((t, Some(token))),
+        Err(e) if refused(&e) => Err(HeldWriteError::SessionEnded),
+        Err(e) => Err(HeldWriteError::Write(e)),
+    }
+}
+
+/// Why a Storage tab write failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StorageWriteError {
+    Failed(String),
+    /// A fingerprint session's token was refused, then the new one taken
+    /// for the write too ([`write_with_held_token`]): the FIDO2 tab locks.
+    SessionEnded,
+}
+
+impl std::fmt::Display for StorageWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageWriteError::Failed(e) => f.write_str(e),
+            StorageWriteError::SessionEnded => f.write_str(vault_pane::FINGER_UNLOCK_REFUSED),
+        }
+    }
+}
+
+impl From<String> for StorageWriteError {
+    fn from(e: String) -> Self {
+        StorageWriteError::Failed(e)
+    }
+}
+
+impl From<&str> for StorageWriteError {
+    fn from(e: &str) -> Self {
+        StorageWriteError::Failed(e.to_string())
+    }
+}
+
 /// Write `serialized` over `before` (the array just read and planned from)
 /// with the FIDO2 session's unlock. A PIN session takes a new large-blob-write
 /// token from its PIN, as it always did. A fingerprint session writes with
-/// its `held` token, which carries large-blob write, so a note costs no new
-/// touch; only when the key refuses it (`0x33`) is the finger asked again,
-/// for a new session token. Returns that new token, which the session keeps
-/// from then on (it ends the old one).
+/// its `held` token ([`write_with_held_token`]): a refused token asks the
+/// finger again, and a new token comes back for the session to keep; refused
+/// again, the session ended ([`StorageWriteError::SessionEnded`]).
 fn write_large_blobs<D: keyroost_ctap::transport::CtapTransport>(
     dev: &mut D,
     info: &keyroost_ctap::AuthenticatorInfo,
@@ -338,24 +409,32 @@ fn write_large_blobs<D: keyroost_ctap::transport::CtapTransport>(
     prompt: &FingerPrompt,
     before: &keyroost_ctap::large_blobs::LargeBlobArray,
     serialized: &[u8],
-) -> Result<Option<PinUvAuthToken>, String> {
+) -> Result<Option<PinUvAuthToken>, StorageWriteError> {
     // Names read from keys before or during the write are stale.
     let write = |dev: &mut D, token: &PinUvAuthToken| {
         keyroost_resolve::with_key_names_forgotten(|| {
             keyroost_ctap::large_blobs::write(dev, info, token, serialized)
         })
     };
-    let renew = |dev: &mut D| -> Result<PinUvAuthToken, String> {
-        let token = large_blob_write_token(dev, info, unlock, prompt, before)?;
-        write(dev, &token).map_err(|e| e.to_string())?;
-        Ok(token)
-    };
     match unlock {
-        SessionUnlock::Pin(_) => renew(dev).map(|_| None),
-        SessionUnlock::Fingerprint => match write(dev, held) {
-            Err(keyroost_ctap::CtapError::StatusCode(0x33)) => renew(dev).map(Some),
-            other => other.map(|()| None).map_err(|e| e.to_string()),
-        },
+        SessionUnlock::Pin(_) => {
+            let token = large_blob_write_token(dev, info, unlock, prompt, before)?;
+            write(dev, &token).map_err(|e| e.to_string())?;
+            Ok(None)
+        }
+        SessionUnlock::Fingerprint => write_with_held_token(
+            dev,
+            held,
+            write,
+            |e| matches!(e, keyroost_ctap::CtapError::StatusCode(0x33)),
+            |dev| large_blob_write_token(dev, info, unlock, prompt, before),
+        )
+        .map(|((), renewed)| renewed)
+        .map_err(|e| match e {
+            HeldWriteError::Write(e) => StorageWriteError::Failed(e.to_string()),
+            HeldWriteError::Renew(e) => StorageWriteError::Failed(e),
+            HeldWriteError::SessionEnded => StorageWriteError::SessionEnded,
+        }),
     }
 }
 
@@ -543,9 +622,9 @@ fn write_key_name_on<D: keyroost_ctap::transport::CtapTransport>(
     };
     let failed = |e| key_name_failure(e, used);
     let renewed = match (unlock, held) {
-        (SessionUnlock::Fingerprint, Some(held)) => match apply(dev, held) {
-            Err(LabelError::Ctap(keyroost_ctap::CtapError::StatusCode(0x33))) => {
-                let token = session_token(
+        (SessionUnlock::Fingerprint, Some(held)) => {
+            let renew = |dev: &mut D| {
+                session_token(
                     dev,
                     &info,
                     unlock,
@@ -553,23 +632,23 @@ fn write_key_name_on<D: keyroost_ctap::transport::CtapTransport>(
                     prompt,
                     keyroost_ctap::client_pin::FingerAsk::Again,
                 )
-                .map_err(unlock_failed)?;
-                // Refused again: the session's unlock no longer works here.
-                match apply(dev, &token) {
-                    Err(LabelError::Ctap(keyroost_ctap::CtapError::StatusCode(0x33))) => {
-                        return Err(KeyNameFailure::SessionEnded(
-                            vault_pane::FINGER_UNLOCK_REFUSED.to_owned(),
-                        ));
+            };
+            let refused = |e: &LabelError| {
+                matches!(
+                    e,
+                    LabelError::Ctap(keyroost_ctap::CtapError::StatusCode(0x33))
+                )
+            };
+            write_with_held_token(dev, held, apply, refused, renew)
+                .map_err(|e| match e {
+                    HeldWriteError::Write(e) => failed(e),
+                    HeldWriteError::Renew(e) => unlock_failed(e),
+                    HeldWriteError::SessionEnded => {
+                        KeyNameFailure::SessionEnded(vault_pane::FINGER_UNLOCK_REFUSED.to_owned())
                     }
-                    other => other.map_err(failed)?,
-                }
-                Some(token)
-            }
-            other => {
-                other.map_err(failed)?;
-                None
-            }
-        },
+                })?
+                .1
+        }
         _ => {
             let token = session_token(
                 dev,
@@ -8110,6 +8189,28 @@ impl App {
     fn storage_failed(&mut self, status: String) {
         self.log(Severity::Err, format!("Storage: {status}"));
         self.security_keys.lb_status = Some(status);
+    }
+
+    /// A Storage tab write on `for_device` that failed, said after `context`
+    /// ("Save failed"). A fingerprint session the key refused twice is over
+    /// ([`StorageWriteError::SessionEnded`]): said in the finger's words
+    /// alone, as the name save and the Vault tab say it, and the FIDO2 tab
+    /// locks, unless the session went or moved to another key meanwhile.
+    fn storage_write_failed(
+        &mut self,
+        for_device: Option<&DeviceId>,
+        context: &str,
+        e: StorageWriteError,
+    ) {
+        match e {
+            StorageWriteError::SessionEnded => {
+                if completion_still_valid(for_device, self.security_keys.session_device.as_ref()) {
+                    self.relock_fido_session();
+                }
+                self.storage_failed(e.to_string());
+            }
+            StorageWriteError::Failed(e) => self.storage_failed(format!("{context}: {e}")),
+        }
     }
 
     /// Resolve a failed unlocked-session operation. When the underlying CTAP
@@ -22339,7 +22440,7 @@ impl App {
                     keyroost_ctap::large_blobs::BlobCapacity,
                     Option<PinUvAuthToken>,
                 ),
-                String,
+                StorageWriteError,
             > {
                 let (mut dev, cbor, _init) = open_fido(&target)?;
                 if !cbor {
@@ -22393,7 +22494,7 @@ impl App {
                         app.security_keys.error = None;
                     }
                     Err(e) => {
-                        app.storage_failed(format!("Save failed: {e}"));
+                        app.storage_write_failed(for_device.as_ref(), "Save failed", e);
                     }
                 }
             })
@@ -22424,7 +22525,7 @@ impl App {
                     keyroost_ctap::large_blobs::BlobCapacity,
                     Option<PinUvAuthToken>,
                 ),
-                String,
+                StorageWriteError,
             > {
                 let (mut dev, cbor, _init) = open_fido(&target)?;
                 if !cbor {
@@ -22474,7 +22575,7 @@ impl App {
                         app.security_keys.error = None;
                     }
                     Err(e) => {
-                        app.storage_failed(format!("Edit failed: {e}"));
+                        app.storage_write_failed(for_device.as_ref(), "Edit failed", e);
                     }
                 }
             })
@@ -22581,7 +22682,7 @@ impl App {
                     keyroost_ctap::large_blobs::BlobCapacity,
                     Option<PinUvAuthToken>,
                 ),
-                String,
+                StorageWriteError,
             > {
                 let (mut dev, cbor, _init) = open_fido(&target)?;
                 if !cbor {
@@ -22638,7 +22739,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        app.storage_failed(format!("Update failed: {e}"));
+                        app.storage_write_failed(for_device.as_ref(), "Update failed", e);
                     }
                 }
             })
@@ -22681,7 +22782,7 @@ impl App {
                     keyroost_ctap::large_blobs::BlobCapacity,
                     Option<PinUvAuthToken>,
                 ),
-                String,
+                StorageWriteError,
             > {
                 let (mut dev, cbor, _init) = open_fido(&target)?;
                 if !cbor {
@@ -22744,7 +22845,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        app.storage_failed(format!("Clear failed: {e}"));
+                        app.storage_write_failed(for_device.as_ref(), "Clear failed", e);
                     }
                 }
             })
@@ -36703,6 +36804,110 @@ mod tests {
         assert_eq!(key.subs, [2, 9]);
         assert_eq!(key.perms, [u64::from(LBW)]);
         assert!(key.seen_prompts.is_empty());
+    }
+
+    /// A Storage write on a fingerprint session refused twice stops there
+    /// (one Again ask, no third token), says so in the finger's words, never
+    /// the PIN's, and locks the FIDO2 tab, as the name save does.
+    #[test]
+    fn a_twice_refused_fingerprint_storage_write_ends_the_session() {
+        let prompt = FingerPrompt::default();
+        let mut key = TokenKey::with_finger(0, &prompt);
+        key.blobs = true;
+        let s = App::unlock_on(&mut key, SessionUnlock::Fingerprint, &prompt)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let info = keyroost_ctap::get_info(&mut key).unwrap();
+        let before = keyroost_ctap::large_blobs::read(&mut key, &info).unwrap();
+        let bytes = before
+            .with_text_note("hello")
+            .serialize_with_checksum()
+            .unwrap();
+        let asks = key.subs.iter().filter(|s| **s == 6).count();
+        key.blob_stale = 2;
+        let err = write_large_blobs(
+            &mut key, &info, &s.unlock, &s.token, &prompt, &before, &bytes,
+        )
+        .err()
+        .expect("refused twice");
+        assert_eq!(err, StorageWriteError::SessionEnded);
+        assert_eq!(
+            key.subs.iter().filter(|s| **s == 6).count(),
+            asks + 1,
+            "one ask after the refusal, no third token"
+        );
+        assert_eq!(
+            key.seen_prompts.last().unwrap().as_deref(),
+            Some(keyroost_ctap::client_pin::FingerAsk::Again.prompt())
+        );
+        assert_eq!(key.blob_writes, 2);
+        assert!(!key.subs.contains(&9), "never the PIN");
+
+        let id: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(id.clone()),
+            ..Default::default()
+        };
+        app.security_keys.session = Some(unlocked_session(1));
+        app.security_keys.session_device = Some(id.clone());
+        app.storage_write_failed(Some(&id), "Save failed", err);
+        let text = app.security_keys.lb_status.clone().unwrap();
+        assert_eq!(text, vault_pane::FINGER_UNLOCK_REFUSED);
+        assert!(!text.contains("PIN"), "{text}");
+        assert!(app.security_keys.session.is_none(), "the FIDO2 tab locks");
+        assert_eq!(app.security_keys.error.as_deref(), Some(FIDO_RELOCKED));
+    }
+
+    /// The PIN session's Storage write is as it was: one large-blob-write
+    /// token from the PIN, no retry when the key refuses the write, and the
+    /// failure said with its context, the FIDO2 tab left unlocked.
+    #[test]
+    fn a_refused_pin_storage_write_is_unchanged() {
+        use keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE as LBW;
+        let prompt = FingerPrompt::default();
+        let mut key = TokenKey::new(0);
+        key.blobs = true;
+        key.watch = Some(prompt.clone());
+        let info = keyroost_ctap::get_info(&mut key).unwrap();
+        let before = keyroost_ctap::large_blobs::read(&mut key, &info).unwrap();
+        let bytes = before
+            .with_text_note("hello")
+            .serialize_with_checksum()
+            .unwrap();
+        key.blob_stale = 1;
+        let pin = SessionUnlock::Pin(zeroize::Zeroizing::new("1234".into()));
+        let err = write_large_blobs(
+            &mut key,
+            &info,
+            &pin,
+            &token_of(&[0x01; 16]),
+            &prompt,
+            &before,
+            &bytes,
+        )
+        .err()
+        .expect("refused");
+        let StorageWriteError::Failed(e) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(e.contains("0x33"), "{e}");
+        assert_eq!(key.subs, [2, 9]);
+        assert_eq!(key.perms, [u64::from(LBW)]);
+        assert_eq!(key.blob_writes, 1);
+        assert!(key.seen_prompts.is_empty());
+
+        let id: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(id.clone()),
+            ..Default::default()
+        };
+        app.security_keys.session = Some(unlocked_session(1));
+        app.security_keys.session_device = Some(id.clone());
+        app.storage_write_failed(Some(&id), "Save failed", err.clone());
+        assert_eq!(
+            app.security_keys.lb_status.as_deref(),
+            Some(format!("Save failed: {err}").as_str())
+        );
+        assert!(app.security_keys.session.is_some(), "still unlocked");
     }
 
     /// The on-key name on a fingerprint session reuses its held token: no
