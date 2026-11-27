@@ -13,8 +13,10 @@
 
 use std::fmt;
 
-use keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE;
-use keyroost_ctap::client_pin::PinUvAuthToken;
+use keyroost_ctap::client_pin::permissions::{
+    CREDENTIAL_MANAGEMENT, GET_ASSERTION, LARGE_BLOB_WRITE, MAKE_CREDENTIAL,
+};
+use keyroost_ctap::client_pin::{FingerAsk, PinUvAuthToken, Verified};
 use keyroost_ctap::get_assertion::vault_name_from_user_id;
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
 use keyroost_vault::{VaultError, RP_ID};
@@ -357,38 +359,142 @@ impl From<VaultError> for VaultKeyError {
     }
 }
 
+/// What every fingerprint token in a vault flow carries, bound to the vault
+/// RP: each permission a vault step uses (credential management of the
+/// vault RP's credentials, getAssertion, makeCredential, the largeBlob
+/// write), so one finger serves every step until a touch of the key ends
+/// what the token allows. Never `be` or `acfg`, so whether a finger may
+/// unlock ([`uv_precheck`](keyroost_ctap::client_pin::uv_precheck)) is the
+/// same as for any one step.
+const FINGER_PERMISSIONS: u32 =
+    CREDENTIAL_MANAGEMENT | GET_ASSERTION | MAKE_CREDENTIAL | LARGE_BLOB_WRITE;
+
+/// The getInfo `versions` entry of a CTAP 2.2 key.
+const CTAP_2_2: &str = "FIDO_2_2";
+
 /// How a vault flow proves the person may use the key. Holds the secret
-/// and the pinUvAuthToken it last obtained, with that token's permissions,
-/// so a flow can reuse a token that still covers what it needs.
+/// (or the way to ask for a finger) and the pinUvAuthToken it last
+/// obtained, with that token's permissions, so a flow can reuse a token
+/// that still covers what it needs.
+///
+/// The PIN asks for each step's own token. A fingerprint asks for one
+/// token covering every vault step, bound to the vault RP, and reuses it
+/// for each step it still covers, so a command asks for the finger once,
+/// and again only where a touch of the key ended what that token allows
+/// (CTAP 2.1: a makeCredential or getAssertion leaves it only the largeBlob
+/// write) and a later step needs more, or where the key refused it.
 pub struct VaultAuth {
     method: Method,
     /// The current token, its permissions and the RP it was bound to.
     token: Option<(PinUvAuthToken, u32, Option<String>)>,
+    /// How the last token obtained was obtained.
+    verified: Option<Verified>,
+    /// Credential listings take a fingerprint token bound to no RP: the key
+    /// reports CTAP 2.2 (whose 6.8.4 lists only under such a token), or it
+    /// refused the vault-RP-bound token for a listing. Every later listing
+    /// of this auth then takes an unbound one.
+    unbound_listing: bool,
 }
 
-/// The ways to obtain a token. A later method (fingerprint) adds a variant
-/// and a constructor; the flows don't change.
+/// The ways to obtain a token. Each method is a variant and a constructor;
+/// the flows don't change, they only ask [`VaultAuth`] for a token.
 enum Method {
     Pin(Zeroizing<String>),
+    /// A fingerprint, asking through `ask` before each finger. With a
+    /// `fallback` PIN, the first fingerprint error turns the method into
+    /// `Pin(fallback)` for the life of this `VaultAuth`: every later token
+    /// it obtains, in this flow and any later one, comes from the PIN. A new
+    /// `VaultAuth` tries the finger again.
+    Fingerprint {
+        fallback: Option<Zeroizing<String>>,
+        ask: Box<dyn FnMut(FingerAsk) + Send>,
+    },
 }
 
 impl VaultAuth {
+    fn with(method: Method) -> Self {
+        VaultAuth {
+            method,
+            token: None,
+            verified: None,
+            unbound_listing: false,
+        }
+    }
+
     /// Authenticate with the key's PIN.
     pub fn pin(pin: Zeroizing<String>) -> Self {
-        VaultAuth {
-            method: Method::Pin(pin),
-            token: None,
-        }
+        VaultAuth::with(Method::Pin(pin))
+    }
+
+    /// Authenticate with a fingerprint only. `ask` runs right before the
+    /// key waits for each finger, saying why it is asked
+    /// ([`FingerAsk::Unlock`], or [`FingerAsk::Again`] when the key dropped
+    /// the token it gave). A key that cannot take a finger, or refuses it,
+    /// fails the flow with a [`CtapError::Fingerprint`] that points at the
+    /// PIN.
+    pub fn fingerprint(ask: Box<dyn FnMut(FingerAsk) + Send>) -> Self {
+        VaultAuth::with(Method::Fingerprint {
+            fallback: None,
+            ask,
+        })
+    }
+
+    /// A fingerprint, and the PIN when one is given and the finger is
+    /// refused or cannot be asked (no fingerprint on the key, no tries
+    /// left): from then on every token this `VaultAuth` obtains comes from
+    /// the PIN; a new one tries the finger again. With no PIN, the same as
+    /// [`fingerprint`](Self::fingerprint).
+    pub fn auto(pin: Option<Zeroizing<String>>, ask: Box<dyn FnMut(FingerAsk) + Send>) -> Self {
+        VaultAuth::with(Method::Fingerprint { fallback: pin, ask })
+    }
+
+    /// How the last token was obtained; `None` before the first one.
+    pub fn verified(&self) -> Option<Verified> {
+        self.verified
     }
 
     /// Obtain a new token with `permissions` (bound to `rp_id` when given)
     /// and keep it as the current one. A key that demands a PIN change is
-    /// refused before the PIN is sent.
+    /// refused before the PIN is sent or a finger is asked for. A finger is
+    /// asked for as [`FingerAsk::Unlock`]; after the key dropped a token,
+    /// use [`renewed_token`](Self::renewed_token). A fingerprint token
+    /// carries [`FINGER_PERMISSIONS`] too, bound to the vault RP whatever
+    /// `rp_id` says; a PIN token (also a fallback PIN's) carries exactly
+    /// `permissions` and `rp_id`.
     pub(crate) fn fresh_token(
         &mut self,
         key: &mut impl VaultKey,
         permissions: u32,
         rp_id: Option<&str>,
+    ) -> Result<&PinUvAuthToken, VaultKeyError> {
+        self.obtain(key, permissions, rp_id, FingerAsk::Unlock, false)
+    }
+
+    /// [`fresh_token`](Self::fresh_token) after the key refused the held
+    /// token (dropped or expired): a finger is asked for as
+    /// [`FingerAsk::Again`], so the person learns why. The PIN path is the
+    /// same as a fresh token.
+    pub(crate) fn renewed_token(
+        &mut self,
+        key: &mut impl VaultKey,
+        permissions: u32,
+        rp_id: Option<&str>,
+    ) -> Result<&PinUvAuthToken, VaultKeyError> {
+        self.obtain(key, permissions, rp_id, FingerAsk::Again, false)
+    }
+
+    /// The token request behind [`fresh_token`](Self::fresh_token) and
+    /// [`renewed_token`](Self::renewed_token). `unbound` asks a fingerprint
+    /// for exactly `permissions` and no RP (a listing on a key that lists
+    /// only so); otherwise a fingerprint token carries
+    /// [`FINGER_PERMISSIONS`] bound to the vault RP. The PIN ignores it.
+    fn obtain(
+        &mut self,
+        key: &mut impl VaultKey,
+        permissions: u32,
+        rp_id: Option<&str>,
+        why: FingerAsk,
+        unbound: bool,
     ) -> Result<&PinUvAuthToken, VaultKeyError> {
         if key.info().force_pin_change == Some(true) {
             return Err(CtapError::PinChangeRequired.into());
@@ -396,13 +502,50 @@ impl VaultAuth {
         // A new token invalidates the old one on the key; drop ours first so
         // a failed request never leaves a stale one looking current.
         self.token = None;
-        let token = match &self.method {
-            Method::Pin(pin) => key.pin_token(pin, permissions, rp_id)?,
+        let (finger, finger_rp) = if unbound {
+            (permissions, None)
+        } else {
+            (permissions | FINGER_PERMISSIONS, Some(RP_ID))
         };
-        let (token, _, _) = self
-            .token
-            .insert((token, permissions, rp_id.map(str::to_owned)));
+        let got = match &mut self.method {
+            Method::Pin(pin) => key
+                .pin_token(pin, permissions, rp_id)
+                .map(|t| (t, Verified::Pin, permissions, rp_id)),
+            Method::Fingerprint { ask, .. } => key
+                .uv_token(finger, finger_rp, &mut || ask(why))
+                .map(|t| (t, Verified::Fingerprint, finger, finger_rp)),
+        };
+        let (token, verified, held, bound) = match got {
+            Err(CtapError::Fingerprint(e)) => match self.fall_back_to_pin() {
+                Some(pin) => (
+                    key.pin_token(pin, permissions, rp_id)?,
+                    Verified::Pin,
+                    permissions,
+                    rp_id,
+                ),
+                None => return Err(CtapError::Fingerprint(e).into()),
+            },
+            got => got?,
+        };
+        self.verified = Some(verified);
+        let (token, _, _) = self.token.insert((token, held, bound.map(str::to_owned)));
         Ok(token)
+    }
+
+    /// Turn a fingerprint method with a fallback PIN into the PIN method for
+    /// the life of this `VaultAuth`, and return that PIN. `None` when there
+    /// is no PIN to fall back to, and always for the PIN method: a PIN that
+    /// was just sent is never sent again as a fallback.
+    fn fall_back_to_pin(&mut self) -> Option<&Zeroizing<String>> {
+        let Method::Fingerprint { fallback, .. } = &mut self.method else {
+            return None;
+        };
+        let pin = fallback.take()?;
+        self.method = Method::Pin(pin);
+        match &self.method {
+            Method::Pin(pin) => Some(pin),
+            Method::Fingerprint { .. } => None,
+        }
     }
 
     /// The current token, only when its permissions include every bit of
@@ -415,24 +558,146 @@ impl VaultAuth {
         }
     }
 
+    /// The held fingerprint token, when it still covers `permissions`: what
+    /// a step reuses in place of a new token. `None` for the PIN (each step
+    /// takes its own token, as it always has) and when nothing covers them.
+    pub(crate) fn held_finger(&self, permissions: u32) -> Option<PinUvAuthToken> {
+        match (&self.method, &self.token) {
+            (Method::Fingerprint { .. }, Some((token, held, Some(rp))))
+                if held & permissions == permissions && rp == RP_ID =>
+            {
+                Some(token.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether tokens come from a fingerprint (not, or no longer, the PIN).
+    pub(crate) fn is_fingerprint(&self) -> bool {
+        matches!(self.method, Method::Fingerprint { .. })
+    }
+
+    /// Run one credential listing of the vault RP (no touch) that needs
+    /// `permissions`. The PIN takes a fresh token and makes one call.
+    ///
+    /// A fingerprint uses the token it holds when that covers `permissions`,
+    /// else a fresh one: bound to the vault RP, so the getAssertion or
+    /// makeCredential that follows needs no other finger (CTAP 2.1 6.8.4
+    /// takes a token bound to the RP listed).
+    ///
+    /// CTAP 2.2's 6.8.4 is written to list only under a token bound to no
+    /// RP, so on a key whose getInfo `versions` has `FIDO_2_2` the listing
+    /// takes an unbound token with `permissions` from the start, and the
+    /// step after it its own bound one: two fingers, none wasted. A pre-2.2
+    /// key may enforce that rule too: when it refuses a bound token it just
+    /// gave (`PIN_AUTH_INVALID`), that is no dropped token, so one unbound
+    /// token is asked for, saying why ([`FingerAsk::ListVaults`]). Either
+    /// way every later listing of this auth takes an unbound token straight
+    /// away. A held token refused as dropped or expired is renewed once
+    /// first ([`FingerAsk::Again`]). At most those two more tokens, never a
+    /// loop: on a key that takes the bound token, a held token refused and
+    /// then its renewal refused too leads to a third ask, worded as the
+    /// listing's reason ([`FingerAsk::ListVaults`]), and the unbound token's
+    /// answer is final.
+    pub(crate) fn with_listing<K: VaultKey, T>(
+        &mut self,
+        key: &mut K,
+        permissions: u32,
+        mut call: impl FnMut(&mut K, &PinUvAuthToken) -> Result<T, CtapError>,
+    ) -> Result<T, VaultKeyError> {
+        if !self.is_fingerprint() {
+            let token = self.fresh_token(key, permissions, None)?;
+            return Ok(call(key, token)?);
+        }
+        if key.info().versions.iter().any(|v| v == CTAP_2_2) {
+            self.unbound_listing = true;
+        }
+        let held = match &self.token {
+            Some((token, held, rp))
+                if held & permissions == permissions && !(self.unbound_listing && rp.is_some()) =>
+            {
+                Some(token.clone())
+            }
+            _ => None,
+        };
+        let (mut token, mut fresh) = match held {
+            Some(token) => (token, false),
+            None => (
+                self.listing_token(key, permissions, FingerAsk::Unlock)?,
+                true,
+            ),
+        };
+        loop {
+            let bound = matches!(&self.token, Some((_, _, Some(_))));
+            match call(key, &token) {
+                Err(e) if ops::stale_token(&e) => {
+                    let refused_bound = matches!(e, CtapError::StatusCode(ops::PIN_AUTH_INVALID));
+                    if fresh && bound && refused_bound && self.is_fingerprint() {
+                        self.unbound_listing = true;
+                        token = self.listing_token(key, permissions, FingerAsk::ListVaults)?;
+                    } else if !fresh {
+                        token = self.listing_token(key, permissions, FingerAsk::Again)?;
+                    } else {
+                        return Err(e.into());
+                    }
+                    fresh = true;
+                }
+                r => return Ok(r?),
+            }
+        }
+    }
+
+    /// A new token for a listing: unbound once the key refused a bound one
+    /// for it, else as [`obtain`](Self::obtain) gives one.
+    fn listing_token(
+        &mut self,
+        key: &mut impl VaultKey,
+        permissions: u32,
+        why: FingerAsk,
+    ) -> Result<PinUvAuthToken, VaultKeyError> {
+        let unbound = self.unbound_listing;
+        self.obtain(key, permissions, None, why, unbound).cloned()
+    }
+
     /// Run one call that waits for a touch (makeCredential or getAssertion):
-    /// a fresh token with `permissions`, bound to the vault RP, then `step`
+    /// a token with `permissions`, bound to the vault RP, then `step`
     /// reported, then `call`, then the token cut as the key cuts it
     /// ([`after_presence`](Self::after_presence)), whatever `call` returned.
     /// Every touch in the vault flows goes through here, so no flow can
-    /// forget the cut. A refused PIN reports no step and makes no call.
+    /// forget the cut. A refused PIN or finger reports no step and makes no
+    /// call.
+    ///
+    /// The PIN takes a fresh token every time. A fingerprint reuses the held
+    /// token when it still covers `permissions` (a listing just took it), so
+    /// no finger is asked for; when the key refuses that token as dropped or
+    /// expired, it is renewed once (asking again, saying why) and `call`
+    /// runs once more, `step` not reported again. A refused token makes the
+    /// key do nothing, so the retry repeats no touch and makes no second
+    /// credential.
     pub(crate) fn with_touch<K: VaultKey, T>(
         &mut self,
         key: &mut K,
         permissions: u32,
         step: VaultStep,
         on_step: &mut dyn FnMut(VaultStep),
-        call: impl FnOnce(&mut K, &PinUvAuthToken) -> Result<T, CtapError>,
+        mut call: impl FnMut(&mut K, &PinUvAuthToken) -> Result<T, CtapError>,
     ) -> Result<T, VaultKeyError> {
-        let result = {
-            let token = self.fresh_token(key, permissions, Some(RP_ID))?;
-            on_step(step);
-            call(key, token)
+        let result = match self.held_finger(permissions) {
+            Some(held) => {
+                on_step(step);
+                match call(key, &held) {
+                    Err(e) if ops::stale_token(&e) => {
+                        let token = self.renewed_token(key, permissions, Some(RP_ID))?;
+                        call(key, token)
+                    }
+                    r => r,
+                }
+            }
+            None => {
+                let token = self.fresh_token(key, permissions, Some(RP_ID))?;
+                on_step(step);
+                call(key, token)
+            }
         };
         self.after_presence();
         Ok(result?)
@@ -452,11 +717,16 @@ impl VaultAuth {
     }
 }
 
-// Hand-written so the PIN and the token never land in a log.
+// Hand-written so the PIN, the token and the ask callback never land in a
+// log.
 impl fmt::Debug for VaultAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let method = match self.method {
+        let method = match &self.method {
             Method::Pin(_) => "pin <redacted>",
+            Method::Fingerprint { fallback: None, .. } => "fingerprint",
+            Method::Fingerprint {
+                fallback: Some(_), ..
+            } => "fingerprint, pin fallback <redacted>",
         };
         let token = self
             .token
@@ -465,6 +735,8 @@ impl fmt::Debug for VaultAuth {
         f.debug_struct("VaultAuth")
             .field("method", &method)
             .field("token", &token)
+            .field("verified", &self.verified)
+            .field("unbound_listing", &self.unbound_listing)
             .finish()
     }
 }
@@ -521,8 +793,10 @@ mod tests {
         CREDENTIAL_MANAGEMENT as CM, GET_ASSERTION as GA, LARGE_BLOB_WRITE as LBW,
         MAKE_CREDENTIAL as MC,
     };
-    use keyroost_ctap::client_pin::PinUvAuthToken;
+    use keyroost_ctap::client_pin::{PinUvAuthToken, Verified};
     use keyroost_ctap::get_assertion::Assertion;
+    use keyroost_ctap::large_blobs::LargeBlobArray;
+    use keyroost_ctap::FingerprintError;
     use keyroost_vault::{open, user_handle, Entry, Vault, RP_ID};
     use std::error::Error as _;
 
@@ -732,6 +1006,150 @@ mod tests {
         let shown = format!("{auth:?}");
         assert!(!shown.contains(FakeKey::PIN), "{shown}");
         assert!(shown.contains("redacted"), "{shown}");
+    }
+
+    #[test]
+    fn a_fingerprint_auth_never_prints_a_pin() {
+        let (_, ask) = super::fake::asks();
+        let auto = VaultAuth::auto(Some(Zeroizing::new("123456".into())), ask);
+        let shown = format!("{auto:?}");
+        assert!(!shown.contains("123456"), "{shown}");
+        assert!(
+            shown.contains("\"fingerprint, pin fallback <redacted>\""),
+            "{shown}"
+        );
+
+        let (_, ask) = super::fake::asks();
+        let shown = format!("{:?}", VaultAuth::fingerprint(ask));
+        assert!(shown.contains("\"fingerprint\""), "{shown}");
+        let (_, ask) = super::fake::asks();
+        let shown = format!("{:?}", VaultAuth::auto(None, ask));
+        assert!(shown.contains("\"fingerprint\""), "{shown}");
+        assert!(format!("{:?}", pin()).contains("\"pin <redacted>\""));
+    }
+
+    /// A key whose PIN token request answers with a fingerprint error.
+    struct FingerErrOnPin(FakeKey);
+
+    impl VaultKey for FingerErrOnPin {
+        fn info(&self) -> &AuthenticatorInfo {
+            self.0.info()
+        }
+        fn pin_token(
+            &mut self,
+            pin: &str,
+            permissions: u32,
+            rp_id: Option<&str>,
+        ) -> Result<PinUvAuthToken, CtapError> {
+            self.0.pin_token(pin, permissions, rp_id)?;
+            Err(CtapError::Fingerprint(FingerprintError::Refused(0x3F)))
+        }
+        fn uv_token(
+            &mut self,
+            permissions: u32,
+            rp_id: Option<&str>,
+            on_finger: &mut dyn FnMut(),
+        ) -> Result<PinUvAuthToken, CtapError> {
+            self.0.uv_token(permissions, rp_id, on_finger)
+        }
+        fn make_credential(
+            &mut self,
+            token: &PinUvAuthToken,
+            user_id: &[u8],
+            name: &str,
+        ) -> Result<keyroost_ctap::make_credential::MadeCredential, CtapError> {
+            self.0.make_credential(token, user_id, name)
+        }
+        fn assertions(
+            &mut self,
+            token: &PinUvAuthToken,
+            allow: Option<&[u8]>,
+        ) -> Result<Vec<Assertion>, CtapError> {
+            self.0.assertions(token, allow)
+        }
+        fn credentials(
+            &mut self,
+            token: &PinUvAuthToken,
+        ) -> Result<Vec<VaultCredential>, CtapError> {
+            self.0.credentials(token)
+        }
+        fn delete_credential(
+            &mut self,
+            token: &PinUvAuthToken,
+            credential_id: &[u8],
+        ) -> Result<(), CtapError> {
+            self.0.delete_credential(token, credential_id)
+        }
+        fn read_blobs(&mut self) -> Result<LargeBlobArray, CtapError> {
+            self.0.read_blobs()
+        }
+        fn write_blobs(
+            &mut self,
+            token: &PinUvAuthToken,
+            serialized: &[u8],
+        ) -> Result<(), CtapError> {
+            self.0.write_blobs(token, serialized)
+        }
+    }
+
+    #[test]
+    fn a_pin_is_never_sent_twice_as_its_own_fallback() {
+        let pin_requests = |key: &FingerErrOnPin| {
+            key.0
+                .log
+                .iter()
+                .filter(|c| matches!(c, Call::Token { .. }))
+                .count()
+        };
+        let is_finger_err = |r: &Result<_, VaultKeyError>| {
+            matches!(r, Err(VaultKeyError::Ctap(CtapError::Fingerprint(_))))
+        };
+
+        // The PIN method: one request, its error returned as is.
+        let mut key = FingerErrOnPin(FakeKey::new());
+        let mut auth = pin();
+        let r = auth.fresh_token(&mut key, LBW, None).map(drop);
+        assert!(is_finger_err(&r), "{r:?}");
+        assert_eq!(pin_requests(&key), 1);
+        assert!(auth.current_for(LBW).is_none());
+
+        // auto: the refused finger falls back once; the fallback's own
+        // fingerprint error is not a reason to send the PIN again.
+        let mut key = FingerErrOnPin(FakeKey::with_fingerprint());
+        key.0.uv_refusals.push_back(0x3F);
+        let (_, ask) = super::fake::asks();
+        let mut auth = VaultAuth::auto(Some(Zeroizing::new(FakeKey::PIN.to_owned())), ask);
+        let r = auth.fresh_token(&mut key, LBW, None).map(drop);
+        assert!(is_finger_err(&r), "{r:?}");
+        assert_eq!(pin_requests(&key), 1);
+        let r = auth.fresh_token(&mut key, LBW, None).map(drop);
+        assert!(is_finger_err(&r), "{r:?}");
+        assert_eq!(pin_requests(&key), 2, "one PIN request per token asked for");
+    }
+
+    #[test]
+    fn a_renewed_pin_token_is_a_fresh_one() {
+        let mut key = FakeKey::new();
+        let mut auth = pin();
+        token(&mut auth, &mut key, CM, None);
+        assert_eq!(auth.verified(), Some(Verified::Pin));
+        auth.renewed_token(&mut key, LBW, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            key.log,
+            vec![
+                Call::Token {
+                    perms: CM,
+                    rp: None
+                },
+                Call::Token {
+                    perms: LBW,
+                    rp: None
+                }
+            ]
+        );
+        assert!(auth.current_for(LBW).is_some());
+        assert!(auth.current_for(CM).is_none());
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! The seam between the vault flows and a key: [`VaultKey`], and
 //! [`CtapVaultKey`], the real key over CTAP.
 
-use keyroost_ctap::client_pin::{get_pin_uv_auth_token_with_permissions, PinUvAuthToken};
+use keyroost_ctap::client_pin::{
+    get_pin_uv_auth_token_with_permissions, get_token, PinUvAuthToken, TokenSource,
+};
 use keyroost_ctap::cred_mgmt::CredentialManager;
 use keyroost_ctap::get_assertion::{get_assertions, Assertion, GetAssertionRequest};
 use keyroost_ctap::hmac_secret::{self, prf_salt};
@@ -26,6 +28,19 @@ pub trait VaultKey {
         pin: &str,
         permissions: u32,
         rp_id: Option<&str>,
+    ) -> Result<PinUvAuthToken, CtapError>;
+
+    /// A pinUvAuthToken from a fingerprint (CTAP 2.1 built-in user
+    /// verification) with `permissions`, bound to `rp_id` when given.
+    /// Refused with [`CtapError::Fingerprint`] and no finger asked when the
+    /// key cannot give one (no fingerprint, a permission a finger cannot
+    /// grant, no tries left); otherwise `on_finger` runs once, right before
+    /// the key waits for the finger.
+    fn uv_token(
+        &mut self,
+        permissions: u32,
+        rp_id: Option<&str>,
+        on_finger: &mut dyn FnMut(),
     ) -> Result<PinUvAuthToken, CtapError>;
 
     /// Make a discoverable vault credential (waits for a touch).
@@ -114,6 +129,23 @@ impl<T: CtapTransport> VaultKey for CtapVaultKey<T> {
         get_pin_uv_auth_token_with_permissions(&mut self.dev, pin, permissions, rp_id)
     }
 
+    fn uv_token(
+        &mut self,
+        permissions: u32,
+        rp_id: Option<&str>,
+        on_finger: &mut dyn FnMut(),
+    ) -> Result<PinUvAuthToken, CtapError> {
+        get_token(
+            &mut self.dev,
+            &self.info,
+            TokenSource::Fingerprint,
+            permissions,
+            rp_id,
+            on_finger,
+        )
+        .map(|(token, _)| token)
+    }
+
     fn make_credential(
         &mut self,
         token: &PinUvAuthToken,
@@ -184,5 +216,75 @@ impl<T: CtapTransport> VaultKey for CtapVaultKey<T> {
 
     fn write_blobs(&mut self, token: &PinUvAuthToken, serialized: &[u8]) -> Result<(), CtapError> {
         large_blobs::write(&mut self.dev, &self.info, token, serialized)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keyroost_ctap::cbor::{self, Value};
+    use keyroost_ctap::cred_mgmt::CTAP2_CREDENTIAL_MANAGEMENT;
+
+    /// Records every credential-management request and answers each with
+    /// CTAP2_ERR_NO_CREDENTIALS.
+    struct Recorder(Vec<Vec<u8>>);
+
+    impl CtapTransport for Recorder {
+        fn transact(&mut self, _cmd: u8, payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            self.0.push(payload.to_vec());
+            Ok(vec![0x2E])
+        }
+    }
+
+    /// A request's subCommand and subCommandParams.
+    fn sub_command(payload: &[u8]) -> (u64, Option<Value>) {
+        assert_eq!(payload[0], CTAP2_CREDENTIAL_MANAGEMENT);
+        let (Value::Map(entries), _) = cbor::decode(&payload[1..]).unwrap() else {
+            panic!("a map");
+        };
+        let field = |k| {
+            entries
+                .iter()
+                .find(|(key, _)| *key == Value::UInt(k))
+                .map(|(_, v)| v.clone())
+        };
+        let Some(Value::UInt(sub)) = field(1) else {
+            panic!("a subCommand");
+        };
+        (sub, field(2))
+    }
+
+    /// Credential management in the vault flows only ever names the vault
+    /// RP: enumerateCredentialsBegin with its rpIdHash and deleteCredential,
+    /// never getCredsMetadata or enumerateRPs, which CTAP 2.1 refuses under a
+    /// token bound to an RP (6.8.2, 6.8.3). So a fingerprint token bound to
+    /// the vault RP serves every credential-management step a flow takes.
+    #[test]
+    fn credential_management_names_only_the_vault_rp() {
+        let info = AuthenticatorInfo {
+            options: vec![("credMgmt".into(), true)],
+            ..AuthenticatorInfo::default()
+        };
+        let mut key = CtapVaultKey {
+            dev: Recorder(Vec::new()),
+            info,
+        };
+        let token = PinUvAuthToken {
+            protocol: 2,
+            token: vec![7; 32],
+        };
+        assert!(key.credentials(&token).unwrap().is_empty());
+        let _ = key.delete_credential(&token, &[1, 2, 3]);
+        let sent = &key.dev.0;
+        assert_eq!(sent.len(), 2);
+        let rp_hash = keyroost_proto::sha256::sha256(RP_ID.as_bytes()).to_vec();
+        assert_eq!(
+            sub_command(&sent[0]),
+            (
+                0x04,
+                Some(Value::Map(vec![(Value::UInt(1), Value::Bytes(rp_hash))]))
+            )
+        );
+        assert_eq!(sub_command(&sent[1]).0, 0x06);
     }
 }

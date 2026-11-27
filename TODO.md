@@ -108,6 +108,54 @@ items marked *(no hardware)* need a device the maintainer does not have.
   and the app's Vault tab and Overview card
   (`vault_pane::experimental_note`).
 
+- **Lift the experimental label on fingerprint unlock** *(no hardware)*.
+  Built against scripted keys only (CTAP 2.1 built-in UV, clientPIN 0x06 /
+  0x07). On a bio key (Token2 Bio, YubiKey Bio or similar), check:
+  - the built-in UV token: `fido credential list --unlock fingerprint`, and
+    the app's Touch fingerprint on the FIDO2 tab, the Vault tab, the naming
+    field (save on the key) and the Settings dialog (keys with `uvAcfg`);
+    fingerprint management by finger on keys with `uvBioEnroll`, and the
+    plain "use the PIN" refusal on keys without;
+  - `--unlock auto --pin …` falling back to the PIN when the finger is
+    refused and when it times out, and printing which one unlocked;
+  - a key that clears the token after getAssertion: the vault and the
+    app's notes and name writes ask for the finger again, saying why;
+  - `fido fingerprint add --unlock fingerprint` with no fingerprint
+    enrolled: refused, suggesting the PIN;
+  - UV_BLOCKED and the retries count (`getUVRetries`): the refusal before
+    any finger at 0 tries;
+  - NFC, in the app only (the CLI's FIDO commands are USB-HID only).
+
+  Fingers asked for under `--unlock fingerprint` (each token is its own
+  finger; compare against the key): every non-vault command 1 (`credential
+  compare` 1 per key). A vault command takes one token carrying every
+  permission its steps use (`cm`, `ga`, `mc`, `lbw`), bound to the vault RP
+  `fido2-vault.token2`, and reuses it until a touch of the key leaves it only
+  `lbw` (CTAP 2.1): `fido vault list`, `export`, the `entry` commands and
+  `import` into a vault on the key (`--dry-run` too) 1, then their touch (no
+  touch on a key with no vault); `delete` 1 and no touch (one touch on a key
+  that lists no largeBlobKey for the vault); `add` and `import` into a new
+  vault 2 and two touches; `rotate` 4 and three touches. A key that
+  clears the token after the touch adds 1 ("asked again") to `entry
+  add|edit|delete`, `add` and `import`. The app's Vault tab: unlock 1, save
+  none, create 2, rotate 3, delete 1. Those are for a key without
+  `FIDO_2_2` in getInfo `versions` that lists the vault RP's credentials
+  (enumerateCredentialsBegin) under the RP-bound token, as CTAP 2.1 §6.8.4
+  allows. CTAP 2.2's §6.8.4 is written to list only under a token bound to
+  no RP (its own §6.8 example says otherwise), so on a key reporting
+  `FIDO_2_2` keyroost lists under an unbound token from the start: `list`,
+  `export`, the `entry` commands and `import` into a vault on the key 2,
+  `delete` 1, `add` and `import` into a new vault 3, `rotate` 5; the app's
+  unlock 2. A pre-2.2 key that refuses the bound listing anyway (0x33) gets
+  one more ask, "This key needs a second fingerprint to list its vaults",
+  remembered for the rest of that command or app session: `list` 3,
+  `delete` 2, `add` 4, `rotate` 6, the app's unlock 3. Confirm on a 2.1 and
+  a 2.2 bio key which way each lists (does the 2.2 key take the bound token
+  after all?), that every vault command works, and that deleteCredential
+  takes the RP-bound token on both. Then drop "experimental" from `--unlock`'s help
+  (`FIDO_UNLOCK_HELP`), the README, `docs/fido2.html`, `docs/vault.html` and
+  the app (`vault_pane::fingerprint_experimental_note`).
+
 - **Lift the "experimental" label on the Token2 PIN+ OATH and OpenPGP
   applets.** PIV is exercised on a PIN+ Dual Ace R3.4 since #251; verify
   OATH and OpenPGP over CCID on a PIN+ key (on Windows: Linux's libccid

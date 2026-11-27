@@ -41,9 +41,11 @@ fn credentials_and_array(
     auth: &mut VaultAuth,
 ) -> Result<(Vec<VaultCredential>, LargeBlobArray), VaultKeyError> {
     check_support(key.info())?;
-    // largeBlobWrite too, so a delete that follows needs no second token.
-    let token = auth.fresh_token(key, CREDENTIAL_MANAGEMENT | LARGE_BLOB_WRITE, None)?;
-    let mut creds = key.credentials(token)?;
+    // largeBlobWrite too, so a delete that follows needs no second token. A
+    // fingerprint reuses the token it holds when that still allows both.
+    let mut creds = auth.with_listing(key, CREDENTIAL_MANAGEMENT | LARGE_BLOB_WRITE, |k, t| {
+        k.credentials(t)
+    })?;
     let array = key.read_blobs()?;
     for c in &mut creds {
         c.stored = match &c.large_blob_key {
@@ -260,8 +262,8 @@ fn remove_data(
 }
 
 /// Delete credential `id` with the current token when it allows credential
-/// management, else a fresh one; once more with a fresh token when the key
-/// dropped it or let it expire.
+/// management, else a fresh one; once more with a renewed token when the
+/// key dropped it or let it expire.
 fn delete_credential(
     key: &mut impl VaultKey,
     auth: &mut VaultAuth,
@@ -273,7 +275,7 @@ fn delete_credential(
     };
     match key.delete_credential(&token, id) {
         Err(e) if stale_token(&e) => {
-            let token = auth.fresh_token(key, CREDENTIAL_MANAGEMENT, None)?;
+            let token = auth.renewed_token(key, CREDENTIAL_MANAGEMENT, None)?;
             Ok(key.delete_credential(token, id)?)
         }
         r => Ok(r?),
@@ -1071,6 +1073,40 @@ mod tests {
     }
 
     #[test]
+    fn a_fingerprint_delete_asks_again_on_a_stale_token() {
+        use super::super::fake::asks;
+        use keyroost_ctap::client_pin::FingerAsk;
+        let mut key = FakeKey::with_fingerprint();
+        let p = key.add_vault("Personal", &Vault::default());
+        key.delete_refusals.extend([0x33]);
+        let (asked, ask) = asks();
+        let (r, _) = run_delete(&mut key, &mut VaultAuth::fingerprint(ask), "Personal");
+        r.unwrap_or_else(|e| panic!("{e}"));
+        let finger = Call::UvToken {
+            perms: CM | GA | MC | LBW,
+            rp: Some(RP_ID.into()),
+        };
+        assert_eq!(
+            key.log,
+            vec![
+                finger.clone(),
+                Call::Credentials,
+                Call::Read,
+                Call::Read,
+                Call::Write,
+                Call::Delete(p.clone()),
+                finger,
+                Call::Delete(p),
+            ]
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [FingerAsk::Unlock, FingerAsk::Again]
+        );
+        assert!(key.creds.is_empty());
+    }
+
+    #[test]
     fn delete_of_a_vault_without_data_skips_the_write() {
         let mut key = FakeKey::new();
         key.add_foreign_entries();
@@ -1612,5 +1648,504 @@ mod tests {
         );
         assert!(steps.is_empty());
         assert_eq!(key.log, vec![Call::Read]);
+    }
+
+    // ----- finger asks per command -----
+
+    use super::super::fake::asks;
+    use super::super::{save, Change};
+    use keyroost_ctap::client_pin::FingerAsk;
+    use std::sync::{Arc, Mutex};
+
+    /// What one fingerprint token carries in a vault flow.
+    const FINGER: u32 = CM | GA | MC | LBW;
+
+    /// The key calls of each `fido vault` command, as `vault_cmd.rs` makes
+    /// them; the app's jobs are the same calls without the unlock in front.
+    #[derive(Debug, Clone, Copy)]
+    enum Command {
+        /// `list`, `export`, `entry list`, `entry show`: the unlock.
+        List,
+        /// `entry add|edit|delete`: the unlock and one save.
+        EntryAdd,
+        /// `add`: a create.
+        Add,
+        /// `delete`: the listing and the delete.
+        Delete,
+        /// `rotate`: the unlock and the rotate.
+        Rotate,
+        /// `import` into a vault on the key: listing, unlock, one save.
+        ImportExisting,
+        /// `import` into a new vault: listing, then a create.
+        ImportNew,
+    }
+
+    fn first_open(key: &mut FakeKey, auth: &mut VaultAuth) -> OpenVault {
+        let mut u = unlock(key, auth, &mut |_| {}).unwrap_or_else(|e| panic!("{e}"));
+        u.vaults.remove(0).state.unwrap_or_else(|p| panic!("{p}"))
+    }
+
+    fn run_command(key: &mut FakeKey, auth: &mut VaultAuth, command: Command) {
+        fn ok<T>(r: Result<T, VaultKeyError>, command: Command) -> T {
+            r.unwrap_or_else(|e| panic!("{command:?}: {e}"))
+        }
+        let quiet = &mut |_| {};
+        match command {
+            Command::List => drop(ok(unlock(key, auth, quiet), command)),
+            Command::EntryAdd => {
+                let mut open = first_open(key, auth);
+                let change = Change::Add(entry("A"));
+                ok(save(key, auth, &mut open, &change, quiet), command);
+            }
+            Command::Add => {
+                let made = create(key, auth, "Travel", &Vault::default(), quiet);
+                drop(ok(made, command));
+            }
+            Command::Delete => {
+                let creds = ok(list_credentials(key, auth), command);
+                ok(delete(key, auth, &creds[0], quiet), command);
+            }
+            Command::Rotate => {
+                let old = first_open(key, auth);
+                drop(ok(rotate(key, auth, &old, quiet), command));
+            }
+            Command::ImportExisting => {
+                ok(list_credentials(key, auth), command);
+                let mut open = first_open(key, auth);
+                let change = Change::Import {
+                    incoming: Vault {
+                        entries: vec![entry("B")],
+                    },
+                    chosen: vec![0],
+                };
+                ok(save(key, auth, &mut open, &change, quiet), command);
+            }
+            Command::ImportNew => {
+                ok(list_credentials(key, auth), command);
+                let made = create(key, auth, "New", &two_entries(), quiet);
+                drop(ok(made, command));
+            }
+        }
+    }
+
+    /// `command` under a fingerprint on a key holding a Personal vault; the
+    /// asks it made, and every fingerprint token request.
+    fn fingers_for(command: Command, drops: bool) -> (Vec<FingerAsk>, Vec<Call>) {
+        fingers_on(command, drops, Listing::Lenient)
+    }
+
+    /// How a key lists the vault RP's credentials.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Listing {
+        /// CTAP 2.1: under a token bound to the vault RP too.
+        Lenient,
+        /// A pre-2.2 key that lists only under an unbound token.
+        Strict21,
+        /// A key reporting CTAP 2.2 that lists as its 6.8.4 is written.
+        Ctap22,
+    }
+
+    /// [`fingers_for`] on a key that lists as `listing` says.
+    fn fingers_on(command: Command, drops: bool, listing: Listing) -> (Vec<FingerAsk>, Vec<Call>) {
+        let mut key = FakeKey::with_fingerprint();
+        key.drops_token_after_presence = drops;
+        match listing {
+            Listing::Lenient => {}
+            Listing::Strict21 => key.strict_listing = true,
+            Listing::Ctap22 => key.as_ctap22(),
+        }
+        key.add_vault("Personal", &two_entries());
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        run_command(&mut key, &mut auth, command);
+        assert!(
+            !key.log.iter().any(|c| matches!(c, Call::Token { .. })),
+            "{command:?}: no PIN"
+        );
+        let requests = key
+            .log
+            .into_iter()
+            .filter(|c| matches!(c, Call::UvToken { .. }))
+            .collect();
+        let asked = asked.lock().unwrap().clone();
+        (asked, requests)
+    }
+
+    /// One finger per command, except where a touch of the key ends what the
+    /// token allows (CTAP 2.1 6.5.5.7: a makeCredential or getAssertion
+    /// leaves it only largeBlobWrite) and a later step needs more: a create
+    /// asks again before its getAssertion, a rotate before its
+    /// makeCredential, its getAssertion and its credential delete. Each
+    /// token carries every permission a vault step needs, bound to the
+    /// vault RP. A key that drops the token after a touch adds one "asked
+    /// again" where a write follows the touch, never more.
+    #[test]
+    fn a_fingerprint_command_asks_for_the_finger_once_where_ctap_allows() {
+        use FingerAsk::{Again as G, Unlock as U};
+        for (command, keeps, drops) in [
+            (Command::List, vec![U], vec![U]),
+            (Command::EntryAdd, vec![U], vec![U, G]),
+            (Command::Add, vec![U, U], vec![U, U, G]),
+            (Command::Delete, vec![U], vec![U]),
+            (Command::Rotate, vec![U, U, U, U], vec![U, U, U, G]),
+            (Command::ImportExisting, vec![U], vec![U, G]),
+            (Command::ImportNew, vec![U, U], vec![U, U, G]),
+        ] {
+            for (drops_token, expected) in [(false, keeps), (true, drops)] {
+                let (asked, requests) = fingers_for(command, drops_token);
+                assert_eq!(asked, expected, "{command:?}, drops = {drops_token}");
+                assert_eq!(requests.len(), asked.len(), "{command:?}");
+                for r in &requests {
+                    assert_eq!(
+                        *r,
+                        Call::UvToken {
+                            perms: FINGER,
+                            rp: Some(RP_ID.into())
+                        },
+                        "{command:?}"
+                    );
+                }
+            }
+        }
+
+        // A key with no vault: the listing's finger only, and no touch.
+        let mut key = FakeKey::with_fingerprint();
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        let u = unlock(&mut key, &mut auth, &mut |_| {}).unwrap_or_else(|e| panic!("{e}"));
+        assert!(u.vaults.is_empty());
+        assert_eq!(*asked.lock().unwrap(), [FingerAsk::Unlock]);
+        assert!(!key.log.iter().any(|c| matches!(c, Call::Assertions(_))));
+    }
+
+    /// A key reporting CTAP 2.2 lists under an unbound token from the
+    /// start: no bound attempt is wasted and no reason line is needed, and
+    /// the step after the listing takes its own bound token (a new token
+    /// replaces the one held, 6.5.5.7.3). `list` is 2 fingers.
+    #[test]
+    fn a_ctap22_key_lists_under_an_unbound_token_from_the_start() {
+        use FingerAsk::{Again as G, Unlock as U};
+        let bound = Call::UvToken {
+            perms: FINGER,
+            rp: Some(RP_ID.into()),
+        };
+        let unbound = Call::UvToken {
+            perms: CM | LBW,
+            rp: None,
+        };
+        for (command, expected) in [
+            (Command::List, vec![(U, &unbound), (U, &bound)]),
+            (Command::EntryAdd, vec![(U, &unbound), (U, &bound)]),
+            (Command::Add, vec![(U, &unbound), (U, &bound), (U, &bound)]),
+            (Command::Delete, vec![(U, &unbound)]),
+            (
+                Command::Rotate,
+                vec![
+                    (U, &unbound),
+                    (U, &bound),
+                    (U, &bound),
+                    (U, &bound),
+                    (U, &bound),
+                ],
+            ),
+            (Command::ImportExisting, vec![(U, &unbound), (U, &bound)]),
+            (
+                Command::ImportNew,
+                vec![(U, &unbound), (U, &bound), (U, &bound)],
+            ),
+        ] {
+            let (asked, requests) = fingers_on(command, false, Listing::Ctap22);
+            let got: Vec<(FingerAsk, &Call)> = asked.into_iter().zip(&requests).collect();
+            assert_eq!(got, expected, "{command:?}");
+            assert_eq!(requests.len(), expected.len(), "{command:?}");
+        }
+
+        // A key that also drops the token after a touch: one "asked again",
+        // bound, where a write follows the touch.
+        for (command, expected) in [
+            (Command::List, vec![(U, &unbound), (U, &bound)]),
+            (
+                Command::EntryAdd,
+                vec![(U, &unbound), (U, &bound), (G, &bound)],
+            ),
+            (
+                Command::Add,
+                vec![(U, &unbound), (U, &bound), (U, &bound), (G, &bound)],
+            ),
+            (Command::Delete, vec![(U, &unbound)]),
+            (
+                Command::Rotate,
+                vec![
+                    (U, &unbound),
+                    (U, &bound),
+                    (U, &bound),
+                    (U, &bound),
+                    (G, &bound),
+                ],
+            ),
+            (
+                Command::ImportExisting,
+                vec![(U, &unbound), (U, &bound), (G, &bound)],
+            ),
+            (
+                Command::ImportNew,
+                vec![(U, &unbound), (U, &bound), (U, &bound), (G, &bound)],
+            ),
+        ] {
+            let (asked, requests) = fingers_on(command, true, Listing::Ctap22);
+            let got: Vec<(FingerAsk, &Call)> = asked.into_iter().zip(&requests).collect();
+            assert_eq!(got, expected, "{command:?}, drops");
+            assert_eq!(requests.len(), expected.len(), "{command:?}, drops");
+        }
+    }
+
+    /// A pre-2.2 key that lists only under an unbound token refuses the
+    /// vault-RP-bound token for the listing: the flow asks once more for an
+    /// unbound listing token, saying why, and every later listing of the
+    /// same auth takes an unbound token straight away. Every command works;
+    /// no "refused" reaches the person. The worst case, 3 for `list`.
+    #[test]
+    fn a_strict_key_lists_under_an_unbound_token_and_every_command_works() {
+        use FingerAsk::{Again as G, ListVaults as L, Unlock as U};
+        let bound = Call::UvToken {
+            perms: FINGER,
+            rp: Some(RP_ID.into()),
+        };
+        let unbound = Call::UvToken {
+            perms: CM | LBW,
+            rp: None,
+        };
+        // (command, keeps the token, drops it after a touch)
+        for (command, keeps, drops) in [
+            (Command::List, vec![U, L, U], vec![U, L, U]),
+            (Command::EntryAdd, vec![U, L, U], vec![U, L, U, G]),
+            (Command::Add, vec![U, L, U, U], vec![U, L, U, U, G]),
+            (Command::Delete, vec![U, L], vec![U, L]),
+            (
+                Command::Rotate,
+                vec![U, L, U, U, U, U],
+                vec![U, L, U, U, U, G],
+            ),
+            (Command::ImportExisting, vec![U, L, U], vec![U, L, U, G]),
+            (Command::ImportNew, vec![U, L, U, U], vec![U, L, U, U, G]),
+        ] {
+            for (drops_token, expected) in [(false, keeps), (true, drops)] {
+                let (asked, requests) = fingers_on(command, drops_token, Listing::Strict21);
+                assert_eq!(asked, expected, "{command:?}, drops = {drops_token}");
+                assert_eq!(requests.len(), asked.len(), "{command:?}");
+                for (ask, request) in asked.iter().zip(&requests) {
+                    let want = if *ask == L { &unbound } else { &bound };
+                    assert_eq!(request, want, "{command:?}");
+                }
+            }
+            // A key that takes the bound token never asks for an unbound one.
+            let (lenient, _) = fingers_on(command, false, Listing::Lenient);
+            assert!(!lenient.contains(&L), "{command:?}");
+        }
+    }
+
+    /// The fallback is one more token, never a loop: a finger refused for
+    /// it ends the flow there, and a held bound token the strict key
+    /// refuses is renewed once before the unbound one.
+    #[test]
+    fn the_unbound_listing_fallback_asks_once() {
+        let mut key = FakeKey::with_fingerprint();
+        key.strict_listing = true;
+        key.add_vault("Personal", &two_entries());
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        // The first (bound) token is given; the unbound one is refused.
+        let mut steps = Vec::new();
+        let r = unlock_with_second_refused(&mut key, &mut auth, &mut steps);
+        assert!(
+            matches!(
+                r,
+                Err(VaultKeyError::Ctap(CtapError::Fingerprint(
+                    keyroost_ctap::FingerprintError::Refused(0x3F)
+                )))
+            ),
+            "{r:?}"
+        );
+        assert!(steps.is_empty(), "no touch asked for");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [FingerAsk::Unlock, FingerAsk::ListVaults]
+        );
+
+        // A held bound token (here a delete's, which saw no touch) on a
+        // strict key: renewed once, then the unbound token.
+        let mut key = FakeKey::with_fingerprint();
+        key.strict_listing = true;
+        key.add_vault("Personal", &two_entries());
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        auth.fresh_token(&mut key, LBW, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let creds = listed(&mut key, &mut auth);
+        assert_eq!(creds.len(), 1);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [FingerAsk::Unlock, FingerAsk::Again, FingerAsk::ListVaults]
+        );
+    }
+
+    /// Unlock with the key refusing the second finger it is asked for.
+    fn unlock_with_second_refused(
+        key: &mut FakeKey,
+        auth: &mut VaultAuth,
+        steps: &mut Vec<VaultStep>,
+    ) -> Result<super::super::Unlocked, VaultKeyError> {
+        // The fake pops one scripted refusal per request, so the refusal is
+        // scripted only once the first request has been given its token.
+        struct Second<'a>(&'a mut FakeKey, usize);
+        impl VaultKey for Second<'_> {
+            fn info(&self) -> &keyroost_ctap::AuthenticatorInfo {
+                self.0.info()
+            }
+            fn pin_token(
+                &mut self,
+                pin: &str,
+                permissions: u32,
+                rp_id: Option<&str>,
+            ) -> Result<keyroost_ctap::client_pin::PinUvAuthToken, CtapError> {
+                self.0.pin_token(pin, permissions, rp_id)
+            }
+            fn uv_token(
+                &mut self,
+                permissions: u32,
+                rp_id: Option<&str>,
+                on_finger: &mut dyn FnMut(),
+            ) -> Result<keyroost_ctap::client_pin::PinUvAuthToken, CtapError> {
+                self.1 += 1;
+                if self.1 == 2 {
+                    self.0.uv_refusals.push_back(0x3F);
+                }
+                self.0.uv_token(permissions, rp_id, on_finger)
+            }
+            fn make_credential(
+                &mut self,
+                token: &keyroost_ctap::client_pin::PinUvAuthToken,
+                user_id: &[u8],
+                name: &str,
+            ) -> Result<keyroost_ctap::make_credential::MadeCredential, CtapError> {
+                self.0.make_credential(token, user_id, name)
+            }
+            fn assertions(
+                &mut self,
+                token: &keyroost_ctap::client_pin::PinUvAuthToken,
+                allow: Option<&[u8]>,
+            ) -> Result<Vec<keyroost_ctap::get_assertion::Assertion>, CtapError> {
+                self.0.assertions(token, allow)
+            }
+            fn credentials(
+                &mut self,
+                token: &keyroost_ctap::client_pin::PinUvAuthToken,
+            ) -> Result<Vec<VaultCredential>, CtapError> {
+                self.0.credentials(token)
+            }
+            fn delete_credential(
+                &mut self,
+                token: &keyroost_ctap::client_pin::PinUvAuthToken,
+                credential_id: &[u8],
+            ) -> Result<(), CtapError> {
+                self.0.delete_credential(token, credential_id)
+            }
+            fn read_blobs(&mut self) -> Result<LargeBlobArray, CtapError> {
+                self.0.read_blobs()
+            }
+            fn write_blobs(
+                &mut self,
+                token: &keyroost_ctap::client_pin::PinUvAuthToken,
+                serialized: &[u8],
+            ) -> Result<(), CtapError> {
+                self.0.write_blobs(token, serialized)
+            }
+        }
+        unlock(&mut Second(key, 0), auth, &mut |s| steps.push(s))
+    }
+
+    /// The PIN path keeps its own tokens: each step asks for what it needs,
+    /// with no rpId for credential management.
+    #[test]
+    fn a_pin_command_takes_its_tokens_as_before() {
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &two_entries());
+        run_command(&mut key, &mut pin(), Command::Rotate);
+        let tokens: Vec<Call> = key
+            .log
+            .into_iter()
+            .filter(|c| matches!(c, Call::Token { .. }))
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                token(CM | LBW, None),
+                token(GA | LBW, Some(RP_ID)),
+                token(MC, Some(RP_ID)),
+                token(GA | LBW, Some(RP_ID)),
+                token(CM, None),
+            ]
+        );
+    }
+
+    /// A held fingerprint token the key refuses at a touch (here another
+    /// token replaced it while a question waited) is renewed once, asking
+    /// again and saying why; the touch is reported once.
+    #[test]
+    fn a_stale_held_token_at_a_touch_asks_again_once() {
+        let mut key = FakeKey::with_fingerprint();
+        key.credmgmt_without_lbk = true;
+        let id = key.add_vault("Personal", &two_entries());
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        let creds = listed(&mut key, &mut auth);
+        key.pin_token(FakeKey::PIN, LBW, None).unwrap();
+        let mut steps = Vec::new();
+        delete(&mut key, &mut auth, &creds[0], &mut |s| steps.push(s))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(steps, vec![VaultStep::UnlockTouch]);
+        assert_eq!(
+            key.log
+                .iter()
+                .filter(|c| matches!(c, Call::Assertions(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [FingerAsk::Unlock, FingerAsk::Again, FingerAsk::Unlock],
+            "the listing, the renewal, the delete after the touch"
+        );
+        assert!(!key.creds.iter().any(|c| c.id == id));
+
+        // Refused again: no third token.
+        let mut key = FakeKey::with_fingerprint();
+        key.credmgmt_without_lbk = true;
+        key.add_vault("Personal", &two_entries());
+        let (asked, ask) = asks();
+        let mut auth = VaultAuth::fingerprint(ask);
+        listed(&mut key, &mut auth);
+        key.pin_token(FakeKey::PIN, LBW, None).unwrap();
+        let stale = Arc::new(Mutex::new(0));
+        let count = Arc::clone(&stale);
+        let r = auth.with_touch(
+            &mut key,
+            GA | LBW,
+            VaultStep::UnlockTouch,
+            &mut |_| {},
+            |_, _| -> Result<(), CtapError> {
+                *count.lock().unwrap() += 1;
+                Err(CtapError::StatusCode(0x33))
+            },
+        );
+        assert!(
+            matches!(r, Err(VaultKeyError::Ctap(CtapError::StatusCode(0x33)))),
+            "{r:?}"
+        );
+        assert_eq!(*stale.lock().unwrap(), 2, "one retry");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [FingerAsk::Unlock, FingerAsk::Again]
+        );
     }
 }
