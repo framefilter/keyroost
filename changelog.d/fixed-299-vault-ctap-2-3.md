@@ -6,4 +6,4 @@
   fingerprint ("This key needs a second fingerprint to list its vaults").
   A key that lists `FIDO_2_3` or a later 2.x now gets the unbound token
   CTAP 2.3 lists under from the start. Checked against scripted keys, not
-  yet on a fingerprint key. ([#0])
+  yet on a fingerprint key. ([#299])
