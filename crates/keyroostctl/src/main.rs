@@ -455,17 +455,6 @@ impl CliPivMgmtAlg {
             CliPivMgmtAlg::Aes256 => Aes256,
         }
     }
-
-    /// The compatibility tables' name for this algorithm.
-    fn to_choice(self) -> keyroost_piv::compat::MgmtAlgChoice {
-        use keyroost_piv::compat::MgmtAlgChoice::*;
-        match self {
-            CliPivMgmtAlg::TripleDes => TripleDes,
-            CliPivMgmtAlg::Aes128 => Aes128,
-            CliPivMgmtAlg::Aes192 => Aes192,
-            CliPivMgmtAlg::Aes256 => Aes256,
-        }
-    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -11590,19 +11579,6 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         keyroost_piv::compat::PivExtension::SetManagementKey,
                         *force,
                     )?;
-                    // The algorithm too, as the app's algorithm list does: one
-                    // the list marks unsupported on this key (a CanoKey 3.1
-                    // takes only AES-192) is refused here, before anything is
-                    // sent, unless --force. Unverified algorithms run without
-                    // a second note; the line above already covers the key.
-                    let alg_extension = keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm(
-                        algorithm.to_choice(),
-                    );
-                    if s.feature_gate(alg_extension)
-                        == keyroost_piv::compat::FeatureGate::Unsupported
-                    {
-                        guard_piv_feature(s, alg_extension, *force)?;
-                    }
                     let pin_unlock_gate =
                         s.feature_gate(keyroost_piv::compat::PivExtension::PinManagementAuth);
                     // Whether to run the PIN-protected-storage maintenance step
@@ -16455,7 +16431,6 @@ fn ctap2_json(info: &keyroost_ctap::AuthenticatorInfo) -> json_out::Ctap2InfoJso
         transports: info.transports.clone(),
         min_pin_length: info.min_pin_length,
         force_pin_change: info.force_pin_change,
-        long_touch_for_reset: info.long_touch_for_reset,
         firmware_version: info.firmware_version,
     }
 }
@@ -16638,9 +16613,6 @@ fn fido_info_rows(info: &keyroost_ctap::AuthenticatorInfo) -> Vec<(&'static str,
     }
     if info.force_pin_change == Some(true) {
         rows.push(("Force PIN change", "yes".to_owned()));
-    }
-    if info.long_touch_for_reset == Some(true) {
-        rows.push(("Reset", "needs a long touch".to_owned()));
     }
     if let Some(v) = info.firmware_version {
         rows.push(("CTAP firmware version", v.to_string()));
@@ -17790,10 +17762,6 @@ fn cose_algorithm_name(alg: i64) -> &'static str {
     match alg {
         -7 => "ES256",
         -8 => "EdDSA",
-        -47 => "ES256K",
-        -48 => "ML-DSA-44",
-        -49 => "ML-DSA-65",
-        -50 => "ML-DSA-87",
         -35 => "ES384",
         -36 => "ES512",
         -257 => "RS256",
@@ -27836,7 +27804,6 @@ mod cli_tests {
                 transports: vec!["usb".into()],
                 min_pin_length: Some(4),
                 force_pin_change: Some(false),
-                long_touch_for_reset: None,
                 firmware_version: Some(328706),
             }),
             metadata: None,
@@ -29927,36 +29894,8 @@ mod feitian_tests {
 }
 
 #[cfg(test)]
-mod cose_names {
-    use super::cose_algorithm_name;
-
-    #[test]
-    fn the_registered_post_quantum_and_k256_algorithms_are_named() {
-        assert_eq!(cose_algorithm_name(-7), "ES256");
-        assert_eq!(cose_algorithm_name(-47), "ES256K");
-        assert_eq!(cose_algorithm_name(-48), "ML-DSA-44");
-        assert_eq!(cose_algorithm_name(-49), "ML-DSA-65");
-        assert_eq!(cose_algorithm_name(-50), "ML-DSA-87");
-        // CanoKey's SM2 uses an unregistered, configurable ID.
-        assert_eq!(cose_algorithm_name(-54), "unknown");
-    }
-}
-
-#[cfg(test)]
 mod canokey_resets {
-    use super::{canokey_factory_reset_action, refuse_canokey_reader_reset, CliPivMgmtAlg};
-
-    #[test]
-    fn each_cli_management_key_algorithm_is_gated_under_its_own_name() {
-        for alg in [
-            CliPivMgmtAlg::TripleDes,
-            CliPivMgmtAlg::Aes128,
-            CliPivMgmtAlg::Aes192,
-            CliPivMgmtAlg::Aes256,
-        ] {
-            assert_eq!(alg.to_choice().to_mgmt_alg(), Some(alg.to_alg()));
-        }
-    }
+    use super::{canokey_factory_reset_action, refuse_canokey_reader_reset};
 
     #[test]
     fn the_factory_reset_question_says_whether_the_admin_pin_is_blocked_yet() {
