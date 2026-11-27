@@ -144,7 +144,7 @@ pub fn write_private_file(
 
 /// Non-Unix fallback: a new file is created exclusively; an agreed
 /// overwrite goes through a temp file renamed over the old one
-/// ([`replace_via_temp`]), so a failed write never leaves the old file
+/// (`replace_via_temp`), so a failed write never leaves the old file
 /// truncated. Windows ACL hardening is out of scope for this helper.
 #[cfg(not(unix))]
 pub fn write_private_file(
