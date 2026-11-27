@@ -158,7 +158,8 @@ pub struct Unlocked {
 /// (every key that passes the check has it): with none, the result is an
 /// empty list after one read of the largeBlob array, and no touch is asked
 /// for. Otherwise one token (getAssertion and largeBlobWrite, bound to the
-/// vault RP), a [`VaultStep::UnlockTouch`], one getAssertion over every
+/// vault RP; a fingerprint's listing token covers it, so one finger serves
+/// both), a [`VaultStep::UnlockTouch`], one getAssertion over every
 /// vault credential and one read of the largeBlob array. A vault the key
 /// gives no secret for, or whose data does not open, is listed with its
 /// [`VaultProblem`]; the others open regardless.
@@ -1988,6 +1989,11 @@ mod tests {
     use keyroost_ctap::client_pin::{FingerAsk, Verified};
     use keyroost_ctap::FingerprintError;
 
+    use keyroost_ctap::client_pin::permissions::MAKE_CREDENTIAL as MC;
+
+    /// What one fingerprint token carries in a vault flow.
+    const FINGER: u32 = CM | GA | MC | LBW;
+
     fn no_pin_token(key: &FakeKey) -> bool {
         key.log.iter().all(|c| !matches!(c, Call::Token { .. }))
     }
@@ -2007,27 +2013,22 @@ mod tests {
         let u = r.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(steps, vec![VaultStep::UnlockTouch]);
         assert!(no_pin_token(&key), "{:?}", key.log);
+        // One token for the listing and the touch: every permission a
+        // vault step needs, bound to the vault RP.
         assert_eq!(
             key.log,
             vec![
                 Call::UvToken {
-                    perms: CM | LBW,
-                    rp: None
-                },
-                Call::Credentials,
-                Call::UvToken {
-                    perms: GA | LBW,
+                    perms: FINGER,
                     rp: Some(RP_ID.into())
                 },
+                Call::Credentials,
                 Call::Assertions(None),
                 Call::Read,
             ]
         );
-        assert_eq!(
-            *asked.lock().unwrap(),
-            [FingerAsk::Unlock, FingerAsk::Unlock]
-        );
-        assert_eq!(key.fingers, 2);
+        assert_eq!(*asked.lock().unwrap(), [FingerAsk::Unlock]);
+        assert_eq!(key.fingers, 1);
         // The same hmac-secret whichever way the token came, so the vault
         // a PIN unlock sealed opens.
         assert_eq!(opened(&u.vaults[0]).contents, personal);
@@ -2055,8 +2056,8 @@ mod tests {
                 Call::Read,
                 Call::Write,
                 Call::UvToken {
-                    perms: LBW,
-                    rp: None
+                    perms: FINGER,
+                    rp: Some(RP_ID.into())
                 },
                 Call::Read,
                 Call::Write,
@@ -2065,7 +2066,7 @@ mod tests {
         assert_eq!(steps, vec![VaultStep::Write, VaultStep::Write]);
         assert_eq!(
             *asked.lock().unwrap(),
-            [FingerAsk::Unlock, FingerAsk::Unlock, FingerAsk::Again]
+            [FingerAsk::Unlock, FingerAsk::Again]
         );
         assert!(no_pin_token(&key));
         assert_eq!(key.vault_on_key(&id), Some(Vault { entries: vec![a] }));
@@ -2085,18 +2086,21 @@ mod tests {
         key.log.clear();
         run(&mut key, &mut auth).0.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
-            key.log[..2],
+            key.log,
             [
                 Call::Credentials,
                 Call::UvToken {
-                    perms: CM | LBW,
-                    rp: None
-                }
+                    perms: FINGER,
+                    rp: Some(RP_ID.into())
+                },
+                Call::Credentials,
+                Call::Assertions(None),
+                Call::Read,
             ]
         );
         assert_eq!(
             *asked.lock().unwrap(),
-            [FingerAsk::Unlock, FingerAsk::Again, FingerAsk::Unlock]
+            [FingerAsk::Unlock, FingerAsk::Again]
         );
     }
 
@@ -2137,8 +2141,8 @@ mod tests {
             key.log[..3],
             [
                 Call::UvToken {
-                    perms: CM | LBW,
-                    rp: None
+                    perms: FINGER,
+                    rp: Some(RP_ID.into())
                 },
                 Call::Token {
                     perms: CM | LBW,

@@ -8,7 +8,12 @@
 //! the permission a call needs, a successful makeCredential or
 //! getAssertion leaves the token only its largeBlobWrite permission (CTAP
 //! 2.1 `clearPinUvAuthTokenPermissionsExceptLbw`), and a write larger than
-//! the store is refused. A key made [`FakeKey::with_fingerprint`] also gives
+//! the store is refused. A token bound to a relying party (its permissions
+//! RP ID) serves only that RP: credential management of the vault RP's
+//! credentials, and makeCredential / getAssertion for it, are refused under a
+//! token bound to another RP, and a token with none is bound to the vault RP
+//! by its first makeCredential or getAssertion; largeBlobWrite ignores the RP
+//! (CTAP 2.1 §6.5.5.7, §6.8.4, §6.8.5). A key made [`FakeKey::with_fingerprint`] also gives
 //! tokens for a finger, with scripted refusals and tries left, and can drop
 //! a token entirely after a touch, as some keys do.
 //!
@@ -29,7 +34,7 @@ use keyroost_ctap::get_assertion::Assertion;
 use keyroost_ctap::large_blobs::{empty_array_serialized, LargeBlobArray};
 use keyroost_ctap::make_credential::MadeCredential;
 use keyroost_ctap::{AuthenticatorInfo, CtapError, FingerprintError};
-use keyroost_vault::{open, seal, user_handle, Vault};
+use keyroost_vault::{open, seal, user_handle, Vault, RP_ID};
 use zeroize::Zeroizing;
 
 use super::{vault_name, StoredData, VaultCredential, VaultKey, VaultRef};
@@ -105,6 +110,29 @@ pub enum Call {
     Write,
 }
 
+/// A token the key issued.
+struct Issued {
+    bytes: Vec<u8>,
+    perms: u32,
+    /// Its permissions RP ID: the `rpId` it was asked for with, or the RP
+    /// of its first makeCredential or getAssertion.
+    rp: Option<String>,
+}
+
+/// What a call asks of the token's permissions RP ID (CTAP 2.1).
+#[derive(Clone, Copy)]
+enum RpUse {
+    /// largeBlobWrite: the RP is ignored.
+    Ignored,
+    /// Credential management of the vault RP's credentials (enumerating
+    /// them, deleting one): a token bound to another RP is refused.
+    VaultCredentials,
+    /// makeCredential / getAssertion for the vault RP: a token bound to
+    /// another RP is refused, and one bound to none is bound to the vault
+    /// RP.
+    VaultRequest,
+}
+
 /// Run once, between the `n`th `Read` (counting from 1) and whatever comes
 /// next: another writer changing the store under the flow.
 pub type Hook = Box<dyn FnOnce(&mut FakeKey)>;
@@ -152,8 +180,8 @@ pub struct FakeKey {
     pub fingers: usize,
     /// The serialized array with its checksum.
     stored: Vec<u8>,
-    /// Every token issued: its bytes and permissions.
-    issued: Vec<(Vec<u8>, u32)>,
+    /// Every token issued: its bytes, permissions and permissions RP ID.
+    issued: Vec<Issued>,
     /// The bytes of the one token the key accepts now.
     current: Option<Vec<u8>>,
     reads: usize,
@@ -339,22 +367,48 @@ impl FakeKey {
 
     // ----- token checks -----
 
+    fn issued_mut(&mut self, token: &PinUvAuthToken) -> Option<&mut Issued> {
+        self.issued.iter_mut().find(|i| i.bytes == token.token)
+    }
+
     /// The permissions of `token` when the key issued it, else 0.
     fn perms_of(&self, token: &PinUvAuthToken) -> u32 {
         self.issued
             .iter()
-            .find(|(t, _)| *t == token.token)
-            .map_or(0, |(_, p)| *p)
+            .find(|i| i.bytes == token.token)
+            .map_or(0, |i| i.perms)
     }
 
-    /// Accept `token` for a call needing `needed`: it must be the current
-    /// token and carry the permission.
-    fn check(&self, token: &PinUvAuthToken, needed: u32) -> Result<(), CtapError> {
+    /// The permissions RP ID of `token`, when the key issued it with one or
+    /// has bound it since.
+    pub fn rp_of(&self, token: &PinUvAuthToken) -> Option<String> {
+        self.issued
+            .iter()
+            .find(|i| i.bytes == token.token)
+            .and_then(|i| i.rp.clone())
+    }
+
+    /// Accept `token` for a call needing `needed` as `rp` says: it must be
+    /// the current token, carry the permission, and be bound to no RP or to
+    /// the vault RP where the call is about the vault RP (then a
+    /// makeCredential or getAssertion binds an unbound one).
+    fn check(&mut self, token: &PinUvAuthToken, needed: u32, rp: RpUse) -> Result<(), CtapError> {
+        let refused = Err(CtapError::StatusCode(PIN_AUTH_INVALID));
         let current = self.current.as_deref() == Some(&token.token[..]);
-        if current && self.perms_of(token) & needed == needed {
-            Ok(())
-        } else {
-            Err(CtapError::StatusCode(PIN_AUTH_INVALID))
+        if !current || self.perms_of(token) & needed != needed {
+            return refused;
+        }
+        let Some(issued) = self.issued_mut(token) else {
+            return refused;
+        };
+        match (rp, issued.rp.as_deref()) {
+            (RpUse::Ignored, _) | (_, Some(RP_ID)) => Ok(()),
+            (RpUse::VaultCredentials, None) => Ok(()),
+            (RpUse::VaultRequest, None) => {
+                issued.rp = Some(RP_ID.to_owned());
+                Ok(())
+            }
+            (_, Some(_)) => refused,
         }
     }
 
@@ -368,16 +422,21 @@ impl FakeKey {
         } else {
             LARGE_BLOB_WRITE
         };
-        if let Some((_, perms)) = self.issued.iter_mut().find(|(t, _)| *t == token.token) {
-            *perms &= keep;
+        if let Some(issued) = self.issued_mut(token) {
+            issued.perms &= keep;
         }
     }
 
-    /// Issue a new token with `permissions`; it invalidates the old one.
-    fn issue(&mut self, permissions: u32) -> PinUvAuthToken {
+    /// Issue a new token with `permissions`, bound to `rp_id` when given;
+    /// it invalidates the old one.
+    fn issue(&mut self, permissions: u32, rp_id: Option<&str>) -> PinUvAuthToken {
         let mut bytes = vec![0x70; 32];
         bytes[0] = self.issued.len() as u8;
-        self.issued.push((bytes.clone(), permissions));
+        self.issued.push(Issued {
+            bytes: bytes.clone(),
+            perms: permissions,
+            rp: rp_id.map(str::to_owned),
+        });
         self.current = Some(bytes.clone());
         PinUvAuthToken {
             protocol: 2,
@@ -410,7 +469,7 @@ impl VaultKey for FakeKey {
         if pin != Self::PIN {
             return Err(CtapError::StatusCode(PIN_INVALID));
         }
-        Ok(self.issue(permissions))
+        Ok(self.issue(permissions, rp_id))
     }
 
     /// The rules `get_token` follows for a fingerprint: what getInfo rules
@@ -443,7 +502,7 @@ impl VaultKey for FakeKey {
                 None => Err(CtapError::StatusCode(code)),
             };
         }
-        Ok(self.issue(permissions))
+        Ok(self.issue(permissions, rp_id))
     }
 
     fn make_credential(
@@ -453,7 +512,7 @@ impl VaultKey for FakeKey {
         name: &str,
     ) -> Result<MadeCredential, CtapError> {
         self.log.push(Call::MakeCredential);
-        self.check(token, MAKE_CREDENTIAL)?;
+        self.check(token, MAKE_CREDENTIAL, RpUse::VaultRequest)?;
         let id = self.add_credential(user_id.to_vec(), Some(name));
         if self.mc_without_lbk {
             self.creds.last_mut().expect("just added").lbk = None;
@@ -472,7 +531,7 @@ impl VaultKey for FakeKey {
         allow: Option<&[u8]>,
     ) -> Result<Vec<Assertion>, CtapError> {
         self.log.push(Call::Assertions(allow.map(<[u8]>::to_vec)));
-        self.check(token, GET_ASSERTION)?;
+        self.check(token, GET_ASSERTION, RpUse::VaultRequest)?;
         let matching: Vec<&FakeCred> = self
             .creds
             .iter()
@@ -501,7 +560,7 @@ impl VaultKey for FakeKey {
 
     fn credentials(&mut self, token: &PinUvAuthToken) -> Result<Vec<VaultCredential>, CtapError> {
         self.log.push(Call::Credentials);
-        self.check(token, CREDENTIAL_MANAGEMENT)?;
+        self.check(token, CREDENTIAL_MANAGEMENT, RpUse::VaultCredentials)?;
         Ok(self
             .creds
             .iter()
@@ -529,7 +588,7 @@ impl VaultKey for FakeKey {
         if let Some(code) = self.delete_refusals.pop_front() {
             return Err(CtapError::StatusCode(code));
         }
-        self.check(token, CREDENTIAL_MANAGEMENT)?;
+        self.check(token, CREDENTIAL_MANAGEMENT, RpUse::VaultCredentials)?;
         if self.delete_fails {
             return Err(CtapError::StatusCode(NOT_ALLOWED));
         }
@@ -558,7 +617,7 @@ impl VaultKey for FakeKey {
         if let Some(code) = self.write_refusals.pop_front() {
             return Err(CtapError::StatusCode(code));
         }
-        self.check(token, LARGE_BLOB_WRITE)?;
+        self.check(token, LARGE_BLOB_WRITE, RpUse::Ignored)?;
         let max = self.info.max_serialized_large_blob_array.unwrap_or(1024);
         if serialized.len() as u64 > max {
             return Err(CtapError::StatusCode(STORAGE_FULL));
@@ -905,16 +964,70 @@ mod tests {
         ));
 
         let t = key
-            .uv_token(CREDENTIAL_MANAGEMENT, Some("example.com"), &mut || {})
+            .uv_token(CREDENTIAL_MANAGEMENT, Some(RP_ID), &mut || {})
             .unwrap();
         assert_eq!(
             key.log.last(),
             Some(&Call::UvToken {
                 perms: CREDENTIAL_MANAGEMENT,
-                rp: Some("example.com".into())
+                rp: Some(RP_ID.into())
             })
         );
         assert!(key.credentials(&t).is_ok());
+        assert_eq!(key.rp_of(&t).as_deref(), Some(RP_ID));
+    }
+
+    /// CTAP 2.1: a token's permissions RP ID limits credential management to
+    /// that RP's credentials (6.8.4 enumerateCredentialsBegin, 6.8.5
+    /// deleteCredential) and makeCredential / getAssertion to that RP; the
+    /// largeBlob write ignores it, and a token with none is bound by its
+    /// first makeCredential or getAssertion.
+    #[test]
+    fn a_token_bound_to_an_rp_serves_only_that_rp() {
+        let all = CREDENTIAL_MANAGEMENT | GET_ASSERTION | MAKE_CREDENTIAL | LARGE_BLOB_WRITE;
+        let refused =
+            |r: Result<(), CtapError>| matches!(r, Err(CtapError::StatusCode(PIN_AUTH_INVALID)));
+        let bytes = FakeKey::new().stored().to_vec();
+        for fingerprint in [false, true] {
+            let mut key = FakeKey::with_fingerprint();
+            let id = key.add_vault("Personal", &Vault::default());
+            let bound = |key: &mut FakeKey, rp| {
+                if fingerprint {
+                    key.uv_token(all, rp, &mut || {}).unwrap()
+                } else {
+                    key.pin_token(FakeKey::PIN, all, rp).unwrap()
+                }
+            };
+
+            let other = bound(&mut key, Some("example.com"));
+            assert!(refused(key.credentials(&other).map(drop)));
+            assert!(refused(key.delete_credential(&other, &id)));
+            assert!(refused(key.assertions(&other, None).map(drop)));
+            assert!(refused(
+                key.make_credential(&other, &user_handle("W").unwrap(), "W")
+                    .map(drop)
+            ));
+            key.write_blobs(&other, &bytes).unwrap();
+            assert_eq!(key.creds.len(), 1, "nothing made or deleted");
+
+            let vault = bound(&mut key, Some(RP_ID));
+            assert_eq!(key.credentials(&vault).unwrap().len(), 1);
+            let made = key
+                .make_credential(&vault, &user_handle("W").unwrap(), "W")
+                .unwrap();
+            let vault = bound(&mut key, Some(RP_ID));
+            assert_eq!(key.assertions(&vault, None).unwrap().len(), 2);
+            let vault = bound(&mut key, Some(RP_ID));
+            key.delete_credential(&vault, &made.credential_id).unwrap();
+
+            // No RP: credential management of the vault RP serves, and the
+            // first getAssertion binds it to the vault RP.
+            let unbound = bound(&mut key, None);
+            assert_eq!(key.rp_of(&unbound), None);
+            assert_eq!(key.credentials(&unbound).unwrap().len(), 1);
+            assert_eq!(key.assertions(&unbound, None).unwrap().len(), 1);
+            assert_eq!(key.rp_of(&unbound).as_deref(), Some(RP_ID));
+        }
     }
 
     #[test]

@@ -218,3 +218,73 @@ impl<T: CtapTransport> VaultKey for CtapVaultKey<T> {
         large_blobs::write(&mut self.dev, &self.info, token, serialized)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keyroost_ctap::cbor::{self, Value};
+    use keyroost_ctap::cred_mgmt::CTAP2_CREDENTIAL_MANAGEMENT;
+
+    /// Records every credential-management request and answers each with
+    /// CTAP2_ERR_NO_CREDENTIALS.
+    struct Recorder(Vec<Vec<u8>>);
+
+    impl CtapTransport for Recorder {
+        fn transact(&mut self, _cmd: u8, payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            self.0.push(payload.to_vec());
+            Ok(vec![0x2E])
+        }
+    }
+
+    /// A request's subCommand and subCommandParams.
+    fn sub_command(payload: &[u8]) -> (u64, Option<Value>) {
+        assert_eq!(payload[0], CTAP2_CREDENTIAL_MANAGEMENT);
+        let (Value::Map(entries), _) = cbor::decode(&payload[1..]).unwrap() else {
+            panic!("a map");
+        };
+        let field = |k| {
+            entries
+                .iter()
+                .find(|(key, _)| *key == Value::UInt(k))
+                .map(|(_, v)| v.clone())
+        };
+        let Some(Value::UInt(sub)) = field(1) else {
+            panic!("a subCommand");
+        };
+        (sub, field(2))
+    }
+
+    /// Credential management in the vault flows only ever names the vault
+    /// RP: enumerateCredentialsBegin with its rpIdHash and deleteCredential,
+    /// never getCredsMetadata or enumerateRPs, which CTAP 2.1 refuses under a
+    /// token bound to an RP (6.8.2, 6.8.3). So a fingerprint token bound to
+    /// the vault RP serves every credential-management step a flow takes.
+    #[test]
+    fn credential_management_names_only_the_vault_rp() {
+        let info = AuthenticatorInfo {
+            options: vec![("credMgmt".into(), true)],
+            ..AuthenticatorInfo::default()
+        };
+        let mut key = CtapVaultKey {
+            dev: Recorder(Vec::new()),
+            info,
+        };
+        let token = PinUvAuthToken {
+            protocol: 2,
+            token: vec![7; 32],
+        };
+        assert!(key.credentials(&token).unwrap().is_empty());
+        let _ = key.delete_credential(&token, &[1, 2, 3]);
+        let sent = &key.dev.0;
+        assert_eq!(sent.len(), 2);
+        let rp_hash = keyroost_proto::sha256::sha256(RP_ID.as_bytes()).to_vec();
+        assert_eq!(
+            sub_command(&sent[0]),
+            (
+                0x04,
+                Some(Value::Map(vec![(Value::UInt(1), Value::Bytes(rp_hash))]))
+            )
+        );
+        assert_eq!(sub_command(&sent[1]).0, 0x06);
+    }
+}

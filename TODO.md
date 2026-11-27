@@ -128,13 +128,22 @@ items marked *(no hardware)* need a device the maintainer does not have.
 
   Fingers asked for under `--unlock fingerprint` (each token is its own
   finger; compare against the key): every non-vault command 1 (`credential
-  compare` 1 per key). `fido vault list`, `export` and the `entry` commands
-  2, then the touch (1 and no touch on a key with no vault); `add` 3 and two
-  touches; `delete` 1; `rotate` 5 and three touches; `import` 2 into a vault
-  on the key (`--dry-run` too), 4 into a new one. A key that clears the token
-  after the touch adds 1 ("asked again") to `entry add|edit|delete`, `add`,
-  `rotate` and `import`. The app's Vault tab unlock is
-  `vault list`'s 2. Then drop "experimental" from `--unlock`'s help
+  compare` 1 per key). A vault command takes one token carrying every
+  permission its steps use (`cm`, `ga`, `mc`, `lbw`), bound to the vault RP
+  `fido2-vault.token2`, and reuses it until a touch of the key leaves it only
+  `lbw` (CTAP 2.1): `fido vault list`, `export`, the `entry` commands,
+  `delete` and `import` into a vault on the key (`--dry-run` too) 1, then
+  their touch (no touch on a key with no vault); `add` and `import` into a
+  new vault 2 and two touches; `rotate` 4 and three touches. A key that
+  clears the token after the touch adds 1 ("asked again") to `entry
+  add|edit|delete`, `add` and `import`. The app's Vault tab: unlock 1, save
+  none, create 2, rotate 3, delete 1. Confirm on the key that it takes the
+  RP-bound token for credential management of the vault RP
+  (enumerateCredentialsBegin with its rpIdHash, deleteCredential), as CTAP
+  2.1 §6.8.4 and §6.8.5 allow; CTAP 2.2's §6.8.4 asks for a token with no RP
+  for enumerateCredentialsBegin, so a key that follows that text would
+  refuse the listing (0x33) and every fingerprint vault command would fail
+  after its first finger. Then drop "experimental" from `--unlock`'s help
   (`FIDO_UNLOCK_HELP`), the README, `docs/fido2.html`, `docs/vault.html` and
   the app (`vault_pane::fingerprint_experimental_note`).
 

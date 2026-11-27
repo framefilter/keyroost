@@ -11035,6 +11035,52 @@ mod tests {
         );
     }
 
+    /// A fingerprint session asks for the finger once per job, and again
+    /// only where a touch of the key ended what that token allows: the
+    /// unlock 1 (its listing and its touch share the token), a save none, a
+    /// create 2, a rotate 3, a vault delete 1 (none when the token it would
+    /// take is still held untouched).
+    #[test]
+    fn a_fingerprint_session_asks_for_the_finger_once_per_job() {
+        let mut key = FakeKey::with_fingerprint();
+        two_vaults(&mut key);
+        let mut app = finger_app();
+        let seen = finger_unlock_into(&mut app, &mut key);
+        assert_eq!(key.fingers, 1);
+        assert_eq!(
+            seen,
+            vec![unlock_prompt(), Some("Touch your key\u{2026}".to_owned())]
+        );
+        let check = |app: &App, key: &FakeKey, fingers: usize, job: &str| {
+            assert!(app.vault.error.is_none(), "{job}: {:?}", app.vault.error);
+            assert!(app.vault.info.is_some(), "{job}: done");
+            assert_eq!(key.fingers, fingers, "{job}");
+        };
+        add_into(&mut app, &mut key, "Saved");
+        check(&app, &key, 1, "save");
+        create_into(&mut app, &mut key, "Travel");
+        check(&app, &key, 3, "create");
+        app.vault_ask_rotate();
+        rotate_into(&mut app, &mut key);
+        check(&app, &key, 6, "rotate");
+        // The rotate's last token (for the old credential's delete) saw no
+        // touch, so it still serves a vault delete.
+        app.vault_ask_delete_vault();
+        delete_vault_into(&mut app, &mut key);
+        check(&app, &key, 6, "delete after a rotate");
+        assert!(!key.log.iter().any(|c| matches!(c, Call::Token { .. })));
+
+        // Right after an unlock (whose touch left the token only the
+        // write), a delete takes one finger.
+        let mut key = FakeKey::with_fingerprint();
+        two_vaults(&mut key);
+        let mut app = finger_app();
+        finger_unlock_into(&mut app, &mut key);
+        app.vault_ask_delete_vault();
+        delete_vault_into(&mut app, &mut key);
+        check(&app, &key, 2, "delete");
+    }
+
     /// The key refuses the session's token and the one it gave after the
     /// finger was asked again: the vault locks in the finger's words, never
     /// the PIN's, and the FIDO2 tab's PIN session stays. A PIN session
