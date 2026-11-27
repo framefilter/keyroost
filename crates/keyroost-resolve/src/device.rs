@@ -1876,6 +1876,14 @@ pub enum ResetStep {
     /// way [`Self::Fido`] always stays last regardless.
     Piv,
     Fido,
+    /// CanoKey's own device-wide factory reset, in place of every other
+    /// step: it wipes FIDO2, OATH, OpenPGP, PIV, NDEF and PASS and restores
+    /// the key's settings and Admin PIN, once the Admin PIN is blocked and
+    /// the key is touched each time it blinks
+    /// (`keyroost_transport::CanoKeyAdminSession::factory_reset`). The only
+    /// step [`factory_reset_plan_for`] plans for a CanoKey on its own USB
+    /// reader ([`crate::canokey::takes_device_reset`]).
+    CanoKey,
 }
 
 impl ResetStep {
@@ -1889,6 +1897,7 @@ impl ResetStep {
             ResetStep::Token2Otp => "OTP",
             ResetStep::FeitianOtp => "FEITIAN-OTP",
             ResetStep::Fido => "FIDO2",
+            ResetStep::CanoKey => "the whole CanoKey",
         }
     }
 }
@@ -1910,6 +1919,17 @@ impl ResetStep {
 /// [`ResetStep::Piv`] is the one other case this doesn't itself resolve:
 /// `Caps::PIV` says the applet is there, not that it can be reset at all — call
 /// [`exclude_unresettable_piv`] once a live fingerprint confirms it can't.
+/// [`factory_reset_plan`] for one device: the plan from its capabilities,
+/// except for a CanoKey on its own USB reader, which takes CanoKey's
+/// device-wide reset as its single step ([`ResetStep::CanoKey`]).
+pub fn factory_reset_plan_for(dev: &Device) -> Vec<ResetStep> {
+    if crate::canokey::takes_device_reset(dev) {
+        vec![ResetStep::CanoKey]
+    } else {
+        factory_reset_plan(dev.caps)
+    }
+}
+
 pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     let mut steps = Vec::new();
     if caps.has(Caps::OATH) {
@@ -4565,6 +4585,40 @@ mod tests {
 
     fn ids_of(devs: &[Device]) -> Vec<&str> {
         devs.iter().map(|d| d.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_canokey_on_its_own_reader_takes_the_device_reset_alone() {
+        let hids = [canokey_hid(
+            "/dev/hidraw3",
+            Some("1A2B3C4D"),
+            Some(1),
+            Some(9),
+        )];
+        let probes = [canokey_reader(Some("1a2b3c4d"), Some(1), Some(9))];
+        let usb = &correlate(&hids, &probes, &Keyring::default())[0];
+        assert!(crate::canokey::takes_device_reset(usb));
+        assert_eq!(factory_reset_plan_for(usb), vec![ResetStep::CanoKey]);
+        // Its FIDO node alone (no reader to reach the Admin applet): the
+        // ordinary plan.
+        let fido_only = &correlate(&hids, &[], &Keyring::default())[0];
+        assert_eq!(factory_reset_plan_for(fido_only), vec![ResetStep::Fido]);
+        // Another key: the ordinary plan.
+        let yk = probe(
+            "Yubico YubiKey OTP+FIDO+CCID 0",
+            false,
+            true,
+            true,
+            true,
+            None,
+            None,
+            None,
+        );
+        let yk = &correlate(&[], &[yk], &Keyring::default())[0];
+        assert_eq!(
+            factory_reset_plan_for(yk),
+            vec![ResetStep::Oath, ResetStep::OpenPgp, ResetStep::Piv]
+        );
     }
 
     /// A CanoKey's FIDO HID node, as its USB descriptor names it.

@@ -1603,6 +1603,10 @@ struct OathState {
     /// the password by design — it is the recovery for a forgotten one — so
     /// this is reachable from the locked view too.
     confirm_reset: Option<DeviceId>,
+    /// The CanoKey Admin PIN typed into the reset confirmation: a CanoKey
+    /// resets OATH through its Admin applet. Wiped on send, on cancel and by
+    /// the idle lock.
+    reset_admin_pin: zeroize::Zeroizing<String>,
     /// The selected key's applet asks for a touch on every delete (a
     /// Nitrokey 3), not only for touch accounts. Learned by the listing.
     delete_asks_touch: bool,
@@ -3069,6 +3073,16 @@ fn factory_reset_confirm_summary(
     if plan.contains(&ResetStep::Fido) {
         msg.push_str("\n\nFinishes with a step to unplug the key, plug it back in, and touch it.");
     }
+    if plan.contains(&ResetStep::CanoKey) {
+        msg = format!(
+            "Factory-reset {model} (serial {serial})?\n\nWipes everything on the key: \
+             every FIDO2 passkey, OATH code, OpenPGP and PIV key, the NDEF message \
+             and both PASS slots, and restores its settings. Every PIN goes back to \
+             its default (the CanoKey Admin PIN to 123456).\n\nThe key's Admin PIN \
+             is blocked first, as the key requires; then touch the key each time it \
+             blinks, five times, within two seconds each."
+        );
+    }
     msg
 }
 
@@ -3556,6 +3570,16 @@ fn run_card_reset_step(
                 s.reset().map_err(|e| e.to_string())?;
             }
             ResetStep::Fido => {}
+            ResetStep::CanoKey => {
+                // The Admin PIN is blocked first, as the key requires; the
+                // key then blinks five times and wants a touch each time.
+                let name = reader.ok_or("no PC/SC reader for the CanoKey")?;
+                let mut admin = keyroost_transport::CanoKeyAdminSession::open_traced(name, false)
+                    .map_err(|e| e.to_string())?;
+                admin.block_pin().map_err(|e| e.to_string())?;
+                KEY_WANTS_TOUCH.store(true, std::sync::atomic::Ordering::Relaxed);
+                admin.factory_reset().map_err(|e| e.to_string())?;
+            }
         }
         Ok(())
     };
@@ -3571,7 +3595,11 @@ fn run_card_reset_step(
 /// (Nitrokey 3); that step raises the touch banner itself once it knows.
 fn factory_reset_busy_label(card_steps: &[keyroost_resolve::ResetStep]) -> &'static str {
     use keyroost_resolve::ResetStep;
-    if card_steps.contains(&ResetStep::Token2Otp) || card_steps.contains(&ResetStep::FeitianOtp) {
+    if card_steps.contains(&ResetStep::CanoKey) {
+        "Factory-resetting key \u{2014} touch the key each time it blinks (five times)\u{2026}"
+    } else if card_steps.contains(&ResetStep::Token2Otp)
+        || card_steps.contains(&ResetStep::FeitianOtp)
+    {
         "Factory-resetting key \u{2014} touch the key if it blinks\u{2026}"
     } else {
         "Factory-resetting key\u{2026}"
@@ -8009,6 +8037,11 @@ impl App {
         if include_vault {
             self.vault_idle_lock();
         }
+        if !self.oath.reset_admin_pin.is_empty() {
+            // The reset confirmation goes, and the Admin PIN typed into it.
+            self.oath.confirm_reset = None;
+            self.oath.reset_admin_pin = Default::default();
+        }
         if self.security_keys.change_pin.has_pin_input() {
             // Replacing the form wipes its PINs (ChangePinDialog's Drop).
             self.security_keys.change_pin = ChangePinDialog::default();
@@ -9688,9 +9721,12 @@ impl App {
             let mut asks = false;
             // The account was written, whatever the re-list after it says.
             let mut wrote = false;
+            let mut starts_at_one = false;
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&name, &password)?;
                 asks = session.asks_touch_to_delete();
+                starts_at_one = oath_type == keyroost_oath::OathType::Hotp
+                    && session.hotp_first_counter(0) != 0;
                 let family =
                     keyroost_import::plan::OathFamily::from_vendor(&vendor, session.version());
                 if family.prefix_issue() {
@@ -9729,6 +9765,12 @@ impl App {
                 }
                 if wrote {
                     app.log(Severity::Ok, "Authenticator account added");
+                    if starts_at_one {
+                        app.log(
+                            Severity::Warn,
+                            keyroost_import::plan::CANOKEY_HOTP_STARTS_AT_ONE,
+                        );
+                    }
                 }
                 if let Some(why) = &refused {
                     app.log(
@@ -10138,6 +10180,12 @@ impl App {
             return;
         }
         let mut decision: Option<bool> = None;
+        let canokey = self
+            .devices
+            .iter()
+            .any(|d| d.id == for_device && d.vendor == keyroost_resolve::canokey::VENDOR);
+        let p = self.palette();
+        let pin = &mut self.oath.reset_admin_pin;
         egui::Window::new("Reset OATH applet?")
             .collapsible(false)
             .resizable(false)
@@ -10147,6 +10195,17 @@ impl App {
                     "Permanently wipe EVERY authenticator credential on this key \
                      and clear its password? This cannot be undone.",
                 );
+                if canokey {
+                    ui.add_space(6.0);
+                    ui.label(
+                        "A CanoKey resets its Authenticator through its Admin applet: \
+                         enter the key's CanoKey Admin PIN (123456 until changed). \
+                         Forgot it? Factory reset, on the Overview tab, resets the \
+                         whole key without it.",
+                    );
+                    ui.add_space(4.0);
+                    pin_field(ui, &p, "Admin PIN", pin);
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if theme::key_egui_button(ui, "Reset applet", waiting.as_deref()).clicked() {
@@ -10160,9 +10219,13 @@ impl App {
         match decision {
             Some(true) => {
                 self.oath.confirm_reset = None;
-                self.reset_oath_applet();
+                let pin = std::mem::take(&mut self.oath.reset_admin_pin);
+                self.reset_oath_applet(canokey.then_some(pin));
             }
-            Some(false) => self.oath.confirm_reset = None,
+            Some(false) => {
+                self.oath.confirm_reset = None;
+                self.oath.reset_admin_pin = Default::default();
+            }
             None => {}
         }
     }
@@ -10171,7 +10234,10 @@ impl App {
     /// unlocking — the applet's RESET requires no password (it is the
     /// recovery path for a forgotten one) — then rebuilds the pane state
     /// from scratch, which now shows an empty, unprotected applet.
-    fn reset_oath_applet(&mut self) {
+    ///
+    /// A CanoKey's OATH applet has no RESET of its own: with `canokey_pin`
+    /// (its Admin PIN) the reset goes through its Admin applet instead.
+    fn reset_oath_applet(&mut self, canokey_pin: Option<zeroize::Zeroizing<String>>) {
         self.oath.error = None;
         let Some(reader) = self.selected_oath_reader() else {
             self.oath.error = Some("no OATH key selected".into());
@@ -10183,6 +10249,12 @@ impl App {
         let label = "Resetting OATH applet\u{2026}";
         self.spawn_job(label, move || {
             let result = (|| -> Result<(), TransportError> {
+                if let Some(pin) = canokey_pin {
+                    let mut admin =
+                        keyroost_transport::CanoKeyAdminSession::open_traced(&reader, false)?;
+                    admin.verify_pin(pin.as_bytes())?;
+                    return admin.reset_applet(keyroost_canokey::Applet::Oath);
+                }
                 let mut session = keyroost_transport::OathSession::open(&reader)?;
                 KEY_WANTS_TOUCH.store(
                     session.asks_touch_to_reset(),
@@ -10239,7 +10311,7 @@ impl App {
             return;
         };
         self.factory_reset_confirm_typed.clear();
-        let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        let plan = keyroost_resolve::factory_reset_plan_for(&dev);
         if !plan.contains(&keyroost_resolve::ResetStep::Piv) {
             self.factory_reset_confirm = Some(FactoryResetConfirmState {
                 for_device: dev.id,
@@ -10333,7 +10405,7 @@ impl App {
         }
         let (summary, fido_replug) = match self.selected_device() {
             Some(dev) => {
-                let mut plan = keyroost_resolve::factory_reset_plan(dev.caps);
+                let mut plan = keyroost_resolve::factory_reset_plan_for(dev);
                 if factory_reset_piv_unresettable(piv_preview) {
                     keyroost_resolve::exclude_unresettable_piv(&mut plan);
                 }
@@ -10646,6 +10718,15 @@ impl App {
                         app.ftotp_tried = false;
                     }
                     ResetStep::Fido => {}
+                    // Everything on the key went: each card pane re-reads.
+                    ResetStep::CanoKey => {
+                        app.oath = OathState::default();
+                        app.oath_tried = false;
+                        app.openpgp = OpenPgpState::default();
+                        app.pgp_tried = false;
+                        app.piv = PivState::default();
+                        app.piv_tried = false;
+                    }
                 }
             }
         }
@@ -10734,7 +10815,7 @@ impl App {
         let Some(dev) = self.selected_device().cloned() else {
             return false;
         };
-        let mut plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        let mut plan = keyroost_resolve::factory_reset_plan_for(&dev);
         let piv_preview = self
             .factory_reset_confirm
             .as_ref()
@@ -21360,7 +21441,7 @@ impl App {
             // its own reset in its pane; a bare ProgToken has no resettable
             // applet, so its plan is empty and no card renders).
             if dev.kind == DeviceKind::Key {
-                let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+                let plan = keyroost_resolve::factory_reset_plan_for(dev);
                 if !plan.is_empty() {
                     ui.add_space(14.0);
                     let mut arm = false;

@@ -168,6 +168,9 @@ pub use oath::OathSession;
 mod feitianotp;
 pub use feitianotp::{FeitianOtpListing, FeitianOtpSession};
 
+mod canokey;
+pub use canokey::{AdminPinState, CanoKeyAdminSession};
+
 mod ctap_pcsc;
 pub use ctap_pcsc::{CtapPcscDevice, WINDOWS_NEEDS_ADMIN};
 
@@ -455,6 +458,33 @@ pub enum TransportError {
     /// or delete a touch-required account, and answers `6982` when none comes
     /// in time. `action` is what was asked ("save the account", ...).
     OathNoTouch { action: &'static str },
+    /// A CanoKey's OATH applet already holds an account of this name: it
+    /// refuses a PUT of one with `6985` rather than overwrite it.
+    OathNameExists,
+    /// A CanoKey's OATH applet stores names and secrets of at most `max`
+    /// bytes (canokey-core `include/oath.h`: `MAX_NAME_LEN`, and
+    /// `MAX_KEY_LEN` less its two type and digits bytes); `what` names which.
+    OathTooLongForCanoKey { what: &'static str, max: usize },
+    /// A CanoKey's OATH applet has no RESET of its own: it is reset through
+    /// the key's Admin applet, with the Admin PIN
+    /// ([`CanoKeyAdminSession::reset_applet`]).
+    OathResetIsCanoKeyAdmin,
+    /// The CanoKey Admin PIN was wrong; it has `tries_remaining` tries left.
+    CanoKeyAdminPinRejected { tries_remaining: u8 },
+    /// The CanoKey Admin PIN is blocked: only a factory reset unblocks it.
+    CanoKeyAdminPinBlocked,
+    /// A CanoKey Admin PIN is 6 to 64 characters.
+    CanoKeyAdminPinLength,
+    /// The command needs the CanoKey Admin PIN verified first.
+    CanoKeyAdminPinNeeded,
+    /// The Admin PIN still reported tries left after every wrong guess a
+    /// factory reset sends to block it.
+    CanoKeyAdminPinWouldNotBlock,
+    /// A CanoKey factory reset got no touch each time the key blinked.
+    CanoKeyResetNoTouch,
+    /// A CanoKey factory reset was refused: the Admin PIN isn't blocked, or
+    /// the key is held to an NFC reader (it resets over USB only).
+    CanoKeyResetNotAllowed,
     /// A Feitian OTP applet response could not be parsed.
     FeitianOtpParse(keyroost_feitianotp::ParseError),
     /// A Feitian OTP command could not be built: the name or secret does not
@@ -843,6 +873,50 @@ impl fmt::Display for TransportError {
                 f,
                 "the key would not {action} (SW=6982); it may want a touch: \
                  try again and touch the key when it blinks"
+            ),
+            TransportError::OathNameExists => write!(
+                f,
+                "an account with this name is already on the key (SW=6985)"
+            ),
+            TransportError::OathTooLongForCanoKey { what, max } => {
+                write!(f, "a CanoKey stores an OATH {what} of at most {max} bytes")
+            }
+            TransportError::OathResetIsCanoKeyAdmin => write!(
+                f,
+                "a CanoKey's OATH applet is reset through its Admin applet, \
+                 with the CanoKey Admin PIN"
+            ),
+            TransportError::CanoKeyAdminPinRejected { tries_remaining } => write!(
+                f,
+                "wrong CanoKey Admin PIN ({tries_remaining} tries left before it blocks)"
+            ),
+            TransportError::CanoKeyAdminPinBlocked => write!(
+                f,
+                "the CanoKey Admin PIN is blocked; only a factory reset \
+                 (`keyroostctl factory-reset`) unblocks it"
+            ),
+            TransportError::CanoKeyAdminPinLength => {
+                write!(f, "a CanoKey Admin PIN is 6 to 64 characters")
+            }
+            TransportError::CanoKeyAdminPinNeeded => {
+                write!(f, "the key asked for its CanoKey Admin PIN first (SW=6982)")
+            }
+            TransportError::CanoKeyAdminPinWouldNotBlock => write!(
+                f,
+                "the CanoKey Admin PIN did not block after the wrong PINs sent \
+                 to block it, so the key was NOT reset"
+            ),
+            TransportError::CanoKeyResetNoTouch => write!(
+                f,
+                "the key was not touched each time it blinked, so it was NOT \
+                 reset (SW=6982); run the reset again and touch it each of the \
+                 five times it blinks"
+            ),
+            TransportError::CanoKeyResetNotAllowed => write!(
+                f,
+                "the key refused the factory reset (SW=6985): it resets only \
+                 over USB, not held to an NFC reader, and only with its Admin \
+                 PIN blocked"
             ),
             TransportError::FeitianOtpParse(e) => {
                 write!(f, "Feitian OTP response parse error: {}", e)
@@ -2475,6 +2549,36 @@ fn read_yubikey_serial(card: &Card) -> Result<String, TransportError> {
     }
     let serial = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
     Ok(serial.to_string())
+}
+
+/// Whether the card on `card` is a CanoKey: its ATR is a CanoKey's own
+/// ([`is_canokey_ccid_atr`]), or the ATR has no historical bytes (the ATR
+/// an NFC reader builds for a CanoKey, whose ATS has none, canokey-core
+/// `interfaces/NFC/fm.c`) and the card's Admin applet answers a firmware
+/// version. That last check SELECTs the Admin applet, so call this
+/// before selecting the applet a session uses.
+pub(crate) fn card_is_canokey(card: &Card) -> bool {
+    let mut names = [0u8; 256];
+    let mut atr = [0u8; pcsc::MAX_ATR_SIZE];
+    let Ok(status) = card.status2(&mut names, &mut atr) else {
+        return false;
+    };
+    if is_canokey_ccid_atr(status.atr()) {
+        return true;
+    }
+    if !keyroost_piv::fingerprint::atr_historical_bytes(status.atr()).is_some_and(<[u8]>::is_empty)
+    {
+        return false;
+    }
+    let answers = |apdu: &[u8]| {
+        transmit_apdu(card, apdu)
+            .ok()
+            .filter(|(_, s1, s2)| sw_ok(*s1, *s2))
+            .map(|(data, _, _)| data)
+    };
+    answers(&keyroost_canokey::select_admin()).is_some()
+        && answers(&keyroost_canokey::read_firmware_version())
+            .is_some_and(|v| keyroost_canokey::parse_firmware_version(&v).is_some())
 }
 
 /// Whether `atr` is the ATR a CanoKey answers over its own USB CCID

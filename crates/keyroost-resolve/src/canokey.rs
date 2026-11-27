@@ -54,6 +54,18 @@ pub fn is_reader_name(reader_name: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(MANUFACTURER))
 }
 
+/// Whether a factory reset of `dev` is CanoKey's own device-wide one
+/// (`keyroost_transport::CanoKeyAdminSession::factory_reset`) rather than
+/// keyroost's applet-by-applet plan: a CanoKey reached through its own USB
+/// reader. The device-wide reset wipes every applet (FIDO2, OATH, OpenPGP,
+/// PIV, NDEF, PASS) and the device settings in one step, once its Admin PIN
+/// is blocked, and is the only reset of the key's OATH applet that needs no
+/// Admin PIN; the key refuses it over NFC, where the plan applies.
+#[must_use]
+pub fn takes_device_reset(dev: &crate::Device) -> bool {
+    dev.vendor == VENDOR && dev.reader.as_deref().is_some_and(is_reader_name)
+}
+
 /// A CanoKey serial number, from the hex form the key reports it in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Serial {

@@ -38,6 +38,16 @@ enum OathAnswer {
 /// duplicates), `6A84` no space, `6982` or `6985` the password is needed
 /// (a password-protected Solo 2 answers `6985` once its one-command unlock
 /// has lapsed).
+/// PUT on a CanoKey: it refuses a name it already holds with `6985`, and
+/// asks for no touch to save, so `6985` is "exists" there (its password
+/// refusal is `6982`).
+fn canokey_oath_put_answer(sw: u16) -> OathAnswer {
+    match sw {
+        crate::oath::CANOKEY_SW_NAME_EXISTS => OathAnswer::Exists,
+        other => oath_put_answer(other),
+    }
+}
+
 fn oath_put_answer(sw: u16) -> OathAnswer {
     match sw {
         0x6983 => OathAnswer::Exists,
@@ -270,7 +280,12 @@ fn oath_add<I: OathIo + ?Sized>(
         return Err(StoreError::Failed(refusal));
     }
     let params = put_params(n, entry, touch)?;
-    oath_with_reauth(io, hint, &mut |io| io.put(&params), oath_put_answer)
+    let answer = if family == OathFamily::CanoKey {
+        canokey_oath_put_answer
+    } else {
+        oath_put_answer
+    };
+    oath_with_reauth(io, hint, &mut |io| io.put(&params), answer)
 }
 
 fn oath_delete<I: OathIo + ?Sized>(
@@ -1033,6 +1048,10 @@ mod tests {
         // A password-protected Solo 2 (fw 2.964) answers a PUT sent after its
         // one-command unlock lapsed with 6985, not 6982 (seen on hardware).
         assert_eq!(oath_put_answer(0x6985), OathAnswer::NeedsAuth);
+        // A CanoKey answers a name it already holds with 6985.
+        assert_eq!(canokey_oath_put_answer(0x6985), OathAnswer::Exists);
+        assert_eq!(canokey_oath_put_answer(0x6982), OathAnswer::NeedsAuth);
+        assert_eq!(canokey_oath_put_answer(0x9000), OathAnswer::Ok);
         assert_eq!(oath_delete_answer(0x6985), OathAnswer::NeedsAuth);
     }
 
