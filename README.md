@@ -38,7 +38,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   reader). Fingerprint (bio) enrollment — list / enroll / rename / delete — and
   FIDO Metadata Service (MDS) authenticator identification (the app's
   Overview tab, `fido info`). Unlock with the key's fingerprint sensor
-  instead of the PIN (experimental), CLI `--unlock fingerprint|auto` and the
+  instead of the PIN (experimental): CLI `--unlock fingerprint|auto` and the
   app's Touch fingerprint button. PIN
   protocols v1 and v2. CTAP 2.1 security policy over
   `authenticatorConfig` (always-require-UV, minimum PIN length, force a PIN
