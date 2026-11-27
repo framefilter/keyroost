@@ -3,4 +3,4 @@
   instead of 341, among them the GoTrust Idem Card and Idem Key mini, the
   IDEMIA Cosmo FIDO R2 USB-C FIPS E, the PalmFaith Scout and three SafeNet
   IDPrime CL / eToken Fusion models, and the certification status, name or
-  logo of six others brought up to date. ([#0])
+  logo of six others brought up to date. ([#297])
