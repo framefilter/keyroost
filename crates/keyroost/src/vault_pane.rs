@@ -10456,16 +10456,16 @@ mod tests {
     fn storage_delete_says_what_it_loses() {
         assert_eq!(
             crate::lb_delete_question(0, false, false),
-            "Delete entry 1 and rewrite the array? Requires the key unlocked."
+            "Delete entry 1 and rewrite the array? Requires the key to be unlocked."
         );
         assert_eq!(
             crate::lb_delete_question(3, false, true),
-            "Delete entry 4 and rewrite the array? Requires the key unlocked. This is a \
+            "Delete entry 4 and rewrite the array? Requires the key to be unlocked. This is a \
              password vault: deleting it loses every entry in it."
         );
         assert_eq!(
             crate::lb_delete_question(1, true, false),
-            "Delete entry 2 and rewrite the array? Requires the key unlocked. This removes \
+            "Delete entry 2 and rewrite the array? Requires the key to be unlocked. This removes \
              the key's name."
         );
     }

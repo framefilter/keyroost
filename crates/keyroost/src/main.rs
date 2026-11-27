@@ -385,7 +385,7 @@ fn lb_delete_question(idx: usize, is_name: bool, is_vault: bool) -> String {
         ""
     };
     format!(
-        "Delete entry {} and rewrite the array? Requires the key unlocked.{loses}",
+        "Delete entry {} and rewrite the array? Requires the key to be unlocked.{loses}",
         idx + 1
     )
 }
@@ -20327,13 +20327,17 @@ impl App {
             ui.add_space(4.0);
             let pin = &mut self.rename_pin;
             let held = t.confirm.is_some();
+            // A finger save waiting on the question: a PIN typed now would
+            // be ignored, so the field takes none.
+            let finger_waits = held && t.finger;
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Key PIN")
                         .font(theme::f_reg(12.5))
                         .color(p.txt2),
                 );
-                let resp = ui.add(
+                let resp = ui.add_enabled(
+                    !finger_waits,
                     egui::TextEdit::singleline(pin)
                         .margin(theme::TEXT_EDIT_MARGIN)
                         .password(true)
@@ -23186,7 +23190,7 @@ impl App {
                             "{what} This erases {every} \u{2014} \
                              including any relying-party data (e.g. SSH certificates, sign-in \
                              records), not just keyroost notes. Cannot be undone; requires the \
-                             key unlocked.{name_clause}",
+                             key to be unlocked.{name_clause}",
                         ))
                         .font(theme::f_reg(12.5))
                         .color(p.txt),
@@ -23875,8 +23879,9 @@ impl App {
 
         if apply {
             self.run_advanced_action();
-        } else if apply_finger {
-            // No PIN waits behind the finger.
+        } else if apply_finger && !self.refuse_if_busy() {
+            // No PIN waits behind the finger. Refused while busy before the
+            // wipe, so a typed PIN stays for Apply.
             if let Some(d) = self.security_keys.advanced.as_mut() {
                 wipe(&mut d.pin_input);
             }
@@ -37254,6 +37259,129 @@ mod tests {
             app.rename_unlock(),
             Some(SessionUnlock::Pin(ref p)) if p.as_str() == "1234"
         ));
+    }
+
+    /// Touch fingerprint can't start a second save: disabled while the
+    /// remove question is open, gone while a save runs, and inert while
+    /// another job holds the key. Each try leaves the typed PIN alone.
+    #[test]
+    fn touch_fingerprint_is_disabled_while_the_name_is_saving() {
+        let d = key_with_storage(Some("Desk"));
+        let press = |app: &mut App| {
+            click_in_pane(app, "Touch fingerprint", |app, ui, p| {
+                let (_, _, _, finger) = app.rename_details(ui, p, "key");
+                if finger {
+                    app.save_device_name_by_finger();
+                }
+            });
+        };
+        let ready = |app: &mut App| {
+            app.rename_input.clear();
+            app.rename_target.as_mut().unwrap().hid_path = None;
+            app.rename_pin = "1234".into();
+        };
+
+        // The question is open: the press does nothing.
+        let mut app = naming_on_key(&d, &["uv"]);
+        ready(&mut app);
+        app.save_device_name();
+        assert!(app.rename_target.as_ref().unwrap().confirm.is_some());
+        press(&mut app);
+        let t = app.rename_target.as_ref().unwrap();
+        assert!(!t.finger, "still the PIN's question");
+        assert_eq!(app.rename_pin, "1234");
+
+        // A save runs: no PIN row, no Touch fingerprint.
+        let mut app = naming_on_key(&d, &["uv"]);
+        ready(&mut app);
+        app.rename_target.as_mut().unwrap().saving = true;
+        let texts = naming_texts(&mut app);
+        assert!(
+            !texts
+                .iter()
+                .any(|(t, _)| t == "Touch fingerprint" || t == "Key PIN"),
+            "{texts:?}"
+        );
+
+        // Another job holds the key: disabled, and refused if reached.
+        let mut app = naming_on_key(&d, &["uv"]);
+        ready(&mut app);
+        app.busy_jobs = 1;
+        app.busy_label = Some("Reading passkeys\u{2026}".into());
+        app.busy_since = Some(std::time::Instant::now() - DISABLE_BUTTONS_AFTER);
+        press(&mut app);
+        app.save_device_name_by_finger();
+        let t = app.rename_target.as_ref().unwrap();
+        assert!(!t.finger && t.confirm.is_none(), "nothing started");
+        assert_eq!(app.rename_pin, "1234", "the typed PIN stays");
+    }
+
+    /// While a finger save waits on the remove question, the PIN field
+    /// takes no typing: the save would ignore it. Before, it does.
+    #[test]
+    fn the_pin_field_takes_nothing_behind_a_finger_save() {
+        let d = key_with_storage(Some("Desk"));
+        let type_pin = |app: &mut App| {
+            let ctx = egui::Context::default();
+            crate::ui::theme::install_fonts(&ctx);
+            let mut render = |app: &mut App, ui: &mut egui::Ui, p: &Palette| {
+                app.rename_details(ui, p, "key");
+            };
+            pane_frame(&ctx, app, Vec::new(), &mut render);
+            let texts = pane_frame(&ctx, app, Vec::new(), &mut render);
+            let label = texts
+                .iter()
+                .find(|(t, _)| t == "Key PIN")
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("Key PIN drawn: {texts:?}"));
+            // The field sits right after its label.
+            let pos = egui::pos2(label.right() + 60.0, label.center().y);
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            for events in [
+                vec![egui::Event::PointerMoved(pos)],
+                vec![press(true)],
+                vec![press(false)],
+                vec![egui::Event::Text("9".into())],
+            ] {
+                pane_frame(&ctx, app, events, &mut render);
+            }
+        };
+        let mut app = naming_on_key(&d, &["uv"]);
+        app.rename_input.clear();
+        app.rename_target.as_mut().unwrap().hid_path = None;
+        type_pin(&mut app);
+        assert_eq!(app.rename_pin, "9", "the field takes typing");
+
+        app.save_device_name_by_finger();
+        assert!(app.rename_target.as_ref().unwrap().confirm.is_some());
+        type_pin(&mut app);
+        assert!(app.rename_pin.is_empty(), "{:?}", app.rename_pin);
+    }
+
+    /// A finger press in the settings dialog while another job runs is
+    /// refused before the typed PIN is wiped, so Apply can still use it.
+    #[test]
+    fn a_busy_settings_finger_press_keeps_the_typed_pin() {
+        let mut app = settings_dialog(&["authnrCfg", "uv", "uvAcfg"]);
+        app.security_keys.advanced.as_mut().unwrap().pin_input = "1234".into();
+        app.busy_jobs = 1;
+        app.busy_label = Some("Reading passkeys\u{2026}".into());
+        // Not yet long enough to disable the buttons: the click lands.
+        app.busy_since = Some(std::time::Instant::now());
+        click_in_pane(&mut app, "Touch fingerprint", |app, ui, p| {
+            app.render_advanced_confirm(ui.ctx(), p)
+        });
+        let d = app
+            .security_keys
+            .advanced
+            .as_ref()
+            .expect("the dialog stays");
+        assert_eq!(d.pin_input, "1234");
     }
 
     /// The naming field's Touch fingerprint asks the finger for a
