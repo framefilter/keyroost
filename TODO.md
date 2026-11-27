@@ -108,6 +108,36 @@ items marked *(no hardware)* need a device the maintainer does not have.
   and the app's Vault tab and Overview card
   (`vault_pane::experimental_note`).
 
+- **Lift the experimental label on fingerprint unlock** *(no hardware)*.
+  Built against scripted keys only (CTAP 2.1 built-in UV, clientPIN 0x06 /
+  0x07). On a bio key (Token2 Bio, YubiKey Bio or similar), check:
+  - the built-in UV token: `fido credential list --unlock fingerprint`, and
+    the app's Touch fingerprint on the FIDO2 tab, the Vault tab, the naming
+    field (save on the key) and the Settings dialog (keys with `uvAcfg`);
+    fingerprint management by finger on keys with `uvBioEnroll`, and the
+    plain "use the PIN" refusal on keys without;
+  - `--unlock auto --pin …` falling back to the PIN when the finger is
+    refused and when it times out, and printing which one unlocked;
+  - a key that clears the token after getAssertion: the vault and the
+    app's notes and name writes ask for the finger again, saying why;
+  - `fido fingerprint add --unlock fingerprint` with no fingerprint
+    enrolled: refused, suggesting the PIN;
+  - UV_BLOCKED and the retries count (`getUVRetries`): the refusal before
+    any finger at 0 tries;
+  - NFC, in the app only (the CLI's FIDO commands are USB-HID only).
+
+  Fingers asked for under `--unlock fingerprint` (each token is its own
+  finger; compare against the key): every non-vault command 1 (`credential
+  compare` 1 per key). `fido vault list`, `export` and the `entry` commands
+  2, then the touch (1 and no touch on a key with no vault); `add` 3 and two
+  touches; `delete` 1; `rotate` 5 and three touches; `import` 2 into a vault
+  on the key (`--dry-run` too), 4 into a new one. A key that clears the token
+  after the touch adds 1 ("asked again") to `entry add|edit|delete`, `add`,
+  `rotate` and `import`. The app's Vault tab unlock is
+  `vault list`'s 2. Then drop "experimental" from `--unlock`'s help
+  (`FIDO_UNLOCK_HELP`), the README, `docs/fido2.html`, `docs/vault.html` and
+  the app (`vault_pane::fingerprint_experimental_note`).
+
 - **Lift the "experimental" label on the Token2 PIN+ OATH and OpenPGP
   applets.** PIV is exercised on a PIN+ Dual Ace R3.4 since #251; verify
   OATH and OpenPGP over CCID on a PIN+ key (on Windows: Linux's libccid

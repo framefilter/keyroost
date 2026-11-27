@@ -94,6 +94,12 @@
     <p>One PIN entry serves both tabs. When the FIDO2 tab is already unlocked, the Vault tab
       uses its PIN; a PIN typed in the Vault tab also unlocks the FIDO2 tab. Each vault
       unlock still asks for its touch. <strong>Lock</strong> locks only the tab it is on.</p>
+    <p>On a key with a fingerprint sensor, <strong>Touch fingerprint</strong> beside Unlock
+      opens the vaults with a finger instead of the PIN (experimental;
+      <a href="fido2.html#fingerprint-unlock">see FIDO2</a>). The sensor may be asked for
+      more than once before the touch, and again to create, rotate or delete a vault; a
+      fingerprint unlock opens only the Vault tab, and the tab says <em>Unlocked with a
+      fingerprint</em>.</p>
     <p>The top bar's <strong>Refresh</strong> reads the open vaults again with no PIN and no
       touch, so a change made by another program shows. A vault made elsewhere appears after
       Lock and Unlock.</p>
@@ -113,7 +119,7 @@
       <em>Password</em>, <em>URL</em> and <em>Notes</em>. <em>Generate</em> makes up a
       password: 20 characters from A–Z, a–z, 0–9 and symbols, unless you change the length
       or the character sets. <strong>Save</strong> writes the vault back to the key with no
-      touch; the PIN is already entered.</p>
+      touch; the vault is already unlocked.</p>
     <p>An opened entry shows its web address and notes, and when it last changed.
       The password stays hidden until <strong>Show</strong>. <strong>Edit</strong> opens the
       same form; <strong>Delete</strong> asks first, and needs no touch.</p>
@@ -205,6 +211,7 @@
   <section class="kr-section" id="cli">
     <h2>Command line</h2>
 <pre><code>keyroostctl fido vault list                    # asks for the PIN (hidden), then a touch
+keyroostctl fido vault list --unlock fingerprint   # the sensor (maybe more than once), then a touch
 keyroostctl fido vault add Personal            # a new vault (two touches)
 keyroostctl fido vault entry add GitHub --username alice --generate-password
 keyroostctl fido vault entry show GitHub --reveal

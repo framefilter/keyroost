@@ -37,7 +37,9 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   and show how many attempts are left, reset a key (USB replug ceremony, or in place for a card in a
   reader). Fingerprint (bio) enrollment — list / enroll / rename / delete — and
   FIDO Metadata Service (MDS) authenticator identification (the app's
-  Overview tab, `fido info`). PIN
+  Overview tab, `fido info`). Unlock with the key's fingerprint sensor
+  instead of the PIN (experimental), CLI `--unlock fingerprint|auto` and the
+  app's Touch fingerprint button. PIN
   protocols v1 and v2. CTAP 2.1 security policy over
   `authenticatorConfig` (always-require-UV, minimum PIN length, force a PIN
   change, enterprise attestation) and a largeBlob store for plaintext notes (`fido blob`)
@@ -48,7 +50,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   Resident SSH credentials can be listed and their stored OpenSSH certificate
   extracted from largeBlob to a `-cert.pub` file (`fido ssh`). Also an
   encrypted password vault on FIDO2 keys with a large-blob store, opened with
-  the PIN and a touch (`fido vault`, experimental); it uses Token2 FidoParole's vault and
+  the PIN or a fingerprint, and a touch (`fido vault`, experimental); it uses Token2 FidoParole's vault and
   backup formats, checked against FidoParole's own vault code and libfido2.
   The app has a Vault tab on each FIDO2 key that can hold one (experimental),
   with the same features.

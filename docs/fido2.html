@@ -125,6 +125,38 @@
     </div>
   </section>
 
+  <section class="kr-section" id="fingerprint-unlock">
+    <h2>Unlocking with a fingerprint</h2>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">Experimental</div>
+      <p>Fingerprint unlock follows the CTAP 2.1 specification but hasn't been checked on a
+        key with a fingerprint sensor yet. Please
+        <a href="https://github.com/framefilter/keyroost/issues">report problems</a>.</p>
+    </div>
+    <p>On a key with a fingerprint sensor and a fingerprint enrolled, a touch of the sensor
+      can unlock the key instead of the PIN. The key checks the finger itself; no PIN is
+      typed or sent, and the PIN stays set and keeps working.</p>
+    <p>In the app, <strong>Touch fingerprint</strong> sits beside <strong>Unlock</strong> on
+      the FIDO2 tab when the key offers it, and on the Vault tab, when saving a name on the
+      key, and in the Settings dialog. Each tab takes its own touch: a fingerprint unlock of
+      the FIDO2 tab doesn't unlock the Vault tab, or the other way round. When the key asks
+      for a new unlock partway through, keyroost asks for the finger again and says why.</p>
+<pre><code>keyroostctl fido credential list --unlock fingerprint             # touch the sensor, no PIN
+keyroostctl fido credential list --unlock auto --pin env:KR_PIN   # the finger, else that PIN</code></pre>
+    <p><code>--unlock fingerprint</code> takes no PIN, so adding <code>--pin</code> is an
+      error. <code>--unlock auto</code> uses the finger when the key offers it, and
+      otherwise, or when the finger is refused, the PIN given by <code>--pin</code>; it never
+      asks for a PIN, and it says which one unlocked the key. Every command that takes the
+      FIDO2 PIN takes <code>--unlock</code>, apart from <code>fido pin change</code>, which
+      needs the current PIN itself. <code>fido credential compare</code> asks each key for
+      its own touch.</p>
+    <p>Managing fingerprints and changing settings with a finger work only on keys that
+      allow it in their <code>getInfo</code> (<code>uvBioEnroll</code>,
+      <code>uvAcfg</code>); elsewhere those take the PIN. When the finger can't unlock —
+      no fingerprint enrolled, not recognized, timed out, or too many tries — keyroost says
+      so and to use the PIN instead.</p>
+  </section>
+
   <section class="kr-section">
     <h2>What keyroost does with FIDO2</h2>
     <div class="kr-tool">
