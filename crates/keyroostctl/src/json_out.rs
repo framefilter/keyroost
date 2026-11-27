@@ -198,6 +198,8 @@ pub(crate) struct Ctap2InfoJson {
     pub transports: Vec<String>,
     pub min_pin_length: Option<u64>,
     pub force_pin_change: Option<bool>,
+    /// Whether a FIDO2 reset needs a long touch (getInfo `0x18`).
+    pub long_touch_for_reset: Option<bool>,
     pub firmware_version: Option<u64>,
 }
 
@@ -1165,6 +1167,7 @@ mod tests {
             ("transports", "array"),
             ("min_pin_length", "number|null"),
             ("force_pin_change", "bool|null"),
+            ("long_touch_for_reset", "bool|null"),
             ("firmware_version", "number|null"),
         ];
         let info = |ctap2| FidoInfoJson {
@@ -1194,6 +1197,7 @@ mod tests {
                 transports: vec![],
                 min_pin_length: some.then_some(4),
                 force_pin_change: some.then_some(false),
+                long_touch_for_reset: some.then_some(true),
                 firmware_version: some.then_some(7),
             };
             let v = to_v(&info(Some(c)));
