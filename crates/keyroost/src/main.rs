@@ -16317,6 +16317,42 @@ fn duplicate_serial_note<'a>(serials: impl Iterator<Item = &'a str>) -> Option<S
     })
 }
 
+/// Why a tab carries its "?" ([`DeviceView::tab_unverified`]), for its
+/// hover text. FIDO2 (and the Vault built on it) is unverified for one of
+/// two reasons: the key was reached only through its smart-card reader,
+/// where it answered as a U2F key without saying whether it also speaks
+/// FIDO2, or its USB FIDO interface gave no clear answer. Anything else is
+/// unverified because no reader answered for it.
+fn unverified_tab_hint(dev: &Device, t: CapTab) -> &'static str {
+    let fido2 = device::tab_cap(t) == Some(Caps::FIDO2);
+    match (fido2, dev.hid_path.is_some(), cfg!(windows)) {
+        (true, false, true) => {
+            "Not verified: keyroost reached this key's FIDO side only through its \
+             smart-card reader, where it answered as a U2F key without saying \
+             whether it also speaks FIDO2. Run keyroost as administrator to let \
+             it check over USB. It is offered anyway — using it gives a definite \
+             answer."
+        }
+        (true, false, false) => {
+            "Not verified: keyroost reached this key's FIDO side only through its \
+             smart-card reader, where it answered as a U2F key without saying \
+             whether it also speaks FIDO2. With access to its USB FIDO interface \
+             (keyroost's udev rules) keyroost can check. It is offered anyway — \
+             using it gives a definite answer."
+        }
+        (true, true, _) => {
+            "Not verified: the key's USB FIDO interface didn't say whether it \
+             speaks FIDO2 or only U2F. It is offered anyway — using it gives a \
+             definite answer."
+        }
+        (false, _, _) => {
+            "Not verified: no smart-card reader was available to confirm this \
+             feature on the key (reader missing or the smart-card service is not \
+             running). It is offered anyway — using it gives a definite answer."
+        }
+    }
+}
+
 /// Short label for a capability tab.
 fn cap_tab_label(t: CapTab) -> &'static str {
     match t {
@@ -20826,12 +20862,7 @@ impl App {
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if unverified {
-                    resp = resp.on_hover_text(
-                        "Not verified: no smart-card reader was available to \
-                         confirm this feature on the key (reader missing or the \
-                         smart-card service is not running). It is offered \
-                         anyway — using it gives a definite answer.",
-                    );
+                    resp = resp.on_hover_text(unverified_tab_hint(dev, t));
                 }
                 if active {
                     let y = resp.rect.bottom() + 6.0;
@@ -35874,6 +35905,33 @@ mod tests {
     /// for a card (nothing to unplug, no touch surface, and the arm's removal
     /// detector keys on a HID path the card does not have), so routing it
     /// there hangs the dialog forever — which is exactly what was reported.
+    #[test]
+    fn an_unverified_tab_says_why_it_is_unverified() {
+        // FIDO2 reached only through the key's reader.
+        let mut reader_only = test_key("reader:canokey", "10001174", None);
+        reader_only.caps.insert(Caps::FIDO2);
+        reader_only.unverified.insert(Caps::FIDO2);
+        reader_only.reader = Some("canokeys.org OpenPGP PIV OATH 0".into());
+        for tab in [CapTab::Fido2, CapTab::Vault] {
+            let hint = unverified_tab_hint(&reader_only, tab);
+            assert!(
+                hint.contains("only through its smart-card reader"),
+                "{hint}"
+            );
+            assert!(
+                !hint.contains("no smart-card reader was available"),
+                "{hint}"
+            );
+        }
+        // FIDO2 over USB whose interface gave no clear answer.
+        let mut usb = reader_only.clone();
+        usb.hid_path = Some(std::path::PathBuf::from("/dev/hidraw9"));
+        assert!(unverified_tab_hint(&usb, CapTab::Fido2).contains("USB FIDO interface"));
+        // Anything else keeps the reader explanation.
+        assert!(unverified_tab_hint(&reader_only, CapTab::Otp)
+            .contains("no smart-card reader was available"));
+    }
+
     #[test]
     fn card_reset_route_is_reader_only_devices_exactly() {
         // A card: FIDO2 over a reader, no HID interface -> in-place route.

@@ -1579,6 +1579,42 @@ fn select_names_fido2(data: &[u8], s1: u8, s2: u8) -> bool {
     sw_ok(s1, s2) && data.starts_with(b"FIDO_2_0")
 }
 
+/// Whether the FIDO applet just selected on `card` lists a CTAP2 version
+/// (`FIDO_2_*`) in its authenticatorGetInfo, sent as `NFCCTAP_MSG` (CTAP
+/// 11.2.3) the way [`CtapPcscDevice`] sends it. Any failure is "not
+/// confirmed": the row then keeps its `FIDO2?`.
+fn get_info_names_fido2(card: &Card) -> bool {
+    const GET_INFO: [u8; 7] = [0x80, 0x10, 0x00, 0x00, 0x01, 0x04, 0x00];
+    let Ok((mut data, mut s1, mut s2)) = transmit_apdu(card, &GET_INFO) else {
+        return false;
+    };
+    // A reply longer than one frame comes in `61 xx` pieces; a getInfo is a
+    // few hundred bytes, so a handful of pieces at most.
+    for _ in 0..16 {
+        if s1 != 0x61 {
+            break;
+        }
+        let Ok((more, n1, n2)) = transmit_apdu(card, &[0x00, 0xC0, 0x00, 0x00, s2]) else {
+            return false;
+        };
+        data.extend_from_slice(&more);
+        (s1, s2) = (n1, n2);
+    }
+    sw_ok(s1, s2) && get_info_reply_names_fido2(&data)
+}
+
+/// [`get_info_names_fido2`]'s decision on the reply: CTAP status `00`, then a
+/// getInfo map whose versions include a `FIDO_2_*` entry.
+fn get_info_reply_names_fido2(reply: &[u8]) -> bool {
+    let Some((&0x00, body)) = reply.split_first() else {
+        return false;
+    };
+    keyroost_ctap::cbor::decode(body)
+        .ok()
+        .and_then(|(value, _)| keyroost_ctap::cmd::parse_authenticator_info(&value).ok())
+        .is_some_and(|info| info.versions.iter().any(|v| v.starts_with("FIDO_2_")))
+}
+
 fn probe_trace_on() -> bool {
     PROBE_TRACE.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var_os("KEYROOST_PROBE_DEBUG").is_some()
@@ -2119,6 +2155,22 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
                 // U2F_V2 doesn't mean U2F only. A continuation or any other
                 // answer leaves CTAP2 unconfirmed.
                 probe.fido_ctap2_confirmed = select_names_fido2(&data, s1, s2);
+                // A CanoKey answers that SELECT with `U2F_V2` though it
+                // speaks CTAP2 too; its getInfo, read through this reader as
+                // `fido info --reader` does, settles it.
+                if canokey_ccid && probe.has_fido && !probe.fido_ctap2_confirmed {
+                    probe.fido_ctap2_confirmed = get_info_names_fido2(&card);
+                    if trace {
+                        probe_note(&format!(
+                            "fido getInfo (canokey usb) -> CTAP2 {}",
+                            if probe.fido_ctap2_confirmed {
+                                "confirmed"
+                            } else {
+                                "not confirmed"
+                            }
+                        ));
+                    }
+                }
             }
             // Token2 on-device OTP applet — select it to confirm presence,
             // rather than inferring from the reader name (which mislabels any
@@ -3195,6 +3247,26 @@ mod redaction_tests {
         assert!(select_names_fido2(b"FIDO_2_0_extra", 0x90, 0x00));
         assert!(!select_names_fido2(b"U2F_V2", 0x90, 0x00));
         assert!(!select_names_fido2(b"FIDO_2_0", 0x6A, 0x82));
+    }
+
+    #[test]
+    fn get_info_names_ctap2_by_its_versions() {
+        // Status 00, then {1: ["U2F_V2", "FIDO_2_0"]}.
+        let mut ctap2 = vec![0x00, 0xA1, 0x01, 0x82, 0x66];
+        ctap2.extend_from_slice(b"U2F_V2");
+        ctap2.push(0x68);
+        ctap2.extend_from_slice(b"FIDO_2_0");
+        assert!(get_info_reply_names_fido2(&ctap2));
+        // {1: ["U2F_V2"]}: U2F only.
+        let mut u2f = vec![0x00, 0xA1, 0x01, 0x81, 0x66];
+        u2f.extend_from_slice(b"U2F_V2");
+        assert!(!get_info_reply_names_fido2(&u2f));
+        // A CTAP error status, nothing at all, and bytes that aren't CBOR.
+        let mut failed = ctap2.clone();
+        failed[0] = 0x01;
+        assert!(!get_info_reply_names_fido2(&failed));
+        assert!(!get_info_reply_names_fido2(&[]));
+        assert!(!get_info_reply_names_fido2(&[0x00, 0xFF, 0xFF]));
     }
 
     /// The applet reassembly loop must distinguish `61xx` (more data),
