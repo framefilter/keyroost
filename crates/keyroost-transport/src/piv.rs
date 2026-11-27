@@ -2607,35 +2607,6 @@ impl<'tx> PivSession<'tx> {
         selectable
     }
 
-    /// SELECT [`keyroost_piv::fingerprint::NITROKEY_ADMIN_AID`] (Trussed's admin
-    /// application) and, if accepted, read the hardware variant via its
-    /// `GET STATUS` management command
-    /// ([`keyroost_piv::fingerprint::NITROKEY_GET_ADMIN_STATUS`], for
-    /// `applet_name`), the firmware version via its `GET_VERSION` management
-    /// command in string-output mode
-    /// ([`keyroost_piv::fingerprint::NITROKEY_GET_VERSION_STRING`], split into
-    /// byte components for [`PivStatus::version_firmware`]), and the device
-    /// serial via [`keyroost_piv::fingerprint::NITROKEY_GET_SERIAL`] (its own
-    /// 128-bit value, not the Yubico GET SERIAL extension a Nitrokey answers
-    /// with an unrelated, made-up number) — then unconditionally re-SELECT
-    /// PIV on every path (mirrors [`Self::probe_feitian_rid`] against yet
-    /// another applet, but reading three commands' worth of reply instead of
-    /// just the SELECT result). The three commands degrade independently: no
-    /// `name` when SELECT itself is refused (no admin application on this
-    /// build) or the status command is refused/too short/names an
-    /// unrecognised variant byte, no `version_firmware` when the version
-    /// command is refused, empty, or not a dotted-`u8` string, no `serial`
-    /// when the serial command is refused or too long to fit a `u128` —
-    /// either way, a Nitrokey that can't answer one of these simply reports
-    /// nothing for that field rather than an error.
-    ///
-    /// `id` and `version` are folded straight into the returned
-    /// [`AppletFingerprintResult`] unchanged — this probe doesn't produce
-    /// either of them itself (`id` is already known to be `Trussed(Nitrokey)`
-    /// by the time `Self::applet_fingerprint` calls this; `version` is
-    /// Yubico's own GET VERSION reply, which a Nitrokey answers same as any
-    /// other applet) — so the caller doesn't have to unpack a probe-shaped
-    /// tuple and re-wrap it into the struct itself.
     /// What a CanoKey's Admin applet reports without a PIN: its firmware
     /// version and hardware variant. `None` when the card doesn't select
     /// the Admin AID. Re-SELECTs PIV afterwards; run before any
@@ -2727,6 +2698,35 @@ impl<'tx> PivSession<'tx> {
         }
     }
 
+    /// SELECT [`keyroost_piv::fingerprint::NITROKEY_ADMIN_AID`] (Trussed's admin
+    /// application) and, if accepted, read the hardware variant via its
+    /// `GET STATUS` management command
+    /// ([`keyroost_piv::fingerprint::NITROKEY_GET_ADMIN_STATUS`], for
+    /// `applet_name`), the firmware version via its `GET_VERSION` management
+    /// command in string-output mode
+    /// ([`keyroost_piv::fingerprint::NITROKEY_GET_VERSION_STRING`], split into
+    /// byte components for [`PivStatus::version_firmware`]), and the device
+    /// serial via [`keyroost_piv::fingerprint::NITROKEY_GET_SERIAL`] (its own
+    /// 128-bit value, not the Yubico GET SERIAL extension a Nitrokey answers
+    /// with an unrelated, made-up number) — then unconditionally re-SELECT
+    /// PIV on every path (mirrors [`Self::probe_feitian_rid`] against yet
+    /// another applet, but reading three commands' worth of reply instead of
+    /// just the SELECT result). The three commands degrade independently: no
+    /// `name` when SELECT itself is refused (no admin application on this
+    /// build) or the status command is refused/too short/names an
+    /// unrecognised variant byte, no `version_firmware` when the version
+    /// command is refused, empty, or not a dotted-`u8` string, no `serial`
+    /// when the serial command is refused or too long to fit a `u128` —
+    /// either way, a Nitrokey that can't answer one of these simply reports
+    /// nothing for that field rather than an error.
+    ///
+    /// `id` and `version` are folded straight into the returned
+    /// [`AppletFingerprintResult`] unchanged — this probe doesn't produce
+    /// either of them itself (`id` is already known to be `Trussed(Nitrokey)`
+    /// by the time `Self::applet_fingerprint` calls this; `version` is
+    /// Yubico's own GET VERSION reply, which a Nitrokey answers same as any
+    /// other applet) — so the caller doesn't have to unpack a probe-shaped
+    /// tuple and re-wrap it into the struct itself.
     fn probe_nitrokey_admin(
         &mut self,
         id: keyroost_piv::fingerprint::AppletFingerprint,
@@ -6801,11 +6801,6 @@ fn metadata_apdu_for(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>, key_ref:
     }
 }
 
-/// Whether `apdu` — built by [`piv::general_auth_sign`], [`piv::put_data`]
-/// or [`piv::import_key`], whose data field is never empty — used
-/// extended-length encoding. Both
-/// always emit a non-zero short-form `Lc` for a body that fits in one byte,
-/// so byte 4 being the `0x00` extended-length marker is unambiguous.
 /// What [`PivSession::read_canokey_admin`] read.
 struct CanoKeyAdmin {
     firmware: Option<keyroost_canokey::FirmwareVersion>,
@@ -6842,6 +6837,11 @@ fn canokey_key_alg(ids: &keyroost_canokey::PivAlgorithmIds, id: u8) -> Option<Ke
     }
 }
 
+/// Whether `apdu` — built by [`piv::general_auth_sign`], [`piv::put_data`]
+/// or [`piv::import_key`], whose data field is never empty — used
+/// extended-length encoding. Both
+/// always emit a non-zero short-form `Lc` for a body that fits in one byte,
+/// so byte 4 being the `0x00` extended-length marker is unambiguous.
 fn uses_extended_length(apdu: &[u8]) -> bool {
     apdu.get(4) == Some(&0x00)
 }

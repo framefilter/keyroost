@@ -118,7 +118,8 @@ jobs:
                        keyroost-keyring keyroost-rsakey keyroost-vault \
                        keyroost-ctap keyroost-oath keyroost-openpgp keyroost-piv \
                        keyroost-pivtest keyroost-p12 \
-                       keyroost-token2otp keyroost-feitianotp keyroost-canokey \n                       keyroost-token2prog \
+                       keyroost-token2otp keyroost-feitianotp keyroost-canokey \
+                       keyroost-token2prog \
                        keyroost-import \
                        keyroost-transport keyroost-pgpkey keyroost-resolve keyroost-qr \
                        keyroost-winwebauthn keyroost-screengrab \

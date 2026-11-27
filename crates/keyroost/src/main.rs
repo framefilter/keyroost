@@ -1610,6 +1610,11 @@ struct OathState {
     /// The selected key's applet asks for a touch on every delete (a
     /// Nitrokey 3), not only for touch accounts. Learned by the listing.
     delete_asks_touch: bool,
+    /// The selected key's OATH session says it is a CanoKey, which the key's
+    /// row may not (a CanoKey held to an NFC reader with its OpenPGP applet
+    /// off). Learned by the listing, or by a reset the key refused for want
+    /// of its Admin PIN.
+    canokey: bool,
 }
 
 /// One credential row in the OATH pane: its stored name and the last code we
@@ -9646,7 +9651,8 @@ impl App {
         self.spawn_job("Reading OATH codes\u{2026}", move || {
             let result = Self::oath_open_unlock(&name, &password).and_then(|mut session| {
                 let asks = session.asks_touch_to_delete();
-                Self::oath_list_rows(&mut session, &touch).map(|rows| (rows, asks))
+                let canokey = session.is_canokey();
+                Self::oath_list_rows(&mut session, &touch).map(|rows| (rows, asks, canokey))
             });
             Box::new(move |app: &mut App| {
                 // Discard if the user switched devices while the read (which
@@ -9654,7 +9660,10 @@ impl App {
                 // not show device A's codes.
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     match &result {
-                        Ok((_, asks)) => app.oath.delete_asks_touch = *asks,
+                        Ok((_, asks, canokey)) => {
+                            app.oath.delete_asks_touch = *asks;
+                            app.oath.canokey = *canokey;
+                        }
                         // An automatic read: logged once, in the background.
                         Err(e) => {
                             if let Some(line) = oath_failure_line(e, !password.is_empty()) {
@@ -9666,7 +9675,7 @@ impl App {
                             }
                         }
                     }
-                    Self::apply_oath_rows(app, result.map(|(rows, _)| rows), password);
+                    Self::apply_oath_rows(app, result.map(|(rows, _, _)| rows), password);
                 }
             })
         });
@@ -10184,10 +10193,11 @@ impl App {
             return;
         }
         let mut decision: Option<bool> = None;
-        let canokey = self
-            .devices
-            .iter()
-            .any(|d| d.id == for_device && d.vendor == keyroost_resolve::canokey::VENDOR);
+        let canokey = self.oath.canokey
+            || self
+                .devices
+                .iter()
+                .any(|d| d.id == for_device && d.vendor == keyroost_resolve::canokey::VENDOR);
         let p = self.palette();
         let pin = &mut self.oath.reset_admin_pin;
         egui::Window::new("Reset OATH applet?")
@@ -10279,6 +10289,17 @@ impl App {
                         // clearing oath_tried lets the pane re-list on its own.
                         app.oath = OathState::default();
                         app.oath_tried = false;
+                    }
+                    // The key turned out to be a CanoKey its row didn't name:
+                    // nothing was reset; ask again, now with the Admin PIN.
+                    Err(TransportError::OathResetIsCanoKeyAdmin) => {
+                        app.log(
+                            Severity::Warn,
+                            "This key is a CanoKey: its Authenticator resets with its \
+                             CanoKey Admin PIN. Nothing was reset.",
+                        );
+                        app.oath.canokey = true;
+                        app.oath.confirm_reset = for_device;
                     }
                     Err(e) => {
                         app.log(Severity::Err, format!("Authenticator reset failed: {e}"));
@@ -13172,6 +13193,7 @@ impl App {
         self.oath.notice = None;
         self.oath.unlocked_password = None;
         self.oath.delete_asks_touch = false;
+        self.oath.canokey = false;
         self.openpgp.status = None;
         self.openpgp.key_present = [None; 3];
         self.openpgp.loaded = false;

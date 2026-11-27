@@ -9127,7 +9127,8 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             }
             if canokey_admin_pin.is_some() {
                 output::warn(
-                    "--canokey-admin-pin is not used: this key is not a CanoKey, so its                      OATH applet resets without one",
+                    "--canokey-admin-pin is not used: this key is not a CanoKey, so its \
+                     OATH applet resets without one",
                 );
             }
             crate::prompt::reverify_if_asked(&dev, asked)?;

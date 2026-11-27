@@ -480,7 +480,6 @@ fn version_of(v: &[u8]) -> Option<(u8, u8, u8)> {
     }
 }
 
-/// Map an OATH status word to success or a labeled APDU error.
 /// A CanoKey's answer to a PUT of a name it already holds (canokey-core
 /// `oath_put`: `SW_CONDITIONS_NOT_SATISFIED`).
 pub(crate) const CANOKEY_SW_NAME_EXISTS: u16 = 0x6985;
@@ -515,6 +514,7 @@ fn canokey_put_params<'a>(
     Ok(params)
 }
 
+/// Map an OATH status word to success or a labeled APDU error.
 fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     if sw == oath::SW_OK {
         Ok(())

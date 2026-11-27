@@ -2645,12 +2645,10 @@ pub(crate) fn card_is_canokey(card: &Card) -> bool {
     let Ok(status) = card.status2(&mut names, &mut atr) else {
         return false;
     };
-    if is_canokey_ccid_atr(status.atr()) {
-        return true;
-    }
-    if !keyroost_piv::fingerprint::atr_historical_bytes(status.atr()).is_some_and(<[u8]>::is_empty)
-    {
-        return false;
+    match canokey_by_atr(status.atr()) {
+        CanoKeyByAtr::Ccid => return true,
+        CanoKeyByAtr::No => return false,
+        CanoKeyByAtr::AskAdmin => {}
     }
     let answers = |apdu: &[u8]| {
         transmit_apdu(card, apdu)
@@ -2661,6 +2659,31 @@ pub(crate) fn card_is_canokey(card: &Card) -> bool {
     answers(&keyroost_canokey::select_admin()).is_some()
         && answers(&keyroost_canokey::read_firmware_version())
             .is_some_and(|v| keyroost_canokey::parse_firmware_version(&v).is_some())
+}
+
+/// What a card's ATR alone says about it being a CanoKey, for
+/// [`card_is_canokey`]: only [`CanoKeyByAtr::AskAdmin`] sends the card
+/// anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanoKeyByAtr {
+    /// A CanoKey's own USB CCID ATR ([`is_canokey_ccid_atr`]).
+    Ccid,
+    /// No historical bytes, like the ATR an NFC reader builds for a
+    /// CanoKey: only its Admin applet can tell.
+    AskAdmin,
+    /// Any other ATR, or one that doesn't parse: not taken for a CanoKey.
+    No,
+}
+
+/// See [`CanoKeyByAtr`].
+pub(crate) fn canokey_by_atr(atr: &[u8]) -> CanoKeyByAtr {
+    if is_canokey_ccid_atr(atr) {
+        CanoKeyByAtr::Ccid
+    } else if keyroost_piv::fingerprint::atr_historical_bytes(atr).is_some_and(<[u8]>::is_empty) {
+        CanoKeyByAtr::AskAdmin
+    } else {
+        CanoKeyByAtr::No
+    }
 }
 
 /// Whether `atr` is the ATR a CanoKey answers over its own USB CCID
@@ -3247,6 +3270,36 @@ mod redaction_tests {
         assert!(select_names_fido2(b"FIDO_2_0_extra", 0x90, 0x00));
         assert!(!select_names_fido2(b"U2F_V2", 0x90, 0x00));
         assert!(!select_names_fido2(b"FIDO_2_0", 0x6A, 0x82));
+    }
+
+    #[test]
+    fn only_an_atr_without_historical_bytes_is_sent_the_canokey_admin_probe() {
+        // A CanoKey on its own USB reader: known from its ATR, nothing sent.
+        let canokey = [
+            0x3B, 0xF7, 0x11, 0x00, 0x00, 0x81, 0x31, 0xFE, 0x65, 0x43, 0x61, 0x6E, 0x6F, 0x6B,
+            0x65, 0x79, 0x99,
+        ];
+        assert_eq!(canokey_by_atr(&canokey), CanoKeyByAtr::Ccid);
+        // A contactless card whose ATS has no historical bytes, as a
+        // CanoKey's: only its Admin applet can tell.
+        assert_eq!(
+            canokey_by_atr(&[0x3B, 0x80, 0x80, 0x01, 0x01]),
+            CanoKeyByAtr::AskAdmin
+        );
+        // Cards whose ATR carries historical bytes get no Admin SELECT: a
+        // YubiKey over USB, a YubiKey NEO held to an NFC reader, and an
+        // ATR that doesn't parse.
+        let yubikey_usb = [
+            0x3B, 0xFD, 0x13, 0x00, 0x00, 0x81, 0x31, 0xFE, 0x15, 0x80, 0x73, 0xC0, 0x21, 0xC0,
+            0x57, 0x59, 0x75, 0x62, 0x69, 0x4B, 0x65, 0x79, 0x40,
+        ];
+        let yubikey_nfc = [
+            0x3B, 0x8C, 0x80, 0x01, 0x59, 0x75, 0x62, 0x69, 0x6B, 0x65, 0x79, 0x4E, 0x45, 0x4F,
+            0x72, 0x33, 0x58,
+        ];
+        for atr in [&yubikey_usb[..], &yubikey_nfc, &[], &[0x3B]] {
+            assert_eq!(canokey_by_atr(atr), CanoKeyByAtr::No, "{atr:02X?}");
+        }
     }
 
     #[test]

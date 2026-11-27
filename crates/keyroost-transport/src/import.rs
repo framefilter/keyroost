@@ -34,10 +34,6 @@ enum OathAnswer {
     Other(u16),
 }
 
-/// PUT: `9000` stored, `6983` the name exists (applets that refuse
-/// duplicates), `6A84` no space, `6982` or `6985` the password is needed
-/// (a password-protected Solo 2 answers `6985` once its one-command unlock
-/// has lapsed).
 /// PUT on a CanoKey: it refuses a name it already holds with `6985`, and
 /// asks for no touch to save, so `6985` is "exists" there (its password
 /// refusal is `6982`).
@@ -48,6 +44,10 @@ fn canokey_oath_put_answer(sw: u16) -> OathAnswer {
     }
 }
 
+/// PUT: `9000` stored, `6983` the name exists (applets that refuse
+/// duplicates), `6A84` no space, `6982` or `6985` the password is needed
+/// (a password-protected Solo 2 answers `6985` once its one-command unlock
+/// has lapsed).
 fn oath_put_answer(sw: u16) -> OathAnswer {
     match sw {
         0x6983 => OathAnswer::Exists,
