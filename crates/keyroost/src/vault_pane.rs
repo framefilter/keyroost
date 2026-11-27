@@ -809,6 +809,13 @@ fn with_unlock_again(why: &str) -> String {
 /// (then [`UNLOCK_AGAIN`]).
 const JOB_NOT_STARTED: &str = "That couldn't start, and nothing was changed.";
 
+/// Why an unlock by fingerprint ended when the key refused the token it
+/// gave, and the one it gave after asking again: the key's own words name
+/// the PIN, which a person who touched the sensor never typed. The FIDO2
+/// tab says the same.
+pub(crate) const FINGER_UNLOCK_REFUSED: &str =
+    "The key refused the fingerprint unlock; unlock again and retry.";
+
 /// The unlock job couldn't be queued: the PIN typed for it is wiped.
 const UNLOCK_NOT_STARTED: &str = "Unlocking couldn't start; press Unlock again.";
 
@@ -1426,6 +1433,10 @@ impl App {
             }
             Err(e) => {
                 let refused = pin_refused(&e);
+                if refused && auth.verified() == Some(Verified::Fingerprint) {
+                    self.vault_fail_finger_refused();
+                    return;
+                }
                 self.vault_fail(&e);
                 if refused && pin_from_fido {
                     // The shared PIN is wrong on the FIDO2 tab too.
@@ -2038,6 +2049,13 @@ impl App {
         self.log(Severity::Ok, format!("Vault: {logged}"));
         self.vault.error = None;
         self.vault.info = Some(shown);
+    }
+
+    /// [`FINGER_UNLOCK_REFUSED`] in the pane and the activity log.
+    fn vault_fail_finger_refused(&mut self) {
+        self.log(Severity::Err, format!("Vault: {FINGER_UNLOCK_REFUSED}"));
+        self.vault.info = None;
+        self.vault.error = Some(FINGER_UNLOCK_REFUSED.to_owned());
     }
 
     /// A vault job that failed: the pane and the activity log say why.
@@ -2965,8 +2983,9 @@ impl App {
     /// locks the vault (only a new unlock lists what the key holds now): a
     /// vault gone elsewhere, a failed create that left something behind, a
     /// rotate that left two copies. A refused PIN locks it too, so no retry
-    /// spends another of the key's PIN tries. Anything else is said, and
-    /// the session stays.
+    /// spends another of the key's PIN tries; on a fingerprint session the
+    /// refused token is [`FINGER_UNLOCK_REFUSED`]. Anything else is said,
+    /// and the session stays.
     fn vault_job_failed(&mut self, e: &VaultJobError, pin_from_fido: bool) {
         let stale = matches!(
             e,
@@ -2981,6 +3000,16 @@ impl App {
             let text = job_error_text(e);
             self.log(Severity::Err, format!("Vault: {text}"));
             self.vault_lock(Some(text));
+        } else if pin_refused(e)
+            && self
+                .vault_session()
+                .is_some_and(|s| s.verified == Some(Verified::Fingerprint))
+        {
+            // No PIN was ever typed: say the finger's unlock ended. The
+            // FIDO2 tab took no part in it, so it stays.
+            self.vault_fail_finger_refused();
+            let why = self.vault.error.take();
+            self.vault_lock(why);
         } else if pin_refused(e) {
             self.vault_fail(e);
             let why = self.vault.error.take();
@@ -10991,6 +11020,42 @@ mod tests {
                 .and_then(VaultAuth::verified),
             Some(Verified::Fingerprint)
         );
+    }
+
+    /// The key refuses the session's token and the one it gave after the
+    /// finger was asked again: the vault locks in the finger's words, never
+    /// the PIN's, and the FIDO2 tab's PIN session stays. A PIN session
+    /// keeps its existing text.
+    #[test]
+    fn a_twice_refused_fingerprint_token_locks_in_plain_words() {
+        let mut key = FakeKey::with_fingerprint();
+        two_vaults(&mut key);
+        let mut app = finger_app();
+        app.security_keys.session = Some(fido_session("123456"));
+        app.security_keys.session_device = Some(KEY.into());
+        finger_unlock_into(&mut app, &mut key);
+        key.write_refusals.extend([0x33, 0x33]);
+        let seen = add_into(&mut app, &mut key, "Refused twice");
+        assert_eq!(seen, vec![again_prompt()], "one ask after the refusal");
+        assert!(app.vault.session.is_none(), "the vault locks");
+        assert_eq!(app.vault.error.as_deref(), Some(FINGER_UNLOCK_REFUSED));
+        assert!(!FINGER_UNLOCK_REFUSED.contains("PIN"));
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.text == format!("Vault: {FINGER_UNLOCK_REFUSED}")));
+        assert!(app.security_keys.session.is_some());
+        assert!(app.security_keys.error.is_none());
+
+        let mut key = FakeKey::with_fingerprint();
+        two_vaults(&mut key);
+        let mut app = finger_app();
+        unlock_into(&mut app, &mut key);
+        key.write_refusals.extend([0x33, 0x33]);
+        add_into(&mut app, &mut key, "PIN refused twice");
+        assert!(app.vault.session.is_none());
+        let expected = vault_error_text(&VaultKeyError::Ctap(CtapError::StatusCode(0x33)));
+        assert_eq!(app.vault.error.as_deref(), Some(expected.as_str()));
     }
 
     /// Lock, the idle lock and a key switch drop a fingerprint vault

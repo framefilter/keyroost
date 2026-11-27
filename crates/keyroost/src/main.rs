@@ -556,10 +556,10 @@ fn write_key_name_on<D: keyroost_ctap::transport::CtapTransport>(
                 .map_err(unlock_failed)?;
                 // Refused again: the session's unlock no longer works here.
                 match apply(dev, &token) {
-                    Err(LabelError::Ctap(e @ keyroost_ctap::CtapError::StatusCode(0x33))) => {
-                        return Err(KeyNameFailure::SessionEnded(format!(
-                            "Couldn't unlock the key: {e}"
-                        )));
+                    Err(LabelError::Ctap(keyroost_ctap::CtapError::StatusCode(0x33))) => {
+                        return Err(KeyNameFailure::SessionEnded(
+                            vault_pane::FINGER_UNLOCK_REFUSED.to_owned(),
+                        ));
                     }
                     other => other.map_err(failed)?,
                 }
@@ -36633,6 +36633,33 @@ mod tests {
         assert_eq!(key.seen_prompts.len(), 2, "one ask after the refusal");
         assert_eq!(key.blob_writes, 2);
         assert!(!key.subs.contains(&9), "never the PIN");
+    }
+
+    /// A name save on a fingerprint session refused twice ends the session
+    /// in the finger's words, the same as the Vault tab's, never the PIN's.
+    #[test]
+    fn a_twice_refused_fingerprint_name_save_says_so_plainly() {
+        let prompt = FingerPrompt::default();
+        let mut key = TokenKey::with_finger(0, &prompt);
+        key.blobs = true;
+        let s = App::unlock_on(&mut key, SessionUnlock::Fingerprint, &prompt)
+            .unwrap_or_else(|e| panic!("{e}"));
+        key.blob_stale = 2;
+        let err = write_key_name_on(
+            &mut key,
+            Some("Desk"),
+            None,
+            Some(&SessionUnlock::Fingerprint),
+            Some(&s.token),
+            &prompt,
+        )
+        .err()
+        .expect("refused twice");
+        let KeyNameFailure::SessionEnded(text) = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(text, vault_pane::FINGER_UNLOCK_REFUSED);
+        assert!(!text.contains("PIN"), "{text}");
     }
 
     /// A refused fingerprint ends the unlock with the reason, in plain
