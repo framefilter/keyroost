@@ -438,6 +438,21 @@ pub fn uv_grants(info: &AuthenticatorInfo, permissions: u32) -> bool {
         && needs(permissions::AUTHENTICATOR_CONFIGURATION, "uvAcfg")
 }
 
+/// Whether getInfo lets a fingerprint unlock this key for `permissions`:
+/// `Ok` when [`built_in_uv`] is [`BuiltInUv::Ready`] and [`uv_grants`]
+/// allows them, else why not: [`FingerprintError::NoneEnrolled`],
+/// [`FingerprintError::NotOffered`] or [`FingerprintError::NotForThis`].
+/// Reads `info` only, no I/O, so a caller can refuse before any question or
+/// PIN prompt. [`get_token`] checks the same before asking for the finger.
+pub fn uv_precheck(info: &AuthenticatorInfo, permissions: u32) -> Result<(), FingerprintError> {
+    match built_in_uv(info) {
+        BuiltInUv::Ready if !uv_grants(info, permissions) => Err(FingerprintError::NotForThis),
+        BuiltInUv::Ready => Ok(()),
+        BuiltInUv::NoneEnrolled => Err(FingerprintError::NoneEnrolled),
+        BuiltInUv::NotOffered => Err(FingerprintError::NotOffered),
+    }
+}
+
 /// Read how many built-in UV (fingerprint) attempts are left
 /// (`getUVRetries`, 0x07). No auth, no finger. The request declares the
 /// protocol [`select_pin_protocol`] picks from `info`.
@@ -570,8 +585,8 @@ impl FingerAsk {
 ///   [`BuiltInUv::Ready`] or [`uv_grants`] does not allow `permissions`;
 ///   refused without asking for the finger when getUVRetries reads 0 (a
 ///   failed read is not a refusal: the token request answers for itself).
-///   Then `on_finger` runs once, right before the 0x06 request that waits
-///   for the finger.
+///   Then `on_finger` runs once, right before the key agreement that leads
+///   to the 0x06 request, which waits for the finger.
 /// - `FingerprintOrPin(pin)`: the fingerprint; on any
 ///   [`CtapError::Fingerprint`] with a PIN given, the PIN instead (without a
 ///   second `on_finger`). Any other error is returned as is.
@@ -617,17 +632,11 @@ fn finger_token(
     rp_id: Option<&str>,
     on_finger: &mut dyn FnMut(),
 ) -> Result<PinUvAuthToken, CtapError> {
-    let refuse = |why| Err(CtapError::Fingerprint(why));
-    match built_in_uv(info) {
-        BuiltInUv::Ready => {}
-        BuiltInUv::NoneEnrolled => return refuse(FingerprintError::NoneEnrolled),
-        BuiltInUv::NotOffered => return refuse(FingerprintError::NotOffered),
-    }
-    if !uv_grants(info, permissions) {
-        return refuse(FingerprintError::NotForThis);
-    }
+    uv_precheck(info, permissions).map_err(CtapError::Fingerprint)?;
     if let Ok(0) = get_uv_retries(dev, info) {
-        return refuse(FingerprintError::Blocked { status: None });
+        return Err(CtapError::Fingerprint(FingerprintError::Blocked {
+            status: None,
+        }));
     }
     on_finger();
     get_pin_uv_auth_token_using_uv(dev, info, permissions, rp_id)
@@ -1599,6 +1608,33 @@ mod tests {
             Ok(_) => panic!("the token request must be refused"),
             Err(error) => error,
         }
+    }
+
+    /// The one getInfo check for a fingerprint token: ready, none enrolled,
+    /// not offered, or not allowed for these permissions.
+    #[test]
+    fn uv_precheck_says_why_a_finger_cannot_unlock() {
+        use permissions::{BIO_ENROLLMENT as BE, CREDENTIAL_MANAGEMENT as CM};
+        let ready = info_with(&[("uv", true), ("pinUvAuthToken", true)]);
+        assert_eq!(uv_precheck(&ready, CM), Ok(()));
+        assert_eq!(
+            uv_precheck(&ready, CM | BE),
+            Err(FingerprintError::NotForThis)
+        );
+        let bio = info_with(&[
+            ("uv", true),
+            ("pinUvAuthToken", true),
+            ("uvBioEnroll", true),
+        ]);
+        assert_eq!(uv_precheck(&bio, CM | BE), Ok(()));
+        assert_eq!(
+            uv_precheck(&info_with(&[("uv", false), ("pinUvAuthToken", true)]), CM),
+            Err(FingerprintError::NoneEnrolled)
+        );
+        assert_eq!(
+            uv_precheck(&info_with(&[("uv", true)]), CM),
+            Err(FingerprintError::NotOffered)
+        );
     }
 
     fn info_with(opts: &[(&str, bool)]) -> AuthenticatorInfo {

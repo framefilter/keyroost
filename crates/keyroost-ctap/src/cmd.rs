@@ -134,7 +134,7 @@ impl std::fmt::Display for FingerprintError {
 /// (`getPinUvAuthTokenUsingUvWithPermissions`) answers when the finger did not
 /// unlock the key, as a [`FingerprintError`]. Any other status is not about
 /// the finger and stays a [`CtapError::StatusCode`] (`None`).
-pub(crate) fn fingerprint_refusal(code: u8) -> Option<FingerprintError> {
+pub fn fingerprint_refusal(code: u8) -> Option<FingerprintError> {
     match code {
         0x3C => Some(FingerprintError::Blocked { status: Some(code) }),
         // OPERATION_DENIED, USER_ACTION_TIMEOUT, NOT_ALLOWED, PIN_AUTH_BLOCKED,

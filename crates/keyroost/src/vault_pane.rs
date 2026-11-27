@@ -2083,11 +2083,7 @@ impl App {
             .and_then(|s| s.unlock.pin())
             .is_some_and(|pin| !pin.is_empty());
         // Experimental: no key with a sensor was on hand to try it.
-        let finger = !shared
-            && self.security_keys.info.as_ref().is_some_and(|i| {
-                keyroost_ctap::client_pin::built_in_uv(i)
-                    == keyroost_ctap::client_pin::BuiltInUv::Ready
-            });
+        let finger = !shared && self.finger_ready();
         let mut unlock = false;
         let mut unlock_finger = false;
         theme::card_frame(p).show(ui, |ui| {

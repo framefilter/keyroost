@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use keyroost_ctap::client_pin::permissions::{
     CREDENTIAL_MANAGEMENT, GET_ASSERTION, LARGE_BLOB_WRITE, MAKE_CREDENTIAL,
 };
-use keyroost_ctap::client_pin::{built_in_uv, uv_grants, BuiltInUv, FingerAsk, PinUvAuthToken};
+use keyroost_ctap::client_pin::{uv_precheck, FingerAsk, PinUvAuthToken};
+use keyroost_ctap::cmd::fingerprint_refusal;
 use keyroost_ctap::device_label::DeviceLabel;
 use keyroost_ctap::get_assertion::Assertion;
 use keyroost_ctap::large_blobs::{empty_array_serialized, LargeBlobArray};
@@ -47,6 +48,7 @@ const STORAGE_FULL: u8 = 0x18;
 /// `CTAP2_ERR_UV_INVALID`: the finger was not recognized; one try spent.
 const UV_INVALID: u8 = 0x3F;
 /// `CTAP2_ERR_UV_BLOCKED`.
+#[cfg(test)]
 const UV_BLOCKED: u8 = 0x3C;
 /// The fingerprint tries a fresh key has.
 const UV_TRIES: u32 = 5;
@@ -422,14 +424,7 @@ impl VaultKey for FakeKey {
         on_finger: &mut dyn FnMut(),
     ) -> Result<PinUvAuthToken, CtapError> {
         let refuse = |why| Err(CtapError::Fingerprint(why));
-        match built_in_uv(&self.info) {
-            BuiltInUv::Ready => {}
-            BuiltInUv::NoneEnrolled => return refuse(FingerprintError::NoneEnrolled),
-            BuiltInUv::NotOffered => return refuse(FingerprintError::NotOffered),
-        }
-        if !uv_grants(&self.info, permissions) {
-            return refuse(FingerprintError::NotForThis);
-        }
+        uv_precheck(&self.info, permissions).map_err(CtapError::Fingerprint)?;
         self.log.push(Call::UvToken {
             perms: permissions,
             rp: rp_id.map(str::to_owned),
@@ -443,12 +438,9 @@ impl VaultKey for FakeKey {
             if code == UV_INVALID {
                 self.uv_retries -= 1;
             }
-            return match code {
-                UV_BLOCKED => refuse(FingerprintError::Blocked { status: Some(code) }),
-                0x27 | 0x2F | 0x30 | 0x34 | 0x3A | UV_INVALID | 0x40 => {
-                    refuse(FingerprintError::Refused(code))
-                }
-                _ => Err(CtapError::StatusCode(code)),
+            return match fingerprint_refusal(code) {
+                Some(why) => refuse(why),
+                None => Err(CtapError::StatusCode(code)),
             };
         }
         Ok(self.issue(permissions))

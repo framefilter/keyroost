@@ -2508,11 +2508,16 @@ mod tests {
             format!("{:?}", vault_auth(crate::FidoUnlock::Auto(Some(pin()))))
                 .contains("fingerprint, pin fallback")
         );
-        // Nothing was asked yet, so `auto` has nothing to say.
-        print_unlocked_with(
-            crate::Unlock::Auto,
-            &vault_auth(crate::FidoUnlock::Auto(None)),
-        );
+        // Nothing was asked yet, so `auto` has nothing to say: no token,
+        // so no way it was unlocked to print.
+        for unlock in [
+            crate::FidoUnlock::Fingerprint,
+            crate::FidoUnlock::Pin(pin()),
+            crate::FidoUnlock::Auto(Some(pin())),
+            crate::FidoUnlock::Auto(None),
+        ] {
+            assert!(vault_auth(unlock).verified().is_none());
+        }
     }
 
     #[test]

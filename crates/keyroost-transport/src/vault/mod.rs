@@ -499,7 +499,7 @@ impl VaultAuth {
         self.method = Method::Pin(pin);
         match &self.method {
             Method::Pin(pin) => Some(pin),
-            Method::Fingerprint { .. } => unreachable!("just set to the PIN"),
+            Method::Fingerprint { .. } => None,
         }
     }
 

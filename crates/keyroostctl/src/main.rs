@@ -2971,8 +2971,8 @@ enum FidoCmd {
     ///
     /// Each vault is a FIDO2 credential on the key; its entries are sealed
     /// with a secret only the key gives out (after the PIN or a fingerprint,
-    /// and a touch) and stored in the key's large-blob store. If the key is lost or reset,
-    /// its vaults go with it: keep a backup.
+    /// and a touch) and stored in the key's large-blob store. If the key is
+    /// lost or reset, its vaults go with it: keep a backup.
     ///
     /// The large-blob store is shared space on the key, meant for data that
     /// belongs to a passkey; each vault is kept there as the data of its own
@@ -14702,18 +14702,11 @@ fn fingerprint_check(
     pin_given: bool,
     permissions: u32,
 ) -> Result<(), keyroost_ctap::CtapError> {
-    use keyroost_ctap::client_pin::{built_in_uv, uv_grants, BuiltInUv};
-    use keyroost_ctap::{CtapError, FingerprintError};
     if !unlock.finger_only(pin_given) {
         return Ok(());
     }
-    let refuse = |why| Err(CtapError::Fingerprint(why));
-    match built_in_uv(info) {
-        BuiltInUv::Ready if !uv_grants(info, permissions) => refuse(FingerprintError::NotForThis),
-        BuiltInUv::Ready => Ok(()),
-        BuiltInUv::NoneEnrolled => refuse(FingerprintError::NoneEnrolled),
-        BuiltInUv::NotOffered => refuse(FingerprintError::NotOffered),
-    }
+    keyroost_ctap::client_pin::uv_precheck(info, permissions)
+        .map_err(keyroost_ctap::CtapError::Fingerprint)
 }
 
 /// [`fingerprint_check`] on `dev` before any question or PIN, for a
