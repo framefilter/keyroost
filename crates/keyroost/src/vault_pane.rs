@@ -168,11 +168,12 @@ fn sentence(s: &str) -> String {
 /// The Overview card's line: why there is no vault, or what is in it.
 /// `read_failed` is whether the key's getInfo read failed (the FIDO2 tab's
 /// "Couldn't read this key."); `vaults` is the unlocked list, `None` while
-/// locked.
+/// locked; `finger` whether the key's sensor can unlock it.
 pub(crate) fn overview_line(
     offer: VaultOffer,
     read_failed: bool,
     vaults: Option<&[VaultOnKey]>,
+    finger: bool,
 ) -> String {
     match offer {
         VaultOffer::Unknown => fido_unread_line(false, read_failed).to_owned(),
@@ -187,6 +188,11 @@ pub(crate) fn overview_line(
             "A password vault needs a FIDO2 PIN; set one on the FIDO2 tab.".to_owned()
         }
         VaultOffer::Ready => match vaults {
+            None if finger => {
+                "Passwords in an encrypted vault on this key, opened with the PIN or \
+                               a fingerprint, and a touch."
+                    .to_owned()
+            }
             None => "Passwords in an encrypted vault on this key, opened with the PIN and a touch."
                 .to_owned(),
             Some([]) => "No vaults on this key yet.".to_owned(),
@@ -2217,6 +2223,7 @@ impl App {
                     offer,
                     self.security_keys.error.is_some(),
                     None,
+                    false,
                 ))
                 .font(theme::f_reg(13.0))
                 .color(if offer == VaultOffer::Unknown {
@@ -3266,8 +3273,8 @@ impl App {
                 ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
                 ui.label(
                     egui::RichText::new(
-                        "Saving writes the vault back to the key (PIN already entered; no \
-                         touch needed).",
+                        "Saving writes the vault back to the key (already unlocked; no touch \
+                         needed).",
                     )
                     .font(theme::f_reg(11.5))
                     .color(p.txt3),
@@ -5063,33 +5070,43 @@ mod tests {
     #[test]
     fn overview_line_says_why() {
         assert_eq!(
-            overview_line(VaultOffer::Unknown, false, None),
+            overview_line(VaultOffer::Unknown, false, None, false),
             "Reading key\u{2026}"
         );
         // A failed read isn't left on "Reading key…".
         assert_eq!(
-            overview_line(VaultOffer::Unknown, true, None),
+            overview_line(VaultOffer::Unknown, true, None, false),
             "Couldn't read this key."
         );
         assert_eq!(
-            overview_line(VaultOffer::NeedsAdmin, false, None),
+            overview_line(VaultOffer::NeedsAdmin, false, None, false),
             "Open the FIDO2 tab to manage this key via Windows settings or restart as \
              administrator."
         );
         assert_eq!(
-            overview_line(VaultOffer::No("largeBlobKey"), false, None),
+            overview_line(VaultOffer::No("largeBlobKey"), false, None, false),
             "This key cannot hold a password vault: it does not support largeBlobKey."
         );
         assert_eq!(
-            overview_line(VaultOffer::NeedsPin, false, None),
+            overview_line(VaultOffer::NeedsPin, false, None, false),
             "A password vault needs a FIDO2 PIN; set one on the FIDO2 tab."
         );
         assert_eq!(
-            overview_line(VaultOffer::Ready, false, None),
+            overview_line(VaultOffer::Ready, false, None, false),
             "Passwords in an encrypted vault on this key, opened with the PIN and a touch."
         );
         assert_eq!(
-            overview_line(VaultOffer::Ready, false, Some(&[])),
+            overview_line(VaultOffer::Ready, false, None, true),
+            "Passwords in an encrypted vault on this key, opened with the PIN or a fingerprint, \
+             and a touch."
+        );
+        assert_eq!(
+            overview_line(VaultOffer::Ready, false, Some(&[]), true),
+            "No vaults on this key yet.",
+            "unlocked, what the vaults hold"
+        );
+        assert_eq!(
+            overview_line(VaultOffer::Ready, false, Some(&[]), false),
             "No vaults on this key yet."
         );
         let mut key = FakeKey::new();
@@ -5102,7 +5119,7 @@ mod tests {
         key.add_vault("Work", &Vault::default());
         let vaults = unlocked(&mut key);
         assert_eq!(
-            overview_line(VaultOffer::Ready, false, Some(&vaults)),
+            overview_line(VaultOffer::Ready, false, Some(&vaults), false),
             "Personal \u{00B7} 2, Work \u{00B7} 0"
         );
     }
@@ -7385,7 +7402,7 @@ mod tests {
             "Generate: 20 characters",
             "change",
             "optional",
-            "Saving writes the vault back to the key (PIN already entered; no touch needed).",
+            "Saving writes the vault back to the key (already unlocked; no touch needed).",
             "Cancel",
             "Save",
         ] {
@@ -10439,17 +10456,17 @@ mod tests {
     fn storage_delete_says_what_it_loses() {
         assert_eq!(
             crate::lb_delete_question(0, false, false),
-            "Delete entry 1 and rewrite the array? Requires your PIN."
+            "Delete entry 1 and rewrite the array? Requires the key unlocked."
         );
         assert_eq!(
             crate::lb_delete_question(3, false, true),
-            "Delete entry 4 and rewrite the array? Requires your PIN. This is a password \
-             vault: deleting it loses every entry in it."
+            "Delete entry 4 and rewrite the array? Requires the key unlocked. This is a \
+             password vault: deleting it loses every entry in it."
         );
         assert_eq!(
             crate::lb_delete_question(1, true, false),
-            "Delete entry 2 and rewrite the array? Requires your PIN. This removes the key's \
-             name."
+            "Delete entry 2 and rewrite the array? Requires the key unlocked. This removes \
+             the key's name."
         );
     }
 

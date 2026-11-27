@@ -51,7 +51,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "unlock" => &Help {
             title: "Unlocking the key",
-            body: "Enter the key's PIN to unlock it for this session. Unlocking gives access to managing passkeys, fingerprints, and security settings; it stays unlocked until you lock it again, unplug the key, or leave the app untouched for 5 minutes. The PIN never leaves the device.",
+            body: "Enter the key's PIN, or touch its fingerprint sensor if it has one, to unlock it for this session. Unlocking gives access to managing passkeys, fingerprints, and security settings; it stays unlocked until you lock it again, unplug the key, or leave the app untouched for 5 minutes. The PIN never leaves the device.",
             slug: "",
         },
         "oath" => &Help {
@@ -81,7 +81,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "fingerprint" => &Help {
             title: "Fingerprints (biometric enrollment)",
-            body: "Enroll, rename, and delete fingerprints on a biometric key via CTAP2 authenticatorBioEnrollment. Enrolled fingerprints let the key satisfy user verification by touch instead of typing the PIN. Requires the PIN to manage. Templates live on the device and never leave it.",
+            body: "Enroll, rename, and delete fingerprints on a biometric key via CTAP2 authenticatorBioEnrollment. Enrolled fingerprints let the key satisfy user verification by touch instead of typing the PIN. Requires the PIN, or a fingerprint on keys that allow it, to manage. Templates live on the device and never leave it.",
             slug: "/fingerprint",
         },
         "touch-hotp" => &Help {
@@ -191,12 +191,12 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "vault" => &Help {
             title: "Password vault",
-            body: "Passwords kept in an encrypted vault on this key, opened with the key's PIN and a touch. If the key is lost or reset, the vault goes with it, so keep a backup file. Refresh reads the vault again without a touch; vaults made elsewhere appear after Lock and Unlock.",
+            body: "Passwords kept in an encrypted vault on this key, opened with the key's PIN or a fingerprint, and a touch. If the key is lost or reset, the vault goes with it, so keep a backup file. Refresh reads the vault again without a touch; vaults made elsewhere appear after Lock and Unlock.",
             slug: "/vault",
         },
         "large_blobs" => &Help {
             title: "Large blob storage",
-            body: "A key-global area where relying parties store opaque, RP-encrypted data (e.g. SSH certificates). Anyone holding the key can read it, so it is not a place for plaintext secrets. keyroost shows each stored entry as hex and ASCII; you can also keep your own plaintext notes here (add, edit, delete). Writing rewrites the whole array with a fresh checksum and needs your PIN. keyroost recognizes its own notes and the key's name, and shows a capacity meter; anything else is relying-party data, displayed raw and never modified. Any entry can be exported to a file as it is stored; an SSH credential's certificate is saved with “Save certificate…” on the Passkeys tab.",
+            body: "A key-global area where relying parties store opaque, RP-encrypted data (e.g. SSH certificates). Anyone holding the key can read it, so it is not a place for plaintext secrets. keyroost shows each stored entry as hex and ASCII; you can also keep your own plaintext notes here (add, edit, delete). Writing rewrites the whole array with a fresh checksum and needs the key unlocked. keyroost recognizes its own notes and the key's name, and shows a capacity meter; anything else is relying-party data, displayed raw and never modified. Any entry can be exported to a file as it is stored; an SSH credential's certificate is saved with “Save certificate…” on the Passkeys tab.",
             slug: "/storage",
         },
         _ => return None,

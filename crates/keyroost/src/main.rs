@@ -385,7 +385,7 @@ fn lb_delete_question(idx: usize, is_name: bool, is_vault: bool) -> String {
         ""
     };
     format!(
-        "Delete entry {} and rewrite the array? Requires your PIN.{loses}",
+        "Delete entry {} and rewrite the array? Requires the key unlocked.{loses}",
         idx + 1
     )
 }
@@ -1325,6 +1325,10 @@ struct RenameTarget {
     confirm: Option<(String, Option<String>)>,
     /// An on-key save is running.
     saving: bool,
+    /// Touch fingerprint started the save: the on-key write unlocks with
+    /// the key's sensor, not the typed PIN, also once the replace/remove
+    /// question is answered.
+    finger: bool,
     /// Display hints for the log line and the keys.json record.
     vendor: String,
     model: String,
@@ -8554,7 +8558,7 @@ impl App {
     /// Open the device and run `f` with a [`Configurator`](keyroost_ctap::config::Configurator) holding a fresh
     /// pinUvAuthToken that carries the AuthenticatorConfiguration permission.
     /// Mirrors `with_fresh_bio`; config commands need their own permissioned
-    /// token, so they always take a PIN at action time.
+    /// token, so they always take the PIN or a finger at action time.
     fn with_config<T>(
         target: &FidoTarget,
         unlock: &SessionUnlock,
@@ -8589,9 +8593,21 @@ impl App {
         f(&mut cfg)
     }
 
-    /// Dispatch the pending Advanced action on a worker thread, then refresh the
-    /// key's info so the view reflects the new state.
+    /// Dispatch the pending Advanced action on a worker thread with the PIN
+    /// typed in the dialog, then refresh the key's info so the view
+    /// reflects the new state.
     fn run_advanced_action(&mut self) {
+        let Some(dlg) = self.security_keys.advanced.as_ref() else {
+            return;
+        };
+        // Zeroizing so the worker closure's PIN copy is scrubbed when the job ends.
+        let pin = zeroize::Zeroizing::new(dlg.pin_input.clone());
+        self.run_advanced_action_with(SessionUnlock::Pin(pin));
+    }
+
+    /// [`Self::run_advanced_action`] unlocking with `unlock`: the typed PIN
+    /// (refused when empty) or the key's fingerprint, asked by the job.
+    fn run_advanced_action_with(&mut self, unlock: SessionUnlock) {
         if self.refuse_if_busy() {
             return;
         }
@@ -8599,8 +8615,6 @@ impl App {
             return;
         };
         let action = dlg.action;
-        // Zeroizing so the worker closure's PIN copy is scrubbed when the job ends.
-        let pin = zeroize::Zeroizing::new(dlg.pin_input.clone());
         let force_change = dlg.force_change;
         let min_pin = dlg.min_pin_input.trim().parse::<u32>().ok();
         let dlg_device = dlg.device.clone();
@@ -8627,7 +8641,7 @@ impl App {
             self.security_keys.error = Some("Enter a whole number for the new minimum.".into());
             return;
         }
-        if pin.is_empty() {
+        if unlock.pin().is_some_and(|p| p.is_empty()) {
             self.security_keys.error = Some("Enter the device PIN to apply this change.".into());
             return;
         }
@@ -8646,7 +8660,6 @@ impl App {
             _ => "Enterprise attestation enabled",
         };
         let for_device = self.selected_device.clone();
-        let unlock = SessionUnlock::Pin(pin);
         let prompt = self.security_keys.finger_prompt.clone();
         self.spawn_job(label, move || {
             let result = Self::with_config(&target, &unlock, &prompt, |cfg| match action {
@@ -15139,6 +15152,7 @@ impl App {
             error: None,
             confirm: None,
             saving: false,
+            finger: false,
             vendor: dev.vendor.clone(),
             model: dev.model.clone(),
         });
@@ -15174,13 +15188,58 @@ impl App {
         !(self.selected_device.as_ref() == Some(&t.device_id) && self.fido_session().is_some())
     }
 
+    /// Whether the selected key can unlock with its own sensor, by the
+    /// getInfo the FIDO2 tab holds (experimental: no such key was on hand
+    /// to try).
+    fn finger_ready(&self) -> bool {
+        self.security_keys.info.as_ref().is_some_and(|i| {
+            keyroost_ctap::client_pin::built_in_uv(i) == keyroost_ctap::client_pin::BuiltInUv::Ready
+        })
+    }
+
+    /// [`Self::finger_ready`] for the key the naming field is open for: it
+    /// must be the selected key, whose getInfo that is.
+    fn rename_finger_ready(&self) -> bool {
+        self.rename_target
+            .as_ref()
+            .is_some_and(|t| self.selected_device.as_ref() == Some(&t.device_id))
+            && self.finger_ready()
+    }
+
+    /// Whether the naming field offers Touch fingerprint: an on-key save
+    /// that would ask for the PIN, on a key whose sensor can unlock it.
+    fn rename_offers_finger(&self) -> bool {
+        self.rename_goes_on_key() && self.rename_needs_pin() && self.rename_finger_ready()
+    }
+
     /// Persist (or clear) the friendly name for the device the rename field was
     /// opened against, keyed by the serial pinned at open time, where the
     /// dialog says ([`device::plan_name_save`]). Empty input removes the name
     /// wherever it lives. Writing against the *pinned* serial (not the live
     /// selection) is what keeps a mid-edit rescan from landing the name on the
     /// wrong key. Certain refusals come before any question or PIN use.
+    /// An on-key save unlocks with the PIN typed in the field.
     fn save_device_name(&mut self) {
+        self.save_device_name_with(false);
+    }
+
+    /// Touch fingerprint in the naming field: [`Self::save_device_name`],
+    /// the on-key write unlocking with the key's sensor. A PIN typed in the
+    /// field is wiped, so none waits behind the finger.
+    fn save_device_name_by_finger(&mut self) {
+        if self.refuse_if_busy() || self.rename_blocked() {
+            return;
+        }
+        wipe(&mut self.rename_pin);
+        self.save_device_name_with(true);
+    }
+
+    /// [`Self::save_device_name`], `finger` choosing how an on-key write
+    /// unlocks ([`RenameTarget::finger`]).
+    fn save_device_name_with(&mut self, finger: bool) {
+        if let Some(t) = self.rename_target.as_mut() {
+            t.finger = finger;
+        }
         let Some(target) = self.rename_target.clone() else {
             // No pinned target (e.g. the device had no serial at open); nothing
             // to write.
@@ -15265,9 +15324,29 @@ impl App {
 
     /// Set (`Some`) or clear (`None`) the name on the key the open naming
     /// field is pinned to, in the background, then record it on this
-    /// computer. The worker plans first and refuses what can't work before
-    /// the PIN is used.
+    /// computer, unlocking as the field says ([`Self::rename_unlock`]).
     fn start_key_name_write(&mut self, name: Option<String>) {
+        let unlock = self.rename_unlock();
+        self.start_key_name_write_with(name, unlock);
+    }
+
+    /// The naming field's own unlock for an on-key save: the finger when
+    /// Touch fingerprint started it, else the PIN typed there.
+    fn rename_unlock(&self) -> Option<SessionUnlock> {
+        let t = self.rename_target.as_ref()?;
+        Some(if t.finger {
+            SessionUnlock::Fingerprint
+        } else {
+            SessionUnlock::Pin(zeroize::Zeroizing::new(self.rename_pin.clone()))
+        })
+    }
+
+    /// [`Self::start_key_name_write`] with the naming field's `unlock`,
+    /// used while the FIDO2 tab is locked; an unlocked tab's session and
+    /// its token save instead (a fingerprint one asks the finger only when
+    /// the key refuses that token). The worker plans first and refuses what
+    /// can't work before the PIN or the finger is used.
+    fn start_key_name_write_with(&mut self, name: Option<String>, unlock: Option<SessionUnlock>) {
         let Some(target) = self.rename_target.clone() else {
             return;
         };
@@ -15276,14 +15355,9 @@ impl App {
         if self.refuse_if_busy() {
             return;
         }
-        // The PIN typed here, or the FIDO2 tab's unlock and its token.
+        // The field's own unlock, or the FIDO2 tab's unlock and its token.
         let (unlock, held) = if self.rename_needs_pin() {
-            (
-                Some(SessionUnlock::Pin(zeroize::Zeroizing::new(
-                    self.rename_pin.clone(),
-                ))),
-                None,
-            )
+            (unlock, None)
         } else {
             match self.fido_session() {
                 Some(s) => (Some(s.unlock.clone()), Some(s.token.clone())),
@@ -20179,11 +20253,17 @@ impl App {
 
     /// What the naming field explains under the text box: where the name
     /// goes (and the choice, when the key can hold its own name), the PIN
-    /// field for an on-key save, the last error, and the replace/remove
+    /// field for an on-key save (with Touch fingerprint on a key whose
+    /// sensor can unlock it), the last error, and the replace/remove
     /// question. `what` is "key" or "token". Returns (confirm, cancel the
     /// question, Enter pressed in the PIN field — a save like the name
-    /// field's Enter).
-    fn rename_details(&mut self, ui: &mut egui::Ui, p: &Palette, what: &str) -> (bool, bool, bool) {
+    /// field's Enter, Touch fingerprint pressed — a save with the finger).
+    fn rename_details(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        what: &str,
+    ) -> (bool, bool, bool, bool) {
         let waiting = self.waiting_for().map(str::to_owned);
         let note = |ui: &mut egui::Ui, text: &str| {
             ui.label(
@@ -20199,8 +20279,10 @@ impl App {
         let needs_pin = self.rename_needs_pin();
         let on_key = self.rename_goes_on_key();
         let blocked = self.rename_blocked();
+        let finger_ready = self.rename_finger_ready();
+        let offer_finger = self.rename_offers_finger();
         let Some(t) = self.rename_target.as_mut() else {
-            return (false, false, false);
+            return (false, false, false, false);
         };
         ui.add_space(3.0);
         if t.choices.contains(&device::NameStoreChoice::Key) {
@@ -20219,7 +20301,12 @@ impl App {
                 );
                 note(
                     ui,
-                    "Visible to anyone who has the key. Saving asks for the key's PIN.",
+                    if finger_ready {
+                        "Visible to anyone who has the key. Saving asks for the key's PIN or \
+                         a fingerprint."
+                    } else {
+                        "Visible to anyone who has the key. Saving asks for the key's PIN."
+                    },
                 );
             });
         } else {
@@ -20235,7 +20322,7 @@ impl App {
             ui.add_space(3.0);
             ui.colored_label(p.err, device::NAME_IS_ON_THE_KEY);
         }
-        let mut submit = false;
+        let (mut submit, mut finger) = (false, false);
         if on_key && needs_pin && !t.saving {
             ui.add_space(4.0);
             let pin = &mut self.rename_pin;
@@ -20255,10 +20342,29 @@ impl App {
                 guard_secret_field(ui.ctx(), &resp);
                 submit =
                     !held && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if offer_finger {
+                    ui.add_space(4.0);
+                    if held || blocked {
+                        theme::button_disabled(ui, p, "Touch fingerprint");
+                    } else {
+                        finger = theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Default,
+                            "Touch fingerprint",
+                            waiting.as_deref(),
+                        )
+                        .clicked();
+                    }
+                }
             });
+            if offer_finger {
+                ui.add_space(4.0);
+                vault_pane::fingerprint_experimental_note(ui, p);
+            }
         }
         let Some(t) = self.rename_target.as_mut() else {
-            return (false, false, false);
+            return (false, false, false, false);
         };
         if let Some(e) = &t.error {
             ui.add_space(3.0);
@@ -20288,7 +20394,7 @@ impl App {
                     });
                 });
         }
-        (confirm, cancel, submit)
+        (confirm, cancel, submit, finger)
     }
 
     /// Apply what [`Self::rename_details`] returned.
@@ -20308,7 +20414,8 @@ impl App {
         let mut open_rename = false;
         let mut do_save = false;
         let mut do_cancel = false;
-        let (mut do_confirm, mut do_unconfirm, mut pin_enter) = (false, false, false);
+        let (mut do_confirm, mut do_unconfirm, mut pin_enter, mut do_finger) =
+            (false, false, false, false);
         let mut write_back: Option<WriteBack> = None;
         let offer = device::write_back_offer(dev, self.write_back_dismissed.contains(&dev.id))
             .filter(|_| self.rename_target.is_none())
@@ -20391,7 +20498,8 @@ impl App {
                         }
                     }
                     if self.rename_target.is_some() {
-                        (do_confirm, do_unconfirm, pin_enter) = self.rename_details(ui, p, "key");
+                        (do_confirm, do_unconfirm, pin_enter, do_finger) =
+                            self.rename_details(ui, p, "key");
                     }
                     ui.add_space(2.0);
                     let serial = if dev.serial.is_empty() {
@@ -20462,7 +20570,10 @@ impl App {
             },
         );
         self.apply_rename_question(do_confirm, do_unconfirm);
-        let save = (do_save || pin_enter) && !self.rename_blocked();
+        if do_finger {
+            self.save_device_name_by_finger();
+        }
+        let save = (do_save || pin_enter) && !do_finger && !self.rename_blocked();
         self.apply_rename_actions(dev, open_rename, do_cancel, save);
         if let (Some(action), Some(n)) = (write_back, offer) {
             self.apply_write_back(dev, action, &n);
@@ -20788,10 +20899,12 @@ impl App {
         let offer = self.vault_offer_with(non_admin);
         // A failed read says "Reading key…" here, as the FIDO2 card above it
         // does; unlocked, what the vaults hold.
+        let finger = self.finger_ready();
         let line = vault_pane::overview_line(
             offer,
             false,
             self.vault_session().map(|s| s.unlocked.vaults.as_slice()),
+            finger,
         );
         theme::card_frame(p).show(ui, |ui| {
             if matches!(offer, VaultOffer::No(_)) {
@@ -21535,11 +21648,8 @@ impl App {
             let mut unlock = false;
             let mut unlock_finger = false;
             // A key whose own sensor can unlock it offers the touch beside
-            // the PIN (experimental: no such key was on hand to try).
-            let finger = self.security_keys.info.as_ref().is_some_and(|i| {
-                keyroost_ctap::client_pin::built_in_uv(i)
-                    == keyroost_ctap::client_pin::BuiltInUv::Ready
-            });
+            // the PIN.
+            let finger = self.finger_ready();
             theme::card_frame(p).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -22198,15 +22308,15 @@ impl App {
     }
 
     /// Append a keyroost text note to the array and write it back. Needs the
-    /// unlocked session's PIN (the write path requires a Large-Blob-Write token).
+    /// unlocked session: the write takes a Large-Blob-Write token from its
+    /// PIN, or uses a fingerprint session's own ([`write_large_blobs`]).
     fn add_large_blob_note(&mut self, text: String) {
         let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
             return;
         };
         let Some(session) = self.fido_session() else {
-            self.security_keys.lb_status =
-                Some("Unlock the key with your PIN first to add data.".into());
+            self.security_keys.lb_status = Some("Unlock the key first to add data.".into());
             return;
         };
         let unlock = session.unlock.clone();
@@ -22287,15 +22397,15 @@ impl App {
     }
 
     /// Replace the keyroost note at `idx` with `text` and write the array back.
-    /// Refuses if the entry is not a keyroost note. Needs the session PIN.
+    /// Refuses if the entry is not a keyroost note. Needs the unlocked
+    /// session ([`write_large_blobs`]).
     fn edit_large_blob_note(&mut self, idx: usize, text: String) {
         let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
             return;
         };
         let Some(session) = self.fido_session() else {
-            self.security_keys.lb_status =
-                Some("Unlock the key with your PIN first to edit notes.".into());
+            self.security_keys.lb_status = Some("Unlock the key first to edit notes.".into());
             return;
         };
         let unlock = session.unlock.clone();
@@ -22424,8 +22534,9 @@ impl App {
     }
 
     /// Delete entry `idx`, re-serialize the remaining entries with a fresh
-    /// checksum, and write the array back. Needs a Large-Blob-Write token, which
-    /// we derive from the unlocked session's PIN. Runs on the worker thread.
+    /// checksum, and write the array back. Needs the unlocked session's
+    /// Large-Blob-Write token ([`write_large_blobs`]). Runs on the worker
+    /// thread.
     fn delete_large_blob_entry(&mut self, idx: usize) {
         let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
@@ -22436,7 +22547,7 @@ impl App {
         };
         let Some(session) = self.fido_session() else {
             self.security_keys.lb_status =
-                Some("Unlock the key with your PIN first to modify large blobs.".into());
+                Some("Unlock the key first to modify large blobs.".into());
             return;
         };
         let Some(target_entry) = array.entry(idx).cloned() else {
@@ -22535,9 +22646,9 @@ impl App {
     /// is the only way to erase plaintext notes that survive a reset. With
     /// `keep_name` and a name on the key, the key's name entry is written back
     /// exactly as read (`fido blob clear --keep-name`). Refuses, before the PIN
-    /// is used, when the array on the key is no longer the one shown. Needs a
-    /// Large-Blob-Write token derived from the unlocked session's PIN. Runs on
-    /// the worker thread.
+    /// is used, when the array on the key is no longer the one shown. Needs the
+    /// unlocked session's Large-Blob-Write token ([`write_large_blobs`]). Runs
+    /// on the worker thread.
     fn clear_large_blob_storage(&mut self, keep_name: bool) {
         let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
@@ -22548,7 +22659,7 @@ impl App {
         };
         let Some(session) = self.fido_session() else {
             self.security_keys.lb_status =
-                Some("Unlock the key with your PIN first to modify large blobs.".into());
+                Some("Unlock the key first to modify large blobs.".into());
             return;
         };
         let unlock = session.unlock.clone();
@@ -22798,7 +22909,7 @@ impl App {
                     }
                     if !unlocked {
                         ui.label(
-                            egui::RichText::new("Unlock with your PIN to save.")
+                            egui::RichText::new("Unlock the key to save.")
                                 .font(theme::f_reg(11.0))
                                 .color(p.txt3),
                         );
@@ -22938,7 +23049,7 @@ impl App {
                         }
                         if !unlocked {
                             ui.label(
-                                egui::RichText::new("Unlock with your PIN to save.")
+                                egui::RichText::new("Unlock the key to save.")
                                     .font(theme::f_reg(11.0))
                                     .color(p.txt3),
                             );
@@ -23074,8 +23185,8 @@ impl App {
                         egui::RichText::new(format!(
                             "{what} This erases {every} \u{2014} \
                              including any relying-party data (e.g. SSH certificates, sign-in \
-                             records), not just keyroost notes. Cannot be undone; requires your \
-                             PIN.{name_clause}",
+                             records), not just keyroost notes. Cannot be undone; requires the \
+                             key unlocked.{name_clause}",
                         ))
                         .font(theme::f_reg(12.5))
                         .color(p.txt),
@@ -23616,8 +23727,17 @@ impl App {
             AdvancedAction::None => return,
         };
 
-        let mut apply = false;
+        let (mut apply, mut apply_finger) = (false, false);
         let mut cancel = false;
+        // A key whose sensor can unlock it, and may change settings with it
+        // (`uvAcfg`), offers the finger beside Apply.
+        let finger = self.finger_ready()
+            && self.security_keys.info.as_ref().is_some_and(|i| {
+                keyroost_ctap::client_pin::uv_grants(
+                    i,
+                    keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
+                )
+            });
         // No built-in title bar, so handle Esc-to-dismiss ourselves.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             cancel = true;
@@ -23719,10 +23839,29 @@ impl App {
                         apply = true;
                     }
                     ui.add_space(8.0);
+                    if finger
+                        && theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Default,
+                            "Touch fingerprint",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                    {
+                        apply_finger = true;
+                    }
+                    if finger {
+                        ui.add_space(8.0);
+                    }
                     if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
                         cancel = true;
                     }
                 });
+                if finger {
+                    ui.add_space(10.0);
+                    vault_pane::fingerprint_experimental_note(ui, p);
+                }
 
                 if let Some(err) = &self.security_keys.error {
                     ui.add_space(10.0);
@@ -23736,6 +23875,12 @@ impl App {
 
         if apply {
             self.run_advanced_action();
+        } else if apply_finger {
+            // No PIN waits behind the finger.
+            if let Some(d) = self.security_keys.advanced.as_mut() {
+                wipe(&mut d.pin_input);
+            }
+            self.run_advanced_action_with(SessionUnlock::Fingerprint);
         } else if cancel {
             // The Cancel button, the ✕, or pressing Esc all dismiss.
             self.security_keys.advanced = None;
@@ -36833,6 +36978,60 @@ mod tests {
     /// Every text of one headless frame of the FIDO2 tab, at the smallest
     /// window with the sidebar full width, with where it was drawn.
     fn fido2_texts(app: &mut App) -> Vec<(String, egui::Rect)> {
+        pane_texts(app, |app, ui, p| app.cap_fido2(ui, p))
+    }
+
+    /// Every text of one headless frame of `render` in the pane beside a
+    /// full-width sidebar, at the smallest window, with where it was drawn.
+    fn pane_texts(
+        app: &mut App,
+        mut render: impl FnMut(&mut App, &mut egui::Ui, &Palette),
+    ) -> Vec<(String, egui::Rect)> {
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx);
+        // Two frames: the first lays out the rows.
+        pane_frame(&ctx, app, Vec::new(), &mut render);
+        pane_frame(&ctx, app, Vec::new(), &mut render)
+    }
+
+    /// Click the text `label` that `render` draws in the pane of
+    /// [`pane_texts`], as a person would: move there, press, release.
+    fn click_in_pane(
+        app: &mut App,
+        label: &str,
+        mut render: impl FnMut(&mut App, &mut egui::Ui, &Palette),
+    ) {
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx);
+        pane_frame(&ctx, app, Vec::new(), &mut render);
+        let texts = pane_frame(&ctx, app, Vec::new(), &mut render);
+        let pos = texts
+            .iter()
+            .find(|(t, _)| t == label)
+            .map(|(_, r)| r.center())
+            .unwrap_or_else(|| panic!("{label} is drawn: {texts:?}"));
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![press(true)],
+            vec![press(false)],
+        ] {
+            pane_frame(&ctx, app, events, &mut render);
+        }
+    }
+
+    /// One frame of [`pane_texts`] on `ctx` with `events`.
+    fn pane_frame(
+        ctx: &egui::Context,
+        app: &mut App,
+        events: Vec<egui::Event>,
+        render: &mut impl FnMut(&mut App, &mut egui::Ui, &Palette),
+    ) -> Vec<(String, egui::Rect)> {
         fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
             match shape {
                 egui::Shape::Text(t) => {
@@ -36842,29 +37041,24 @@ mod tests {
                 _ => {}
             }
         }
-        let ctx = egui::Context::default();
-        crate::ui::theme::install_fonts(&ctx);
         let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
-        let input = || egui::RawInput {
+        let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::Vec2::from(WINDOW_MIN_SIZE),
             )),
+            events,
             ..Default::default()
         };
+        let output = ctx.test_frame(input, |ui| {
+            egui::Panel::left("test_sidebar")
+                .exact_size(SIDEBAR_FULL_W)
+                .show(ui, |_| {});
+            egui::CentralPanel::default().show(ui, |ui| render(app, ui, &palette));
+        });
         let mut out = Vec::new();
-        // Two frames: the first lays out the rows.
-        for _ in 0..2 {
-            let output = ctx.test_frame(input(), |ui| {
-                egui::Panel::left("test_sidebar")
-                    .exact_size(SIDEBAR_FULL_W)
-                    .show(ui, |_| {});
-                egui::CentralPanel::default().show(ui, |ui| app.cap_fido2(ui, &palette));
-            });
-            out.clear();
-            for clipped in output.shapes {
-                collect(&clipped.shape, &mut out);
-            }
+        for clipped in output.shapes {
+            collect(&clipped.shape, &mut out);
         }
         out
     }
@@ -36931,6 +37125,297 @@ mod tests {
                 assert!(r.right() <= WINDOW_MIN_SIZE[0], "{t}: {r:?}");
             }
         }
+    }
+
+    /// The naming field open on `d`, the selected key with getInfo options
+    /// `uv`, saving "Desk" on the key with the FIDO2 tab locked. Nothing
+    /// here loads keys.json: the tests below render or remove only.
+    fn naming_on_key(d: &Device, uv: &[&str]) -> App {
+        let mut app = App {
+            selected_device: Some(d.id.clone()),
+            ..Default::default()
+        };
+        app.security_keys.info = Some(finger_info(uv));
+        app.apply_rename_actions(d, true, false, false);
+        app.rename_target.as_mut().unwrap().store = device::NameStoreChoice::Key;
+        app.rename_input = "Desk".into();
+        app
+    }
+
+    fn naming_texts(app: &mut App) -> Vec<(String, egui::Rect)> {
+        pane_texts(app, |app, ui, p| {
+            app.rename_details(ui, p, "key");
+        })
+    }
+
+    /// An on-key name save on a key whose sensor can unlock it: Touch
+    /// fingerprint beside the PIN field, the note says a finger can save,
+    /// and the experimental note. Otherwise, for a name kept on this
+    /// computer, with the FIDO2 tab unlocked, or with another key's
+    /// getInfo at hand: as before.
+    #[test]
+    fn the_name_dialog_offers_the_fingerprint_for_an_on_key_save() {
+        let pin_note = "Visible to anyone who has the key. Saving asks for the key's PIN.";
+        let finger_note =
+            "Visible to anyone who has the key. Saving asks for the key's PIN or a fingerprint.";
+        let d = key_with_storage(None);
+        for (uv, ready) in [(&["uv"][..], true), (&[][..], false)] {
+            let mut app = naming_on_key(&d, uv);
+            assert!(app.rename_goes_on_key() && app.rename_needs_pin());
+            let texts = naming_texts(&mut app);
+            let has = |s: &str| texts.iter().any(|(t, _)| t == s);
+            assert!(has("Key PIN"), "{uv:?}: {texts:?}");
+            assert_eq!(has("Touch fingerprint"), ready, "{uv:?}: {texts:?}");
+            assert_eq!(has("Experimental"), ready, "{uv:?}: {texts:?}");
+            assert_eq!(has(finger_note), ready, "{uv:?}: {texts:?}");
+            assert_eq!(has(pin_note), !ready, "{uv:?}: {texts:?}");
+        }
+
+        // Beside the PIN field, on its row, inside the window.
+        let mut app = naming_on_key(&d, &["uv"]);
+        let texts = naming_texts(&mut app);
+        let rect = |s: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t == s)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{s} drawn: {texts:?}"))
+        };
+        let (label, finger) = (rect("Key PIN"), rect("Touch fingerprint"));
+        assert!(finger.left() > label.right() + 160.0, "after the field");
+        assert!(
+            (finger.center().y - label.center().y).abs() < 8.0,
+            "one row"
+        );
+        assert!(finger.right() <= WINDOW_MIN_SIZE[0], "{finger:?}");
+
+        let no_finger = |app: &mut App| {
+            let texts = naming_texts(app);
+            assert!(
+                !texts.iter().any(|(t, _)| t == "Touch fingerprint"),
+                "{texts:?}"
+            );
+            texts
+        };
+        // Kept on this computer: no PIN, no finger.
+        let mut app = naming_on_key(&d, &["uv"]);
+        app.rename_target.as_mut().unwrap().store = device::NameStoreChoice::Computer;
+        no_finger(&mut app);
+        // The FIDO2 tab unlocked: its session saves, no PIN field.
+        let mut app = naming_on_key(&d, &["uv"]);
+        app.security_keys.session = Some(unlocked_session(1));
+        app.security_keys.session_device = Some(d.id.clone());
+        let texts = no_finger(&mut app);
+        assert!(!texts.iter().any(|(t, _)| t == "Key PIN"), "{texts:?}");
+        // The getInfo at hand is another key's.
+        let mut app = naming_on_key(&d, &["uv"]);
+        app.selected_device = Some("serial:B".into());
+        let texts = no_finger(&mut app);
+        assert!(texts.iter().any(|(t, _)| t == pin_note), "{texts:?}");
+    }
+
+    /// Touch fingerprint saves as Save does, with the finger: a PIN typed
+    /// first is wiped, and the answer to the remove question saves with the
+    /// finger too. Save goes back to the PIN typed in the field.
+    #[test]
+    fn touch_fingerprint_saves_the_name_with_the_finger() {
+        let d = key_with_storage(Some("Desk"));
+        let mut app = naming_on_key(&d, &["uv"]);
+        // Removing: no keys.json read before the write. No HID path: the
+        // save stops before any I/O, after the unlock is chosen.
+        app.rename_input.clear();
+        app.rename_target.as_mut().unwrap().hid_path = None;
+        app.rename_pin = "1234".into();
+        assert!(app.rename_offers_finger());
+        click_in_pane(&mut app, "Touch fingerprint", |app, ui, p| {
+            let (confirm, cancel, _, finger) = app.rename_details(ui, p, "key");
+            app.apply_rename_question(confirm, cancel);
+            if finger {
+                app.save_device_name_by_finger();
+            }
+        });
+        assert!(app.rename_pin.is_empty(), "no PIN waits behind the finger");
+        assert!(
+            app.rename_target.as_ref().unwrap().confirm.is_some(),
+            "the remove question first"
+        );
+        assert!(matches!(
+            app.rename_unlock(),
+            Some(SessionUnlock::Fingerprint)
+        ));
+        app.apply_rename_question(true, false);
+        let t = app.rename_target.clone().expect("field stays open");
+        assert_eq!(t.error.as_deref(), Some(KEY_NAME_NO_STORAGE));
+
+        // Save: the typed PIN again.
+        app.rename_pin = "1234".into();
+        app.save_device_name();
+        assert!(matches!(
+            app.rename_unlock(),
+            Some(SessionUnlock::Pin(ref p)) if p.as_str() == "1234"
+        ));
+    }
+
+    /// The naming field's Touch fingerprint asks the finger for a
+    /// large-blob-write token (0x06), never a PIN token, and writes once.
+    /// No unlock at all asks for the PIN and sends nothing.
+    #[test]
+    fn a_fingerprint_name_save_sends_no_pin() {
+        let prompt = FingerPrompt::default();
+        let mut key = TokenKey::with_finger(0, &prompt);
+        key.blobs = true;
+        let (w, renewed) = write_key_name_on(
+            &mut key,
+            Some("Desk"),
+            None,
+            Some(&SessionUnlock::Fingerprint),
+            None,
+            &prompt,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(matches!(w, KeyNameWrite::Written(_)));
+        assert!(renewed.is_none(), "no session to hand a token to");
+        assert_eq!(key.subs, [7, 2, 6], "tries left, key agreement, finger");
+        assert_eq!(
+            key.perms,
+            [u64::from(
+                keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE
+            )]
+        );
+        assert_eq!(
+            key.seen_prompts,
+            [Some(
+                keyroost_ctap::client_pin::FingerAsk::Unlock
+                    .prompt()
+                    .to_owned()
+            )]
+        );
+        assert!(prompt.lock().unwrap().is_none(), "the banner line went");
+        assert_eq!(key.blob_writes, 1);
+
+        let mut key = TokenKey::with_finger(0, &prompt);
+        key.blobs = true;
+        let err = write_key_name_on(&mut key, Some("Desk"), None, None, None, &prompt)
+            .err()
+            .expect("no unlock");
+        assert_eq!(err, KeyNameFailure::Failed(KEY_NAME_PIN_NEEDED.into()));
+        assert!(key.subs.is_empty());
+        assert_eq!(key.blob_writes, 0);
+    }
+
+    /// The settings dialog for "serial:AAA", selected, with getInfo
+    /// options `opts`.
+    fn settings_dialog(opts: &[&str]) -> App {
+        let id: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(id.clone()),
+            ..Default::default()
+        };
+        app.security_keys.info = Some(finger_info(opts));
+        app.security_keys.advanced = Some(AdvancedDialog {
+            action: AdvancedAction::ToggleAlwaysUv,
+            pin_input: String::new(),
+            min_pin_input: String::new(),
+            force_change: false,
+            device: Some(id),
+        });
+        app
+    }
+
+    /// The settings dialog offers Touch fingerprint, right of Apply, only
+    /// on a key whose sensor can unlock it and may change settings with it
+    /// (`uvAcfg`), with the experimental note.
+    #[test]
+    fn the_settings_dialog_offers_the_fingerprint() {
+        for (opts, offered) in [
+            (&["authnrCfg", "uv", "uvAcfg"][..], true),
+            (&["authnrCfg", "uv"][..], false),
+            (&["authnrCfg", "uvAcfg"][..], false),
+        ] {
+            let mut app = settings_dialog(opts);
+            let texts = pane_texts(&mut app, |app, ui, p| {
+                app.render_advanced_confirm(ui.ctx(), p)
+            });
+            let has = |s: &str| texts.iter().any(|(t, _)| t == s);
+            assert!(has("Apply") && has("Device PIN"), "{opts:?}: {texts:?}");
+            assert_eq!(has("Touch fingerprint"), offered, "{opts:?}: {texts:?}");
+            assert_eq!(has("Experimental"), offered, "{opts:?}: {texts:?}");
+        }
+        let mut app = settings_dialog(&["authnrCfg", "uv", "uvAcfg"]);
+        let texts = pane_texts(&mut app, |app, ui, p| {
+            app.render_advanced_confirm(ui.ctx(), p)
+        });
+        let rect = |s: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t == s)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{s} drawn: {texts:?}"))
+        };
+        let (apply, finger, cancel) = (rect("Apply"), rect("Touch fingerprint"), rect("Cancel"));
+        assert!(!apply.intersects(finger), "{apply:?} {finger:?}");
+        assert!(!finger.intersects(cancel), "{finger:?} {cancel:?}");
+        assert!(finger.left() > apply.right(), "right of Apply");
+        assert!(
+            (finger.center().y - apply.center().y).abs() < 4.0,
+            "one row"
+        );
+        for (t, r) in &texts {
+            if !t.is_empty() {
+                assert!(
+                    r.left() >= 0.0 && r.right() <= WINDOW_MIN_SIZE[0],
+                    "{t}: {r:?}"
+                );
+            }
+        }
+    }
+
+    /// Apply still needs the typed PIN; Touch fingerprint applies with the
+    /// finger, so an empty PIN box doesn't stop it (the job runs, here
+    /// failing to open a key that isn't there), and wipes what was typed.
+    // Linux only: the job reaches a HID open, a plain file open on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn touch_fingerprint_applies_a_setting_without_the_pin() {
+        let pin_needed = "Enter the device PIN to apply this change.";
+        let with_key = |app: &mut App| {
+            let mut d = test_key("serial:AAA", "AAA", None);
+            d.caps.insert(Caps::FIDO2);
+            d.hid_path = Some("/nonexistent/keyroost-test/hidraw0".into());
+            app.devices = vec![d];
+        };
+        let mut app = settings_dialog(&["authnrCfg", "uv", "uvAcfg"]);
+        with_key(&mut app);
+        app.run_advanced_action();
+        assert_eq!(app.security_keys.error.as_deref(), Some(pin_needed));
+        assert!(app.security_keys.advanced.is_some(), "the dialog stays");
+
+        let mut app = settings_dialog(&["authnrCfg", "uv", "uvAcfg"]);
+        with_key(&mut app);
+        app.security_keys.advanced.as_mut().unwrap().pin_input = "1234".into();
+        click_in_pane(&mut app, "Touch fingerprint", |app, ui, p| {
+            app.render_advanced_confirm(ui.ctx(), p)
+        });
+        let shown = app.security_keys.error.clone().expect("the open failure");
+        assert_ne!(shown, pin_needed);
+        assert!(
+            app.security_keys.advanced.is_none(),
+            "the job ran; its end drops the dialog and the typed PIN"
+        );
+    }
+
+    /// The help bubbles name the fingerprint where it unlocks.
+    #[test]
+    fn help_mentions_the_fingerprint() {
+        let body = |t: &str| crate::ui::help::help(t).expect(t).body;
+        assert!(body("unlock").starts_with(
+            "Enter the key's PIN, or touch its fingerprint sensor if it has one, to unlock it \
+             for this session."
+        ));
+        assert!(body("fingerprint")
+            .contains("Requires the PIN, or a fingerprint on keys that allow it, to manage."));
+        assert!(body("vault").contains("opened with the key's PIN or a fingerprint, and a touch"));
+        assert!(!body("large_blobs").contains("needs your PIN"));
     }
 
     /// Selecting another device closes (and thereby zeroizes) the dialog.
