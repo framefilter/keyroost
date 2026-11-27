@@ -826,6 +826,19 @@ pub enum PivQuirk {
     /// chained GENERAL AUTHENTICATE, PUT DATA and IMPORT; CanoKey's PIV
     /// documentation says the same.
     ExtendedLengthNotSupported,
+    /// GET METADATA goes out with `Le` `00`
+    /// ([`crate::get_metadata_with_le`]): without it the card answers a
+    /// reply longer than one response frame with `6900`.
+    ///
+    /// Hardware-observed on a CanoKey Canary, firmware 3.1.2 (2026-11-27):
+    /// GET METADATA for an RSA-3072 and an RSA-4096 slot answered `6900`
+    /// without `Le`, every time and also straight after the key was
+    /// plugged in again, and returned the 408- and 536-byte replies with
+    /// `Le` `00`; an RSA-2048 slot's 280-byte reply came back either way.
+    /// canokey-core 3.1.2 streams a reply over 288 bytes from a separate
+    /// buffer (`piv_set_public_key_response`). `Le` `00` is the standard
+    /// form of a command that expects data, so it goes to every CanoKey.
+    MetadataNeedsLe,
     /// [`PivExtension::SlotPinPolicy`] is supported on this device in
     /// principle — GENERATE ASYMMETRIC KEYPAIR accepts the `0xAA` tag — but
     /// the specific `Once` value is rejected. A caller offering the PIN
@@ -3094,7 +3107,11 @@ const CANOKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
 /// regress.
 ///
 /// Source-verified on canokey-core 3.1.2 (`applets/piv/piv.c`) and
-/// CanoKey's PIV documentation; not yet hardware-verified:
+/// CanoKey's PIV documentation. Hardware-verified on a CanoKey Canary,
+/// firmware 3.1.2 (2026-11-27): GET METADATA, RESET, SET MANAGEMENT KEY
+/// (AES-192; 3DES answered `6A80`), generating RSA-2048/3072/4096,
+/// P-384/521, Ed25519 and X25519, and the PIN-protected management key
+/// below. The rest is from the source only:
 ///
 /// * MOVE/DELETE KEY (`F6`), GET METADATA (`F7`), ATTEST (`F9`, for keys
 ///   generated on the device, signed by the key provisioned in slot `F9`),
@@ -3109,6 +3126,11 @@ const CANOKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
 /// * PIN policies Never/Once/Always and touch policies Never/Always/Cached
 ///   (15 seconds).
 /// * The AES-192 management key; 3DES is gone from 3.1.0.
+/// * The PIN-protected management key ([`PivExtension::PinManagementAuth`]):
+///   the firmware keeps PRINTED (`5FC109`) behind the PIN and ADMIN DATA
+///   (`5FFF00`) for the host (`piv_do_table`). On the Canary, PRINTED
+///   answered `6982` without the PIN, also after a replug, and with the
+///   PIN read back the 24-byte key keyroost had written.
 const CANOKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
         extensions: &[
@@ -3138,6 +3160,7 @@ const CANOKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::ImportKey(KeyAlg::Ed25519),
             PivExtension::ImportKey(KeyAlg::X25519),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::PinManagementAuth,
         ],
         verdicts: &[VersionVerdict {
             version: &[3, 1],
@@ -3158,8 +3181,9 @@ const CANOKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
 /// CanoKey's applet-axis quirks, at every version: the YubiKey defaults
 /// for the management key (`01 02 .. 08` three times), PIN (`123456`) and
 /// PUK (`12345678`) (`piv.c`: `DEFAULT_MGMT_KEY`, `piv_install`), no touch
-/// to generate or import, and no extended-length APDUs
-/// ([`PivQuirk::ExtendedLengthNotSupported`]).
+/// to generate or import, no extended-length APDUs
+/// ([`PivQuirk::ExtendedLengthNotSupported`]), and GET METADATA with `Le`
+/// ([`PivQuirk::MetadataNeedsLe`]).
 const CANOKEY_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
     version: &[],
     quirks: &[
@@ -3167,6 +3191,7 @@ const CANOKEY_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
         YUBIKEY_DEFAULT_PIN_PUK,
         PivQuirk::NoTouchToGenerateOrImport,
         PivQuirk::ExtendedLengthNotSupported,
+        PivQuirk::MetadataNeedsLe,
     ],
 }];
 
@@ -10064,6 +10089,7 @@ mod tests {
                 PivExtension::ImportKey(KeyAlg::Rsa4096),
                 PivExtension::ImportKey(KeyAlg::X25519),
                 PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+                PivExtension::PinManagementAuth,
             ] {
                 assert_eq!(
                     resolve(ext, canokey, Some(&[5, 7, 0]), Some(firmware)),
@@ -10135,6 +10161,7 @@ mod tests {
             Some(&[3, 1, 2]),
         );
         assert!(quirks.contains(&PivQuirk::ExtendedLengthNotSupported));
+        assert!(quirks.contains(&PivQuirk::MetadataNeedsLe));
         assert!(quirks.contains(&PivQuirk::NoTouchToGenerateOrImport));
         assert_eq!(
             default_9b_management_key(&quirks),

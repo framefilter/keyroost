@@ -3225,7 +3225,8 @@ impl<'tx> PivSession<'tx> {
         ) {
             return (None, None);
         }
-        let Ok((data, sw)) = self.transmit_full(&piv::get_metadata(key_ref)) else {
+        let apdu = self.metadata_apdu(key_ref);
+        let Ok((data, sw)) = self.transmit_full(&apdu) else {
             return (None, None);
         };
         if sw != piv::SW_OK {
@@ -3250,9 +3251,22 @@ impl<'tx> PivSession<'tx> {
         ) {
             return None;
         }
-        self.transmit_full(&piv::get_metadata(key_ref))
-            .ok()
-            .map(|(_, sw)| sw)
+        let apdu = self.metadata_apdu(key_ref);
+        self.transmit_full(&apdu).ok().map(|(_, sw)| sw)
+    }
+
+    /// GET METADATA for `key_ref` in the form this card answers: with `Le`
+    /// where the card needs it ([`keyroost_piv::compat::PivQuirk::MetadataNeedsLe`]),
+    /// otherwise the four bytes every other card has been answering.
+    fn metadata_apdu(&mut self, key_ref: u8) -> Vec<u8> {
+        if self
+            .quirks()
+            .contains(&keyroost_piv::compat::PivQuirk::MetadataNeedsLe)
+        {
+            piv::get_metadata_with_le(key_ref)
+        } else {
+            piv::get_metadata(key_ref)
+        }
     }
 
     /// What keyroost can tell about `slot`'s private key ([`SlotKeyPresence`]).
