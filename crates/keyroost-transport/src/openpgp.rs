@@ -172,14 +172,15 @@ impl OpenPgpStatus {
     /// A CanoKey's serial is the one exception: CanoKey gives it as the
     /// decimal value of the four bytes (`439041101`), as its own tools show
     /// it, though GnuPG shows the hex digits (`1A2B3C4D`);
-    /// [`Self::serial_text_long`] adds those.
+    /// [`Self::serial_text_long`] adds those. A CanoKey whose serial was
+    /// never written (all zeros or all `F`) has none, as `list` says.
     #[must_use]
     pub fn serial_text(&self) -> Option<String> {
         if let Some(s) = self.otp_applet_serial {
             return Some(s.to_string());
         }
         if self.is_canokey() {
-            return self.serial().map(|s| s.to_string());
+            return self.canokey_serial().map(|s| s.to_string());
         }
         let b = self.aid.get(10..14)?;
         Some(b.iter().map(|x| format!("{x:02X}")).collect())
@@ -193,10 +194,16 @@ impl OpenPgpStatus {
     pub fn serial_text_long(&self) -> Option<String> {
         if self.otp_applet_serial.is_none() && self.is_canokey() {
             return self
-                .serial()
+                .canokey_serial()
                 .map(|s| keyroost_piv::format_serial_long(u128::from(s)));
         }
         self.serial_text()
+    }
+
+    /// A CanoKey's AID serial, `None` when it was never written.
+    fn canokey_serial(&self) -> Option<u32> {
+        self.serial()
+            .filter(|&s| !keyroost_canokey::serial_is_unset(s))
     }
 
     /// Whether the AID names CanoKey as the card's manufacturer.
@@ -2114,6 +2121,12 @@ mod tests {
             Some("439041101 (0x1A2B3C4D)")
         );
         // Every other vendor keeps the one form in both.
+        // A serial never written is no serial, as `list` has it.
+        for unset in [0, u32::MAX] {
+            let st = status_with(aid_with(pgp::MANUFACTURER_ID_CANOKEY, unset));
+            assert_eq!(st.serial_text(), None);
+            assert_eq!(st.serial_text_long(), None);
+        }
         let other = status_with(aid_with(0x000F, 0x4268_2EF7));
         assert_eq!(other.serial_text_long(), other.serial_text());
         assert_eq!(status_with(vec![]).serial_text_long(), None);

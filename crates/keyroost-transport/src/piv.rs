@@ -2239,11 +2239,15 @@ impl<'tx> PivSession<'tx> {
             false,
         );
         // A CanoKey names itself in the ATR of its USB CCID interface; held
-        // to an NFC reader it gets the reader's ATR instead, so a card
-        // nothing else fingerprints is asked for CanoKey's Admin applet and
-        // taken for a CanoKey when that answers a firmware version.
+        // to an NFC reader it answers with no historical bytes (its ATS
+        // carries none), so only a card nothing else fingerprints *and*
+        // whose ATR has no historical bytes is asked for CanoKey's Admin
+        // applet, and taken for a CanoKey when that answers a firmware
+        // version. Other cards are not sent the extra SELECTs.
         let mut canokey_admin = None;
-        let id = if id == fingerprint::AppletFingerprint::Generic {
+        let maybe_canokey_nfc =
+            fingerprint::atr_historical_bytes(&atr).is_some_and(<[u8]>::is_empty);
+        let id = if id == fingerprint::AppletFingerprint::Generic && maybe_canokey_nfc {
             let admin = self.read_canokey_admin();
             let is_canokey = admin.as_ref().is_some_and(|a| a.firmware.is_some());
             canokey_admin = Some(admin);
@@ -2652,7 +2656,18 @@ impl<'tx> PivSession<'tx> {
         } else {
             None
         };
-        let _ = self.select();
+        // Back to PIV for everything that follows. A card that won't take
+        // the PIV SELECT again would fail its next command; say why under
+        // --debug rather than leave only that later error.
+        if let Err(e) = self.select() {
+            trace::line(self.traced, || {
+                format_line(
+                    Dir::Note,
+                    "piv fingerprint",
+                    &format!("re-selecting PIV after the CanoKey Admin probe failed: {e}"),
+                )
+            });
+        }
         admin
     }
 

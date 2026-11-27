@@ -841,7 +841,13 @@ pub fn correlate_with(
             format!("serial:{serial}")
         };
         let mut model = if is_canokey {
-            crate::canokey::model_from_reader(&p.reader_name).unwrap_or_else(|| vendor.clone())
+            // Only CanoKey's own reader names carry its model. Held to
+            // another reader (NFC), the reader's name is that reader's, so
+            // the row says just the vendor.
+            Some(&p.reader_name)
+                .filter(|name| crate::canokey::is_reader_name(name))
+                .and_then(|name| crate::canokey::model_from_reader(name))
+                .unwrap_or_else(|| vendor.clone())
         } else {
             reader_model(&p.reader_name, &vendor, cfg!(windows))
         };
@@ -4649,6 +4655,27 @@ mod tests {
         p.openpgp_manufacturer = Some(0xF1D0);
         p.serial = serial.map(str::to_owned);
         p
+    }
+
+    #[test]
+    fn a_canokey_in_another_reader_takes_no_model_from_that_readers_name() {
+        let mut p = probe(
+            "ACS ACR1252 1S CL Reader PICC 0",
+            false,
+            true,
+            true,
+            true,
+            None,
+            None,
+            None,
+        );
+        p.openpgp_manufacturer = Some(0xF1D0);
+        p.serial = Some("1a2b3c4d".into());
+        let devs = correlate(&[], &[p], &Keyring::default());
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].vendor, "CanoKey");
+        assert_eq!(devs[0].model, "CanoKey");
+        assert_eq!(devs[0].serial, "439041101");
     }
 
     #[test]

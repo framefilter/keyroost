@@ -9125,6 +9125,11 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 outln!("OATH applet reset: all credentials wiped, access password cleared.");
                 return Ok(());
             }
+            if canokey_admin_pin.is_some() {
+                output::warn(
+                    "--canokey-admin-pin is not used: this key is not a CanoKey, so its                      OATH applet resets without one",
+                );
+            }
             crate::prompt::reverify_if_asked(&dev, asked)?;
             let mut session = keyroost_transport::OathSession::open_traced(&name, debug)?;
             // A Nitrokey 3 asks for a touch to reset; a YubiKey doesn't.
