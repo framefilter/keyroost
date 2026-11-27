@@ -10786,8 +10786,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             outln!("AID:            {}", hex_encode(&status.aid));
             // The serial as GnuPG shows it (a YubiKey's equals its serial
             // elsewhere); a Token2 key's full serial from its OTP applet is
-            // shown as printed on the key.
-            if let Some(serial) = status.serial_text() {
+            // shown as printed on the key; a CanoKey's in decimal, with the
+            // hex digits GnuPG shows after it.
+            if let Some(serial) = status.serial_text_long() {
                 outln!("Serial:         {serial}");
             }
             outln!(

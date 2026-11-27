@@ -12859,14 +12859,20 @@ impl App {
                                     caps.insert(Caps::FIDO2);
                                     let vid = k.vendor_id.unwrap_or(0);
                                     let pid = k.product_id.unwrap_or(0);
-                                    let model = k
-                                        .product
-                                        .clone()
-                                        .unwrap_or_else(|| "Security key".to_string());
+                                    let vendor = keyroost_resolve::vendor_name_for(vid, pid);
+                                    let product = k.product.clone();
+                                    let model = if keyroost_resolve::canokey::is_usb(vid, pid) {
+                                        product
+                                            .as_deref()
+                                            .and_then(keyroost_resolve::canokey::model_from_product)
+                                            .unwrap_or_else(|| vendor.to_string())
+                                    } else {
+                                        product.unwrap_or_else(|| "Security key".to_string())
+                                    };
                                     devices.push(Device {
                                         id: format!("winfido:{vid:04x}:{pid:04x}:{i}"),
                                         name: None,
-                                        vendor: keyroost_resolve::vendor_name(vid).to_string(),
+                                        vendor: vendor.to_string(),
                                         model,
                                         serial: String::new(),
                                         transport: "USB · FIDO HID (admin required)".into(),

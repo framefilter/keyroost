@@ -168,13 +168,40 @@ impl OpenPgpStatus {
     /// key's serial are BCD there, so the digits are the decimal serial
     /// (`37806840`); a Nitrokey's is its hex serial (`42682EF7`). `None`
     /// when the card reported neither.
+    ///
+    /// A CanoKey's serial is the one exception: CanoKey gives it as the
+    /// decimal value of the four bytes (`439041101`), as its own tools show
+    /// it, though GnuPG shows the hex digits (`1A2B3C4D`);
+    /// [`Self::serial_text_long`] adds those.
     #[must_use]
     pub fn serial_text(&self) -> Option<String> {
         if let Some(s) = self.otp_applet_serial {
             return Some(s.to_string());
         }
+        if self.is_canokey() {
+            return self.serial().map(|s| s.to_string());
+        }
         let b = self.aid.get(10..14)?;
         Some(b.iter().map(|x| format!("{x:02X}")).collect())
+    }
+
+    /// [`Self::serial_text`] for a line a person reads: a CanoKey's decimal
+    /// serial followed by the hex digits GnuPG shows for it
+    /// (`439041101 (0x1A2B3C4D)`, as `piv info` writes a PIV serial).
+    /// Machine-readable output keeps [`Self::serial_text`].
+    #[must_use]
+    pub fn serial_text_long(&self) -> Option<String> {
+        if self.otp_applet_serial.is_none() && self.is_canokey() {
+            return self
+                .serial()
+                .map(|s| keyroost_piv::format_serial_long(u128::from(s)));
+        }
+        self.serial_text()
+    }
+
+    /// Whether the AID names CanoKey as the card's manufacturer.
+    fn is_canokey(&self) -> bool {
+        pgp::aid_manufacturer_id(&self.aid) == Some(pgp::MANUFACTURER_ID_CANOKEY)
     }
 
     /// Human label of the algorithm in `crt`'s slot (`RSA-2048`, `EdDSA
@@ -2056,6 +2083,20 @@ mod tests {
         assert_eq!(shown(0x0006, 0x0123_4567).as_deref(), Some("01234567"));
         // Neither: nothing to show.
         assert_eq!(status_with(vec![]).serial_text(), None);
+    }
+
+    #[test]
+    fn a_canokey_serial_is_shown_in_decimal_with_gnupgs_hex_after_it() {
+        let st = status_with(aid_with(pgp::MANUFACTURER_ID_CANOKEY, 0x1A2B_3C4D));
+        assert_eq!(st.serial_text().as_deref(), Some("439041101"));
+        assert_eq!(
+            st.serial_text_long().as_deref(),
+            Some("439041101 (0x1A2B3C4D)")
+        );
+        // Every other vendor keeps the one form in both.
+        let other = status_with(aid_with(0x000F, 0x4268_2EF7));
+        assert_eq!(other.serial_text_long(), other.serial_text());
+        assert_eq!(status_with(vec![]).serial_text_long(), None);
     }
 
     #[test]
