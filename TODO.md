@@ -137,17 +137,21 @@ items marked *(no hardware)* need a device the maintainer does not have.
   new vault 2 and two touches; `rotate` 4 and three touches. A key that
   clears the token after the touch adds 1 ("asked again") to `entry
   add|edit|delete`, `add` and `import`. The app's Vault tab: unlock 1, save
-  none, create 2, rotate 3, delete 1. Confirm on the key which way it lists
-  the vault RP's credentials (enumerateCredentialsBegin): CTAP 2.1 §6.8.4
-  takes the RP-bound token (the counts above); CTAP 2.2's §6.8.4 as written
-  takes only a token bound to no RP, and then the listing is refused (0x33)
-  and keyroost asks once more for an unbound listing token ("This key needs
-  a second fingerprint to list its vaults"), remembered for the rest of that
-  command or app session. On such a key: `list`, `export`, the `entry`
-  commands and `import` into a vault on the key 3, `delete` 2, `add` and
-  `import` into a new vault 4, `rotate` 6; the app's unlock 3, a later
-  delete 1. Check the command still works and the reason line shows, and
-  that deleteCredential takes the RP-bound token on both kinds. Then drop "experimental" from `--unlock`'s help
+  none, create 2, rotate 3, delete 1. Those are for a key without
+  `FIDO_2_2` in getInfo `versions` that lists the vault RP's credentials
+  (enumerateCredentialsBegin) under the RP-bound token, as CTAP 2.1 §6.8.4
+  allows. CTAP 2.2's §6.8.4 is written to list only under a token bound to
+  no RP (its own §6.8 example says otherwise), so on a key reporting
+  `FIDO_2_2` keyroost lists under an unbound token from the start: `list`,
+  `export`, the `entry` commands and `import` into a vault on the key 2,
+  `delete` 1, `add` and `import` into a new vault 3, `rotate` 5; the app's
+  unlock 2. A pre-2.2 key that refuses the bound listing anyway (0x33) gets
+  one more ask, "This key needs a second fingerprint to list its vaults",
+  remembered for the rest of that command or app session: `list` 3,
+  `delete` 2, `add` 4, `rotate` 6, the app's unlock 3. Confirm on a 2.1 and
+  a 2.2 bio key which way each lists (does the 2.2 key take the bound token
+  after all?), that every vault command works, and that deleteCredential
+  takes the RP-bound token on both. Then drop "experimental" from `--unlock`'s help
   (`FIDO_UNLOCK_HELP`), the README, `docs/fido2.html`, `docs/vault.html` and
   the app (`vault_pane::fingerprint_experimental_note`).
 

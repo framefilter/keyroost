@@ -557,7 +557,9 @@ pub enum Verified {
 
 /// Why the user is asked for a finger: the first unlock, again because
 /// the key dropped the token it gave, or again because the key lists its
-/// vaults only under a second token.
+/// vaults only under a second token. Non-exhaustive, so a new reason is no
+/// breaking change; [`prompt`](Self::prompt) says each one.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FingerAsk {
     Unlock,

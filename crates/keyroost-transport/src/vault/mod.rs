@@ -369,6 +369,9 @@ impl From<VaultError> for VaultKeyError {
 const FINGER_PERMISSIONS: u32 =
     CREDENTIAL_MANAGEMENT | GET_ASSERTION | MAKE_CREDENTIAL | LARGE_BLOB_WRITE;
 
+/// The getInfo `versions` entry of a CTAP 2.2 key.
+const CTAP_2_2: &str = "FIDO_2_2";
+
 /// How a vault flow proves the person may use the key. Holds the secret
 /// (or the way to ask for a finger) and the pinUvAuthToken it last
 /// obtained, with that token's permissions, so a flow can reuse a token
@@ -386,9 +389,10 @@ pub struct VaultAuth {
     token: Option<(PinUvAuthToken, u32, Option<String>)>,
     /// How the last token obtained was obtained.
     verified: Option<Verified>,
-    /// The key refused the vault-RP-bound fingerprint token for a credential
-    /// listing (CTAP 2.2's 6.8.4 as written: listing only under a token bound
-    /// to no RP), so every later listing of this auth takes an unbound one.
+    /// Credential listings take a fingerprint token bound to no RP: the key
+    /// reports CTAP 2.2 (whose 6.8.4 lists only under such a token), or it
+    /// refused the vault-RP-bound token for a listing. Every later listing
+    /// of this auth then takes an unbound one.
     unbound_listing: bool,
 }
 
@@ -578,15 +582,20 @@ impl VaultAuth {
     ///
     /// A fingerprint uses the token it holds when that covers `permissions`,
     /// else a fresh one: bound to the vault RP, so the getAssertion or
-    /// makeCredential that follows needs no other finger. A key may list
-    /// only under a token bound to no RP (CTAP 2.2's 6.8.4 as written;
-    /// CTAP 2.1 also takes one bound to the RP listed): when it refuses a
-    /// bound token it just gave (`PIN_AUTH_INVALID`), that is no dropped
-    /// token, so one unbound token with `permissions` is asked for, saying
-    /// why ([`FingerAsk::ListVaults`]), and every later listing of this
-    /// auth takes an unbound token straight away. A held token refused as
-    /// dropped or expired is renewed once first ([`FingerAsk::Again`]).
-    /// At most those two more tokens, never a loop.
+    /// makeCredential that follows needs no other finger (CTAP 2.1 6.8.4
+    /// takes a token bound to the RP listed).
+    ///
+    /// CTAP 2.2's 6.8.4 is written to list only under a token bound to no
+    /// RP, so on a key whose getInfo `versions` has `FIDO_2_2` the listing
+    /// takes an unbound token with `permissions` from the start, and the
+    /// step after it its own bound one: two fingers, none wasted. A pre-2.2
+    /// key may enforce that rule too: when it refuses a bound token it just
+    /// gave (`PIN_AUTH_INVALID`), that is no dropped token, so one unbound
+    /// token is asked for, saying why ([`FingerAsk::ListVaults`]). Either
+    /// way every later listing of this auth takes an unbound token straight
+    /// away. A held token refused as dropped or expired is renewed once
+    /// first ([`FingerAsk::Again`]). At most those two more tokens, never a
+    /// loop.
     pub(crate) fn with_listing<K: VaultKey, T>(
         &mut self,
         key: &mut K,
@@ -596,6 +605,9 @@ impl VaultAuth {
         if !self.is_fingerprint() {
             let token = self.fresh_token(key, permissions, None)?;
             return Ok(call(key, token)?);
+        }
+        if key.info().versions.iter().any(|v| v == CTAP_2_2) {
+            self.unbound_listing = true;
         }
         let held = match &self.token {
             Some((token, held, rp))

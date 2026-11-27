@@ -264,6 +264,14 @@ impl FakeKey {
         key
     }
 
+    /// Make this a CTAP 2.2 key that lists as 2.2's 6.8.4 is written:
+    /// getInfo `versions` gains `FIDO_2_2`, and
+    /// [`strict_listing`](Self::strict_listing) is on.
+    pub fn as_ctap22(&mut self) {
+        self.info.versions.push("FIDO_2_2".to_owned());
+        self.strict_listing = true;
+    }
+
     /// Set the store's size (`maxSerializedLargeBlobArray`).
     pub fn set_max_bytes(&mut self, max: u64) {
         self.info.max_serialized_large_blob_array = Some(max);

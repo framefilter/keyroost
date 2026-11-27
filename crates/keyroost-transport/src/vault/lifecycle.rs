@@ -1731,15 +1731,29 @@ mod tests {
     /// `command` under a fingerprint on a key holding a Personal vault; the
     /// asks it made, and every fingerprint token request.
     fn fingers_for(command: Command, drops: bool) -> (Vec<FingerAsk>, Vec<Call>) {
-        fingers_on(command, drops, false)
+        fingers_on(command, drops, Listing::Lenient)
     }
 
-    /// [`fingers_for`] on a key that lists only under an unbound token
-    /// (`strict`, CTAP 2.2's 6.8.4 as written) or not.
-    fn fingers_on(command: Command, drops: bool, strict: bool) -> (Vec<FingerAsk>, Vec<Call>) {
+    /// How a key lists the vault RP's credentials.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Listing {
+        /// CTAP 2.1: under a token bound to the vault RP too.
+        Lenient,
+        /// A pre-2.2 key that lists only under an unbound token.
+        Strict21,
+        /// A key reporting CTAP 2.2 that lists as its 6.8.4 is written.
+        Ctap22,
+    }
+
+    /// [`fingers_for`] on a key that lists as `listing` says.
+    fn fingers_on(command: Command, drops: bool, listing: Listing) -> (Vec<FingerAsk>, Vec<Call>) {
         let mut key = FakeKey::with_fingerprint();
         key.drops_token_after_presence = drops;
-        key.strict_listing = strict;
+        match listing {
+            Listing::Lenient => {}
+            Listing::Strict21 => key.strict_listing = true,
+            Listing::Ctap22 => key.as_ctap22(),
+        }
         key.add_vault("Personal", &two_entries());
         let (asked, ask) = asks();
         let mut auth = VaultAuth::fingerprint(ask);
@@ -1804,13 +1818,54 @@ mod tests {
         assert!(!key.log.iter().any(|c| matches!(c, Call::Assertions(_))));
     }
 
-    /// A key that lists only under an unbound token (CTAP 2.2's 6.8.4 as
-    /// written) refuses the vault-RP-bound token for the listing: the flow
-    /// asks once more for an unbound listing token, saying why, and every
-    /// later listing of the same auth takes an unbound token straight away.
-    /// Every command works; no "refused" reaches the person. A new token
-    /// replaces the one held (CTAP 2.1 6.5.5.7.3), so the getAssertion or
-    /// makeCredential after an unbound listing takes its own finger.
+    /// A key reporting CTAP 2.2 lists under an unbound token from the
+    /// start: no bound attempt is wasted and no reason line is needed, and
+    /// the step after the listing takes its own bound token (a new token
+    /// replaces the one held, 6.5.5.7.3). `list` is 2 fingers.
+    #[test]
+    fn a_ctap22_key_lists_under_an_unbound_token_from_the_start() {
+        use FingerAsk::Unlock as U;
+        let bound = Call::UvToken {
+            perms: FINGER,
+            rp: Some(RP_ID.into()),
+        };
+        let unbound = Call::UvToken {
+            perms: CM | LBW,
+            rp: None,
+        };
+        for (command, expected) in [
+            (Command::List, vec![(U, &unbound), (U, &bound)]),
+            (Command::EntryAdd, vec![(U, &unbound), (U, &bound)]),
+            (Command::Add, vec![(U, &unbound), (U, &bound), (U, &bound)]),
+            (Command::Delete, vec![(U, &unbound)]),
+            (
+                Command::Rotate,
+                vec![
+                    (U, &unbound),
+                    (U, &bound),
+                    (U, &bound),
+                    (U, &bound),
+                    (U, &bound),
+                ],
+            ),
+            (Command::ImportExisting, vec![(U, &unbound), (U, &bound)]),
+            (
+                Command::ImportNew,
+                vec![(U, &unbound), (U, &bound), (U, &bound)],
+            ),
+        ] {
+            let (asked, requests) = fingers_on(command, false, Listing::Ctap22);
+            let got: Vec<(FingerAsk, &Call)> = asked.into_iter().zip(&requests).collect();
+            assert_eq!(got, expected, "{command:?}");
+            assert_eq!(requests.len(), expected.len(), "{command:?}");
+        }
+    }
+
+    /// A pre-2.2 key that lists only under an unbound token refuses the
+    /// vault-RP-bound token for the listing: the flow asks once more for an
+    /// unbound listing token, saying why, and every later listing of the
+    /// same auth takes an unbound token straight away. Every command works;
+    /// no "refused" reaches the person. The worst case, 3 for `list`.
     #[test]
     fn a_strict_key_lists_under_an_unbound_token_and_every_command_works() {
         use FingerAsk::{ListVaults as L, Unlock as U};
@@ -1831,7 +1886,7 @@ mod tests {
             (Command::ImportExisting, vec![U, L, U]),
             (Command::ImportNew, vec![U, L, U, U]),
         ] {
-            let (asked, requests) = fingers_on(command, false, true);
+            let (asked, requests) = fingers_on(command, false, Listing::Strict21);
             assert_eq!(asked, expected, "{command:?}");
             assert_eq!(requests.len(), asked.len(), "{command:?}");
             for (ask, request) in asked.iter().zip(&requests) {
@@ -1839,7 +1894,7 @@ mod tests {
                 assert_eq!(request, want, "{command:?}");
             }
             // A key that takes the bound token never asks for an unbound one.
-            let (lenient, _) = fingers_on(command, false, false);
+            let (lenient, _) = fingers_on(command, false, Listing::Lenient);
             assert!(!lenient.contains(&L), "{command:?}");
         }
     }
