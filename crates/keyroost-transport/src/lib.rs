@@ -2477,6 +2477,15 @@ fn read_yubikey_serial(card: &Card) -> Result<String, TransportError> {
     Ok(serial.to_string())
 }
 
+/// Whether `atr` is the ATR a CanoKey answers over its own USB CCID
+/// interface: historical bytes `Canokey`
+/// ([`keyroost_canokey::CCID_ATR_HISTORICAL_BYTES`]). A CanoKey held to an
+/// NFC reader gets the reader's ATR and is not recognized by this.
+pub(crate) fn is_canokey_ccid_atr(atr: &[u8]) -> bool {
+    keyroost_piv::fingerprint::atr_historical_bytes(atr)
+        == Some(keyroost_canokey::CCID_ATR_HISTORICAL_BYTES)
+}
+
 /// Transmit one raw APDU, returning `(payload, sw1, sw2)`.
 fn transmit_apdu(card: &Card, apdu: &[u8]) -> Result<(Vec<u8>, u8, u8), TransportError> {
     // Sized like the session loop's buffer. 256 is *not* enough: a full

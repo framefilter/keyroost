@@ -603,6 +603,24 @@ impl OpenPgpSession {
     /// then — when the card or reader won't take an extended `Lc` — the
     /// command-chaining form `chained` builds. Shared by the RSA and ECC
     /// imports.
+    /// Why a long command goes chained from the start, if it does:
+    /// `KEYROOST_OPENPGP_FORCE_CHAINING`, or a CanoKey on its own USB
+    /// reader, which answers any extended-length APDU `6700` (canokey-core
+    /// 3.1.2 `ccid.c`; it takes PUT DATA of the key, the key import and PSO
+    /// DECIPHER chained). `None`: extended length first.
+    fn chain_upfront_reason(&self) -> Option<&'static str> {
+        if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_some() {
+            return Some("env override");
+        }
+        let mut names = [0u8; 256];
+        let mut atr = [0u8; pcsc::MAX_ATR_SIZE];
+        let canokey = self
+            .card
+            .status2(&mut names, &mut atr)
+            .is_ok_and(|status| crate::is_canokey_ccid_atr(status.atr()));
+        canokey.then_some("this card takes no extended-length APDU")
+    }
+
     fn put_key_import(
         &mut self,
         apdu: &[u8],
@@ -611,7 +629,8 @@ impl OpenPgpSession {
         // Setting KEYROOST_OPENPGP_FORCE_CHAINING forces the command-chaining path
         // (so the fallback can be exercised on a card that also accepts extended
         // length, e.g. for verification). Otherwise: extended length first.
-        if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_none() {
+        let upfront = self.chain_upfront_reason();
+        if upfront.is_none() {
             let (_, sw) = self.transmit_full(apdu)?;
             if sw == pgp::SW_OK {
                 return Ok(());
@@ -638,7 +657,7 @@ impl OpenPgpSession {
                 format_line(
                     Dir::Note,
                     "openpgp import",
-                    "forcing command chaining (env override)",
+                    &format!("forcing command chaining ({})", upfront.unwrap_or_default()),
                 )
             });
         }
@@ -1032,7 +1051,8 @@ impl OpenPgpSession {
     /// [`import_key`](Self::import_key). `KEYROOST_OPENPGP_FORCE_CHAINING` forces
     /// the chaining path for testing.
     fn decipher(&mut self, cipher_do: &[u8]) -> Result<Vec<u8>, TransportError> {
-        if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_none() {
+        let upfront = self.chain_upfront_reason();
+        if upfront.is_none() {
             let (plain, sw) = self.transmit_full(&pgp::pso_decipher(cipher_do))?;
             if sw == pgp::SW_OK {
                 return Ok(plain);
@@ -1057,7 +1077,7 @@ impl OpenPgpSession {
                 format_line(
                     Dir::Note,
                     "openpgp decipher",
-                    "forcing command chaining (env override)",
+                    &format!("forcing command chaining ({})", upfront.unwrap_or_default()),
                 )
             });
         }

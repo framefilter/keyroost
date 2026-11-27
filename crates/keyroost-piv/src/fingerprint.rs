@@ -160,6 +160,14 @@ pub const IDPRIME_SECONDARY_PIV_AID: [u8; 11] = [
     0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x02, 0x00,
 ];
 
+/// CanoKey's Admin applet AID (canokey-core `src/apdu.c`): the
+/// transport layer SELECTs it (then re-SELECTs PIV) to recognise a CanoKey
+/// whose ATR doesn't name it, and to read its firmware version for
+/// [`AppletFingerprint::CanoKey`]. Selecting it ends the PIV session on the
+/// key, so it is read before any authentication. The byte layer for the
+/// applet itself is `keyroost-canokey`.
+pub const CANOKEY_ADMIN_AID: [u8; 5] = [0xF0, 0x00, 0x00, 0x00, 0x00];
+
 /// Trussed's admin application AID. On a Nitrokey
 /// ([`AppletFingerprint::Trussed`]`(`[`TrussedVariant::Nitrokey`]`)`), its
 /// firmware version ([`NITROKEY_GET_VERSION_STRING`]) and hardware variant
@@ -1354,6 +1362,12 @@ pub enum AppletFingerprint {
     ArekinathPivApplet(ArekinathVariant),
     /// Authentrend's ATkey PIV applets — <https://authentrend.com/atkey-card-nfc>.
     AuthentrendATKey,
+    /// CanoKey's PIV applet — <https://canokeys.org> (source:
+    /// <https://github.com/canokeys/canokey-core>). Recognised by the ATR
+    /// historical bytes its USB CCID interface answers, `Canokey`, or, where
+    /// the reader builds the ATR (NFC), by the key answering its Admin
+    /// applet ([`CANOKEY_ADMIN_AID`]) with a firmware version.
+    CanoKey,
     /// Feitian Technologies' security keys — recognised purely by whether
     /// the card can select Feitian's registered RID ([`FEITIAN_RID`]) or,
     /// failing that, the OTP application under it ([`FEITIAN_OTP_AID`]): the
@@ -1492,6 +1506,7 @@ impl core::fmt::Display for AppletFingerprint {
             AppletFingerprint::Generic => write!(f, "Generic"),
             AppletFingerprint::ArekinathPivApplet(v) => write!(f, "ArekinathPivApplet::{v}"),
             AppletFingerprint::AuthentrendATKey => write!(f, "AuthentrendATKey"),
+            AppletFingerprint::CanoKey => write!(f, "CanoKey"),
             AppletFingerprint::Feitian(v) => write!(f, "Feitian::{v}"),
             AppletFingerprint::HidCrescendo(v) => write!(f, "HidCrescendo::{v}"),
             AppletFingerprint::IdPrime => write!(f, "IdPrime"),
@@ -1579,6 +1594,7 @@ impl AppletFingerprint {
                 "Swissbit iShield 1 Series"
             }
             AppletFingerprint::AuthentrendATKey => "Authentrend ATKey Series",
+            AppletFingerprint::CanoKey => "CanoKey",
             AppletFingerprint::Feitian(FeitianModel::Generic) => "Feitian Security Key",
             AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus) => {
                 "Feitian ePass FIDO NFC Plus"
@@ -1785,6 +1801,8 @@ pub fn classify(
         AppletFingerprint::UTrust(UTrustVariant::Generic)
     } else if atr == Some("yubikey") {
         AppletFingerprint::YubiKey
+    } else if atr == Some("canokey") {
+        AppletFingerprint::CanoKey
     } else if sel.is_some_and(|s| s.starts_with("atpiv")) {
         AppletFingerprint::AuthentrendATKey
     } else if feitian_rid_selectable {
@@ -3215,5 +3233,22 @@ mod tests {
             hid_crescendo_c4000_delete_key(crate::KeyAlg::X25519, 0x9A),
             None
         );
+    }
+
+    #[test]
+    fn a_canokey_is_recognized_by_its_ccid_atr() {
+        // canokey-core `ccid.c`: 3B F7 11 00 00 81 31 FE 65 "Canokey" 99.
+        let atr = [
+            0x3B, 0xF7, 0x11, 0x00, 0x00, 0x81, 0x31, 0xFE, 0x65, 0x43, 0x61, 0x6E, 0x6F, 0x6B,
+            0x65, 0x79, 0x99,
+        ];
+        let identity = atr_historical_bytes(&atr).and_then(atr_identity);
+        assert_eq!(identity.as_deref(), Some("Canokey"));
+        assert_eq!(
+            classify(identity.as_deref(), None, false, false, false),
+            AppletFingerprint::CanoKey
+        );
+        assert_eq!(AppletFingerprint::CanoKey.to_string(), "CanoKey");
+        assert_eq!(AppletFingerprint::CanoKey.applet_name(), "CanoKey");
     }
 }

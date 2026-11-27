@@ -1,0 +1,16 @@
+[package]
+name = "keyroost-canokey"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust byte layer for CanoKey's vendor commands: the Admin applet (firmware version, serial, configuration, resets), the PIV algorithm configuration and the USB FIDO selector."
+
+[lints]
+workspace = true
+
+[dependencies]
+keyroost-proto = { path = "../keyroost-proto", version = "0.16.0" }
+# Scrub the Admin PIN out of the VERIFY APDU on drop.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }

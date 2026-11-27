@@ -18,6 +18,7 @@ members = [
     "crates/keyroost-p12",
     "crates/keyroost-token2otp",
     "crates/keyroost-feitianotp",
+    "crates/keyroost-canokey",
     "crates/keyroost-token2prog",
     "crates/keyroost-rsakey",
     "crates/keyroost-pgpkey",

@@ -2047,6 +2047,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyroost-canokey"
+version = "0.16.0"
+dependencies = [
+ "keyroost-proto",
+ "zeroize",
+]
+
+[[package]]
 name = "keyroost-ctap"
 version = "0.16.0"
 dependencies = [
@@ -2263,6 +2271,7 @@ dependencies = [
  "des",
  "getrandom 0.4.3",
  "hidapi",
+ "keyroost-canokey",
  "keyroost-ctap",
  "keyroost-feitianotp",
  "keyroost-hid",

@@ -815,6 +815,17 @@ pub enum PivQuirk {
     /// does not verify). The same two keys sent chained (`CLA 10`, 254-byte
     /// parts) passed it. Feitian's own client sends the import chained.
     ImportKeyGoesChained,
+    /// The card takes no extended-length APDU at all, so every command too
+    /// long for one short APDU (GENERAL AUTHENTICATE, PUT DATA, the key
+    /// import) goes out as an ISO 7816-4 command chain from the start
+    /// rather than after an extended-length attempt fails.
+    ///
+    /// Source-verified on CanoKey (canokey-core 3.1.2): its CCID interface
+    /// answers any extended-length APDU `6700` before it reaches an applet
+    /// (`interfaces/USB/class/ccid/ccid.c`), and its PIV applet takes
+    /// chained GENERAL AUTHENTICATE, PUT DATA and IMPORT; CanoKey's PIV
+    /// documentation says the same.
+    ExtendedLengthNotSupported,
     /// [`PivExtension::SlotPinPolicy`] is supported on this device in
     /// principle — GENERATE ASYMMETRIC KEYPAIR accepts the `0xAA` tag — but
     /// the specific `Once` value is rejected. A caller offering the PIN
@@ -1152,6 +1163,7 @@ fn applet_verdicts(
             }
             AppletFingerprint::Generic => GENERIC_APPLET_VERDICTS,
             AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_APPLET_VERDICTS,
+            AppletFingerprint::CanoKey => CANOKEY_APPLET_VERDICTS,
             AppletFingerprint::Feitian(FeitianModel::Generic) => FEITIAN_APPLET_VERDICTS,
             AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus) => {
                 FEITIAN_EPASS_NFC_PLUS_APPLET_VERDICTS
@@ -1211,6 +1223,7 @@ fn firmware_verdicts(
             }
             AppletFingerprint::Generic => GENERIC_FIRMWARE_VERDICTS,
             AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_FIRMWARE_VERDICTS,
+            AppletFingerprint::CanoKey => CANOKEY_FIRMWARE_VERDICTS,
             AppletFingerprint::Feitian(_) => FEITIAN_FIRMWARE_VERDICTS,
             AppletFingerprint::IdPrime => IDPRIME_FIRMWARE_VERDICTS,
             AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => {
@@ -1278,6 +1291,7 @@ fn applet_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
         }
         AppletFingerprint::Generic => GENERIC_APPLET_QUIRKS,
         AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_APPLET_QUIRKS,
+        AppletFingerprint::CanoKey => CANOKEY_APPLET_QUIRKS,
         AppletFingerprint::Feitian(FeitianModel::Generic) => FEITIAN_APPLET_QUIRKS,
         AppletFingerprint::Feitian(FeitianModel::EPassFidoNfcPlus) => {
             FEITIAN_EPASS_NFC_PLUS_APPLET_QUIRKS
@@ -1325,6 +1339,7 @@ fn firmware_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
         }
         AppletFingerprint::Generic => GENERIC_FIRMWARE_QUIRKS,
         AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_FIRMWARE_QUIRKS,
+        AppletFingerprint::CanoKey => CANOKEY_FIRMWARE_QUIRKS,
         AppletFingerprint::Feitian(_) => FEITIAN_FIRMWARE_QUIRKS,
         AppletFingerprint::IdPrime => IDPRIME_FIRMWARE_QUIRKS,
         AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => TRUSSED_NITROKEY_FIRMWARE_QUIRKS,
@@ -1365,6 +1380,7 @@ fn axis_merge_mode(fingerprint: AppletFingerprint) -> AxisMergeMode {
         }
         AppletFingerprint::Generic => GENERIC_AXIS_MERGE_MODE,
         AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_AXIS_MERGE_MODE,
+        AppletFingerprint::CanoKey => CANOKEY_AXIS_MERGE_MODE,
         AppletFingerprint::Feitian(_) => FEITIAN_AXIS_MERGE_MODE,
         AppletFingerprint::IdPrime => IDPRIME_AXIS_MERGE_MODE,
         AppletFingerprint::Trussed(TrussedVariant::Nitrokey) => TRUSSED_NITROKEY_AXIS_MERGE_MODE,
@@ -3039,6 +3055,123 @@ const GENERIC_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+
+/// CanoKey's cross-axis merge mode — see [`AxisMergeMode`]'s doc.
+const CANOKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
+/// CanoKey's applet-axis known-support table: only what holds whatever the
+/// firmware, so it stands even when the firmware version can't be read
+/// (the applet axis is GET VERSION's answer, a compatibility number the
+/// firmware build sets, not the firmware version; the version-keyed rows
+/// are on the firmware axis, [`CANOKEY_FIRMWARE_VERDICTS`]).
+///
+/// Source-verified against canokey-core (3.1.2 and the earlier release
+/// tags): RSA-1024 is in no firmware's algorithm switch; the management key
+/// is mandatory and is 3DES (to 3.0.3) or AES-192 (3.1.0 on), never AES-128
+/// or AES-256 (`piv_set_management_key` accepts `0A 9B 18` only on 3.1.2);
+/// and the device-wide reset is the Admin applet's, outside PIV, so
+/// [`PivExtension::ResetGlobal`] gets the explicit row every fingerprint
+/// but HID Crescendo carries (see `GENERIC_APPLET_VERDICTS`).
+const CANOKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
+    extensions: &[
+        PivExtension::ResetGlobal,
+        PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+        PivExtension::ImportKey(KeyAlg::Rsa1024),
+        PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+        PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+        PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+    ],
+    verdicts: &[VersionVerdict {
+        version: &[],
+        verdict: Verdict::KnownUnsupportedSince,
+    }],
+}];
+
+/// CanoKey's firmware-axis known-support table, keyed on the firmware
+/// version its Admin applet reports. Only firmware 3.1 is described:
+/// earlier firmware resolves [`FeatureGate::Unverified`] for every row
+/// (older than every verdict), and later firmware is assumed not to
+/// regress.
+///
+/// Source-verified on canokey-core 3.1.2 (`applets/piv/piv.c`) and
+/// CanoKey's PIV documentation; not yet hardware-verified:
+///
+/// * MOVE/DELETE KEY (`F6`), GET METADATA (`F7`), ATTEST (`F9`, for keys
+///   generated on the device, signed by the key provisioned in slot `F9`),
+///   SET PIN RETRIES (`FA`, with the management key and the PIN), RESET
+///   (`FB`, once the PIN and PUK are both blocked) and SET MANAGEMENT KEY
+///   (`FF`).
+/// * Generation and import (the Yubico import layout) of RSA-2048/3072/
+///   4096, P-256/384/521, Ed25519 and X25519. The IDs of the algorithms
+///   outside SP 800-78 come from the key's own table, which the transport
+///   reads (`00 EE 01 00`); with that table switched off they are
+///   unavailable whatever this table says.
+/// * PIN policies Never/Once/Always and touch policies Never/Always/Cached
+///   (15 seconds).
+/// * The AES-192 management key; 3DES is gone from 3.1.0.
+const CANOKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+            PivExtension::GetMetadata,
+            PivExtension::Attest,
+            PivExtension::Reset,
+            PivExtension::SetPinPukRetries,
+            PivExtension::SetManagementKey,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[3, 1],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[PivExtension::ManagementKeyAlgorithm(
+            MgmtAlgChoice::TripleDes,
+        )],
+        verdicts: &[VersionVerdict {
+            version: &[3, 1],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+];
+
+/// CanoKey's applet-axis quirks, at every version: the YubiKey defaults
+/// for the management key (`01 02 .. 08` three times), PIN (`123456`) and
+/// PUK (`12345678`) (`piv.c`: `DEFAULT_MGMT_KEY`, `piv_install`), no touch
+/// to generate or import, and no extended-length APDUs
+/// ([`PivQuirk::ExtendedLengthNotSupported`]).
+const CANOKEY_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
+    version: &[],
+    quirks: &[
+        PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+        YUBIKEY_DEFAULT_PIN_PUK,
+        PivQuirk::NoTouchToGenerateOrImport,
+        PivQuirk::ExtendedLengthNotSupported,
+    ],
+}];
+
+/// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
+const CANOKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
 /// Authentrend's ATkey's cross-axis merge mode — see [`AxisMergeMode`]'s doc.
 const AUTHENTREND_ATKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
@@ -9910,5 +10043,114 @@ mod tests {
             supported_from(PivExtension::ResetGlobal, nitrokey, None, Some(&[1, 8])),
             None
         );
+    }
+
+    #[test]
+    fn canokey_31_supports_its_pivs_extensions() {
+        let canokey = AppletFingerprint::CanoKey;
+        for firmware in [&[3, 1, 0][..], &[3, 1, 2], &[4, 0, 0]] {
+            for ext in [
+                PivExtension::Reset,
+                PivExtension::MoveKey,
+                PivExtension::DeleteKey,
+                PivExtension::GetMetadata,
+                PivExtension::Attest,
+                PivExtension::SetPinPukRetries,
+                PivExtension::SetManagementKey,
+                PivExtension::SlotPinPolicy,
+                PivExtension::SlotTouchPolicy,
+                PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+                PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+                PivExtension::ImportKey(KeyAlg::Rsa4096),
+                PivExtension::ImportKey(KeyAlg::X25519),
+                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            ] {
+                assert_eq!(
+                    resolve(ext, canokey, Some(&[5, 7, 0]), Some(firmware)),
+                    FeatureGate::Supported,
+                    "{ext:?} on {firmware:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canokey_takes_only_an_aes_192_management_key_from_31() {
+        let canokey = AppletFingerprint::CanoKey;
+        let gate = |choice, firmware: Option<&[u8]>| {
+            resolve(
+                PivExtension::ManagementKeyAlgorithm(choice),
+                canokey,
+                Some(&[5, 7, 0]),
+                firmware,
+            )
+        };
+        assert_eq!(
+            gate(MgmtAlgChoice::TripleDes, Some(&[3, 1, 2])),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            gate(MgmtAlgChoice::TripleDes, Some(&[3, 0, 3])),
+            FeatureGate::Unverified
+        );
+        for never in [
+            MgmtAlgChoice::Aes128,
+            MgmtAlgChoice::Aes256,
+            MgmtAlgChoice::Delete,
+        ] {
+            assert_eq!(gate(never, Some(&[3, 1, 2])), FeatureGate::Unsupported);
+            assert_eq!(gate(never, None), FeatureGate::Unsupported, "{never:?}");
+        }
+    }
+
+    #[test]
+    fn canokey_before_31_or_of_unknown_firmware_is_unverified() {
+        let canokey = AppletFingerprint::CanoKey;
+        for firmware in [Some(&[3, 0, 3][..]), Some(&[2, 0, 1]), None] {
+            assert_eq!(
+                resolve(PivExtension::Reset, canokey, Some(&[5, 7, 0]), firmware),
+                FeatureGate::Unverified,
+                "{firmware:?}"
+            );
+        }
+        // What holds for every firmware holds without one too.
+        for ext in [
+            PivExtension::ResetGlobal,
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+        ] {
+            assert_eq!(
+                resolve(ext, canokey, None, None),
+                FeatureGate::Unsupported,
+                "{ext:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canokey_quirks_are_the_yubikey_defaults_and_no_extended_length() {
+        let quirks = resolve_quirks(
+            AppletFingerprint::CanoKey,
+            Some(&[5, 7, 0]),
+            Some(&[3, 1, 2]),
+        );
+        assert!(quirks.contains(&PivQuirk::ExtendedLengthNotSupported));
+        assert!(quirks.contains(&PivQuirk::NoTouchToGenerateOrImport));
+        assert_eq!(
+            default_9b_management_key(&quirks),
+            Some(YUBIKEY_DEFAULT_MGMT_KEY)
+        );
+        assert_eq!(default_pin_puk(&quirks), Some(("123456", "12345678")));
+        // The quirks hold without a reported version too.
+        assert!(resolve_quirks(AppletFingerprint::CanoKey, None, None)
+            .contains(&PivQuirk::ExtendedLengthNotSupported));
+        assert_eq!(
+            import_layout(AppletFingerprint::CanoKey),
+            crate::ImportLayout::Yubico
+        );
+        assert!(import_slot_allowed(
+            AppletFingerprint::CanoKey,
+            crate::Slot::Signature
+        ));
     }
 }
