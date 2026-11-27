@@ -455,6 +455,17 @@ impl CliPivMgmtAlg {
             CliPivMgmtAlg::Aes256 => Aes256,
         }
     }
+
+    /// The compatibility tables' name for this algorithm.
+    fn to_choice(self) -> keyroost_piv::compat::MgmtAlgChoice {
+        use keyroost_piv::compat::MgmtAlgChoice::*;
+        match self {
+            CliPivMgmtAlg::TripleDes => TripleDes,
+            CliPivMgmtAlg::Aes128 => Aes128,
+            CliPivMgmtAlg::Aes192 => Aes192,
+            CliPivMgmtAlg::Aes256 => Aes256,
+        }
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -11573,6 +11584,19 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         keyroost_piv::compat::PivExtension::SetManagementKey,
                         *force,
                     )?;
+                    // The algorithm too, as the app's algorithm list does: one
+                    // the list marks unsupported on this key (a CanoKey 3.1
+                    // takes only AES-192) is refused here, before anything is
+                    // sent, unless --force. Unverified algorithms run without
+                    // a second note; the line above already covers the key.
+                    let alg_extension = keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm(
+                        algorithm.to_choice(),
+                    );
+                    if s.feature_gate(alg_extension)
+                        == keyroost_piv::compat::FeatureGate::Unsupported
+                    {
+                        guard_piv_feature(s, alg_extension, *force)?;
+                    }
                     let pin_unlock_gate =
                         s.feature_gate(keyroost_piv::compat::PivExtension::PinManagementAuth);
                     // Whether to run the PIN-protected-storage maintenance step
@@ -29914,7 +29938,19 @@ mod cose_names {
 
 #[cfg(test)]
 mod canokey_resets {
-    use super::{canokey_factory_reset_action, refuse_canokey_reader_reset};
+    use super::{canokey_factory_reset_action, refuse_canokey_reader_reset, CliPivMgmtAlg};
+
+    #[test]
+    fn each_cli_management_key_algorithm_is_gated_under_its_own_name() {
+        for alg in [
+            CliPivMgmtAlg::TripleDes,
+            CliPivMgmtAlg::Aes128,
+            CliPivMgmtAlg::Aes192,
+            CliPivMgmtAlg::Aes256,
+        ] {
+            assert_eq!(alg.to_choice().to_mgmt_alg(), Some(alg.to_alg()));
+        }
+    }
 
     #[test]
     fn the_factory_reset_question_says_whether_the_admin_pin_is_blocked_yet() {
