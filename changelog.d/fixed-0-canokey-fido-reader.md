@@ -4,4 +4,5 @@
   FIDO2 over the reader works on that firmware too; Windows lets a
   program that isn't administrator use it. A FIDO2 reset is not sent
   through that reader, since power-cycling it doesn't restart the key:
-  keyroost says to reset over FIDO HID or with `factory-reset`. ([#0])
+  keyroost refuses it before asking anything and says to reset over FIDO
+  HID or with `factory-reset`. ([#0])

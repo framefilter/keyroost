@@ -172,7 +172,7 @@ mod canokey;
 pub use canokey::{AdminPinState, CanoKeyAdminSession};
 
 mod ctap_pcsc;
-pub use ctap_pcsc::{CtapPcscDevice, WINDOWS_NEEDS_ADMIN};
+pub use ctap_pcsc::{CtapPcscDevice, CANOKEY_READER_RESET, WINDOWS_NEEDS_ADMIN};
 
 mod token2prog;
 pub use token2prog::Token2ProgSession;
@@ -911,9 +911,11 @@ impl fmt::Display for TransportError {
             ),
             TransportError::CanoKeyResetNoTouch => write!(
                 f,
-                "the key was not touched each time it blinked, so it was NOT \
-                 reset (SW=6982); run the reset again and touch it each of the \
-                 five times it blinks"
+                "the key didn't count a touch within two seconds of one of its \
+                 five blinks, so it was NOT reset (SW=6982), and its Admin PIN \
+                 stays blocked until a reset goes through. Run the reset again: \
+                 each time it blinks, give it a quick tap and let go (holding it \
+                 down doesn't count); the light stops when a tap counts"
             ),
             TransportError::CanoKeyResetNotAllowed => write!(
                 f,

@@ -7516,25 +7516,28 @@ fn open_oath_unlocked(
     Ok(session)
 }
 
-/// What the user confirms before a whole-device wipe, given the plan's
-/// applet labels ("OATH, OpenPGP, PIV, FIDO2").
-///
-/// It does not promise the key "stays usable": PIV's wipe blocks the PIN and
-/// PUK on purpose before erasing, so a run that stops in between leaves that
-/// applet locked and un-wiped. What can be promised is per applet and per step
-/// — the same line the GUI's `factory_reset_confirm_summary` settled on, so the
-/// two front ends ask for consent to the same thing.
-/// The action a CanoKey factory reset confirms.
-const CANOKEY_FACTORY_RESET_ACTION: &str =
-    "factory-reset the whole CanoKey: every FIDO2 passkey, OATH code, OpenPGP and \
-     PIV key, the NDEF message, both PASS slots and the key's settings are erased, \
-     and every PIN goes back to its default (the serial stays). Its Admin PIN is \
-     blocked first, as the key requires";
+/// The action a CanoKey factory reset confirms, worded for whether its Admin
+/// PIN is blocked already (the key takes a factory reset only then).
+fn canokey_factory_reset_action(admin_pin_blocked: bool) -> String {
+    let pin = if admin_pin_blocked {
+        "Its Admin PIN is blocked already, as the key requires"
+    } else {
+        "Its Admin PIN is blocked first, as the key requires"
+    };
+    format!(
+        "factory-reset the whole CanoKey: every FIDO2 passkey, OATH code, OpenPGP \
+         and PIV key, the NDEF message, both PASS slots and the key's settings are \
+         erased, and every PIN goes back to its default (the serial stays). {pin}"
+    )
+}
 
-/// The touch a CanoKey factory reset waits for.
+/// The touch a CanoKey factory reset waits for. The key blinks five times
+/// and counts only a short touch made within two seconds of each blink; it
+/// stops blinking once a touch counts (canokey-core `strong_user_presence_test`).
 const CANOKEY_FACTORY_RESET_TOUCH: &str =
-    "Resetting \u{2014} touch the key each time it blinks (five times, within two \
-     seconds each)\u{2026}";
+    "Resetting \u{2014} the key blinks five times. Each time, give it a quick tap \
+     and let go within two seconds (holding it down doesn't count); the light stops \
+     when a tap counts and blinks again about two seconds later\u{2026}";
 
 /// `factory-reset` on a CanoKey on its own USB reader: CanoKey's device-wide
 /// reset ([`keyroost_resolve::canokey::takes_device_reset`]) in place of the
@@ -7546,11 +7549,16 @@ fn run_canokey_factory_reset(
     yes: bool,
     debug: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    crate::prompt::confirm_typed_on(dev, yes, "reset", CANOKEY_FACTORY_RESET_ACTION)?;
     let reader = crate::target::reader_of(dev)?;
     let mut admin = keyroost_transport::CanoKeyAdminSession::open_traced(&reader, debug)?;
-    errln!("factory reset: blocking the CanoKey Admin PIN\u{2026}");
-    admin.block_pin()?;
+    // Asked before the question, so it says what will happen: a reset that
+    // didn't get its touches leaves the Admin PIN blocked.
+    let blocked = admin.pin_state()? == keyroost_transport::AdminPinState::Blocked;
+    crate::prompt::confirm_typed_on(dev, yes, "reset", &canokey_factory_reset_action(blocked))?;
+    if !blocked {
+        errln!("factory reset: blocking the CanoKey Admin PIN\u{2026}");
+        admin.block_pin()?;
+    }
     crate::prompt::touch(CANOKEY_FACTORY_RESET_TOUCH);
     admin.factory_reset()?;
     outln!(
@@ -7560,6 +7568,14 @@ fn run_canokey_factory_reset(
     Ok(())
 }
 
+/// What the user confirms before a whole-device wipe, given the plan's
+/// applet labels ("OATH, OpenPGP, PIV, FIDO2").
+///
+/// It does not promise the key "stays usable": PIV's wipe blocks the PIN and
+/// PUK on purpose before erasing, so a run that stops in between leaves that
+/// applet locked and un-wiped. What can be promised is per applet and per step
+/// — the same line the GUI's `factory_reset_confirm_summary` settled on, so the
+/// two front ends ask for consent to the same thing.
 fn factory_reset_action(labels: &str) -> String {
     format!(
         "factory-reset {labels} (every credential, code, key and PIN is erased; \
@@ -14958,6 +14974,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
                 // the question, with the error `fido info --reader` gives (on
                 // Windows without administrator rights, that one says so).
                 FidoRoute::Card { reader } => {
+                    refuse_canokey_reader_reset(reader)?;
                     drop(keyroost_transport::CtapPcscDevice::open(reader)?)
                 }
             }
@@ -16408,6 +16425,7 @@ fn ctap2_json(info: &keyroost_ctap::AuthenticatorInfo) -> json_out::Ctap2InfoJso
         transports: info.transports.clone(),
         min_pin_length: info.min_pin_length,
         force_pin_change: info.force_pin_change,
+        long_touch_for_reset: info.long_touch_for_reset,
         firmware_version: info.firmware_version,
     }
 }
@@ -16659,6 +16677,17 @@ fn fido_reset_at(
     Ok(())
 }
 
+/// A CanoKey's own USB reader can't take a FIDO2 reset: power-cycling it
+/// doesn't restart the key, so the window a reset needs never opens
+/// ([`keyroost_transport::CANOKEY_READER_RESET`]). Refused up front, before
+/// anything is asked or sent; the transport refuses it too.
+fn refuse_canokey_reader_reset(reader: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if keyroost_resolve::canokey::is_reader_name(reader) {
+        return Err(keyroost_transport::CANOKEY_READER_RESET.into());
+    }
+    Ok(())
+}
+
 /// Reset the FIDO2 applet of a card in the exact PC/SC reader `exact_reader`.
 ///
 /// A card has no replug and no touch surface, so the "reset within ~10 s of
@@ -16666,6 +16695,7 @@ fn fido_reset_at(
 /// reader and the reset is sent the moment the applet answers (issue #84 —
 /// the replug ceremony can never complete for a card).
 fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::Error>> {
+    refuse_canokey_reader_reset(exact_reader)?;
     // Check that the FIDO applet answers before power-cycling the card, with
     // the same error `fido info --reader` gives (on Windows without
     // administrator rights, that one says so).
@@ -27776,6 +27806,7 @@ mod cli_tests {
                 transports: vec!["usb".into()],
                 min_pin_length: Some(4),
                 force_pin_change: Some(false),
+                long_touch_for_reset: None,
                 firmware_version: Some(328706),
             }),
             metadata: None,
@@ -29878,5 +29909,28 @@ mod cose_names {
         assert_eq!(cose_algorithm_name(-50), "ML-DSA-87");
         // CanoKey's SM2 uses an unregistered, configurable ID.
         assert_eq!(cose_algorithm_name(-54), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod canokey_resets {
+    use super::{canokey_factory_reset_action, refuse_canokey_reader_reset};
+
+    #[test]
+    fn the_factory_reset_question_says_whether_the_admin_pin_is_blocked_yet() {
+        let fresh = canokey_factory_reset_action(false);
+        assert!(fresh.contains("blocked first"), "{fresh}");
+        let blocked = canokey_factory_reset_action(true);
+        assert!(blocked.contains("blocked already"), "{blocked}");
+        assert!(!blocked.contains("blocked first"), "{blocked}");
+    }
+
+    #[test]
+    fn only_a_canokeys_own_reader_is_refused_a_fido_reset() {
+        let err = refuse_canokey_reader_reset("canokeys.org OpenPGP PIV OATH 0")
+            .expect_err("a CanoKey's own reader is refused");
+        assert!(err.to_string().contains("CanoKey"), "{err}");
+        assert!(refuse_canokey_reader_reset("Yubico YubiKey OTP+FIDO+CCID 0").is_ok());
+        assert!(refuse_canokey_reader_reset("ACS ACR1252 1S CL Reader PICC 0").is_ok());
     }
 }

@@ -3078,9 +3078,11 @@ fn factory_reset_confirm_summary(
             "Factory-reset {model} (serial {serial})?\n\nWipes everything on the key: \
              every FIDO2 passkey, OATH code, OpenPGP and PIV key, the NDEF message \
              and both PASS slots, and restores its settings. Every PIN goes back to \
-             its default (the CanoKey Admin PIN to 123456).\n\nThe key's Admin PIN \
-             is blocked first, as the key requires; then touch the key each time it \
-             blinks, five times, within two seconds each."
+             its default (the CanoKey Admin PIN to 123456).\n\nThe key takes this \
+             only with its Admin PIN blocked, so it is blocked first unless it \
+             already is. Then the key blinks five times: each time, give it a quick \
+             tap and let go within two seconds (holding it down doesn't count). The \
+             light stops when a tap counts and blinks again about two seconds later."
         );
     }
     msg
@@ -3571,8 +3573,9 @@ fn run_card_reset_step(
             }
             ResetStep::Fido => {}
             ResetStep::CanoKey => {
-                // The Admin PIN is blocked first, as the key requires; the
-                // key then blinks five times and wants a touch each time.
+                // The key takes the reset only with its Admin PIN blocked
+                // (`block_pin` returns at once when it already is); it then
+                // blinks five times and wants a short touch each time.
                 let name = reader.ok_or("no PC/SC reader for the CanoKey")?;
                 let mut admin = keyroost_transport::CanoKeyAdminSession::open_traced(name, false)
                     .map_err(|e| e.to_string())?;
@@ -3596,7 +3599,8 @@ fn run_card_reset_step(
 fn factory_reset_busy_label(card_steps: &[keyroost_resolve::ResetStep]) -> &'static str {
     use keyroost_resolve::ResetStep;
     if card_steps.contains(&ResetStep::CanoKey) {
-        "Factory-resetting key \u{2014} touch the key each time it blinks (five times)\u{2026}"
+        "Factory-resetting key \u{2014} touch the key each time it blinks (five times): \
+         a quick tap, not a press-and-hold\u{2026}"
     } else if card_steps.contains(&ResetStep::Token2Otp)
         || card_steps.contains(&ResetStep::FeitianOtp)
     {
