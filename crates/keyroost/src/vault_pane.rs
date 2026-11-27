@@ -9025,9 +9025,13 @@ mod tests {
         app.vault_lock(None);
         let file = path.display().to_string();
         app.vault_apply_export(Some(KEY.into()), "Personal".into(), file.clone(), Ok(2));
+        // The log shows the home folder as `~`; the temp folder is under it
+        // on Windows.
         assert_eq!(
             app.log.last().unwrap().text,
-            format!("Vault: backup of vault \"Personal\" written to {file}")
+            crate::without_home(&format!(
+                "Vault: backup of vault \"Personal\" written to {file}"
+            ))
         );
         assert!(app.vault.info.is_none() && app.vault.export.is_none());
         app.vault_apply_export(
