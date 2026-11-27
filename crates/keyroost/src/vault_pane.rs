@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use keyroost_ctap::client_pin::Verified;
 use keyroost_ctap::large_blobs::{BlobCapacity, CredentialData};
 use keyroost_ctap::transport::CtapTransport;
 use keyroost_ctap::{AuthenticatorInfo, CtapError};
@@ -811,6 +812,9 @@ const JOB_NOT_STARTED: &str = "That couldn't start, and nothing was changed.";
 /// The unlock job couldn't be queued: the PIN typed for it is wiped.
 const UNLOCK_NOT_STARTED: &str = "Unlocking couldn't start; press Unlock again.";
 
+/// [`UNLOCK_NOT_STARTED`] for Touch fingerprint.
+const UNLOCK_NOT_STARTED_FINGER: &str = "Unlocking couldn't start; press Touch fingerprint again.";
+
 /// [`UNLOCK_NOT_STARTED`] when the PIN came from the Vault tab's box.
 const UNLOCK_NOT_STARTED_TYPED: &str =
     "Unlocking couldn't start; type the PIN and press Unlock again.";
@@ -1107,12 +1111,16 @@ pub(crate) enum VaultConfirm {
 pub(crate) struct VaultSession {
     /// The key it was unlocked on.
     pub(crate) device: DeviceId,
-    /// The PIN and the token the writes reuse; `None` while a job holds it.
+    /// The PIN (or the fingerprint unlock) and the token the writes reuse;
+    /// `None` while a job holds it.
     pub(crate) auth: Option<VaultAuth>,
     pub(crate) unlocked: Unlocked,
     /// The PIN came from the FIDO2 tab's session, so a refusal of it
     /// locks that tab too.
     pub(crate) pin_from_fido: bool,
+    /// How the unlock was verified, kept here so the tab can say so while
+    /// a job holds [`Self::auth`].
+    pub(crate) verified: Option<Verified>,
 }
 
 impl VaultSession {
@@ -1308,22 +1316,7 @@ impl App {
         // A PIN typed here also unlocks the FIDO2 tab once it's accepted.
         let typed_pin = (!pin_from_fido).then(|| pin.clone());
         let auth = VaultAuth::pin(pin);
-        let shown = self.vault.progress.clone();
-        let for_device = self.selected_device.clone();
-        self.vault.error = None;
-        self.vault.info = None;
-        let queued = self.spawn_job("Unlocking the vault\u{2026}", move || {
-            let mut auth = auth;
-            let result = {
-                let mut touches = TouchProgress::new(shown, 1);
-                open_vault_key(&target).and_then(|mut key| {
-                    run_unlock(&mut key, &mut auth, &mut touches).map_err(VaultJobError::from)
-                })
-            };
-            Box::new(move |app: &mut App| {
-                app.vault_apply_unlock(for_device, auth, pin_from_fido, typed_pin, result);
-            })
-        });
+        let queued = self.vault_spawn_unlock(target, auth, pin_from_fido, typed_pin);
         if !queued {
             // The job dropped (and wiped) the PIN it took; the box is wiped
             // too, so nothing typed waits for a retry.
@@ -1337,6 +1330,62 @@ impl App {
                 .to_owned(),
             );
         }
+    }
+
+    /// Unlock every vault on the selected key with a fingerprint: the key's
+    /// own sensor gives the tokens, then one touch. Only the vault unlocks
+    /// (the FIDO2 tab takes its own touch), and no PIN is kept; one typed
+    /// into the box is wiped.
+    pub(crate) fn vault_unlock_fingerprint(&mut self) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        let Some(target) = self.selected_fido_target() else {
+            return;
+        };
+        wipe(&mut self.vault.pin_input);
+        let auth = self.vault_fingerprint_auth();
+        if !self.vault_spawn_unlock(target, auth, false, None) {
+            self.vault.error = Some(UNLOCK_NOT_STARTED_FINGER.to_owned());
+        }
+    }
+
+    /// A fingerprint [`VaultAuth`] whose asks for the finger show in the
+    /// touch banner ([`VaultState::progress`]), with the reason when the
+    /// key dropped the token it gave.
+    pub(crate) fn vault_fingerprint_auth(&self) -> VaultAuth {
+        let progress = self.vault.progress.clone();
+        VaultAuth::fingerprint(Box::new(move |ask| {
+            if let Ok(mut cell) = progress.lock() {
+                *cell = Some(ask.prompt().to_owned());
+            }
+        }))
+    }
+
+    /// Queue the unlock job with `auth`; whether it was queued.
+    fn vault_spawn_unlock(
+        &mut self,
+        target: FidoTarget,
+        auth: VaultAuth,
+        pin_from_fido: bool,
+        typed_pin: Option<Zeroizing<String>>,
+    ) -> bool {
+        let shown = self.vault.progress.clone();
+        let for_device = self.selected_device.clone();
+        self.vault.error = None;
+        self.vault.info = None;
+        self.spawn_job("Unlocking the vault\u{2026}", move || {
+            let mut auth = auth;
+            let result = {
+                let mut touches = TouchProgress::new(shown, 1);
+                open_vault_key(&target).and_then(|mut key| {
+                    run_unlock(&mut key, &mut auth, &mut touches).map_err(VaultJobError::from)
+                })
+            };
+            Box::new(move |app: &mut App| {
+                app.vault_apply_unlock(for_device, auth, pin_from_fido, typed_pin, result);
+            })
+        })
     }
 
     /// The end of an unlock. A result for a key no longer selected is
@@ -1361,6 +1410,7 @@ impl App {
                 self.vault.error = None;
                 self.vault.session = Some(VaultSession {
                     device,
+                    verified: auth.verified(),
                     auth: Some(auth),
                     unlocked,
                     pin_from_fido,
@@ -2000,14 +2050,22 @@ impl App {
 
     /// The card that unlocks the vault: the FIDO2 tab's PIN when that tab is
     /// unlocked with one, else a PIN box (a fingerprint unlock of the FIDO2
-    /// tab holds no PIN to share).
+    /// tab holds no PIN to share), with Touch fingerprint beside it on a key
+    /// whose sensor can unlock it.
     fn vault_unlock_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let waiting = self.waiting_for().map(str::to_owned);
         let shared = self
             .fido_session()
             .and_then(|s| s.unlock.pin())
             .is_some_and(|pin| !pin.is_empty());
+        // Experimental: no key with a sensor was on hand to try it.
+        let finger = !shared
+            && self.security_keys.info.as_ref().is_some_and(|i| {
+                keyroost_ctap::client_pin::built_in_uv(i)
+                    == keyroost_ctap::client_pin::BuiltInUv::Ready
+            });
         let mut unlock = false;
+        let mut unlock_finger = false;
         theme::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.label(
@@ -2046,17 +2104,39 @@ impl App {
                     {
                         unlock = true;
                     }
+                    if finger
+                        && theme::key_button(
+                            ui,
+                            p,
+                            BtnKind::Default,
+                            "Touch fingerprint",
+                            waiting.as_deref(),
+                        )
+                        .clicked()
+                    {
+                        unlock_finger = true;
+                    }
                 });
             }
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("Unlocking asks for a touch.")
-                    .font(theme::f_reg(11.5))
-                    .color(p.txt3),
+                egui::RichText::new(if finger {
+                    "Touch the fingerprint sensor, or enter the FIDO2 PIN, to unlock the vault."
+                } else {
+                    "Unlocking asks for a touch."
+                })
+                .font(theme::f_reg(11.5))
+                .color(p.txt3),
             );
+            if finger {
+                ui.add_space(6.0);
+                fingerprint_experimental_note(ui, p);
+            }
         });
         if unlock {
             self.vault_unlock();
+        } else if unlock_finger {
+            self.vault_unlock_fingerprint();
         }
     }
 
@@ -2064,6 +2144,9 @@ impl App {
     pub(crate) fn cap_vault(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let offer = self.vault_offer();
         let unlocked = offer == VaultOffer::Ready && self.vault_session().is_some();
+        let by_finger = self
+            .vault_session()
+            .is_some_and(|s| s.verified == Some(Verified::Fingerprint));
         let busy = self.busy();
         let mut open_fido2 = false;
         let mut lock = false;
@@ -2084,9 +2167,13 @@ impl App {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Unlocked with the FIDO2 PIN")
-                            .font(theme::f_reg(13.0))
-                            .color(p.txt2),
+                        egui::RichText::new(if by_finger {
+                            "Unlocked with a fingerprint"
+                        } else {
+                            "Unlocked with the FIDO2 PIN"
+                        })
+                        .font(theme::f_reg(13.0))
+                        .color(p.txt2),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Not while a job runs: a vault job may be
@@ -9791,11 +9878,21 @@ mod tests {
 
     // ----- Final review fixes -----
 
-    /// Every text shape of one headless frame drawn by `render`, with where
-    /// it was drawn.
+    /// Every text shape of one headless 900 x 700 frame drawn by `render`,
+    /// with where it was drawn.
     fn frame_texts(
         ctx: &egui::Context,
         events: Vec<egui::Event>,
+        render: impl FnMut(&mut egui::Ui, &Palette),
+    ) -> Vec<(String, egui::Rect)> {
+        frame_texts_at(ctx, events, egui::vec2(900.0, 700.0), render)
+    }
+
+    /// [`frame_texts`] in a window of `size`.
+    fn frame_texts_at(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        size: egui::Vec2,
         mut render: impl FnMut(&mut egui::Ui, &Palette),
     ) -> Vec<(String, egui::Rect)> {
         use crate::tests::TestFrame;
@@ -9811,10 +9908,7 @@ mod tests {
         }
         let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(900.0, 700.0),
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
             events,
             ..Default::default()
         };
@@ -10562,5 +10656,404 @@ mod tests {
         };
         let gap = at("Save").top() - at("Saving writes the vault").bottom();
         assert!(gap < 40.0, "{gap} px between the last line and Save");
+    }
+
+    // ----- the fingerprint unlock -----
+
+    use keyroost_ctap::client_pin::{FingerAsk, Verified};
+
+    const FINGER_LINE: &str =
+        "Touch the fingerprint sensor, or enter the FIDO2 PIN, to unlock the vault.";
+
+    fn unlock_prompt() -> Option<String> {
+        Some(FingerAsk::Unlock.prompt().to_owned())
+    }
+
+    fn again_prompt() -> Option<String> {
+        Some(FingerAsk::Again.prompt().to_owned())
+    }
+
+    /// An app showing a key whose sensor can unlock it.
+    fn finger_app() -> App {
+        let mut app = app();
+        app.security_keys.info = Some(FakeKey::with_fingerprint().info);
+        app
+    }
+
+    /// A FIDO2 tab session on [`KEY`] unlocked with a fingerprint.
+    fn finger_fido_session() -> UnlockedSession {
+        UnlockedSession {
+            unlock: SessionUnlock::Fingerprint,
+            ..fido_session("")
+        }
+    }
+
+    /// Unlock `key` with a fingerprint as Touch fingerprint's job does (the
+    /// finger asks going to the touch banner's cell), and land it as its
+    /// apply does; what the banner said at each finger and touch.
+    fn finger_unlock_into(app: &mut App, key: &mut FakeKey) -> Vec<Option<String>> {
+        let mut auth = app.vault_fingerprint_auth();
+        let banner = app.vault.progress.clone();
+        let mut watched = Watched {
+            key,
+            banner: banner.clone(),
+            at_touch: Vec::new(),
+        };
+        let result = {
+            let mut touches = TouchProgress::new(banner.clone(), 1);
+            run_unlock(&mut watched, &mut auth, &mut touches).map_err(VaultJobError::from)
+        };
+        assert_eq!(shown(&banner), None, "the prompt is down after the job");
+        let seen = watched.at_touch;
+        app.vault_apply_unlock(Some(KEY.into()), auth, false, None, result);
+        seen
+    }
+
+    /// Add an entry titled `title` through the form and save it as the job
+    /// does, the banner being the app's; what it said at each finger.
+    fn add_into(app: &mut App, key: &mut FakeKey, title: &str) -> Vec<Option<String>> {
+        app.vault_add_entry();
+        replace_text(&mut form(app).title, title);
+        let (vault, kind, change) = app.vault_form_change().expect("a form that validates");
+        let (mut auth, mut open) = app.vault_take_for_save(&vault).expect("an open vault");
+        let banner = app.vault.progress.clone();
+        let mut watched = Watched {
+            key,
+            banner: banner.clone(),
+            at_touch: Vec::new(),
+        };
+        let result = {
+            let mut touches = TouchProgress::new(banner.clone(), 0);
+            run_save(&mut watched, &mut auth, &mut open, &change, &mut touches)
+                .map_err(VaultJobError::from)
+        };
+        let seen = watched.at_touch;
+        app.vault_apply_save(Some(KEY.into()), vault, kind, auth, open, result);
+        seen
+    }
+
+    /// Every text the Vault tab draws at the smallest window, beside a
+    /// full-width sidebar.
+    fn vault_tab_texts(app: &mut App) -> Vec<(String, egui::Rect)> {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let pane = egui::vec2(
+            crate::WINDOW_MIN_SIZE[0] - crate::SIDEBAR_FULL_W,
+            crate::WINDOW_MIN_SIZE[1],
+        );
+        // Two frames: the first lays out the rows.
+        frame_texts_at(&ctx, Vec::new(), pane, |ui, p| app.cap_vault(ui, p));
+        frame_texts_at(&ctx, Vec::new(), pane, |ui, p| app.cap_vault(ui, p))
+    }
+
+    fn has(texts: &[(String, egui::Rect)], s: &str) -> bool {
+        texts.iter().any(|(t, _)| t == s)
+    }
+
+    /// A finger opens the vault and nothing else: the FIDO2 tab stays
+    /// locked, no PIN goes to the key, and the banner asks for the finger
+    /// in plain words.
+    #[test]
+    fn a_fingerprint_vault_unlock_leaves_the_fido2_tab_locked() {
+        let mut key = FakeKey::with_fingerprint();
+        two_vaults(&mut key);
+        let mut app = finger_app();
+        let seen = finger_unlock_into(&mut app, &mut key);
+        let s = app.vault_session().expect("a vault session");
+        assert!(!s.pin_from_fido);
+        assert_eq!(
+            s.auth.as_ref().and_then(VaultAuth::verified),
+            Some(Verified::Fingerprint)
+        );
+        assert_eq!(s.unlocked.vaults.len(), 2);
+        assert!(
+            app.security_keys.session.is_none(),
+            "the FIDO2 tab stays locked"
+        );
+        assert!(app.security_keys.error.is_none());
+        assert!(!key.log.iter().any(|c| matches!(c, Call::Token { .. })));
+        assert!(!seen.contains(&again_prompt()), "{seen:?}");
+        assert_eq!(seen.first(), Some(&unlock_prompt()), "{seen:?}");
+        assert_eq!(
+            seen.last(),
+            Some(&Some("Touch your key\u{2026}".to_owned())),
+            "{seen:?}"
+        );
+        assert!(app.vault.error.is_none());
+    }
+
+    /// A FIDO2 tab unlocked by a finger holds no PIN to share: the vault
+    /// card asks for its own PIN or finger. A PIN session still shares its
+    /// PIN, and a key with no sensor offers no finger.
+    #[test]
+    fn a_fingerprint_fido2_session_does_not_unlock_the_vault() {
+        let shared = "Uses the key's FIDO2 PIN \u{2014} already unlocked on the FIDO2 tab.";
+        let mut app = finger_app();
+        app.security_keys.session = Some(finger_fido_session());
+        app.security_keys.session_device = Some(KEY.into());
+        let texts = vault_tab_texts(&mut app);
+        for s in ["Unlock", "Touch fingerprint", "FIDO2 PIN", FINGER_LINE] {
+            assert!(has(&texts, s), "{s}: {texts:?}");
+        }
+        assert!(!has(&texts, shared), "{texts:?}");
+        assert!(!has(&texts, "Unlocking asks for a touch."), "{texts:?}");
+        let pills = texts.iter().filter(|(t, _)| t == "Experimental").count();
+        assert_eq!(pills, 2, "the tab's note and the finger's: {texts:?}");
+        assert_eq!(app.unlock_pin().err(), Some("PIN is empty"));
+
+        // A PIN session shares its PIN: Unlock alone.
+        app.security_keys.session = Some(fido_session("123456"));
+        let texts = vault_tab_texts(&mut app);
+        assert!(has(&texts, shared), "{texts:?}");
+        assert!(has(&texts, "Unlock"), "{texts:?}");
+        assert!(!has(&texts, "Touch fingerprint"), "{texts:?}");
+        assert!(!has(&texts, FINGER_LINE), "{texts:?}");
+
+        // No sensor: the card as before.
+        let mut app = super::tests::app();
+        app.security_keys.info = Some(FakeKey::new().info);
+        let texts = vault_tab_texts(&mut app);
+        assert!(has(&texts, "Unlock"), "{texts:?}");
+        assert!(has(&texts, "Unlocking asks for a touch."), "{texts:?}");
+        assert!(!has(&texts, "Touch fingerprint"), "{texts:?}");
+        assert!(!has(&texts, FINGER_LINE), "{texts:?}");
+        let pills = texts.iter().filter(|(t, _)| t == "Experimental").count();
+        assert_eq!(pills, 1, "{texts:?}");
+    }
+
+    /// The unlocked vault says how it was unlocked, also while a job holds
+    /// its auth.
+    #[test]
+    fn a_vault_unlocked_by_finger_says_so() {
+        let mut key = FakeKey::with_fingerprint();
+        two_vaults(&mut key);
+        let mut app = finger_app();
+        finger_unlock_into(&mut app, &mut key);
+        let texts = vault_tab_texts(&mut app);
+        assert!(has(&texts, "Unlocked with a fingerprint"), "{texts:?}");
+        assert!(!has(&texts, "Unlocked with the FIDO2 PIN"), "{texts:?}");
+        let held = app.vault_take_auth().expect("the session's auth");
+        let texts = vault_tab_texts(&mut app);
+        assert!(has(&texts, "Unlocked with a fingerprint"), "{texts:?}");
+        app.vault_give_back_auth(held);
+
+        let mut key = FakeKey::with_fingerprint();
+        two_vaults(&mut key);
+        let mut app = finger_app();
+        unlock_into(&mut app, &mut key);
+        let texts = vault_tab_texts(&mut app);
+        assert!(has(&texts, "Unlocked with the FIDO2 PIN"), "{texts:?}");
+        assert!(!has(&texts, "Unlocked with a fingerprint"), "{texts:?}");
+    }
+
+    /// A refused finger says why on the Vault tab and leaves the FIDO2
+    /// tab's PIN session alone, at unlock and on a later save.
+    #[test]
+    fn a_refused_vault_fingerprint_does_not_lock_the_fido2_tab() {
+        let not_recognized = "not recognized";
+        let blocked = "blocked after too many tries";
+        for (refusals, retries, said) in [
+            (vec![0x3F], 5, not_recognized),
+            (vec![0x3C], 5, blocked),
+            (vec![], 0, blocked),
+        ] {
+            let mut key = FakeKey::with_fingerprint();
+            two_vaults(&mut key);
+            key.uv_refusals.extend(refusals);
+            key.uv_retries = retries;
+            let mut app = finger_app();
+            app.security_keys.session = Some(fido_session("123456"));
+            app.security_keys.session_device = Some(KEY.into());
+            finger_unlock_into(&mut app, &mut key);
+            assert!(app.vault.session.is_none());
+            let err = app.vault.error.clone().unwrap_or_default();
+            assert!(err.contains(said), "{said}: {err}");
+            assert!(err.contains("use the PIN instead"), "{err}");
+            assert!(
+                app.security_keys.session.is_some(),
+                "{said}: the FIDO2 tab's PIN was never refused"
+            );
+            assert!(app.security_keys.error.is_none());
+        }
+
+        // Mid-session: the key dropped the token and the finger asked
+        // again is refused. The save fails; both sessions stay.
+        let mut key = FakeKey::with_fingerprint();
+        two_vaults(&mut key);
+        key.drops_token_after_presence = true;
+        let mut app = finger_app();
+        app.security_keys.session = Some(fido_session("123456"));
+        app.security_keys.session_device = Some(KEY.into());
+        finger_unlock_into(&mut app, &mut key);
+        assert!(app.vault_session().is_some());
+        key.uv_refusals.push_back(0x3F);
+        add_into(&mut app, &mut key, "Refused");
+        let err = app.vault.error.clone().unwrap_or_default();
+        assert!(err.contains(not_recognized), "{err}");
+        assert!(
+            app.vault_session().is_some(),
+            "a finger refusal is no PIN refusal"
+        );
+        assert!(app.vault_session().unwrap().auth.is_some());
+        assert!(app.security_keys.session.is_some());
+    }
+
+    /// Unlock and Touch fingerprint sit side by side, apart, inside the
+    /// pane at the smallest window, and nothing on the card runs past it.
+    #[test]
+    fn the_vault_card_buttons_do_not_overlap() {
+        let mut app = finger_app();
+        let texts = vault_tab_texts(&mut app);
+        let rect = |s: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t == s)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{s} drawn: {texts:?}"))
+        };
+        let unlock = rect("Unlock");
+        let finger = rect("Touch fingerprint");
+        assert!(!unlock.intersects(finger), "{unlock:?} {finger:?}");
+        assert!(finger.left() > unlock.right(), "right of Unlock");
+        assert!(
+            (unlock.center().y - finger.center().y).abs() < 2.0,
+            "one row"
+        );
+        let width = crate::WINDOW_MIN_SIZE[0] - crate::SIDEBAR_FULL_W;
+        for (t, r) in &texts {
+            if !t.is_empty() {
+                assert!(r.left() >= 0.0 && r.right() <= width, "{t}: {r:?}");
+            }
+        }
+    }
+
+    /// A key that drops the token after a touch: the save asks the finger
+    /// again and says why; a PIN session re-derives silently, as before.
+    #[test]
+    fn a_dropped_token_puts_the_again_prompt_up() {
+        let mut key = FakeKey::with_fingerprint();
+        let p = two_vaults(&mut key);
+        key.drops_token_after_presence = true;
+        let mut app = finger_app();
+        finger_unlock_into(&mut app, &mut key);
+        let fingers = key.fingers;
+        let seen = add_into(&mut app, &mut key, "Dropped");
+        assert_eq!(seen, vec![again_prompt()]);
+        assert_eq!(key.fingers, fingers + 1);
+        assert_eq!(
+            app.vault.info.as_deref(),
+            Some("Entry \"Dropped\" added to vault \"Personal\".")
+        );
+        assert_eq!(key.vault_on_key(&p).unwrap().entries.len(), 3);
+        assert!(!key.log.iter().any(|c| matches!(c, Call::Token { .. })));
+        // The renewed token is the session's: the next save needs none.
+        key.drops_token_after_presence = false;
+        let seen = add_into(&mut app, &mut key, "Held");
+        assert!(seen.is_empty(), "{seen:?}");
+        assert_eq!(key.fingers, fingers + 1);
+
+        // The PIN path: the same key, no prompt.
+        let mut key = FakeKey::with_fingerprint();
+        two_vaults(&mut key);
+        key.drops_token_after_presence = true;
+        let mut app = finger_app();
+        unlock_into(&mut app, &mut key);
+        let seen = add_into(&mut app, &mut key, "Silent");
+        assert!(seen.is_empty(), "{seen:?}");
+        assert_eq!(shown(&app.vault.progress), None);
+        assert_eq!(key.fingers, 0);
+        assert!(app.vault.info.is_some(), "{:?}", app.vault.error);
+    }
+
+    /// Ruling R2: a create, delete or rotate takes its fresh token by
+    /// design, so a fingerprint session asks for it plainly, never with
+    /// the "asked for a new unlock" reason.
+    #[test]
+    fn a_fingerprint_session_asks_plainly_for_new_tokens() {
+        let mut key = FakeKey::with_fingerprint();
+        two_vaults(&mut key);
+        let mut app = finger_app();
+        finger_unlock_into(&mut app, &mut key);
+        let seen = create_into(&mut app, &mut key, "Travel");
+        assert!(app.vault.error.is_none(), "{:?}", app.vault.error);
+        assert!(!seen.contains(&again_prompt()), "{seen:?}");
+        assert!(app
+            .vault_session()
+            .unwrap()
+            .unlocked
+            .vaults
+            .iter()
+            .any(|v| v.vault_ref.name.as_deref() == Some("Travel")));
+        assert!(!key.log.iter().any(|c| matches!(c, Call::Token { .. })));
+        assert_eq!(
+            app.vault_session()
+                .and_then(|s| s.auth.as_ref())
+                .and_then(VaultAuth::verified),
+            Some(Verified::Fingerprint)
+        );
+    }
+
+    /// Lock, the idle lock and a key switch drop a fingerprint vault
+    /// session like a PIN one, its token with it.
+    #[test]
+    fn a_fingerprint_vault_session_locks_like_a_pin_one() {
+        let opened = || {
+            let mut key = FakeKey::with_fingerprint();
+            two_vaults(&mut key);
+            let mut app = finger_app();
+            finger_unlock_into(&mut app, &mut key);
+            assert!(app.vault_session().is_some());
+            assert!(app.holds_unlocked_secrets());
+            app
+        };
+        let mut app = opened();
+        app.vault_lock(None);
+        assert!(app.vault.session.is_none());
+        assert!(!app.holds_unlocked_secrets());
+
+        let mut app = opened();
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + crate::IDLE_LOCK_AFTER, false);
+        assert!(app.vault.session.is_none());
+        assert_eq!(
+            app.vault.error.as_deref(),
+            Some(crate::idle_locked_msg().as_str())
+        );
+
+        let mut app = opened();
+        let previous = app.selected_device.take();
+        app.selected_device = Some("serial:BBB".into());
+        app.on_device_selected(previous);
+        assert!(app.vault.session.is_none());
+    }
+
+    /// Touch fingerprint on the card runs a vault-only unlock: the job
+    /// opens the key (a path that doesn't exist here, so it says that
+    /// failed), and the FIDO2 tab is never unlocked. A PIN typed into the
+    /// box first is wiped rather than kept.
+    // Linux only: the job reaches a HID open, a plain file open on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn touch_fingerprint_unlocks_only_the_vault() {
+        let mut app = App {
+            devices: vec![crate::ui::device::Device {
+                hid_path: Some("/nonexistent/keyroost-test/hidraw0".into()),
+                ..crate::tests::test_key(KEY, "AAA", None)
+            }],
+            selected_device: Some(KEY.into()),
+            ..Default::default()
+        };
+        app.security_keys.info = Some(FakeKey::with_fingerprint().info);
+        *app.vault.pin_input = "246810".into();
+        click_text("Touch fingerprint", |ui, p| app.cap_vault(ui, p));
+        assert!(app.vault.session.is_none());
+        assert!(app.vault.error.is_some(), "the open failure is said");
+        assert!(app.vault.pin_input.is_empty(), "the typed PIN is wiped");
+        assert!(app.security_keys.session.is_none());
+        assert!(
+            app.security_keys.error.is_none(),
+            "no FIDO2 unlock was tried"
+        );
     }
 }
