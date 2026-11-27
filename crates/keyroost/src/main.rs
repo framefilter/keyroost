@@ -435,6 +435,10 @@ enum KeyNameFailure {
     /// The name or array on the key changed since the dialog opened.
     Stale,
     Failed(String),
+    /// The key refused a fingerprint session's token, then the new one
+    /// taken for the save too: the FIDO2 tab locks, as it does when the key
+    /// refuses a session token twice elsewhere.
+    SessionEnded(String),
 }
 
 impl From<String> for KeyNameFailure {
@@ -477,19 +481,31 @@ fn write_key_name(
     held: Option<&PinUvAuthToken>,
     prompt: &FingerPrompt,
 ) -> Result<(KeyNameWrite, Option<PinUvAuthToken>), KeyNameFailure> {
-    use keyroost_ctap::device_label::{
-        apply_label_plan, plan_label_change, random_nonce, read_label, DeviceLabel, LabelError,
-        LabelState, WRITER_KEYROOST,
-    };
     let (mut dev, init) = open_ctap_hid(path).map_err(|e| e.to_string())?;
     if !init.supports_cbor() {
         return Err(KEY_NAME_NO_STORAGE.into());
     }
-    let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+    write_key_name_on(&mut dev, name, expected, unlock, held, prompt)
+}
+
+/// [`write_key_name`] on an open CTAP2 key.
+fn write_key_name_on<D: keyroost_ctap::transport::CtapTransport>(
+    dev: &mut D,
+    name: Option<&str>,
+    expected: Option<&str>,
+    unlock: Option<&SessionUnlock>,
+    held: Option<&PinUvAuthToken>,
+    prompt: &FingerPrompt,
+) -> Result<(KeyNameWrite, Option<PinUvAuthToken>), KeyNameFailure> {
+    use keyroost_ctap::device_label::{
+        apply_label_plan, plan_label_change, random_nonce, read_label, DeviceLabel, LabelError,
+        LabelState, WRITER_KEYROOST,
+    };
+    let info = keyroost_ctap::get_info(dev).map_err(|e| e.to_string())?;
     if info.option("largeBlobs") != Some(true) {
         return Err(KEY_NAME_NO_STORAGE.into());
     }
-    let current = keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
+    let current = keyroost_ctap::large_blobs::read(dev, &info).map_err(|e| e.to_string())?;
     let used = current.capacity(&info).used_bytes;
     let new = name.map(|l| DeviceLabel {
         label: l.to_string(),
@@ -522,15 +538,15 @@ fn write_key_name(
     let unlock_failed = |e: keyroost_ctap::CtapError| -> KeyNameFailure {
         format!("Couldn't unlock the key: {e}").into()
     };
-    let apply = |dev: &mut CtapHidDevice, token: &PinUvAuthToken| {
+    let apply = |dev: &mut D, token: &PinUvAuthToken| {
         keyroost_resolve::with_key_names_forgotten(|| apply_label_plan(dev, &info, token, &plan))
     };
     let failed = |e| key_name_failure(e, used);
     let renewed = match (unlock, held) {
-        (SessionUnlock::Fingerprint, Some(held)) => match apply(&mut dev, held) {
+        (SessionUnlock::Fingerprint, Some(held)) => match apply(dev, held) {
             Err(LabelError::Ctap(keyroost_ctap::CtapError::StatusCode(0x33))) => {
                 let token = session_token(
-                    &mut dev,
+                    dev,
                     &info,
                     unlock,
                     session_permissions_for(&info, unlock),
@@ -538,7 +554,15 @@ fn write_key_name(
                     keyroost_ctap::client_pin::FingerAsk::Again,
                 )
                 .map_err(unlock_failed)?;
-                apply(&mut dev, &token).map_err(failed)?;
+                // Refused again: the session's unlock no longer works here.
+                match apply(dev, &token) {
+                    Err(LabelError::Ctap(e @ keyroost_ctap::CtapError::StatusCode(0x33))) => {
+                        return Err(KeyNameFailure::SessionEnded(format!(
+                            "Couldn't unlock the key: {e}"
+                        )));
+                    }
+                    other => other.map_err(failed)?,
+                }
                 Some(token)
             }
             other => {
@@ -548,7 +572,7 @@ fn write_key_name(
         },
         _ => {
             let token = session_token(
-                &mut dev,
+                dev,
                 &info,
                 unlock,
                 keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
@@ -556,11 +580,11 @@ fn write_key_name(
                 keyroost_ctap::client_pin::FingerAsk::Unlock,
             )
             .map_err(unlock_failed)?;
-            apply(&mut dev, &token).map_err(failed)?;
+            apply(dev, &token).map_err(failed)?;
             None
         }
     };
-    let now = read_label(&mut dev, &info).map_err(|e| e.to_string())?;
+    let now = read_label(dev, &info).map_err(|e| e.to_string())?;
     let kept = match (&now, name) {
         (LabelState::Present(l), Some(n)) => l.label == n,
         (LabelState::Absent, None) => true,
@@ -8217,10 +8241,12 @@ impl App {
     /// unlock, and run `f` with an armed BioEnrollment. A fresh token per
     /// operation is required: the authenticator can invalidate a token after
     /// a UV-gated bio write, so reusing the unlock token across operations
-    /// fails with 0x33. On a fingerprint session that is a new touch, and the
-    /// banner says why ([`FingerAsk::Again`](keyroost_ctap::client_pin::FingerAsk));
-    /// a key that lets no finger manage fingerprints refuses it with no I/O,
-    /// in plain words, and the session stays.
+    /// fails with 0x33. On a fingerprint session that is a new touch every
+    /// time, by design, so the banner asks plainly
+    /// ([`FingerAsk::Unlock`](keyroost_ctap::client_pin::FingerAsk)) rather
+    /// than giving the dropped-token reason; a key that lets no finger manage
+    /// fingerprints refuses it with no I/O, in plain words, and the session
+    /// stays.
     fn with_fresh_bio<T>(
         target: &FidoTarget,
         unlock: &SessionUnlock,
@@ -8251,7 +8277,7 @@ impl App {
             unlock,
             keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
             prompt,
-            keyroost_ctap::client_pin::FingerAsk::Again,
+            keyroost_ctap::client_pin::FingerAsk::Unlock,
         )
         .map_err(SessionOpError::from_ctap)?;
         let mut bio = keyroost_ctap::bio_enroll::BioEnrollment::new(&mut dev, token, cmd_code);
@@ -8347,7 +8373,7 @@ impl App {
                     &unlock,
                     keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
                     &prompt,
-                    keyroost_ctap::client_pin::FingerAsk::Again,
+                    keyroost_ctap::client_pin::FingerAsk::Unlock,
                 )
                 .map_err(SessionOpError::from_ctap)?;
                 let mut bio =
@@ -15376,6 +15402,23 @@ impl App {
                         }
                         keyroost_resolve::forget_key_names();
                         app.refresh_devices();
+                    }
+                    Err(KeyNameFailure::SessionEnded(e)) => {
+                        if completion_still_valid(
+                            Some(&device_id),
+                            app.security_keys.session_device.as_ref(),
+                        ) {
+                            app.relock_fido_session();
+                        }
+                        if open_here {
+                            app.rename_failed(e);
+                        } else {
+                            app.log_global(
+                                Severity::Err,
+                                LogKind::User,
+                                format!("{old_display}: name not saved: {e}"),
+                            );
+                        }
                     }
                     Err(KeyNameFailure::Failed(e)) => {
                         if open_here {
@@ -36510,6 +36553,86 @@ mod tests {
         assert_eq!(key.subs, [2, 9]);
         assert_eq!(key.perms, [u64::from(LBW)]);
         assert!(key.seen_prompts.is_empty());
+    }
+
+    /// The on-key name on a fingerprint session reuses its held token: no
+    /// finger. A refused token asks the finger once more, saying why, and
+    /// the new token comes back for the session. Refused again, the save
+    /// stops (no third token) and the FIDO2 tab locks.
+    #[test]
+    fn a_fingerprint_name_save_reuses_the_session_token() {
+        use keyroost_ctap::client_pin::permissions::{
+            CREDENTIAL_MANAGEMENT as CM, LARGE_BLOB_WRITE as LBW,
+        };
+        let prompt = FingerPrompt::default();
+        let session = |key: &mut TokenKey| {
+            key.blobs = true;
+            App::unlock_on(key, SessionUnlock::Fingerprint, &prompt)
+                .unwrap_or_else(|e| panic!("{e}"))
+        };
+        let finger = SessionUnlock::Fingerprint;
+        let again = keyroost_ctap::client_pin::FingerAsk::Again.prompt();
+
+        // Held token works: written, no token asked.
+        let mut key = TokenKey::with_finger(0, &prompt);
+        let s = session(&mut key);
+        let subs = key.subs.len();
+        let (w, renewed) = write_key_name_on(
+            &mut key,
+            Some("Desk"),
+            None,
+            Some(&finger),
+            Some(&s.token),
+            &prompt,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(matches!(w, KeyNameWrite::Written(_)));
+        assert!(renewed.is_none());
+        assert_eq!(key.subs.len(), subs, "no finger");
+        assert_eq!(key.blob_writes, 1);
+
+        // Refused once: one Again ask, the new token returned.
+        let mut key = TokenKey::with_finger(0, &prompt);
+        let s = session(&mut key);
+        key.blob_stale = 1;
+        let (w, renewed) = write_key_name_on(
+            &mut key,
+            Some("Desk"),
+            None,
+            Some(&finger),
+            Some(&s.token),
+            &prompt,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(matches!(w, KeyNameWrite::Written(_)));
+        assert_eq!(
+            &renewed.expect("a new token").token,
+            key.issued.last().unwrap()
+        );
+        assert_eq!(key.seen_prompts.len(), 2, "the unlock, then once more");
+        assert_eq!(key.seen_prompts[1].as_deref(), Some(again));
+        assert_eq!(key.perms[1], u64::from(CM | LBW));
+        assert_eq!(key.blob_writes, 2);
+        assert!(prompt.lock().unwrap().is_none());
+
+        // Refused twice: no loop, and the failure ends the session.
+        let mut key = TokenKey::with_finger(0, &prompt);
+        let s = session(&mut key);
+        key.blob_stale = 2;
+        let err = write_key_name_on(
+            &mut key,
+            Some("Desk"),
+            None,
+            Some(&finger),
+            Some(&s.token),
+            &prompt,
+        )
+        .err()
+        .expect("refused twice");
+        assert!(matches!(err, KeyNameFailure::SessionEnded(_)), "{err:?}");
+        assert_eq!(key.seen_prompts.len(), 2, "one ask after the refusal");
+        assert_eq!(key.blob_writes, 2);
+        assert!(!key.subs.contains(&9), "never the PIN");
     }
 
     /// A refused fingerprint ends the unlock with the reason, in plain
