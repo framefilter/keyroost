@@ -88,3 +88,50 @@ fn help_says_a_name_on_the_key_is_visible_to_anyone() {
         );
     }
 }
+
+/// `--unlock` concerns only a name stored on the key: for a name on this
+/// computer it changes nothing, asks for no finger and reaches no key.
+#[test]
+fn unlock_changes_nothing_for_a_local_name() {
+    let plain = run(&["name", "set", "Desk", "--store", "local"]);
+    for unlock in ["fingerprint", "auto"] {
+        let got = run(&[
+            "name", "set", "Desk", "--store", "local", "--unlock", unlock,
+        ]);
+        assert_eq!(got, plain, "{unlock}");
+        assert!(!got.2.contains("fingerprint"), "{unlock}: {}", got.2);
+    }
+
+    // A name only on this computer is removed without a key or a finger.
+    for unlock in ["fingerprint", "auto"] {
+        let dir = common::TempDir::new("names-local");
+        std::fs::create_dir_all(dir.join("keyroost")).unwrap();
+        let file = dir.join("keyroost/keys.json");
+        std::fs::write(
+            &file,
+            r#"{"version":2,"keys":[{"name":"Desk","fingerprint":null,"stored":"computer"}]}"#,
+        )
+        .unwrap();
+        let mut cmd = common::keyroostctl();
+        cmd.args(["name", "clear", "Desk", "--unlock", unlock])
+            .stdin(Stdio::null())
+            .config_in(&dir);
+        let out = cmd.output().unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(out.status.success(), "{unlock}: {stderr}");
+        assert!(
+            stdout.contains("Removed the name 'Desk'."),
+            "{unlock}: {stdout}"
+        );
+        assert!(!stderr.contains("fingerprint"), "{unlock}: {stderr}");
+        assert!(
+            !stderr.contains('\u{2192}'),
+            "{unlock}: a key was selected: {stderr}"
+        );
+        let left = std::fs::read_to_string(&file).unwrap();
+        assert!(!left.contains("Desk"), "{unlock}: {left}");
+    }
+}

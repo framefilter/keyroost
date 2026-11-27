@@ -651,9 +651,7 @@ fn fido_pin_commands() -> Vec<(String, Vec<String>)> {
         let secrets = cols[cols.len() - 2];
         let fido = path.starts_with("fido ") || path.starts_with("name ");
         let takes_pin = secrets.split(' ').any(|s| s == "pin" || s == "a-pin");
-        // The vault commands take --unlock in their own change.
-        let excluded =
-            ["fido pin set", "fido pin change"].contains(&path) || path.starts_with("fido vault");
+        let excluded = ["fido pin set", "fido pin change"].contains(&path);
         if !fido || !takes_pin || excluded || out.iter().any(|(p, _)| p == path) {
             continue;
         }
@@ -670,7 +668,7 @@ fn fido_pin_commands() -> Vec<(String, Vec<String>)> {
 #[test]
 fn every_fido_pin_command_offers_unlock() {
     let commands = fido_pin_commands();
-    assert_eq!(commands.len(), 21, "{commands:?}");
+    assert_eq!(commands.len(), 32, "{commands:?}");
     for (path, _) in &commands {
         let mut args: Vec<&str> = path.split(' ').collect();
         args.push("--help");
@@ -726,4 +724,36 @@ fn fingerprint_needs_no_pin_source_without_a_terminal() {
         assert!(!err.contains(" given: pass "), "{args:?}: {err}");
         assert!(err.contains("no key with FIDO2"), "{args:?}: {err}");
     }
+    // A vault backup: the passphrase is still checked and read, the PIN
+    // source is not (F6).
+    let dir = common::TempDir::new("vault-export-fingerprint");
+    for unlock in ["fingerprint", "auto"] {
+        let out = common::keyroostctl()
+            .args(["fido", "vault", "export", "x", "-o", "f"])
+            .args(["--passphrase", "env:KR_TEST_PASS", "--unlock", unlock])
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .env("KR_TEST_PASS", "a passphrase long enough")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{unlock}: {err}");
+        assert!(!err.contains(" given: pass "), "{unlock}: {err}");
+        assert!(err.contains("no key with FIDO2"), "{unlock}: {err}");
+        assert!(!dir.join("f").exists(), "{unlock}: wrote the backup");
+    }
+    // Without the passphrase the refusal names it, and only it.
+    let (code, err) = run(&[
+        "fido",
+        "vault",
+        "export",
+        "x",
+        "-o",
+        "f",
+        "--unlock",
+        "fingerprint",
+    ]);
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("passphrase given: pass --passphrase"), "{err}");
+    assert!(!err.contains("--pin"), "{err}");
 }

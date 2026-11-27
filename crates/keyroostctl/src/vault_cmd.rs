@@ -35,17 +35,16 @@ use crate::{sanitize_terminal, PATH_HELP};
 /// `fido vault` subcommands.
 #[derive(Subcommand)]
 pub(crate) enum FidoVaultCmd {
-    /// List the key's vaults with how many entries each holds (PIN and a touch).
+    /// List the key's vaults with how many entries each holds (PIN or fingerprint, and a touch).
     List {
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = crate::FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
     },
-    /// Create an empty vault on the key (PIN and two touches).
+    /// Create an empty vault on the key (PIN or fingerprint, and two touches).
     ///
     /// Vault names are unique on a key. If the key is lost or reset, its
     /// vaults go with it: keep a backup with `fido vault export`.
@@ -53,15 +52,14 @@ pub(crate) enum FidoVaultCmd {
         /// The new vault's name: 1 to 32 bytes (accented and non-Latin
         /// letters take 2 to 4 bytes each).
         name: String,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = crate::FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
     },
-    /// Delete a vault and its entries (PIN, no touch). Irreversible: asks first (`--yes` to skip).
+    /// Delete a vault and its entries (PIN or fingerprint, no touch). Irreversible: asks first (`--yes` to skip).
     ///
     /// To keep the entries, export the vault first with `fido vault export`.
     /// Copies that share a name are told apart by how much each stores.
@@ -71,10 +69,9 @@ pub(crate) enum FidoVaultCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = crate::FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
@@ -88,15 +85,14 @@ pub(crate) enum FidoVaultCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = crate::FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
     },
-    /// Write a vault's entries to a backup file protected by a passphrase (PIN and a touch).
+    /// Write a vault's entries to a backup file protected by a passphrase (PIN or fingerprint, and a touch).
     ///
     /// The file opens with its passphrase alone, without the key: keep the
     /// two apart. The passphrase needs at least 10 characters. Restore the
@@ -115,15 +111,18 @@ pub(crate) enum FidoVaultCmd {
         /// neither, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         passphrase: Option<SecretSource>,
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (second line when --passphrase stdin is also given; hidden
-        /// when typed at a terminal). With neither, a terminal asks.
+        /// when typed at a terminal). With neither, a terminal asks
+        /// (`--unlock pin` only).
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
     },
-    /// Bring entries back from a vault backup file: shows what each becomes, then asks once (PIN and a touch; two to make a new vault).
+    /// Bring entries back from a vault backup file: shows what each becomes, then asks once (PIN or fingerprint, and a touch; two to make a new vault).
     ///
     /// An entry the vault lacks is added; one whose backup copy is newer
     /// replaces the vault's; one that is the same is left as is; one whose
@@ -160,9 +159,12 @@ pub(crate) enum FidoVaultCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (second line when --passphrase stdin is also given; hidden
-        /// when typed at a terminal). With neither, a terminal asks.
+        /// when typed at a terminal). With neither, a terminal asks
+        /// (`--unlock pin` only).
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
@@ -182,19 +184,18 @@ const VAULT_HELP: &str = "The vault to use when the key has several";
 /// `fido vault entry` subcommands.
 #[derive(Subcommand)]
 pub(crate) enum FidoVaultEntryCmd {
-    /// List a vault's entries with their usernames and web addresses (PIN and a touch).
+    /// List a vault's entries with their usernames and web addresses (PIN or fingerprint, and a touch).
     List {
         #[arg(long, value_name = "NAME", help = VAULT_HELP)]
         vault: Option<String>,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = crate::FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
     },
-    /// Show one entry; its password only with --reveal (PIN and a touch).
+    /// Show one entry; its password only with --reveal (PIN or fingerprint, and a touch).
     ///
     /// Entries that share a title are told apart by username: name one with
     /// --username, or pick it from a list at a terminal.
@@ -210,15 +211,14 @@ pub(crate) enum FidoVaultEntryCmd {
         /// anything recording, your terminal will capture it.
         #[arg(long)]
         reveal: bool,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = crate::FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
     },
-    /// Add an entry to a vault (PIN and a touch).
+    /// Add an entry to a vault (PIN or fingerprint, and a touch).
     ///
     /// Titles need not be unique: entries that share one are told apart by
     /// username.
@@ -250,16 +250,19 @@ pub(crate) enum FidoVaultEntryCmd {
         /// Length of the generated password (default 20).
         #[arg(long, value_name = "N", requires = "generate_password", value_parser = length_parser())]
         length: Option<usize>,
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (the line after the password and notes when they come from
         /// stdin too: second line after one of them, third after both; hidden
-        /// when typed at a terminal). With neither, a terminal asks.
+        /// when typed at a terminal). With neither, a terminal asks
+        /// (`--unlock pin` only).
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
     },
-    /// Change an entry's title, username, web address, notes or password (PIN and a touch).
+    /// Change an entry's title, username, web address, notes or password (PIN or fingerprint, and a touch).
     ///
     /// Only what the flags name changes; an empty value clears a field
     /// (`--url ""`). Entries that share a title are picked from a list at a
@@ -300,16 +303,19 @@ pub(crate) enum FidoVaultEntryCmd {
         /// Length of the generated password (default 20).
         #[arg(long, value_name = "N", requires = "generate_password", value_parser = length_parser())]
         length: Option<usize>,
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (the line after the password and notes when they come from
         /// stdin too: second line after one of them, third after both; hidden
-        /// when typed at a terminal). With neither, a terminal asks.
+        /// when typed at a terminal). With neither, a terminal asks
+        /// (`--unlock pin` only).
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
     },
-    /// Delete an entry from a vault (PIN and a touch). Irreversible: asks first (`--yes` to skip).
+    /// Delete an entry from a vault (PIN or fingerprint, and a touch). Irreversible: asks first (`--yes` to skip).
     Delete {
         /// The entry's title, as `fido vault entry list` shows it.
         title: String,
@@ -321,10 +327,9 @@ pub(crate) enum FidoVaultEntryCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        #[arg(long, value_enum, default_value_t = crate::Unlock::Pin, help = crate::FIDO_UNLOCK_HELP)]
+        unlock: crate::Unlock,
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, help = crate::FIDO_PIN_HELP)]
         pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<PathBuf>,
@@ -338,13 +343,15 @@ fn length_parser() -> clap::builder::RangedU64ValueParser<usize> {
 
 pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
     match cmd {
-        FidoVaultCmd::List { pin, path } => {
-            let pin = crate::fido_pin(path.as_deref(), pin.as_ref())?;
+        FidoVaultCmd::List { unlock, pin, path } => {
+            let read =
+                crate::fido_unlock(path.as_deref(), *unlock, pin.as_ref(), VAULT_PERMISSIONS)?;
             let mut key = open_vault_key(path.as_deref())?;
-            let mut auth = VaultAuth::pin(pin);
+            let mut auth = vault_auth(read);
             let mut touches = Touches::new(1);
             let unlocked = vault::unlock(&mut key, &mut auth, &mut |s| touches.step(s))
                 .map_err(vault_error)?;
+            print_unlocked_with(*unlock, &auth);
             let rows = rows(&unlocked);
             if json_output() {
                 return emit_json(&list_json(&rows, &unlocked.capacity));
@@ -354,12 +361,18 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
             }
             Ok(())
         }
-        FidoVaultCmd::Add { name, pin, path } => {
+        FidoVaultCmd::Add {
+            name,
+            unlock,
+            pin,
+            path,
+        } => {
             // The format's name rule, before a key is looked for.
             keyroost_vault::user_handle(name)?;
-            let pin = crate::fido_pin(path.as_deref(), pin.as_ref())?;
+            let read =
+                crate::fido_unlock(path.as_deref(), *unlock, pin.as_ref(), VAULT_PERMISSIONS)?;
             let mut key = open_vault_key(path.as_deref())?;
-            let mut auth = VaultAuth::pin(pin);
+            let mut auth = vault_auth(read);
             let mut touches = Touches::new(2);
             let made = vault::create(
                 &mut key,
@@ -369,6 +382,7 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
                 &mut |s| touches.step(s),
             )
             .map_err(vault_error)?;
+            print_unlocked_with(*unlock, &auth);
             outln!("{}", backup_hint(name));
             crate::output::store_note(&made.capacity);
             Ok(())
@@ -376,15 +390,22 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
         FidoVaultCmd::Delete {
             name,
             yes,
+            unlock,
             pin,
             path,
         } => {
-            let (dev, pin) =
-                key_and_pin(path.as_deref(), pin.as_ref(), *yes, &delete_action(name))?;
+            let (dev, read) = key_and_unlock(
+                path.as_deref(),
+                *unlock,
+                pin.as_ref(),
+                *yes,
+                &delete_action(name),
+            )?;
             let mut key = open_vault_key(path.as_deref())?;
-            let mut auth = VaultAuth::pin(pin);
+            let mut auth = vault_auth(read);
             // Credential management: no touch.
             let creds = vault::list_credentials(&mut key, &mut auth).map_err(vault_error)?;
+            print_unlocked_with(*unlock, &auth);
             let matches = vault::matching(&creds, &VaultPick::Name(name)).map_err(vault_error)?;
             let i = choose_vault(
                 &delete_choices(&creds),
@@ -405,17 +426,24 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
         FidoVaultCmd::Rotate {
             name,
             yes,
+            unlock,
             pin,
             path,
         } => {
-            let (dev, pin) =
-                key_and_pin(path.as_deref(), pin.as_ref(), *yes, &rotate_action(name))?;
+            let (dev, read) = key_and_unlock(
+                path.as_deref(),
+                *unlock,
+                pin.as_ref(),
+                *yes,
+                &rotate_action(name),
+            )?;
             let mut key = open_vault_key(path.as_deref())?;
-            let mut auth = VaultAuth::pin(pin);
+            let mut auth = vault_auth(read);
             // One touch to unlock, then the two of the new vault's create.
             let mut touches = Touches::new(3);
             let mut unlocked = vault::unlock(&mut key, &mut auth, &mut |s| touches.step(s))
                 .map_err(vault_error)?;
+            print_unlocked_with(*unlock, &auth);
             let matches =
                 vault::matching(&unlocked.vaults, &VaultPick::Name(name)).map_err(vault_error)?;
             let i = choose_vault(
@@ -436,12 +464,14 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
             name,
             out,
             overwrite,
+            unlock,
             path,
             ..
         } => run_export(
             name,
             out,
             *overwrite,
+            *unlock,
             crate::pair_of(vault_secret_pair(cmd))?,
             path.as_deref(),
         ),
@@ -452,11 +482,13 @@ pub(crate) fn run_fido_vault(cmd: &FidoVaultCmd) -> Result<(), Box<dyn Error>> {
             replace,
             dry_run,
             yes,
+            unlock,
             path,
             ..
         } => run_import(&ImportArgs {
             input,
             vault: vault.as_deref(),
+            unlock: *unlock,
             pair: crate::pair_of(vault_secret_pair(cmd))?,
             entries: entry,
             replace: *replace,
@@ -492,27 +524,30 @@ pub(crate) fn vault_secret_pair(cmd: &FidoVaultCmd) -> Option<crate::SecretPair<
 /// `vault export`. Order: check the passphrase and PIN sources, check the
 /// output file, read the passphrase and check its length (it belongs to the
 /// file, so a short one is refused before the key is used), select the
-/// key, read the PIN, unlock (a touch), choose the vault, encrypt, write.
+/// key, read the PIN (or refuse a fingerprint the key can't give), unlock
+/// (a touch), choose the vault, encrypt, write.
 fn run_export(
     name: &str,
     out: &Path,
     overwrite: bool,
+    unlock: crate::Unlock,
     pair: crate::SecretPair<'_>,
     path: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let mut sec = Secrets::real();
-    pair.check(&sec)?;
+    check_pair(&sec, &pair, unlock)?;
     let mode = crate::prompt::check_secret_overwrite(Some(out), overwrite)?;
     let (pass, pin) = pair.read_first(&mut sec)?;
     let pass = pass.text()?;
     keyroost_vault::check_passphrase(&pass)?;
     let dev = crate::target::select_fido(path)?;
-    let pin = crate::fido_pin_with(&mut sec, &dev, pin.flag)?;
+    let read = crate::fido_unlock_with(&mut sec, &dev, unlock, pin.flag, VAULT_PERMISSIONS)?;
     let mut key = open_vault_key(path)?;
-    let mut auth = VaultAuth::pin(pin);
+    let mut auth = vault_auth(read);
     let mut touches = Touches::new(1);
     let mut unlocked =
         vault::unlock(&mut key, &mut auth, &mut |s| touches.step(s)).map_err(vault_error)?;
+    print_unlocked_with(unlock, &auth);
     let matches = vault::matching(&unlocked.vaults, &VaultPick::Name(name)).map_err(vault_error)?;
     let i = choose_vault(
         &unlocked_choices(&unlocked),
@@ -542,6 +577,7 @@ fn exported_line(name: &str, n: usize, out: &Path) -> String {
 struct ImportArgs<'a> {
     input: &'a Path,
     vault: Option<&'a str>,
+    unlock: crate::Unlock,
     /// The passphrase, then the PIN.
     pair: crate::SecretPair<'a>,
     entries: &'a [String],
@@ -585,7 +621,7 @@ fn run_import(a: &ImportArgs<'_>) -> Result<(), Box<dyn Error>> {
         keyroost_vault::user_handle(name)?;
     }
     let mut sec = Secrets::real();
-    a.pair.check(&sec)?;
+    check_pair(&sec, &a.pair, a.unlock)?;
     let bytes = read_backup_file(a.input)?;
     let (pass, pin) = a.pair.read_first(&mut sec)?;
     let incoming = keyroost_vault::import_backup(&bytes, &pass.text()?)
@@ -603,11 +639,12 @@ fn run_import(a: &ImportArgs<'_>) -> Result<(), Box<dyn Error>> {
         // answer it is refused before the PIN is read.
         refuse_unaskable(&RealTerm, a.yes, &import_action(&file, a.vault), &key_name)?;
     }
-    let pin = crate::fido_pin_with(&mut sec, &dev, pin.flag)?;
+    let read = crate::fido_unlock_with(&mut sec, &dev, a.unlock, pin.flag, VAULT_PERMISSIONS)?;
     let mut key = open_vault_key(a.path)?;
-    let mut auth = VaultAuth::pin(pin);
+    let mut auth = vault_auth(read);
     // Credential management: no touch.
     let creds = vault::list_credentials(&mut key, &mut auth).map_err(vault_error)?;
+    print_unlocked_with(a.unlock, &auth);
     let pick = vault_pick(a.vault);
     match vault::matching(&creds, &pick) {
         Ok(_) => {}
@@ -1074,18 +1111,61 @@ fn import_action(file: &str, vault: Option<&str>) -> String {
 /// The key and its PIN for a command that asks only after the unlock: the
 /// PIN source is checked, the key selected, a run that could never answer
 /// the question refused ([`refuse_unaskable`]), then the PIN read.
-fn key_and_pin(
+fn key_and_unlock(
     path: Option<&Path>,
+    unlock: crate::Unlock,
     pin: Option<&SecretSource>,
     yes: bool,
     action: &str,
-) -> Result<(Device, Zeroizing<String>), Box<dyn Error>> {
+) -> Result<(Device, crate::FidoUnlock), Box<dyn Error>> {
     let mut sec = Secrets::real();
-    sec.check(&crate::FIDO_PIN, Source::from_flag(pin))?;
+    crate::check_fido_unlock(&sec, unlock, Source::from_flag(pin))?;
     let dev = crate::target::select_fido(path)?;
     refuse_unaskable(&RealTerm, yes, action, &key_label(&dev))?;
-    let pin = crate::fido_pin_with(&mut sec, &dev, pin)?;
-    Ok((dev, pin))
+    let read = crate::fido_unlock_with(&mut sec, &dev, unlock, pin, VAULT_PERMISSIONS)?;
+    Ok((dev, read))
+}
+
+/// What a vault token asks for: listing the vault credentials and writing
+/// the store (the flows ask for exactly what each step needs; this is what
+/// a fingerprint is checked against before anything is asked).
+const VAULT_PERMISSIONS: u32 = keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT
+    | keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE;
+
+/// The vault flows' [`VaultAuth`] for a read unlock. A finger prompt is its
+/// own line, printed right before the key waits for each finger (the
+/// vault's touch prompts count only touches).
+fn vault_auth(unlock: crate::FidoUnlock) -> VaultAuth {
+    let ask = || -> Box<dyn FnMut(keyroost_ctap::client_pin::FingerAsk) + Send> {
+        Box::new(|a| crate::prompt::touch(a.prompt()))
+    };
+    match unlock {
+        crate::FidoUnlock::Pin(pin) => VaultAuth::pin(pin),
+        crate::FidoUnlock::Fingerprint => VaultAuth::fingerprint(ask()),
+        crate::FidoUnlock::Auto(pin) => VaultAuth::auto(pin, ask()),
+    }
+}
+
+/// Under `--unlock auto`, say once how the key was unlocked: right after
+/// the command's first vault call, before anything goes to stdout.
+fn print_unlocked_with(unlock: crate::Unlock, auth: &VaultAuth) {
+    if unlock == crate::Unlock::Auto {
+        if let Some(v) = auth.verified() {
+            errln!("{}", crate::unlocked_with_line(v));
+        }
+    }
+}
+
+/// [`crate::SecretPair::check`] for `vault export` and `vault import`: the
+/// passphrase always; the PIN as `--unlock` needs it (none for a
+/// fingerprint, only a given flag under `auto`).
+fn check_pair<I: SecretIo>(
+    sec: &Secrets<I>,
+    pair: &crate::SecretPair<'_>,
+    unlock: crate::Unlock,
+) -> Result<(), Box<dyn Error>> {
+    pair.check_first(sec)?;
+    crate::check_fido_unlock(sec, unlock, pair.second.source())
 }
 
 /// What `vault delete` prints when done.
@@ -1516,7 +1596,7 @@ fn check_content<I: SecretIo>(
 }
 
 /// The password and notes, in stdin order (password first); the PIN comes
-/// after them ([`crate::fido_pin_with`]).
+/// after them ([`crate::fido_unlock_with`]).
 type Content = (Option<Zeroizing<String>>, Option<Zeroizing<String>>);
 
 fn read_content<I: SecretIo>(
@@ -1551,6 +1631,8 @@ struct EntryKey {
     dev: Device,
     key: CtapVaultKey<CtapHidDevice>,
     auth: VaultAuth,
+    /// How `auth` was asked for, so `--unlock auto` can say how it went.
+    unlock: crate::Unlock,
     password: Option<Zeroizing<String>>,
     notes: Option<Zeroizing<String>>,
 }
@@ -1560,23 +1642,25 @@ struct EntryKey {
 /// (`asks`), read the password and notes, then the PIN, then open the key.
 fn open_entry_key(
     path: Option<&Path>,
+    unlock: crate::Unlock,
     pin: Option<&SecretSource>,
     c: ContentFlags<'_>,
 ) -> Result<EntryKey, Box<dyn Error>> {
     let mut sec = Secrets::real();
     check_content(&sec, c.password, c.password_needed, c.notes)?;
-    sec.check(&crate::FIDO_PIN, Source::from_flag(pin))?;
+    crate::check_fido_unlock(&sec, unlock, Source::from_flag(pin))?;
     let dev = crate::target::select_fido(path)?;
     if let Some((yes, action)) = c.asks {
         refuse_unaskable(&RealTerm, yes, action, &key_label(&dev))?;
     }
     let (password, notes) = read_content(&mut sec, c.password, c.password_needed, c.notes)?;
-    let pin = crate::fido_pin_with(&mut sec, &dev, pin)?;
+    let read = crate::fido_unlock_with(&mut sec, &dev, unlock, pin, VAULT_PERMISSIONS)?;
     let key = open_vault_key(path)?;
     Ok(EntryKey {
         dev,
         key,
-        auth: VaultAuth::pin(pin),
+        auth: vault_auth(read),
+        unlock,
         password,
         notes,
     })
@@ -1587,6 +1671,7 @@ fn unlock_one(k: &mut EntryKey, name: Option<&str>) -> Result<(Unlocked, usize),
     let mut touches = Touches::new(1);
     let unlocked =
         vault::unlock(&mut k.key, &mut k.auth, &mut |s| touches.step(s)).map_err(vault_error)?;
+    print_unlocked_with(k.unlock, &k.auth);
     let matches = vault::matching(&unlocked.vaults, &vault_pick(name)).map_err(vault_error)?;
     let i = choose_vault(
         &unlocked_choices(&unlocked),
@@ -2160,8 +2245,18 @@ fn replace_text(field: &mut String, value: &str) {
 
 fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
     match cmd {
-        FidoVaultEntryCmd::List { vault, pin, path } => {
-            let mut k = open_entry_key(path.as_deref(), pin.as_ref(), ContentFlags::default())?;
+        FidoVaultEntryCmd::List {
+            vault,
+            unlock,
+            pin,
+            path,
+        } => {
+            let mut k = open_entry_key(
+                path.as_deref(),
+                *unlock,
+                pin.as_ref(),
+                ContentFlags::default(),
+            )?;
             let (mut unlocked, i) = unlock_one(&mut k, vault.as_deref())?;
             let open = unlocked.vaults[i].open_mut().map_err(vault_error)?;
             if json_output() {
@@ -2182,10 +2277,16 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             username,
             vault,
             reveal,
+            unlock,
             pin,
             path,
         } => {
-            let mut k = open_entry_key(path.as_deref(), pin.as_ref(), ContentFlags::default())?;
+            let mut k = open_entry_key(
+                path.as_deref(),
+                *unlock,
+                pin.as_ref(),
+                ContentFlags::default(),
+            )?;
             let (mut unlocked, i) = unlock_one(&mut k, vault.as_deref())?;
             let open = unlocked.vaults[i].open_mut().map_err(vault_error)?;
             let n = pick_entry(&open.contents, title, username.as_deref(), true)?;
@@ -2215,12 +2316,14 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             password,
             generate_password,
             length,
+            unlock,
             pin,
             path,
         } => {
             check_title(title)?;
             let mut k = open_entry_key(
                 path.as_deref(),
+                *unlock,
                 pin.as_ref(),
                 ContentFlags {
                     password: password.as_ref(),
@@ -2274,6 +2377,7 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             password,
             generate_password,
             length,
+            unlock,
             pin,
             path,
         } => {
@@ -2282,6 +2386,7 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             }
             let mut k = open_entry_key(
                 path.as_deref(),
+                *unlock,
                 pin.as_ref(),
                 ContentFlags {
                     password: password.as_ref(),
@@ -2347,12 +2452,14 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             username,
             vault,
             yes,
+            unlock,
             pin,
             path,
         } => {
             let action = entry_delete_action(title, vault.as_deref());
             let mut k = open_entry_key(
                 path.as_deref(),
+                *unlock,
                 pin.as_ref(),
                 ContentFlags {
                     asks: Some((*yes, &action)),
@@ -2383,6 +2490,76 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use keyroost_resolve::Picker;
+
+    #[test]
+    fn vault_auth_follows_the_unlock() {
+        let pin = || Zeroizing::new("123456".to_string());
+        assert!(format!("{:?}", vault_auth(crate::FidoUnlock::Fingerprint)).contains("fingerprint"));
+        for unlock in [
+            crate::FidoUnlock::Pin(pin()),
+            crate::FidoUnlock::Auto(Some(pin())),
+            crate::FidoUnlock::Auto(None),
+        ] {
+            let shown = format!("{:?}", vault_auth(unlock));
+            assert!(!shown.contains("123456"), "{shown}");
+        }
+        assert!(format!("{:?}", vault_auth(crate::FidoUnlock::Pin(pin()))).contains("pin"));
+        assert!(
+            format!("{:?}", vault_auth(crate::FidoUnlock::Auto(Some(pin()))))
+                .contains("fingerprint, pin fallback")
+        );
+        // Nothing was asked yet, so `auto` has nothing to say.
+        print_unlocked_with(
+            crate::Unlock::Auto,
+            &vault_auth(crate::FidoUnlock::Auto(None)),
+        );
+    }
+
+    #[test]
+    fn vault_help_names_the_fingerprint() {
+        use clap::CommandFactory;
+        let about = |c: &clap::Command| c.get_about().map(|a| a.to_string()).unwrap_or_default();
+        let group = |cmd: clap::Command| -> Vec<(String, String)> {
+            cmd.get_subcommands()
+                .map(|c| (c.get_name().to_string(), about(c)))
+                .collect()
+        };
+        let vault = group(FidoVaultCmd::augment_subcommands(clap::Command::new(
+            "vault",
+        )));
+        let entry = group(FidoVaultEntryCmd::augment_subcommands(clap::Command::new(
+            "entry",
+        )));
+        let mut checked = 0;
+        for (name, about) in vault.iter().chain(&entry) {
+            // `rotate` and the `entry` group never named the PIN.
+            if name == "rotate" || name == "entry" {
+                assert!(!about.contains("PIN"), "{name}: {about}");
+                continue;
+            }
+            assert!(about.contains("(PIN or fingerprint"), "{name}: {about}");
+            checked += 1;
+        }
+        assert_eq!(checked, 10);
+        let root = crate::Cli::command();
+        let fido_vault = root
+            .find_subcommand("fido")
+            .and_then(|f| f.find_subcommand("vault"))
+            .unwrap();
+        let long = fido_vault
+            .get_long_about()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        assert!(
+            long.contains("(after the PIN or a fingerprint, and a touch)"),
+            "{long}"
+        );
+        // The fingerprint path asks for a finger per token (several per
+        // command), so no help promises a single touch for it.
+        for (name, about) in vault.iter().chain(&entry) {
+            assert!(!about.contains("one touch"), "{name}: {about}");
+        }
+    }
 
     /// A scripted terminal: whether one is present, the answers it types,
     /// and what it was told and asked.

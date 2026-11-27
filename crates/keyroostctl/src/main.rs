@@ -2970,8 +2970,8 @@ enum FidoCmd {
     /// https://github.com/framefilter/keyroost/issues and keep a backup.
     ///
     /// Each vault is a FIDO2 credential on the key; its entries are sealed
-    /// with a secret only the key gives out (after the PIN and a touch) and
-    /// stored in the key's large-blob store. If the key is lost or reset,
+    /// with a secret only the key gives out (after the PIN or a fingerprint,
+    /// and a touch) and stored in the key's large-blob store. If the key is lost or reset,
     /// its vaults go with it: keep a backup.
     ///
     /// The large-blob store is shared space on the key, meant for data that
@@ -3287,9 +3287,10 @@ enum FidoAttestationCmd {
 /// Subcommands for resident SSH credentials (RP IDs of the form `ssh:*`).
 ///
 /// A FIDO SSH key may stash its OpenSSH certificate in the FIDO2 large-blob
-/// store, keyed by the credential's per-credential largeBlobKey. These commands
-/// enumerate those credentials (needs the PIN or a fingerprint for credential management) and pull
-/// the certificate back out as an `id-cert.pub` file usable by `ssh`.
+/// store, keyed by the credential's per-credential largeBlobKey. These
+/// commands enumerate those credentials (needs the PIN or a fingerprint for
+/// credential management) and pull the certificate back out as an
+/// `id-cert.pub` file usable by `ssh`.
 #[derive(Subcommand)]
 enum SshCertCmd {
     /// List resident SSH credentials (ssh:* RP IDs) and whether each has a
@@ -3331,8 +3332,9 @@ enum SshCertCmd {
 /// cannot read. The key's own name (`keyroostctl name set NAME --store key`)
 /// is an entry of kind `key name`; change it with `name set`, not here.
 /// Reads need no PIN (the store is world-readable); writes pull a
-/// `largeBlobWrite` token from your PIN or a fingerprint. Every write re-reads the live array
-/// first so existing RP entries are never clobbered by stale state.
+/// `largeBlobWrite` token from your PIN or a fingerprint. Every write
+/// re-reads the live array first so existing RP entries are never clobbered
+/// by stale state.
 #[derive(Subcommand)]
 enum LargeBlobCmd {
     /// List every entry: index, size, type (note, key name or opaque), and a
@@ -14622,34 +14624,6 @@ const FIDO_PIN_B: Spec = Spec::current("PIN for key B", "b-pin");
 const FIDO_OLD_PIN: Spec = Spec::current("current PIN", "pin");
 const FIDO_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
 
-/// The PIN for a FIDO command that always needs it: refused before any
-/// device I/O when it has no source, read after the key is announced and
-/// before the command opens it.
-fn fido_pin(
-    path: Option<&std::path::Path>,
-    flag: Option<&SecretSource>,
-) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
-    let mut sec = Secrets::real();
-    sec.check(&FIDO_PIN, Source::from_flag(flag))?;
-    let dev = crate::target::select_fido(path)?;
-    fido_pin_with(&mut sec, &dev, flag)
-}
-
-/// The PIN for a FIDO command that reads other secrets first, from the
-/// command's one `Secrets` (so a PIN on stdin takes the line after them):
-/// read last, then `dev` (the key selected before any secret was read) is
-/// re-found if a secret was typed at the hidden prompt. The caller has
-/// already checked every source, the PIN's included.
-fn fido_pin_with<I: crate::secrets::SecretIo>(
-    sec: &mut Secrets<I>,
-    dev: &keyroost_resolve::Device,
-    flag: Option<&SecretSource>,
-) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
-    let pin = sec.read(&FIDO_PIN, Source::from_flag(flag))?;
-    fido_reverify_if_prompted(sec, dev)?;
-    Ok(pin)
-}
-
 /// What a FIDO command unlocks the key with, once `--unlock` and the PIN
 /// flag are read: the PIN, a fingerprint, or a fingerprint with the PIN as
 /// fallback (`None` when no flag gave one: the fingerprint only).
@@ -15016,7 +14990,7 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         FidoPinCmd::ForceChange { unlock, pin, path } => {
-            // As `fido_pin`, with the support check between the source check
+            // As `fido_unlock`, with the support check between the source check
             // (a missing source is refused before any device I/O) and the PIN.
             let mut sec = Secrets::real();
             let src = Source::from_flag(pin.as_ref());
@@ -21434,16 +21408,31 @@ mod cli_tests {
     }
 
     #[test]
-    fn fido_pin_with_reads_after_content_secrets() {
+    fn fido_unlock_with_reads_after_content_secrets() {
         // One `Secrets` per command: the content secret takes stdin line 1,
-        // the PIN line 2.
+        // the PIN line 2 (the PIN path does no device I/O before the read).
         use crate::secrets::fake::FakeIo;
         use crate::secrets::{Secrets, Source};
-        let mut sec = Secrets::new(FakeIo::piped(&["pass\n", "1234\n"]));
-        let pass = sec.read(&PGP_PASSPHRASE, Source::new(None, true)).unwrap();
-        let pin = fido_pin_with(&mut sec, &test_fido_row(), Some(&SecretSource::Stdin)).unwrap();
-        assert_eq!((pass.as_str(), pin.as_str()), ("pass", "1234"));
-        assert_eq!(sec.io.lines_read, 2);
+        // (`auto` with a PIN given is not fingerprint-only, so no I/O either.)
+        for unlock in [Unlock::Pin, Unlock::Auto] {
+            let mut sec = Secrets::new(FakeIo::piped(&["pass\n", "1234\n"]));
+            let pass = sec.read(&PGP_PASSPHRASE, Source::new(None, true)).unwrap();
+            assert_eq!(pass.as_str(), "pass");
+            let pin = match fido_unlock_with(
+                &mut sec,
+                &test_fido_row(),
+                unlock,
+                Some(&SecretSource::Stdin),
+                keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
+            )
+            .unwrap()
+            {
+                FidoUnlock::Pin(p) | FidoUnlock::Auto(Some(p)) => p,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(pin.as_str(), "1234");
+            assert_eq!(sec.io.lines_read, 2);
+        }
     }
 
     #[test]
