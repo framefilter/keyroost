@@ -35908,7 +35908,7 @@ mod tests {
     #[test]
     fn an_unverified_tab_says_why_it_is_unverified() {
         // FIDO2 reached only through the key's reader.
-        let mut reader_only = test_key("reader:canokey", "10001174", None);
+        let mut reader_only = test_key("reader:canokey", "439041101", None);
         reader_only.caps.insert(Caps::FIDO2);
         reader_only.unverified.insert(Caps::FIDO2);
         reader_only.reader = Some("canokeys.org OpenPGP PIV OATH 0".into());

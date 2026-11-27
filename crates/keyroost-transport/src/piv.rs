@@ -3274,14 +3274,7 @@ impl<'tx> PivSession<'tx> {
     /// where the card needs it ([`keyroost_piv::compat::PivQuirk::MetadataNeedsLe`]),
     /// otherwise the four bytes every other card has been answering.
     fn metadata_apdu(&mut self, key_ref: u8) -> Vec<u8> {
-        if self
-            .quirks()
-            .contains(&keyroost_piv::compat::PivQuirk::MetadataNeedsLe)
-        {
-            piv::get_metadata_with_le(key_ref)
-        } else {
-            piv::get_metadata(key_ref)
-        }
+        metadata_apdu_for(&self.quirks(), key_ref)
     }
 
     /// What keyroost can tell about `slot`'s private key ([`SlotKeyPresence`]).
@@ -6798,6 +6791,16 @@ fn check_readback(
 /// `exmode = -254`, one byte short of the short-form `Lc` ceiling).
 const CHAIN_CHUNK: usize = 254;
 
+/// [`PivSession::metadata_apdu`] for a card with these quirks: `Le` only
+/// with [`keyroost_piv::compat::PivQuirk::MetadataNeedsLe`].
+fn metadata_apdu_for(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>, key_ref: u8) -> Vec<u8> {
+    if quirks.contains(&keyroost_piv::compat::PivQuirk::MetadataNeedsLe) {
+        piv::get_metadata_with_le(key_ref)
+    } else {
+        piv::get_metadata(key_ref)
+    }
+}
+
 /// Whether `apdu` — built by [`piv::general_auth_sign`], [`piv::put_data`]
 /// or [`piv::import_key`], whose data field is never empty — used
 /// extended-length encoding. Both
@@ -10019,6 +10022,31 @@ mod pcsc_identity_matching {
 mod canokey_algorithms {
     use super::*;
     use keyroost_canokey::PivAlgorithmIds;
+
+    #[test]
+    fn only_a_canokey_is_sent_get_metadata_with_le() {
+        use keyroost_piv::compat::resolve_quirks;
+        use keyroost_piv::fingerprint::AppletFingerprint;
+        // A CanoKey 3.1.2 answers GET VERSION with 6.0.0.
+        let canokey = resolve_quirks(
+            AppletFingerprint::CanoKey,
+            Some(&[6, 0, 0]),
+            Some(&[3, 1, 2]),
+        );
+        assert_eq!(
+            metadata_apdu_for(&canokey, 0x9E),
+            vec![0x00, 0xF7, 0x00, 0x9E, 0x00]
+        );
+        // Every other fingerprint keeps the four bytes it has been answering.
+        for other in [AppletFingerprint::YubiKey, AppletFingerprint::Generic] {
+            let quirks = resolve_quirks(other, Some(&[5, 7, 0]), None);
+            assert_eq!(
+                metadata_apdu_for(&quirks, 0x9E),
+                vec![0x00, 0xF7, 0x00, 0x9E],
+                "{other:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_default_table_gives_keyroosts_own_ids() {
