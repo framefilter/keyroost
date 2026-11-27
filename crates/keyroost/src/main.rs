@@ -10200,8 +10200,9 @@ impl App {
                     ui.label(
                         "A CanoKey resets its Authenticator through its Admin applet: \
                          enter the key's CanoKey Admin PIN (123456 until changed). \
-                         Forgot it? Factory reset, on the Overview tab, resets the \
-                         whole key without it.",
+                         Only the Authenticator is reset. Without the Admin PIN the \
+                         one way left is Factory reset on the Overview tab, which \
+                         erases everything on the key.",
                     );
                     ui.add_space(4.0);
                     pin_field(ui, &p, "Admin PIN", pin);

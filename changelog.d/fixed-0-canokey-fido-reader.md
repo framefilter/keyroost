@@ -1,0 +1,7 @@
+- **A CanoKey's FIDO2 side answers through its smart-card reader again.**
+  From firmware 3.1.2 a CanoKey answers FIDO2 on its own USB reader only
+  under CanoKey's private selector, which keyroost now tries first, so
+  FIDO2 over the reader works on that firmware too; Windows lets a
+  program that isn't administrator use it. A FIDO2 reset is not sent
+  through that reader, since power-cycling it doesn't restart the key:
+  keyroost says to reset over FIDO HID or with `factory-reset`. ([#0])

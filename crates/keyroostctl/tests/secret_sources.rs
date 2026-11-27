@@ -467,6 +467,7 @@ const LITERAL_CASES: &[&[&str]] = &[
     &["oath", "list", "--password", "S3CRETVALUE"],
     &["oath", "password", "set", "--new-password", "S3CRETVALUE"],
     &["oath", "add", "n", "--seed", "S3CRETVALUE"],
+    &["oath", "reset", "--canokey-admin-pin", "S3CRETVALUE"],
     &[
         "oath",
         "import",

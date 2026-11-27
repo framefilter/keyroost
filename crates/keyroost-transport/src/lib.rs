@@ -892,8 +892,11 @@ impl fmt::Display for TransportError {
             ),
             TransportError::CanoKeyAdminPinBlocked => write!(
                 f,
-                "the CanoKey Admin PIN is blocked; only a factory reset \
-                 (`keyroostctl factory-reset`) unblocks it"
+                "the CanoKey Admin PIN is blocked. That erases nothing: passkeys, \
+                 keys and codes keep working with their own PINs, but what needs \
+                 the Admin PIN (an OATH reset, say) can't run. Only resetting the \
+                 whole key with `keyroostctl factory-reset` unblocks it, and that \
+                 erases everything on the key"
             ),
             TransportError::CanoKeyAdminPinLength => {
                 write!(f, "a CanoKey Admin PIN is 6 to 64 characters")
@@ -1595,6 +1598,15 @@ fn probe_note_if(trace: bool) -> impl Fn(&str) {
     }
 }
 
+/// Whether the card on `card` is a CanoKey on its own USB reader, by its
+/// ATR ([`is_canokey_ccid_atr`]). Nothing is sent to the card for it.
+pub(crate) fn card_is_canokey_ccid(card: &Card) -> bool {
+    let mut names = [0u8; 256];
+    let mut atr = [0u8; pcsc::MAX_ATR_SIZE];
+    card.status2(&mut names, &mut atr)
+        .is_ok_and(|status| is_canokey_ccid_atr(status.atr()))
+}
+
 /// Whether the card on `card` is an Identiv/Hirsch uTrust key by its ATR
 /// ([`keyroost_piv::fingerprint::atr_names_utrust`]). Nothing is sent to
 /// the card for it, and the reader's name plays no part: the keys are sold
@@ -2081,10 +2093,26 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
             // FIDO2/U2F: a SELECT of the FIDO applet that the card accepts means
             // a security key is reachable over this reader (NFC or contact), to
             // be driven by CtapPcscDevice.
-            if let Some((data, s1, s2)) = select(
-                "fido",
-                keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
-            ) {
+            // A CanoKey on its own USB reader answers the FIDO applet under
+            // CanoKey's private selector from firmware 3.1.2 on, and the
+            // standard AID before that ([`keyroost_canokey::FIDO_USB_AID`]).
+            let canokey_ccid = card_is_canokey_ccid(&card);
+            let fido_select = if canokey_ccid {
+                select("fido (canokey usb)", keyroost_canokey::select_fido_usb())
+                    .filter(|(_, s1, s2)| accepted(*s1, *s2))
+                    .or_else(|| {
+                        select(
+                            "fido",
+                            keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
+                        )
+                    })
+            } else {
+                select(
+                    "fido",
+                    keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
+                )
+            };
+            if let Some((data, s1, s2)) = fido_select {
                 probe.has_fido = accepted(s1, s2);
                 // U2F_V2 doesn't mean U2F only. A continuation or any other
                 // answer leaves CTAP2 unconfirmed.
@@ -2153,7 +2181,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
             let mut otp_serial_r34 = false;
             // The OTP-applet serial read was tried (and may have failed).
             let mut otp_serial_tried = false;
-            if probe.has_fido {
+            if probe.has_fido && !canokey_ccid {
                 let _ = transmit_apdu(
                     &card,
                     &keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),

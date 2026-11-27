@@ -2303,11 +2303,12 @@ enum OathCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
-        /// The CanoKey Admin PIN, used only on a CanoKey: env:NAME reads that
-        /// environment variable, stdin reads one line (hidden when typed at a
-        /// terminal). With neither, a terminal asks when the key is a CanoKey.
+        /// The CanoKey Admin PIN, used only on a CanoKey (it is not the
+        /// OpenPGP admin PIN): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks when the key is a CanoKey.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        admin_pin: Option<SecretSource>,
+        canokey_admin_pin: Option<SecretSource>,
     },
 }
 
@@ -9072,11 +9073,11 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         OathCmd::Reset {
             reader,
             yes,
-            admin_pin,
+            canokey_admin_pin,
         } => {
             let dev = crate::target::select(Need::Oath, reader.as_deref(), None)?;
             let mut sec = Secrets::real();
-            let src = Source::from_flag(admin_pin.as_ref());
+            let src = Source::from_flag(canokey_admin_pin.as_ref());
             sec.check(&CANOKEY_ADMIN_PIN, src)?;
             let asked = crate::prompt::confirm_then_read(&dev, *yes, "wipe the OATH applet")?;
             // Deliberately NOT open_oath(): reset must work on a
@@ -10804,7 +10805,7 @@ const PGP_USER_PIN: Spec = Spec::current("user PIN (PW1)", "pin");
 const PGP_SIGN_PIN: Spec = Spec::current("signing PIN (PW1)", "pin");
 const PGP_ADMIN_PIN_VERIFY: Spec = Spec::current("admin PIN (PW3)", "pin");
 const PGP_ADMIN_PIN: Spec = Spec::current("admin PIN (PW3)", "admin-pin");
-const CANOKEY_ADMIN_PIN: Spec = Spec::current("CanoKey Admin PIN", "admin-pin");
+const CANOKEY_ADMIN_PIN: Spec = Spec::current("CanoKey Admin PIN", "canokey-admin-pin");
 const PGP_OLD_USER_PIN: Spec = Spec::current("current user PIN (PW1)", "pin");
 const PGP_NEW_USER_PIN: Spec = Spec::new_secret("new user PIN (PW1)", "new-pin");
 const PGP_OLD_ADMIN_PIN: Spec = Spec::current("current admin PIN (PW3)", "pin");
@@ -16590,6 +16591,9 @@ fn fido_info_rows(info: &keyroost_ctap::AuthenticatorInfo) -> Vec<(&'static str,
     if info.force_pin_change == Some(true) {
         rows.push(("Force PIN change", "yes".to_owned()));
     }
+    if info.long_touch_for_reset == Some(true) {
+        rows.push(("Reset", "needs a long touch".to_owned()));
+    }
     if let Some(v) = info.firmware_version {
         rows.push(("CTAP firmware version", v.to_string()));
     }
@@ -17726,6 +17730,10 @@ fn cose_algorithm_name(alg: i64) -> &'static str {
     match alg {
         -7 => "ES256",
         -8 => "EdDSA",
+        -47 => "ES256K",
+        -48 => "ML-DSA-44",
+        -49 => "ML-DSA-65",
+        -50 => "ML-DSA-87",
         -35 => "ES384",
         -36 => "ES512",
         -257 => "RS256",
@@ -29854,5 +29862,21 @@ mod feitian_tests {
             "a"
         ])
         .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cose_names {
+    use super::cose_algorithm_name;
+
+    #[test]
+    fn the_registered_post_quantum_and_k256_algorithms_are_named() {
+        assert_eq!(cose_algorithm_name(-7), "ES256");
+        assert_eq!(cose_algorithm_name(-47), "ES256K");
+        assert_eq!(cose_algorithm_name(-48), "ML-DSA-44");
+        assert_eq!(cose_algorithm_name(-49), "ML-DSA-65");
+        assert_eq!(cose_algorithm_name(-50), "ML-DSA-87");
+        // CanoKey's SM2 uses an unregistered, configurable ID.
+        assert_eq!(cose_algorithm_name(-54), "unknown");
     }
 }

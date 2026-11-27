@@ -312,6 +312,11 @@ pub struct AuthenticatorInfo {
     /// including the 16-byte checksum trailer. Spec minimum is 1024 when the
     /// `largeBlobs` option is supported; absent on keys without large blobs.
     pub max_serialized_large_blob_array: Option<u64>,
+    /// `longTouchForReset` (getInfo key 0x18, CTAP 2.2): the key wants a
+    /// long touch, not a short one, to confirm `authenticatorReset`. Set by
+    /// the `enableLongTouchForReset` configuration, which CanoKey 3.1 offers
+    /// and which only a reset clears.
+    pub long_touch_for_reset: Option<bool>,
 }
 
 impl AuthenticatorInfo {
@@ -390,6 +395,7 @@ pub fn parse_authenticator_info(v: &Value) -> Result<AuthenticatorInfo, CtapErro
             0x0C => info.force_pin_change = val.as_bool(),
             0x0D => info.min_pin_length = val.as_uint(),
             0x0E => info.firmware_version = val.as_uint(),
+            0x18 => info.long_touch_for_reset = val.as_bool(),
             _ => {}
         }
     }
@@ -457,6 +463,7 @@ mod tests {
             (Value::UInt(0x0C), Value::Bool(true)), // forcePINChange
             (Value::UInt(0x0D), Value::UInt(6)),    // minPINLength
             (Value::UInt(0x0E), Value::UInt(328706)), // firmwareVersion
+            (Value::UInt(0x18), Value::Bool(true)), // longTouchForReset
         ]);
         let mut bytes = vec![0u8]; // status byte
         bytes.extend(encode(&v));
@@ -482,6 +489,7 @@ mod tests {
         assert_eq!(info.force_pin_change, Some(true));
         assert_eq!(info.min_pin_length, Some(6));
         assert_eq!(info.firmware_version, Some(328706));
+        assert_eq!(info.long_touch_for_reset, Some(true));
     }
 
     #[test]
