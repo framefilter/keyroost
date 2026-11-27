@@ -10,4 +10,7 @@
   with Le, so `piv test` and the slot list see those keys. The IDs the
   key uses for Ed25519, X25519, RSA-3072/4096 and P-521 are read from
   the key, so a table changed with CanoKey's tools is followed. Firmware
-  before 3.1 is handled as before. ([#296])
+  before 3.1 has only a 3DES management key and no P-521, so neither
+  AES-192 nor P-521 is offered there, and firmware 2.x's own IDs for
+  Ed25519, X25519 and RSA-3072/4096 are used (from CanoKey's source;
+  not checked on such a key). ([#296])

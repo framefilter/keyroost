@@ -3101,10 +3101,20 @@ const CANOKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
 }];
 
 /// CanoKey's firmware-axis known-support table, keyed on the firmware
-/// version its Admin applet reports. Only firmware 3.1 is described:
-/// earlier firmware resolves [`FeatureGate::Unverified`] for every row
-/// (older than every verdict), and later firmware is assumed not to
-/// regress.
+/// version its Admin applet reports. It describes firmware 3.1, plus what
+/// earlier firmware is known from its source to lack; anything else on
+/// earlier firmware resolves [`FeatureGate::Unverified`] (older than every
+/// verdict), and later firmware is assumed not to regress.
+///
+/// Before 3.1, from canokey-core's release tags 1.5.2 to 3.0.3 (source
+/// only, no hardware): the management key is 3DES only (`ALG_TDEA_3KEY`;
+/// AES-192 arrives with `5e0b978d`), and there is no P-521 (it arrives
+/// with `fb19a226`), so both are [`Verdict::KnownUnsupported`] at 3.0.3,
+/// the last release before 3.1, and every earlier one. 3DES itself, and
+/// what 2.0 to 3.0 do have (RSA-3072/4096, Ed25519 and X25519 from 2.0.0,
+/// under the fixed IDs `slot_key_algorithm_apdu_id_override` gives
+/// firmware 2), stay unverified there. So do those four algorithms on
+/// 1.x, which lacks them: a verdict that blocks 1.x would block 2.x too.
 ///
 /// Source-verified on canokey-core 3.1.2 (`applets/piv/piv.c`) and
 /// CanoKey's PIV documentation. Hardware-verified on a CanoKey Canary,
@@ -3148,7 +3158,6 @@ const CANOKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
-            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
             PivExtension::ImportKey(KeyAlg::Rsa2048),
@@ -3156,16 +3165,32 @@ const CANOKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::ImportKey(KeyAlg::Rsa4096),
             PivExtension::ImportKey(KeyAlg::EccP256),
             PivExtension::ImportKey(KeyAlg::EccP384),
-            PivExtension::ImportKey(KeyAlg::EccP521),
             PivExtension::ImportKey(KeyAlg::Ed25519),
             PivExtension::ImportKey(KeyAlg::X25519),
-            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
             PivExtension::PinManagementAuth,
         ],
         verdicts: &[VersionVerdict {
             version: &[3, 1],
             verdict: Verdict::KnownSupported,
         }],
+    },
+    // New in 3.1: not in any release up to 3.0.3 (see the table's doc).
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+        ],
+        verdicts: &[
+            VersionVerdict {
+                version: &[3, 0, 3],
+                verdict: Verdict::KnownUnsupported,
+            },
+            VersionVerdict {
+                version: &[3, 1],
+                verdict: Verdict::KnownSupported,
+            },
+        ],
     },
     ExtensionVerdicts {
         extensions: &[PivExtension::ManagementKeyAlgorithm(
@@ -5028,7 +5053,30 @@ fn slot_key_algorithm_apdu_id_override(
         }
         AppletFingerprint::Feitian(_) if key_alg == KeyAlg::Rsa3072 => Some(0x21),
         AppletFingerprint::Feitian(_) if key_alg == KeyAlg::Rsa4096 => Some(0x22),
+        // CanoKey firmware 2.x has fixed IDs for the algorithms outside SP
+        // 800-78 (canokey-core 2.0.0/2.0.1 `piv.c`: `ALG_ED25519 0x22`,
+        // `ALG_RSA_3072 0x50`, `ALG_RSA_4096 0x51`, `ALG_X25519 0x52`); 3.0
+        // moved them to a configurable table whose defaults are the IDs
+        // every other fingerprint uses. Source only, not seen on a key.
+        AppletFingerprint::CanoKey if firmware_version.is_some_and(|v| v.first() == Some(&2)) => {
+            canokey_v2_algorithm_id(key_alg)
+        }
         _ => None,
+    }
+}
+
+/// CanoKey firmware 2.x's fixed ID for `key_alg`, for the algorithms it
+/// numbers outside SP 800-78; `None` for the rest, which keep
+/// [`KeyAlg::id`] (and for P-521, which 2.x doesn't have).
+const fn canokey_v2_algorithm_id(key_alg: KeyAlg) -> Option<u8> {
+    match key_alg {
+        KeyAlg::Ed25519 => Some(0x22),
+        KeyAlg::Rsa3072 => Some(0x50),
+        KeyAlg::Rsa4096 => Some(0x51),
+        KeyAlg::X25519 => Some(0x52),
+        KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521 => {
+            None
+        }
     }
 }
 
@@ -10151,6 +10199,88 @@ mod tests {
                 "{ext:?}"
             );
         }
+    }
+
+    #[test]
+    fn canokey_before_31_has_no_aes_192_management_key_and_no_p521() {
+        let canokey = AppletFingerprint::CanoKey;
+        let gate = |ext, firmware: &[u8]| resolve(ext, canokey, Some(&[5, 7, 0]), Some(firmware));
+        for ext in [
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+        ] {
+            for before in [&[3, 0, 3][..], &[3, 0, 0], &[2, 0, 1], &[1, 6, 2]] {
+                assert_eq!(
+                    gate(ext, before),
+                    FeatureGate::Unsupported,
+                    "{ext:?} {before:?}"
+                );
+            }
+            for from in [&[3, 1, 0][..], &[3, 1, 2]] {
+                assert_eq!(gate(ext, from), FeatureGate::Supported, "{ext:?} {from:?}");
+            }
+        }
+        // What 2.0 to 3.0 do have stays unverified there, and so does it on
+        // 1.x: blocking 1.x would block 2.x with it.
+        for ext in [
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+        ] {
+            for before in [&[3, 0, 3][..], &[2, 0, 1], &[1, 6, 2]] {
+                assert_eq!(
+                    gate(ext, before),
+                    FeatureGate::Unverified,
+                    "{ext:?} {before:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canokey_2x_uses_its_fixed_algorithm_ids() {
+        let canokey = AppletFingerprint::CanoKey;
+        let v2: &[u8] = &[2, 0, 1];
+        for (alg, id) in [
+            (KeyAlg::Ed25519, 0x22),
+            (KeyAlg::Rsa3072, 0x50),
+            (KeyAlg::Rsa4096, 0x51),
+            (KeyAlg::X25519, 0x52),
+            (KeyAlg::Rsa2048, 0x07),
+            (KeyAlg::EccP256, 0x11),
+            (KeyAlg::EccP384, 0x14),
+        ] {
+            assert_eq!(
+                slot_key_algorithm_apdu_id(alg, canokey, Some(v2)),
+                id,
+                "{alg:?}"
+            );
+            assert_eq!(
+                key_alg_from_apdu_id(id, canokey, Some(v2)),
+                Some(alg),
+                "{id:02X}"
+            );
+        }
+        // 3.0 and later default to the IDs every other fingerprint uses.
+        for later in [&[3, 0, 3][..], &[3, 1, 2]] {
+            for alg in [
+                KeyAlg::Ed25519,
+                KeyAlg::Rsa3072,
+                KeyAlg::Rsa4096,
+                KeyAlg::X25519,
+            ] {
+                assert_eq!(
+                    slot_key_algorithm_apdu_id(alg, canokey, Some(later)),
+                    alg.id()
+                );
+            }
+        }
+        // Without a firmware version, nothing is guessed.
+        assert_eq!(
+            slot_key_algorithm_apdu_id(KeyAlg::Ed25519, canokey, None),
+            KeyAlg::Ed25519.id()
+        );
     }
 
     #[test]
