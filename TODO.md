@@ -131,10 +131,11 @@ items marked *(no hardware)* need a device the maintainer does not have.
   compare` 1 per key). A vault command takes one token carrying every
   permission its steps use (`cm`, `ga`, `mc`, `lbw`), bound to the vault RP
   `fido2-vault.token2`, and reuses it until a touch of the key leaves it only
-  `lbw` (CTAP 2.1): `fido vault list`, `export`, the `entry` commands,
-  `delete` and `import` into a vault on the key (`--dry-run` too) 1, then
-  their touch (no touch on a key with no vault); `add` and `import` into a
-  new vault 2 and two touches; `rotate` 4 and three touches. A key that
+  `lbw` (CTAP 2.1): `fido vault list`, `export`, the `entry` commands and
+  `import` into a vault on the key (`--dry-run` too) 1, then their touch (no
+  touch on a key with no vault); `delete` 1 and no touch (one touch on a key
+  that lists no largeBlobKey for the vault); `add` and `import` into a new
+  vault 2 and two touches; `rotate` 4 and three touches. A key that
   clears the token after the touch adds 1 ("asked again") to `entry
   add|edit|delete`, `add` and `import`. The app's Vault tab: unlock 1, save
   none, create 2, rotate 3, delete 1. Those are for a key without

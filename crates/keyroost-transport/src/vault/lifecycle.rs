@@ -1824,7 +1824,7 @@ mod tests {
     /// replaces the one held, 6.5.5.7.3). `list` is 2 fingers.
     #[test]
     fn a_ctap22_key_lists_under_an_unbound_token_from_the_start() {
-        use FingerAsk::Unlock as U;
+        use FingerAsk::{Again as G, Unlock as U};
         let bound = Call::UvToken {
             perms: FINGER,
             rp: Some(RP_ID.into()),
@@ -1859,6 +1859,44 @@ mod tests {
             assert_eq!(got, expected, "{command:?}");
             assert_eq!(requests.len(), expected.len(), "{command:?}");
         }
+
+        // A key that also drops the token after a touch: one "asked again",
+        // bound, where a write follows the touch.
+        for (command, expected) in [
+            (Command::List, vec![(U, &unbound), (U, &bound)]),
+            (
+                Command::EntryAdd,
+                vec![(U, &unbound), (U, &bound), (G, &bound)],
+            ),
+            (
+                Command::Add,
+                vec![(U, &unbound), (U, &bound), (U, &bound), (G, &bound)],
+            ),
+            (Command::Delete, vec![(U, &unbound)]),
+            (
+                Command::Rotate,
+                vec![
+                    (U, &unbound),
+                    (U, &bound),
+                    (U, &bound),
+                    (U, &bound),
+                    (G, &bound),
+                ],
+            ),
+            (
+                Command::ImportExisting,
+                vec![(U, &unbound), (U, &bound), (G, &bound)],
+            ),
+            (
+                Command::ImportNew,
+                vec![(U, &unbound), (U, &bound), (U, &bound), (G, &bound)],
+            ),
+        ] {
+            let (asked, requests) = fingers_on(command, true, Listing::Ctap22);
+            let got: Vec<(FingerAsk, &Call)> = asked.into_iter().zip(&requests).collect();
+            assert_eq!(got, expected, "{command:?}, drops");
+            assert_eq!(requests.len(), expected.len(), "{command:?}, drops");
+        }
     }
 
     /// A pre-2.2 key that lists only under an unbound token refuses the
@@ -1868,7 +1906,7 @@ mod tests {
     /// no "refused" reaches the person. The worst case, 3 for `list`.
     #[test]
     fn a_strict_key_lists_under_an_unbound_token_and_every_command_works() {
-        use FingerAsk::{ListVaults as L, Unlock as U};
+        use FingerAsk::{Again as G, ListVaults as L, Unlock as U};
         let bound = Call::UvToken {
             perms: FINGER,
             rp: Some(RP_ID.into()),
@@ -1877,21 +1915,28 @@ mod tests {
             perms: CM | LBW,
             rp: None,
         };
-        for (command, expected) in [
-            (Command::List, vec![U, L, U]),
-            (Command::EntryAdd, vec![U, L, U]),
-            (Command::Add, vec![U, L, U, U]),
-            (Command::Delete, vec![U, L]),
-            (Command::Rotate, vec![U, L, U, U, U, U]),
-            (Command::ImportExisting, vec![U, L, U]),
-            (Command::ImportNew, vec![U, L, U, U]),
+        // (command, keeps the token, drops it after a touch)
+        for (command, keeps, drops) in [
+            (Command::List, vec![U, L, U], vec![U, L, U]),
+            (Command::EntryAdd, vec![U, L, U], vec![U, L, U, G]),
+            (Command::Add, vec![U, L, U, U], vec![U, L, U, U, G]),
+            (Command::Delete, vec![U, L], vec![U, L]),
+            (
+                Command::Rotate,
+                vec![U, L, U, U, U, U],
+                vec![U, L, U, U, U, G],
+            ),
+            (Command::ImportExisting, vec![U, L, U], vec![U, L, U, G]),
+            (Command::ImportNew, vec![U, L, U, U], vec![U, L, U, U, G]),
         ] {
-            let (asked, requests) = fingers_on(command, false, Listing::Strict21);
-            assert_eq!(asked, expected, "{command:?}");
-            assert_eq!(requests.len(), asked.len(), "{command:?}");
-            for (ask, request) in asked.iter().zip(&requests) {
-                let want = if *ask == L { &unbound } else { &bound };
-                assert_eq!(request, want, "{command:?}");
+            for (drops_token, expected) in [(false, keeps), (true, drops)] {
+                let (asked, requests) = fingers_on(command, drops_token, Listing::Strict21);
+                assert_eq!(asked, expected, "{command:?}, drops = {drops_token}");
+                assert_eq!(requests.len(), asked.len(), "{command:?}");
+                for (ask, request) in asked.iter().zip(&requests) {
+                    let want = if *ask == L { &unbound } else { &bound };
+                    assert_eq!(request, want, "{command:?}");
+                }
             }
             // A key that takes the bound token never asks for an unbound one.
             let (lenient, _) = fingers_on(command, false, Listing::Lenient);

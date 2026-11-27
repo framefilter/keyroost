@@ -595,7 +595,10 @@ impl VaultAuth {
     /// way every later listing of this auth takes an unbound token straight
     /// away. A held token refused as dropped or expired is renewed once
     /// first ([`FingerAsk::Again`]). At most those two more tokens, never a
-    /// loop.
+    /// loop: on a key that takes the bound token, a held token refused and
+    /// then its renewal refused too leads to a third ask, worded as the
+    /// listing's reason ([`FingerAsk::ListVaults`]), and the unbound token's
+    /// answer is final.
     pub(crate) fn with_listing<K: VaultKey, T>(
         &mut self,
         key: &mut K,
