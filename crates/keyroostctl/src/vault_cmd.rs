@@ -1834,7 +1834,8 @@ fn pick_entry(
     )
 }
 
-/// An entry's `modified_minutes` as a date, `YYYY-MM-DD` (UTC).
+/// An entry's `modified_minutes` as a date, `YYYY-MM-DD` (UTC): the
+/// `--json` documents' `changed` (text output says it in words).
 pub(crate) fn changed_date(minutes: i64) -> String {
     let (y, m, d) = keyroost_pgpkey::cert::civil_from_days(minutes.div_euclid(24 * 60));
     format!("{y:04}-{m:02}-{d:02}")
@@ -1864,7 +1865,8 @@ fn wiped_line(head: &str, value: &str) -> Zeroizing<String> {
     line
 }
 
-/// `entry show` as text: Title, Username, URL, Notes, Changed, then
+/// `entry show` as text: Title, Username, URL, Notes, Changed (in the
+/// app's words: `today`, `3 days ago`, `on 2023-11-14`), then
 /// `Password: (hidden)` or `(none)`. Never the password, never the ID.
 ///
 /// Laid out like [`crate::output::kv_block`] (each value one space after the
@@ -1872,6 +1874,11 @@ fn wiped_line(head: &str, value: &str) -> Zeroizing<String> {
 /// lines, and `kv_block` joins plain `String`s, so every line here is its
 /// own wiped buffer and a note's later lines stay under its column.
 pub(crate) fn entry_lines(e: &Entry) -> Vec<Zeroizing<String>> {
+    entry_lines_at(e, keyroost_transport::vault::now_minutes())
+}
+
+/// [`entry_lines`] with the time now, `now`, in minutes since the epoch.
+pub(crate) fn entry_lines_at(e: &Entry, now: i64) -> Vec<Zeroizing<String>> {
     let head = |name: &str| format!("{:<w$}", format!("{name}:"), w = REVEAL_LABEL.len());
     let field =
         |name: &str, v: &str| wiped_line(&head(name), if v.is_empty() { "(none)" } else { v });
@@ -1893,7 +1900,9 @@ pub(crate) fn entry_lines(e: &Entry) -> Vec<Zeroizing<String>> {
             lines.push(wiped_line(&h, l));
         }
     }
-    lines.push(field("Changed", &changed_date(e.modified_minutes)));
+    // No time recorded: `(none)`, as an empty field.
+    let changed = keyroost_vault::changed_ago(e.modified_minutes, now).unwrap_or_default();
+    lines.push(field("Changed", &changed));
     let password = if e.password.is_empty() {
         "(none)"
     } else {
@@ -3428,7 +3437,7 @@ mod tests {
                 "Username: alice@example.com",
                 "URL:      https://mail.google.com",
                 "Notes:    recovery codes in the safe",
-                "Changed:  2023-11-14",
+                "Changed:  on 2023-11-14",
                 "Password: (hidden)",
             ]
         );
@@ -3447,7 +3456,7 @@ mod tests {
                 "Username: (none)",
                 "URL:      (none)",
                 "Notes:    (none)",
-                "Changed:  2023-11-14",
+                "Changed:  on 2023-11-14",
                 "Password: (none)",
             ]
         );
@@ -3458,6 +3467,33 @@ mod tests {
         let lines = entry_lines(&multi);
         assert_eq!(lines[3].as_str(), "Notes:    one");
         assert_eq!(lines[4].as_str(), "          two");
+    }
+
+    /// The Changed line says it as the app does (`today`, `N days ago`,
+    /// `on` a date); no time recorded is `(none)`.
+    #[test]
+    fn entry_lines_say_when_in_the_apps_words() {
+        const DAY: i64 = 24 * 60;
+        let mut e = ent("id", "X", "u", "");
+        let changed = |e: &Entry, now: i64| {
+            entry_lines_at(e, now)
+                .iter()
+                .find(|l| l.starts_with("Changed:"))
+                .map(|l| l.to_string())
+                .unwrap()
+        };
+        let m = e.modified_minutes;
+        assert_eq!(changed(&e, m + 5), "Changed:  today");
+        assert_eq!(changed(&e, m + DAY), "Changed:  yesterday");
+        assert_eq!(changed(&e, m + 3 * DAY), "Changed:  3 days ago");
+        assert_eq!(changed(&e, m + 60 * DAY), "Changed:  on 2023-11-14");
+        assert_eq!(
+            changed(&e, m + 5).trim_start_matches("Changed:  "),
+            keyroost_vault::changed_ago(m, m + 5).unwrap(),
+            "the app's words"
+        );
+        e.modified_minutes = 0;
+        assert_eq!(changed(&e, m), "Changed:  (none)");
     }
 
     #[test]

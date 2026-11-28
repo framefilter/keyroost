@@ -242,23 +242,11 @@ pub(crate) fn space_line(cap: &BlobCapacity) -> String {
     }
 }
 
-/// When an entry last changed, as an opened entry says it: `modified` and
-/// `now` in minutes since the Unix epoch. Recent changes in days, older (or
-/// clock-skewed) ones as a date; `None` for an entry with no time.
+/// When an entry last changed, as an opened entry says it: `changed `
+/// and [`keyroost_vault::changed_ago`]'s words, which the CLI's `Changed:`
+/// line shows too; `None` for an entry with no time.
 pub(crate) fn changed_ago(modified: i64, now: i64) -> Option<String> {
-    if modified <= 0 {
-        return None;
-    }
-    let days = now.saturating_sub(modified) / (24 * 60);
-    Some(match days {
-        0 if now >= modified => "changed today".to_owned(),
-        1 => "changed yesterday".to_owned(),
-        2..=59 => format!("changed {days} days ago"),
-        _ => {
-            let (y, m, d) = keyroost_pgpkey::cert::civil_from_days(modified.div_euclid(24 * 60));
-            format!("changed on {y:04}-{m:02}-{d:02}")
-        }
-    })
+    keyroost_vault::changed_ago(modified, now).map(|w| format!("changed {w}"))
 }
 
 /// Whether `hay` holds `needle` (already lower-cased), ignoring case,
