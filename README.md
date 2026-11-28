@@ -282,7 +282,10 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   x86_64 Linux ([#109](https://github.com/framefilter/keyroost/pull/109)).
 - **[@plaflamme](https://github.com/plaflamme)** — Dependabot coverage for the
   flake's inputs, keeping `flake.lock` current
-  ([#132](https://github.com/framefilter/keyroost/pull/132)).
+  ([#132](https://github.com/framefilter/keyroost/pull/132)); Nix
+  cross-builds of `keyroost` and `keyroostctl` in CI
+  ([#144](https://github.com/framefilter/keyroost/pull/144)); and the Nix
+  build's test flags ([#272](https://github.com/framefilter/keyroost/pull/272)).
 - **[@episource](https://github.com/episource)** — the project's most prolific
   external contributor: Nitrokey 3 PIV support and `piv chuid generate`
   ([#102](https://github.com/framefilter/keyroost/pull/102)), short-APDU
@@ -321,15 +324,34 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   ([#268](https://github.com/framefilter/keyroost/pull/268)); and the
   Feitian OTP reset, the FIDO HID fallback, and a Feitian key's own serial
   and COS version ([#273](https://github.com/framefilter/keyroost/pull/273));
-  and CanoKey support for firmware 3.1 (the key as one entry with its
-  serial, OATH through its Admin applet, PIV and OpenPGP, and its
-  device-wide factory reset), hardware-verified on a CanoKey Canary
-  ([#296](https://github.com/framefilter/keyroost/pull/296)).
+  PIV on Feitian keys: reset, their own commands, and rows by the product a
+  key reports ([#274](https://github.com/framefilter/keyroost/pull/274)); the
+  app's FIDO2 reset taking a same-port replug on Windows as the re-insert
+  ([#275](https://github.com/framefilter/keyroost/pull/275)); the hidapi fix
+  for a Windows enumeration panic
+  ([#281](https://github.com/framefilter/keyroost/pull/281)); Feitian PIV rows
+  by PIV application version, and a generated key read from its attestation
+  ([#286](https://github.com/framefilter/keyroost/pull/286)); the serial
+  number and printed firmware of Identiv/Hirsch uTrust FIDO2 keys
+  ([#290](https://github.com/framefilter/keyroost/pull/290)); and CanoKey
+  support for firmware 3.1 (the key as one entry with its serial, OATH
+  through its Admin applet, PIV and OpenPGP, and its device-wide factory
+  reset), hardware-verified on a CanoKey Canary
+  ([#296](https://github.com/framefilter/keyroost/pull/296)); the PIV
+  management-key algorithm check, `longTouchForReset` in `fido info` and the
+  app, and the FIDO metadata refresh
+  ([#297](https://github.com/framefilter/keyroost/pull/297)); a doc-link fix
+  for the Windows docs build
+  ([#298](https://github.com/framefilter/keyroost/pull/298)); and the vault's
+  listing on keys that report CTAP 2.3
+  ([#299](https://github.com/framefilter/keyroost/pull/299)).
 - **[@dlacko](https://github.com/dlacko)** — `openpgp info` cardholder name
   and public-key URL: the CLI prints the `005B` name and `5F50` URL
   (`cardholder_name` and `url` in `--json`), and the app's Card details
   entries pre-fill from the card
-  ([#260](https://github.com/framefilter/keyroost/pull/260)).
+  ([#260](https://github.com/framefilter/keyroost/pull/260)); and
+  `fido credential compare`, comparing the resident credentials on two keys
+  ([#287](https://github.com/framefilter/keyroost/pull/287)).
 
 (This credits their contributions to the codebase; it does not change keyroost's
 independent status described above.)
