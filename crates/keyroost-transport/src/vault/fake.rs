@@ -264,11 +264,24 @@ impl FakeKey {
         key
     }
 
-    /// Make this a CTAP 2.2 key that lists as 2.2's 6.8.4 is written:
-    /// getInfo `versions` gains `FIDO_2_2`, and
+    /// Make this a key that lists `FIDO_2_2` in getInfo `versions` and
+    /// lists as 2.2's §6.8.4 is written:
     /// [`strict_listing`](Self::strict_listing) is on.
     pub fn as_ctap22(&mut self) {
-        self.info.versions.push("FIDO_2_2".to_owned());
+        self.lists_strictly_as("FIDO_2_2");
+    }
+
+    /// Make this a CTAP 2.3 key: getInfo `versions` gains `FIDO_2_3` and no
+    /// `FIDO_2_2` (2.3's §6.4), and [`strict_listing`](Self::strict_listing)
+    /// is on, as 2.3's §6.8.4 is written.
+    pub fn as_ctap23(&mut self) {
+        self.lists_strictly_as("FIDO_2_3");
+    }
+
+    /// `version` added to getInfo `versions`, and
+    /// [`strict_listing`](Self::strict_listing) on.
+    fn lists_strictly_as(&mut self, version: &str) {
+        self.info.versions.push(version.to_owned());
         self.strict_listing = true;
     }
 

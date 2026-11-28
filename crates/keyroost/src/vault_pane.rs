@@ -11081,11 +11081,12 @@ mod tests {
         check(&app, &key, 2, "delete");
     }
 
-    /// A pre-2.2 key that lists its vaults only under a token bound to no
-    /// relying party: the unlock asks for a second finger to list, saying
-    /// why, and opens the vaults; the session remembers, so a later delete
-    /// lists with one finger and no reason line. A key reporting CTAP 2.2
-    /// lists unbound from the start: the unlock takes 2 fingers, both plain.
+    /// A key reporting nothing past CTAP 2.1 that lists its vaults only
+    /// under a token bound to no relying party: the unlock asks for a
+    /// second finger to list, saying why, and opens the vaults; the session
+    /// remembers, so a later delete lists with one finger and no reason
+    /// line. A key reporting CTAP 2.3 (`FIDO_2_3`) lists unbound from the
+    /// start: the unlock takes 2 fingers, both plain.
     #[test]
     fn a_strict_listing_key_opens_with_a_second_finger_and_says_why() {
         let mut key = FakeKey::with_fingerprint();
@@ -11112,7 +11113,7 @@ mod tests {
         assert!(!key.log.iter().any(|c| matches!(c, Call::Token { .. })));
 
         let mut key = FakeKey::with_fingerprint();
-        key.as_ctap22();
+        key.as_ctap23();
         two_vaults(&mut key);
         let mut app = finger_app();
         let seen = finger_unlock_into(&mut app, &mut key);

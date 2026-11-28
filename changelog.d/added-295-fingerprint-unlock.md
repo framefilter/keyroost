@@ -8,6 +8,6 @@
   `name set|clear` on the key. The app has a Touch fingerprint button beside
   Unlock on the FIDO2 and Vault tabs and in the naming field, and in the
   Settings dialog on keys that allow settings changes by fingerprint; each tab
-  takes its own touch. It follows CTAP 2.1 and was tested against scripted
-  keys, not yet on a fingerprint key: please report problems as issues.
-  ([#295])
+  takes its own touch. It follows CTAP 2.1, and CTAP 2.3 on a key that lists
+  `FIDO_2_3`, and was tested against scripted keys, not yet on a fingerprint
+  key: please report problems as issues. ([#295], [#299])
