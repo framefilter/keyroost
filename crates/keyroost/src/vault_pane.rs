@@ -3820,6 +3820,25 @@ fn preview_rows(current: Option<&Vault>, incoming: &Vault) -> Vec<ImportRow> {
         .collect()
 }
 
+/// `new` (fresh rows, default ticks) with the tick of each `old` row of
+/// the same backup entry and comparison kept: the user's choice stands
+/// wherever the plan it was made for is unchanged. A row new or of another
+/// comparison takes its default. Whether any row changed.
+fn keep_unchanged_ticks(old: &[ImportRow], new: Vec<ImportRow>) -> (Vec<ImportRow>, bool) {
+    let mut changed = new.len() != old.len();
+    let merged = new
+        .into_iter()
+        .map(|new| match old.iter().find(|r| r.index == new.index) {
+            Some(old) if old.status == new.status => *old,
+            _ => {
+                changed = true;
+                new
+            }
+        })
+        .collect();
+    (merged, changed)
+}
+
 /// A backup entry as its preview row names it: `title (username) · host`,
 /// empty parts left out (the code imports' `title (username)`, with the
 /// URL's host so two entries titled alike can be told apart). Never an ID.
@@ -4133,42 +4152,43 @@ impl App {
         }
     }
 
-    /// After a Refresh: rows whose comparison changed take their new plan
-    /// and default tick, and the dialog says so; the others keep the
-    /// user's ticks.
-    fn vault_import_refreshed(&mut self) {
-        let Some(now) = self.vault_import_rows_now() else {
-            return;
-        };
-        let Some(d) = self.vault.import.as_mut() else {
-            return;
-        };
+    /// The preview against the target as the session holds it now, keeping
+    /// the user's tick on every row whose comparison is unchanged (see
+    /// [`keep_unchanged_ticks`]); whether any row changed. `None` before
+    /// the backup is opened or without the dialog; on `Err` the rows empty
+    /// and the dialog says why.
+    fn vault_import_remerge(&mut self) -> Option<bool> {
+        let now = self.vault_import_rows_now()?;
+        let d = self.vault.import.as_mut()?;
         match now {
             Ok(rows) => {
-                let mut changed = rows.len() != d.rows.len();
-                let merged = rows
-                    .into_iter()
-                    .map(|new| match d.rows.iter().find(|r| r.index == new.index) {
-                        Some(old) if old.status == new.status => *old,
-                        _ => {
-                            changed = true;
-                            new
-                        }
-                    })
-                    .collect();
+                let (merged, changed) = keep_unchanged_ticks(&d.rows, rows);
                 d.rows = merged;
-                if changed {
-                    d.notice = Some(IMPORT_REFRESHED.to_owned());
-                }
+                Some(changed)
             }
             Err(e) => {
                 d.rows = Vec::new();
                 d.notice = Some(e);
+                None
             }
         }
     }
 
-    /// Into vault: another target, and the preview against it.
+    /// After a Refresh: rows whose comparison changed take their new plan
+    /// and default tick, and the dialog says so; the others keep the
+    /// user's ticks.
+    fn vault_import_refreshed(&mut self) {
+        if self.vault_import_remerge() == Some(true) {
+            if let Some(d) = self.vault.import.as_mut() {
+                d.notice = Some(IMPORT_REFRESHED.to_owned());
+            }
+        }
+    }
+
+    /// Into vault: another target, and the preview against it. As after a
+    /// Refresh, a row whose comparison is the same against the new target
+    /// keeps the user's tick; one whose comparison changed takes its
+    /// default.
     pub(crate) fn vault_import_set_target(&mut self, target: ImportTarget) {
         let Some(d) = self.vault.import.as_mut() else {
             return;
@@ -4178,7 +4198,7 @@ impl App {
         }
         d.target = target;
         d.notice = None;
-        self.vault_import_classify();
+        self.vault_import_remerge();
     }
 
     /// Tick or untick row `i`; a row with no box stays as it is.
@@ -9624,17 +9644,32 @@ mod tests {
         app.vault_import_tick(0, false);
         app.vault_import_set_target(ImportTarget::New);
         assert_eq!(statuses(&mut app), vec![New; 5]);
-        assert_eq!(ticks(&mut app), vec![true; 5], "the default ticks again");
+        assert_eq!(
+            ticks(&mut app),
+            vec![false, true, true, true, true],
+            "the unticked new row stays unticked; changed rows take their default"
+        );
+        app.vault_import_tick(1, false);
         let work = app.vault_session().unwrap().unlocked.vaults[1]
             .vault_ref
             .clone();
         assert_eq!(work.name.as_deref(), Some("Work"));
         app.vault_import_set_target(ImportTarget::Existing(work));
         assert_eq!(statuses(&mut app), vec![New; 5]);
+        assert_eq!(
+            ticks(&mut app),
+            vec![false, false, true, true, true],
+            "every row's plan is unchanged: every tick kept"
+        );
+        assert_eq!(
+            import_dialog(&mut app).notice,
+            None,
+            "a switch says nothing"
+        );
         let text = list_text(&mut app);
         assert!(text.contains("for vault \"Work\":"), "{text}");
         assert!(
-            text.contains("0 entries in the vault; 5 will be added"),
+            text.contains("0 entries in the vault; 3 will be added"),
             "{text}"
         );
     }
