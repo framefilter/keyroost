@@ -1985,6 +1985,14 @@ fn show_until_enter(e: &Entry) -> Result<(), Box<dyn Error>> {
     terminal_opens().map_err(|err| {
         format!("could not open the terminal to wait for Enter ({err}); the password was not shown")
     })?;
+    // The classic console prints the erase's escape sequences as text and
+    // leaves the password up unless VT processing is on; held until the
+    // erase is written, then the console mode is put back.
+    #[cfg(windows)]
+    let _vt = keyroost_winwebauthn::console_vt().ok_or(
+        "this console can't erase the password afterwards (the legacy console); \
+         the password was not shown. Use Windows Terminal",
+    )?;
     print_lines(&mut out, &lines[..lines.len() - 1])?;
     // Shown on a terminal: no control characters reach it. (Trailing
     // spaces trimmed: invisible there anyway.)

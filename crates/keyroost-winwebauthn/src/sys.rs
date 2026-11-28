@@ -344,3 +344,46 @@ pub(crate) fn relaunch_as_admin() -> Result<()> {
         Err(WinWebAuthnError::RelaunchFailed)
     }
 }
+
+/// Turn on VT processing for stdout's console; the mode it had before, or
+/// `None` when stdout is no console or the console refuses (the legacy
+/// console).
+pub(crate) fn console_vt_on() -> Option<u32> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: GetStdHandle takes no pointers; GetConsoleMode writes one u32
+    // through a pointer to a live local; SetConsoleMode takes the handle and
+    // a value. A handle that is null, invalid or not a console makes the
+    // mode calls fail, which is checked.
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut mode = 0u32;
+        if GetConsoleMode(h, &mut mode) == 0 {
+            return None;
+        }
+        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0
+            || SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+        {
+            Some(mode)
+        } else {
+            None
+        }
+    }
+}
+
+/// Put back the stdout console mode [`console_vt_on`] found.
+pub(crate) fn console_mode_restore(mode: u32) {
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_OUTPUT_HANDLE};
+    // SAFETY: as in `console_vt_on`; a failure leaves VT on, which is harmless.
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if !h.is_null() && h != INVALID_HANDLE_VALUE {
+            SetConsoleMode(h, mode);
+        }
+    }
+}

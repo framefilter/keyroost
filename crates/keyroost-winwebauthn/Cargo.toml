@@ -25,4 +25,5 @@ windows-sys = { version = "0.61", features = [
     "Win32_Devices_DeviceAndDriverInstallation", # SetupDi* (HID enumeration)
     "Win32_Devices_HumanInterfaceDevice",        # HidD_* / HidP_GetCaps (usage page)
     "Win32_Storage_FileSystem",                  # CreateFileW (open HID for caps)
+    "Win32_System_Console",                      # Get/SetConsoleMode (VT for the CLI's erase)
 ] }

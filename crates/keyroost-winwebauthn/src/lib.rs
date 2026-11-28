@@ -175,6 +175,30 @@ pub fn parse_detail_path(buf: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
+/// Stdout's console with VT processing on, so escape sequences (moving the
+/// cursor, erasing a line) act instead of printing as text, as they do in
+/// the classic console (conhost) by default. Dropping it puts the console
+/// mode back as it was. Windows only.
+#[cfg(windows)]
+pub struct ConsoleVt {
+    prev: u32,
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleVt {
+    fn drop(&mut self) {
+        sys::console_mode_restore(self.prev);
+    }
+}
+
+/// Turn on VT processing for stdout's console until the [`ConsoleVt`] is
+/// dropped; `None` when stdout is no console or the console can't (the
+/// legacy console), so escape sequences would print as text.
+#[cfg(windows)]
+pub fn console_vt() -> Option<ConsoleVt> {
+    sys::console_vt_on().map(|prev| ConsoleVt { prev })
+}
+
 #[cfg(windows)]
 mod sys;
 
