@@ -16230,23 +16230,25 @@ fn duplicate_serial_note<'a>(serials: impl Iterator<Item = &'a str>) -> Option<S
 /// two reasons: the key was reached only through its smart-card reader,
 /// where it answered as a U2F key without saying whether it also speaks
 /// FIDO2, or its USB FIDO interface gave no clear answer. Anything else is
-/// unverified because no reader answered for it.
-fn unverified_tab_hint(dev: &Device, t: CapTab) -> &'static str {
+/// unverified because no reader answered for it. `non_admin` is
+/// [`App::fido_non_admin`]: only then does the reader-only text point at
+/// restarting as administrator (a card in a reader has no USB FIDO
+/// interface to check, and elsewhere no rights stand in the way).
+fn unverified_tab_hint(dev: &Device, t: CapTab, non_admin: bool) -> &'static str {
     let fido2 = device::tab_cap(t) == Some(Caps::FIDO2);
-    match (fido2, dev.hid_path.is_some(), cfg!(windows)) {
+    match (fido2, dev.hid_path.is_some(), non_admin) {
         (true, false, true) => {
             "Not verified: keyroost reached this key's FIDO side only through its \
              smart-card reader, where it answered as a U2F key without saying \
-             whether it also speaks FIDO2. Run keyroost as administrator to let \
-             it check over USB. It is offered anyway — using it gives a definite \
-             answer."
+             whether it also speaks FIDO2. Restart as administrator to let \
+             keyroost check over USB. It is offered anyway — using it gives a \
+             definite answer."
         }
         (true, false, false) => {
             "Not verified: keyroost reached this key's FIDO side only through its \
              smart-card reader, where it answered as a U2F key without saying \
-             whether it also speaks FIDO2. With access to its USB FIDO interface \
-             (keyroost's udev rules) keyroost can check. It is offered anyway — \
-             using it gives a definite answer."
+             whether it also speaks FIDO2. It is offered anyway — using it gives \
+             a definite answer."
         }
         (true, true, _) => {
             "Not verified: the key's USB FIDO interface didn't say whether it \
@@ -20770,7 +20772,13 @@ impl App {
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if unverified {
-                    resp = resp.on_hover_text(unverified_tab_hint(dev, t));
+                    // The rights check enumerates devices, so it runs only
+                    // while the "?" is hovered, and only where it can matter.
+                    let non_admin = resp.hovered()
+                        && dev.hid_path.is_none()
+                        && device::tab_cap(t) == Some(Caps::FIDO2)
+                        && self.fido_non_admin();
+                    resp = resp.on_hover_text(unverified_tab_hint(dev, t, non_admin));
                 }
                 if active {
                     let y = resp.rect.bottom() + 6.0;
@@ -35808,11 +35816,6 @@ mod tests {
         );
     }
 
-    /// Issue #84: a FIDO2 card in a reader must take the in-place reset route,
-    /// and nothing else may. The replug ceremony physically cannot complete
-    /// for a card (nothing to unplug, no touch surface, and the arm's removal
-    /// detector keys on a HID path the card does not have), so routing it
-    /// there hangs the dialog forever — which is exactly what was reported.
     #[test]
     fn an_unverified_tab_says_why_it_is_unverified() {
         // FIDO2 reached only through the key's reader.
@@ -35821,25 +35824,47 @@ mod tests {
         reader_only.unverified.insert(Caps::FIDO2);
         reader_only.reader = Some("Yubico YubiKey OTP+FIDO+CCID 0".into());
         for tab in [CapTab::Fido2, CapTab::Vault] {
-            let hint = unverified_tab_hint(&reader_only, tab);
-            assert!(
-                hint.contains("only through its smart-card reader"),
-                "{hint}"
-            );
-            assert!(
-                !hint.contains("no smart-card reader was available"),
-                "{hint}"
-            );
+            for non_admin in [false, true] {
+                let hint = unverified_tab_hint(&reader_only, tab, non_admin);
+                assert!(
+                    hint.contains("only through its smart-card reader"),
+                    "{hint}"
+                );
+                assert!(
+                    !hint.contains("no smart-card reader was available"),
+                    "{hint}"
+                );
+                // Never a next step that can't help: no udev rules (Linux
+                // never needs them to see a USB FIDO interface).
+                assert!(!hint.contains("udev"), "{hint}");
+                // The administrator step only when the rights check says
+                // so, in the existing button's words.
+                assert_eq!(
+                    hint.contains("Restart as administrator"),
+                    non_admin,
+                    "{hint}"
+                );
+                assert!(hint.ends_with("gives a definite answer."), "{hint}");
+            }
         }
         // FIDO2 over USB whose interface gave no clear answer.
         let mut usb = reader_only.clone();
         usb.hid_path = Some(std::path::PathBuf::from("/dev/hidraw9"));
-        assert!(unverified_tab_hint(&usb, CapTab::Fido2).contains("USB FIDO interface"));
+        for non_admin in [false, true] {
+            let hint = unverified_tab_hint(&usb, CapTab::Fido2, non_admin);
+            assert!(hint.contains("USB FIDO interface"), "{hint}");
+            assert!(!hint.contains("administrator"), "{hint}");
+        }
         // Anything else keeps the reader explanation.
-        assert!(unverified_tab_hint(&reader_only, CapTab::Otp)
+        assert!(unverified_tab_hint(&reader_only, CapTab::Otp, true)
             .contains("no smart-card reader was available"));
     }
 
+    /// Issue #84: a FIDO2 card in a reader must take the in-place reset route,
+    /// and nothing else may. The replug ceremony physically cannot complete
+    /// for a card (nothing to unplug, no touch surface, and the arm's removal
+    /// detector keys on a HID path the card does not have), so routing it
+    /// there hangs the dialog forever — which is exactly what was reported.
     #[test]
     fn card_reset_route_is_reader_only_devices_exactly() {
         // A card: FIDO2 over a reader, no HID interface -> in-place route.
