@@ -9689,10 +9689,13 @@ impl App {
             return;
         };
         // Validate before dispatch; the modal surfaces the reason on failure.
+        // `oath.canokey` is what the pane's last OATH session found on this
+        // key; it names a CanoKey whose row doesn't.
+        let canokey = self.oath.canokey;
         let family = self
             .selected_device()
             .map_or(keyroost_import::plan::OathFamily::Other, |d| {
-                keyroost_import::plan::OathFamily::from_vendor(&d.vendor, None)
+                keyroost_import::plan::OathFamily::from_session(&d.vendor, None, canokey)
             });
         let (cred_name, secret) = match self.oath.add.validate(family) {
             Ok((n, s)) => (n, zeroize::Zeroizing::new(s)),
@@ -9740,8 +9743,11 @@ impl App {
                 asks = session.asks_touch_to_delete();
                 starts_at_one = oath_type == keyroost_oath::OathType::Hotp
                     && session.hotp_first_counter(0) != 0;
-                let family =
-                    keyroost_import::plan::OathFamily::from_vendor(&vendor, session.version());
+                let family = keyroost_import::plan::OathFamily::from_session(
+                    &vendor,
+                    session.version(),
+                    session.is_canokey(),
+                );
                 if family.prefix_issue() {
                     let listing = session.list()?;
                     refused = family.prefix_refusal(

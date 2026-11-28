@@ -82,6 +82,18 @@ impl OathFamily {
         }
     }
 
+    /// [`Self::from_vendor`] for a key whose OATH session has been opened:
+    /// `canokey` is what that session found (the transport's
+    /// `OathSession::is_canokey`), which names a CanoKey whose row doesn't,
+    /// such as one held to an NFC reader with its OpenPGP applet off.
+    pub fn from_session(vendor: &str, version: Option<(u8, u8, u8)>, canokey: bool) -> Self {
+        if canokey {
+            OathFamily::CanoKey
+        } else {
+            Self::from_vendor(vendor, version)
+        }
+    }
+
     /// The longest name this family stores, in bytes, when known.
     pub fn name_limit(self) -> Option<usize> {
         match self {
@@ -2528,6 +2540,17 @@ mod tests {
         assert_eq!(
             OathFamily::from_vendor("CanoKey", None),
             OathFamily::CanoKey
+        );
+        // A row that doesn't name it (NFC, OpenPGP applet off): the session does.
+        assert_eq!(
+            OathFamily::from_session("", None, true),
+            OathFamily::CanoKey
+        );
+        assert_eq!(
+            OathFamily::from_session("Yubico", Some((5, 7, 1)), false),
+            OathFamily::YubiKey {
+                version: Some((5, 7, 1))
+            }
         );
         assert_eq!(CANOKEY.device_name(), "CanoKey");
         assert_eq!(OathFamily::CanoKey.name_limit(), Some(64));

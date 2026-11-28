@@ -205,12 +205,33 @@ pub fn preselect(
     }
 }
 
+/// What an OATH session read says about the key besides its accounts: the
+/// applet's version and whether the session found a CanoKey (which names a
+/// CanoKey whose row doesn't). Default for a key not read yet, or not OATH.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OathSeen {
+    pub version: Option<(u8, u8, u8)>,
+    pub canokey: bool,
+}
+
+impl OathSeen {
+    fn of(session: &keyroost_transport::OathSession) -> Self {
+        Self {
+            version: session.version(),
+            canokey: session.is_canokey(),
+        }
+    }
+}
+
 /// The plan's store for a destination: an OATH key's family comes from its
-/// vendor and, once read, the applet's version.
-pub fn store_of(kind: StoreKind, vendor: &str, version: Option<(u8, u8, u8)>) -> Store {
+/// vendor and, once read, the applet's version and the session's CanoKey
+/// check.
+pub fn store_of(kind: StoreKind, vendor: &str, seen: OathSeen) -> Store {
     match kind {
         StoreKind::Molto2 => Store::Molto2,
-        StoreKind::Oath => Store::Oath(OathFamily::from_vendor(vendor, version)),
+        StoreKind::Oath => {
+            Store::Oath(OathFamily::from_session(vendor, seen.version, seen.canokey))
+        }
         StoreKind::Token2Otp => Store::Token2Otp,
         StoreKind::FeitianOtp => Store::FeitianOtp,
     }
@@ -463,7 +484,7 @@ impl ImportBlock {
 }
 
 /// What the chosen key holds, read by the preview job.
-pub type KeyContents = (DestKey, Existing, Option<(u8, u8, u8)>);
+pub type KeyContents = (DestKey, Existing, OathSeen);
 
 /// The dialog for one file.
 #[derive(Default)]
@@ -675,7 +696,7 @@ enum Read {
 
 /// What the preview job read.
 enum Preview {
-    Read(Existing, Option<(u8, u8, u8)>),
+    Read(Existing, OathSeen),
     /// The key needs its password / PIN.
     Locked,
     /// A password / PIN was sent and refused (or the read failed after it).
@@ -688,7 +709,7 @@ enum Added {
     /// The run's report and its counts line.
     Done(Report, String),
     /// The key's codes changed since the preview; nothing was written.
-    Changed(Existing, Option<(u8, u8, u8)>),
+    Changed(Existing, OathSeen),
     Locked,
     /// The password was sent and refused; nothing was written.
     Refused(String),
@@ -997,7 +1018,7 @@ impl App {
                         }
                     }
                     match keyroost_transport::import::read_oath_existing(&mut s) {
-                        Ok(ex) => Preview::Read(ex, s.version()),
+                        Ok(ex) => Preview::Read(ex, OathSeen::of(&s)),
                         Err(e) => Preview::Failed(e.to_string()),
                     }
                 })
@@ -1021,7 +1042,7 @@ impl App {
                         &mut s,
                         pin.as_deref().map(String::as_str),
                     ) {
-                        Ok(ex) => Preview::Read(ex, None),
+                        Ok(ex) => Preview::Read(ex, OathSeen::default()),
                         Err(keyroost_transport::OtpTransportError::PinRequired) => Preview::Locked,
                         // Like the OTP pane and the CLI: a key supplied
                         // without the OTP function says so plainly.
@@ -1055,7 +1076,7 @@ impl App {
                         Err(e) => return Preview::Failed(e.to_string()),
                     };
                     match keyroost_transport::import::read_feitian_existing(&mut s) {
-                        Ok(ex) => Preview::Read(ex, None),
+                        Ok(ex) => Preview::Read(ex, OathSeen::default()),
                         Err(e) => Preview::Failed(e.to_string()),
                     }
                 })
@@ -1091,8 +1112,8 @@ impl App {
         d.reading = false;
         d.preview_wanted = false;
         match preview {
-            Preview::Read(ex, version) => {
-                d.existing = Some((dest.clone(), ex, version));
+            Preview::Read(ex, seen) => {
+                d.existing = Some((dest.clone(), ex, seen));
                 d.dest_locked = false;
                 d.dest_error = None;
             }
@@ -1142,8 +1163,8 @@ impl App {
                 (Some(plan), meta.is_none())
             }
             _ => match d.contents() {
-                Some((_, ex, version)) => {
-                    let store = store_of(dest.store, &dev.vendor, *version);
+                Some((_, ex, seen)) => {
+                    let store = store_of(dest.store, &dev.vendor, *seen);
                     let mut plan = plan_for(file, store, 0, ex.clone(), d.replace);
                     plan.set_touch(|r| d.wants_touch(r));
                     (Some(plan), false)
@@ -1168,12 +1189,13 @@ impl App {
             .filter_map(|k| {
                 let dev = self.import_device(&k.device)?;
                 let fit = d.file.as_ref().map_or(0, |f| {
-                    let version = d
+                    let seen = d
                         .existing
                         .as_ref()
                         .filter(|(dk, _, _)| dk == k)
-                        .and_then(|(_, _, v)| *v);
-                    fit_count(f, store_of(k.store, &dev.vendor, version), d.molto_start)
+                        .map(|(_, _, seen)| *seen)
+                        .unwrap_or_default();
+                    fit_count(f, store_of(k.store, &dev.vendor, seen), d.molto_start)
                 });
                 Some((k.clone(), dest_label(&dev.title(), k.store), fit))
             })
@@ -1327,8 +1349,8 @@ impl App {
                                 return Added::Refused(e.to_string());
                             }
                         }
-                        let version = s.version();
-                        let store = store_of(StoreKind::Oath, &vendor, version);
+                        let seen = OathSeen::of(&s);
+                        let store = store_of(StoreKind::Oath, &vendor, seen);
                         let ex = match keyroost_transport::import::read_oath_existing(&mut s) {
                             Ok(ex) => ex,
                             Err(e) => return Added::Failed(e.to_string()),
@@ -1336,11 +1358,11 @@ impl App {
                         let mut again = plan_for(&file, store, 0, ex.clone(), replace);
                         again.set_touch(|r| touch_all || touch.contains(&r.index));
                         if !again.same_rows(&shown) {
-                            return Added::Changed(ex, version);
+                            return Added::Changed(ex, seen);
                         }
                         let mut w = keyroost_transport::import::OathImportStore::new(
                             &mut s,
-                            OathFamily::from_vendor(&vendor, version),
+                            OathFamily::from_session(&vendor, seen.version, seen.canokey),
                         )
                         .password_hint(OATH_PASSWORD_HINT)
                         // A Nitrokey 3 asks for a touch on every delete
@@ -1390,7 +1412,7 @@ impl App {
                         let mut again = plan_for(&file, Store::Token2Otp, 0, ex.clone(), replace);
                         again.set_touch(|r| touch_all || touch.contains(&r.index));
                         if !again.same_rows(&shown) {
-                            return Added::Changed(ex, None);
+                            return Added::Changed(ex, OathSeen::default());
                         }
                         let mut w =
                             keyroost_transport::import::Token2ImportStore::new(&mut s, pin.clone());
@@ -1427,7 +1449,7 @@ impl App {
                         let mut again = plan_for(&file, Store::FeitianOtp, 0, ex.clone(), replace);
                         again.set_touch(|r| touch_all || touch.contains(&r.index));
                         if !again.same_rows(&shown) {
-                            return Added::Changed(ex, None);
+                            return Added::Changed(ex, OathSeen::default());
                         }
                         let mut w =
                             keyroost_transport::import::FeitianImportStore::new(&mut s, &ex);
@@ -1510,8 +1532,8 @@ impl App {
                 d.report = Some(report);
                 d.report_line = line;
             }
-            Added::Changed(ex, version) => {
-                d.existing = Some((dest.clone(), ex, version));
+            Added::Changed(ex, seen) => {
+                d.existing = Some((dest.clone(), ex, seen));
                 d.dest_error = Some(
                     "The codes on the key changed; check the preview and try again.".to_owned(),
                 );
@@ -2158,7 +2180,11 @@ mod tests {
         d.file_password = "hunter2".into();
         d.dest = Some(dk("a", StoreKind::Oath));
         d.dest_secret = "oathpw".into();
-        d.existing = Some((dk("a", StoreKind::Oath), Existing::default(), None));
+        d.existing = Some((
+            dk("a", StoreKind::Oath),
+            Existing::default(),
+            OathSeen::default(),
+        ));
         d.report = Some(Report {
             rows: Vec::new(),
             stopped: None,
@@ -2230,7 +2256,7 @@ mod tests {
             "ePass \u{2014} Feitian OTP"
         );
         assert_eq!(
-            store_of(StoreKind::FeitianOtp, "Feitian", None),
+            store_of(StoreKind::FeitianOtp, "Feitian", OathSeen::default()),
             Store::FeitianOtp
         );
         assert_eq!(
@@ -2800,9 +2826,25 @@ mod tests {
             entry("B", HashAlg::Sha512, 30),
             entry("C", HashAlg::Sha1, 60),
         ]);
-        let yubi = store_of(StoreKind::Oath, "Yubico", Some((5, 7, 0)));
-        let solo = store_of(StoreKind::Oath, "SoloKeys", None);
-        let nk3 = store_of(StoreKind::Oath, "Nitrokey", None);
+        let yubi = store_of(
+            StoreKind::Oath,
+            "Yubico",
+            OathSeen {
+                version: Some((5, 7, 0)),
+                canokey: false,
+            },
+        );
+        let solo = store_of(StoreKind::Oath, "SoloKeys", OathSeen::default());
+        let nk3 = store_of(StoreKind::Oath, "Nitrokey", OathSeen::default());
+        // The session's CanoKey check names a key its row doesn't.
+        let seen_canokey = OathSeen {
+            version: None,
+            canokey: true,
+        };
+        assert_eq!(
+            store_of(StoreKind::Oath, "", seen_canokey),
+            Store::Oath(OathFamily::CanoKey)
+        );
         assert_eq!(fit_count(&file, yubi, 0), 3);
         // Solo 2 doesn't take SHA-512.
         assert_eq!(fit_count(&file, solo, 0), 2);
