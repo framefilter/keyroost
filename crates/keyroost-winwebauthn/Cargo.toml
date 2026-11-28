@@ -20,9 +20,9 @@ unsafe_code = "allow"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Windows-only. On other platforms the crate still builds but every entry point
-# is inert (returns empty / Unsupported), so callers can depend on it
-# unconditionally and gate behaviour at runtime.
+# Windows-only. On other platforms the Windows entry points are inert (return
+# empty / Unsupported), so callers can depend on the crate unconditionally and
+# gate behavior at runtime; the Unix Ctrl+C erase is the one non-Windows part.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
