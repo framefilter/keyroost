@@ -1,4 +1,5 @@
-//! Windows-only helper for keyroost's **non-admin FIDO2 tab**.
+//! Windows helper for keyroost's **non-admin FIDO2 tab**, and the CLI's
+//! console and terminal guards for showing a password (below).
 //!
 //! keyroost talks raw CTAP-HID to a security key, which on Windows requires the
 //! process to be elevated (admin) since Win10 1903. When keyroost is not
@@ -12,26 +13,28 @@
 //!      biometrics **without admin** because Settings itself is the privileged
 //!      component ([`open_windows_security_key_settings`]).
 //!
-//! That is the entire scope: an informational tab plus a link to the Windows
-//! security-key page. No passkey enumeration, no PIN/reset over the API (the
-//! `webauthn.dll` API was investigated and proved to not support external-key
-//! management — see the crate README).
+//! For FIDO that is the whole scope: an informational tab plus a link to the
+//! Windows security-key page. No passkey enumeration, no PIN/reset over the
+//! API (the `webauthn.dll` API was investigated and proved to not support
+//! external-key management — see the crate README).
 //!
-//! On non-Windows targets every function is inert, so the rest of keyroost can
-//! depend on this crate unconditionally and branch at runtime.
+//! On non-Windows targets these FIDO functions are inert, so the rest of
+//! keyroost can depend on this crate unconditionally and branch at runtime.
 //!
-//! It is also the CLI's home for the console and terminal FFI that
+//! The crate is also the CLI's home for the console and terminal FFI that
 //! `keyroostctl` (which forbids `unsafe`) needs while it shows a password:
 //! VT processing for the classic Windows console (`console_vt`, Windows
 //! only) and an erase when the user presses Ctrl+C
 //! ([`erase_on_interrupt`]: a console control handler on Windows, a signal
-//! handler on Unix).
+//! handler on Unix, in `src/unix.rs`). That erase is not inert anywhere:
+//! it is the one part of the crate that runs on Unix.
 //!
 //! # Verification status
 //!
 //! The Windows code can't be compiled or run off-Windows. It is written against
 //! Microsoft's documented APIs; spots needing on-Windows checking are marked
-//! `VERIFY:` in `src/sys.rs`. The non-Windows (inert) path compiles cleanly.
+//! `VERIFY:` in `src/sys.rs`. The non-Windows path compiles cleanly, and the
+//! Unix signal handler is tested in a child process.
 
 use std::fmt;
 
@@ -278,7 +281,7 @@ mod interrupt_tests {
 
     const ERASE: &str = "\x1b8\x1b[J";
     const NOTE: &str = "error: canceled; erased\n";
-    /// Set in the child run of [`a_sigint_erases_and_exits_130`].
+    /// Set in the child run of [`a_sigint_erases_then_ends_by_the_signal`].
     const CHILD: &str = "KEYROOST_WINWEBAUTHN_SIGNAL_CHILD";
 
     fn in_child() -> bool {
@@ -302,6 +305,9 @@ mod interrupt_tests {
         let guard = erase_on_interrupt(ERASE, NOTE).expect("armed");
         assert!(unix::armed());
         assert_eq!(now(), vec![unix::handler(); 2]);
+        for sig in unix::SIGNALS {
+            assert!(unix::masks(sig), "both signals blocked in the handler");
+        }
         assert!(erase_on_interrupt(ERASE, NOTE).is_none(), "one at a time");
         drop(guard);
         assert!(!unix::armed());
@@ -316,9 +322,10 @@ mod interrupt_tests {
 
     /// The real thing in a child process: armed, then a SIGINT (as the
     /// password reader raises on Ctrl+C). The child writes the erase to
-    /// stdout and the note to stderr, and exits 130.
+    /// stdout and the note to stderr, and ends killed by SIGINT (a shell
+    /// shows 130).
     #[test]
-    fn a_sigint_erases_and_exits_130() {
+    fn a_sigint_erases_then_ends_by_the_signal() {
         if in_child() {
             let _guard = erase_on_interrupt(ERASE, NOTE).expect("armed");
             // SAFETY: raising a signal in this process; the handler ends it.
@@ -330,7 +337,7 @@ mod interrupt_tests {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "interrupt_tests::a_sigint_erases_and_exits_130",
+                "interrupt_tests::a_sigint_erases_then_ends_by_the_signal",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -339,7 +346,12 @@ mod interrupt_tests {
             .output()
             .unwrap();
         use std::os::unix::process::ExitStatusExt;
-        assert_eq!(out.status.code(), Some(130), "{:?}", out.status.signal());
+        assert_eq!(
+            out.status.signal(),
+            Some(libc::SIGINT),
+            "killed by the signal: {:?}",
+            out.status.code()
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stdout.ends_with(ERASE), "{stdout:?}");

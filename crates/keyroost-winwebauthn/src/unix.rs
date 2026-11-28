@@ -1,10 +1,14 @@
 //! Unix implementation of [`crate::erase_on_interrupt`]: a SIGINT/SIGTERM
 //! handler, installed only while the CLI shows a password, that puts the
-//! terminal settings back, writes the erase and ends the process.
+//! terminal settings back, writes the erase and ends the process by the
+//! same signal, so a parent sees it killed as it would have been.
 //!
 //! All of this crate's Unix FFI is confined here. The handler calls only
-//! async-signal-safe functions (`tcsetattr`, `write`, `_exit`) and reads
-//! only atomics and memory written before it was armed.
+//! async-signal-safe functions (`tcsetattr`, `write`, `sigaction`,
+//! `sigemptyset`, `sigaddset`, `sigprocmask`, `raise`, `_exit`), never
+//! reads `errno`, and reads only atomics and memory written before it was
+//! armed. Both signals are blocked while it runs, so a second one can't
+//! end the process before the erase is written.
 
 use std::cell::UnsafeCell;
 use std::fs::File;
@@ -32,17 +36,25 @@ static NOTE_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static NOTE_LEN: AtomicUsize = AtomicUsize::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-/// The exit status of a process ended by `sig`, as a shell reports it.
+/// The exit status of a process ended by `sig`, as a shell reports it:
+/// the handler's fallback if re-raising the signal doesn't end it.
 pub(crate) fn interrupted_status(sig: libc::c_int) -> libc::c_int {
     128 + sig
 }
 
-/// `write(2)` all of `ptr`/`len` to `fd`, retrying after a signal.
+/// How many failed `write(2)` calls [`write_all`] tries again (an `EINTR`
+/// from a signal outside the blocked pair, say) before giving up; it never
+/// reads `errno` to tell why.
+const WRITE_RETRIES: u32 = 8;
+
+/// `write(2)` all of `ptr`/`len` to `fd`, trying a failed call again a
+/// few times.
 ///
 /// # Safety
 /// `ptr`/`len` describe a live buffer (here: a `&'static str`), or are
 /// null/0.
 unsafe fn write_all(fd: libc::c_int, mut ptr: *const u8, mut len: usize) {
+    let mut retries = WRITE_RETRIES;
     while !ptr.is_null() && len > 0 {
         // SAFETY: the caller's buffer holds `len` more bytes from `ptr`.
         let n = unsafe { libc::write(fd, ptr.cast(), len) };
@@ -51,10 +63,24 @@ unsafe fn write_all(fd: libc::c_int, mut ptr: *const u8, mut len: usize) {
             // SAFETY: `n <= len`, so this stays inside the buffer.
             ptr = unsafe { ptr.add(n) };
             len -= n;
-        } else if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
+        } else if n < 0 && retries > 0 {
+            retries -= 1;
         } else {
             return;
+        }
+    }
+}
+
+/// The set holding both [`SIGNALS`]: blocked while the handler runs.
+///
+/// # Safety
+/// `set` is a live `sigset_t`.
+unsafe fn both_signals(set: *mut libc::sigset_t) {
+    // SAFETY: the caller's set is live.
+    unsafe {
+        libc::sigemptyset(set);
+        for sig in SIGNALS {
+            libc::sigaddset(set, sig);
         }
     }
 }
@@ -80,8 +106,22 @@ extern "C" fn on_signal(sig: libc::c_int) {
             );
         }
     }
-    // SAFETY: ends the process at once, as the signal would have.
-    unsafe { libc::_exit(interrupted_status(sig)) }
+    // SAFETY: the default action back, `sig` unblocked (it is blocked
+    // while its handler runs) and raised again: the process ends by the
+    // signal, as it would have without the handler. Should it not, the
+    // shell's status for it. All locals are live.
+    unsafe {
+        let mut default: libc::sigaction = std::mem::zeroed();
+        default.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut default.sa_mask);
+        libc::sigaction(sig, &default, std::ptr::null_mut());
+        let mut only: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut only);
+        libc::sigaddset(&mut only, sig);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &only, std::ptr::null_mut());
+        libc::raise(sig);
+        libc::_exit(interrupted_status(sig))
+    }
 }
 
 /// The armed handler; dropping it puts the previous handlers back.
@@ -115,11 +155,11 @@ pub(crate) fn arm(erase: &'static str, note: &'static str) -> Option<Guard> {
     ARMED.store(true, Ordering::Release);
 
     // SAFETY: zeroed is a valid `sigaction` (no handler, empty flags);
-    // sigemptyset and sigaction take pointers to live locals.
+    // the set calls and sigaction take pointers to live locals.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        libc::sigemptyset(&mut action.sa_mask);
+        both_signals(&mut action.sa_mask);
         let mut previous: [libc::sigaction; 2] = std::mem::zeroed();
         for (i, sig) in SIGNALS.iter().enumerate() {
             if libc::sigaction(*sig, &action, &mut previous[i]) != 0 {
@@ -159,6 +199,17 @@ pub(crate) fn current_handler(sig: libc::c_int) -> libc::sighandler_t {
         let mut now: libc::sigaction = std::mem::zeroed();
         libc::sigaction(sig, std::ptr::null(), &mut now);
         now.sa_sigaction
+    }
+}
+
+/// Whether `sig` is in the handler's mask (for the tests).
+#[cfg(test)]
+pub(crate) fn masks(sig: libc::c_int) -> bool {
+    // SAFETY: a null new action only reads the current one into a local.
+    unsafe {
+        let mut now: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGINT, std::ptr::null(), &mut now);
+        libc::sigismember(&now.sa_mask, sig) == 1
     }
 }
 
