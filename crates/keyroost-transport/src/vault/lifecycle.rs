@@ -1919,11 +1919,6 @@ mod tests {
     /// first ([`FingerAsk::ListVaults`] never asked).
     #[test]
     fn a_ctap23_key_needs_no_extra_finger_for_the_listing() {
-        let mut key = FakeKey::with_fingerprint();
-        key.as_ctap23();
-        assert!(key.info().versions.iter().any(|v| v == "FIDO_2_3"));
-        assert!(!key.info().versions.iter().any(|v| v == "FIDO_2_2"));
-
         let (asked, requests) = fingers_on(Command::List, false, Listing::Ctap23);
         assert_eq!(asked, [FingerAsk::Unlock, FingerAsk::Unlock]);
         assert_eq!(

@@ -264,9 +264,8 @@ impl FakeKey {
         key
     }
 
-    /// Make this a key that lists `FIDO_2_2` in getInfo `versions`, which
-    /// CTAP 2.3's §6.4 says MUST not be present (no conforming key does),
-    /// and lists as 2.2's §6.8.4 is written:
+    /// Make this a key that lists `FIDO_2_2` in getInfo `versions` and
+    /// lists as 2.2's §6.8.4 is written:
     /// [`strict_listing`](Self::strict_listing) is on.
     pub fn as_ctap22(&mut self) {
         self.lists_strictly_as("FIDO_2_2");
