@@ -2482,6 +2482,24 @@ fn key_firmware(
 const FIDO_RELOCKED: &str =
     "the key re-locked (PIN or session changed) \u{2014} unlock again to continue.";
 
+/// Why the FIDO2 tab won't reset a CanoKey through its own USB reader, in
+/// the app's words ([`keyroost_transport::CANOKEY_READER_RESET`] names the
+/// CLI command).
+const CANOKEY_READER_RESET_APP: &str =
+    "A CanoKey takes a FIDO2 reset only within 10 seconds of being plugged in, and \
+     power-cycling its reader doesn't restart the key, so it can't be reset here. \
+     Reset FIDO2 over its FIDO interface, unplugging and replugging it when asked \
+     (on Windows that needs an administrator session), or reset the whole key with \
+     Factory reset on the Overview tab.";
+
+/// [`keyroost_transport::TransportError::CanoKeyAdminPinBlocked`] in the
+/// app's words.
+const CANOKEY_ADMIN_PIN_BLOCKED_APP: &str =
+    "the CanoKey Admin PIN is blocked. That erases nothing: passkeys, keys and codes \
+     keep working with their own PINs, but what needs the Admin PIN (this reset) \
+     can't run. Only Factory reset on the Overview tab unblocks it, and that erases \
+     everything on the key.";
+
 /// The permissions of the FIDO2 tab's session token: credential management,
 /// plus bio enrollment when the key supports it, so the one cached token
 /// authorizes both passkey management and fingerprint operations. Only
@@ -10307,6 +10325,12 @@ impl App {
                         app.oath.canokey = true;
                         app.oath.confirm_reset = for_device;
                     }
+                    // The transport's wording names the CLI command.
+                    Err(TransportError::CanoKeyAdminPinBlocked) => {
+                        let msg = CANOKEY_ADMIN_PIN_BLOCKED_APP;
+                        app.log(Severity::Err, format!("Authenticator reset failed: {msg}"));
+                        app.oath.error = Some(format!("reset failed: {msg}"));
+                    }
                     Err(e) => {
                         app.log(Severity::Err, format!("Authenticator reset failed: {e}"));
                         app.oath.error = Some(format!("reset failed: {e}"));
@@ -10943,6 +10967,11 @@ impl App {
         // reset, no replug and no touch. `None` for USB keys, which keep the
         // armed replug ceremony.
         let card_reader = Self::card_reset_reader(self.selected_device());
+        // A CanoKey's own USB reader can't take a FIDO2 reset (the transport
+        // refuses it too): say so before the question, in the app's words.
+        let canokey_reader = card_reader
+            .as_deref()
+            .is_some_and(keyroost_resolve::canokey::is_reader_name);
         let blockers = self.serial_less_reset_blockers();
         // Device-scoped, not app-global: this dialog may belong to a different
         // key than the armed one, and telling the user to "unplug the key, then
@@ -10990,6 +11019,15 @@ impl App {
                     ui.label("key will blink. Touch it to finish the wipe.");
                     ui.add_space(6.0);
                     if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                } else if canokey_reader {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 160, 80),
+                        CANOKEY_READER_RESET_APP,
+                    );
+                    ui.add_space(6.0);
+                    if ui.button("Close").clicked() {
                         cancel = true;
                     }
                 } else {
@@ -26909,8 +26947,9 @@ impl App {
             // The three per-key algorithm+fingerprint rows live under the sub-tab
             // strip now, not here.
             if let Some(status) = &self.openpgp.status {
+                // With the hex GnuPG shows for a CanoKey, as `openpgp info`.
                 let serial = status
-                    .serial_text()
+                    .serial_text_long()
                     .unwrap_or_else(|| "\u{2014}".to_string());
                 let sigs = status
                     .signature_count

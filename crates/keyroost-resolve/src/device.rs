@@ -1903,7 +1903,7 @@ impl ResetStep {
             ResetStep::Token2Otp => "OTP",
             ResetStep::FeitianOtp => "FEITIAN-OTP",
             ResetStep::Fido => "FIDO2",
-            ResetStep::CanoKey => "the whole CanoKey",
+            ResetStep::CanoKey => "Whole device",
         }
     }
 }
