@@ -44,6 +44,27 @@ jobs:
         run: python3 packaging/assemble-changelog.py --check
       - name: changelog assembler self-test
         run: bash packaging/test-assemble-changelog.sh
+      - name: contributor credit check self-test
+        run: bash packaging/check-contributor-credit.sh --self-test
+
+  # An outside contributor's PR credits itself in README.md's Contributors
+  # section, alongside its changelog.d fragment (CONTRIBUTING.md, "How a PR
+  # lands"). The maintainer's and Dependabot's PRs pass without one. The PR
+  # number and author login reach the script through env:, never interpolated
+  # into the shell command.
+  contributor-credit:
+    name: Contributor credit in README
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: README Contributors section credits this PR
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: bash packaging/check-contributor-credit.sh "$PR_NUMBER" "$PR_AUTHOR"
 
   # One source tree, compiled and tested three ways. This matrix is what keeps
   # the macOS/Windows code (the cfg-gated hidapi HID backend) from rotting: a

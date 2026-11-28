@@ -8,9 +8,17 @@ issue reports alike. This file collects the practical details in one place.
 PRs are reviewed against `packaging/REVIEWING.md`, then squash-merged. The
 squash commit carries your authorship. CI for outside contributors runs
 after maintainer approval of the workflow run, so there can be a delay
-between opening a PR and checks starting. Contributions are credited in the
-changelog and, for a first contribution, in the README's Contributors
-section.
+between opening a PR and checks starting.
+
+Every contributor PR credits itself in the README's Contributors section,
+alongside its changelog fragment: add this PR's number to your line, in the
+same style as the links already there —
+`([#123](https://github.com/framefilter/keyroost/pull/123))`. On a first PR,
+add a line for yourself in the section's existing style. A PR without its
+credit isn't merged; CI's "Contributor credit in README" check flags a
+missing one, and
+`bash packaging/check-contributor-credit.sh <pr-number> <your-login>` runs
+the same check locally (`--self-test` tests the script itself).
 
 For a user-facing change, add one file to `changelog.d/` instead of editing
 `CHANGELOG.md` directly — every PR editing the same spot at the top of
