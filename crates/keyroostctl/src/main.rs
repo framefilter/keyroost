@@ -436,7 +436,7 @@ impl CliPivKeyAlg {
 }
 
 /// Management-key cipher algorithm.
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum CliPivMgmtAlg {
     #[value(name = "3des")]
     TripleDes,
@@ -448,6 +448,17 @@ enum CliPivMgmtAlg {
 impl CliPivMgmtAlg {
     fn to_alg(self) -> keyroost_piv::MgmtAlg {
         use keyroost_piv::MgmtAlg::*;
+        match self {
+            CliPivMgmtAlg::TripleDes => TripleDes,
+            CliPivMgmtAlg::Aes128 => Aes128,
+            CliPivMgmtAlg::Aes192 => Aes192,
+            CliPivMgmtAlg::Aes256 => Aes256,
+        }
+    }
+
+    /// The compatibility tables' name for this algorithm.
+    fn to_choice(self) -> keyroost_piv::compat::MgmtAlgChoice {
+        use keyroost_piv::compat::MgmtAlgChoice::*;
         match self {
             CliPivMgmtAlg::TripleDes => TripleDes,
             CliPivMgmtAlg::Aes128 => Aes128,
@@ -8268,6 +8279,9 @@ fn fido_reset_after_replug(
     step_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serial_less = expected_serial.is_empty();
+    // Read while the key is surely connected, not in the post-power-up
+    // window the reset has to land in: whether its touch prompt says hold.
+    let long_touch = fido_reset_needs_long_touch_at(armed_path);
 
     // No Enter to press: the replug itself is the go-ahead. Watching the cheap
     // HID-only scan (no identity reads) keeps the poll light; a run nobody
@@ -8389,9 +8403,37 @@ fn fido_reset_after_replug(
     // Exactly one touch prompt: this step's name when there is one (factory
     // reset), else `fido_reset_at`'s own generic one (standalone `fido reset`).
     if let Some(name) = step_name {
-        crate::prompt::touch(&format!("{name}  touch the key now\u{2026}"));
+        crate::prompt::touch(&format!(
+            "{name}  {}\u{2026}",
+            fido_reset_touch_words(long_touch)
+        ));
     }
-    fido_reset_at(&path, needs_generic_touch_prompt(step_name))
+    fido_reset_at(&path, needs_generic_touch_prompt(step_name), long_touch)
+}
+
+/// Whether the FIDO key at `path` says a reset needs a long touch (getInfo
+/// `longTouchForReset`). Any failure to ask (a U2F-only key, an interface
+/// that won't open) reads as no: the prompt then keeps its usual words.
+fn fido_reset_needs_long_touch_at(path: &Path) -> bool {
+    let Ok((mut dev, init)) = open_ctap_hid(path) else {
+        return false;
+    };
+    init.supports_cbor()
+        && keyroost_ctap::get_info(&mut dev)
+            .ok()
+            .and_then(|i| i.long_touch_for_reset)
+            == Some(true)
+}
+
+/// The FIDO2 reset's touch instruction: "touch and hold" on a key that says
+/// a reset needs a long touch ([`fido_reset_needs_long_touch_at`]), else the
+/// usual one. No duration: CTAP 2.2 and 2.3 name different ones.
+fn fido_reset_touch_words(long_touch: bool) -> &'static str {
+    if long_touch {
+        "touch and hold the key now"
+    } else {
+        "touch the key now"
+    }
 }
 
 /// Whether [`fido_reset_at`] must print its own generic touch prompt: only
@@ -11479,6 +11521,33 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         keyroost_piv::compat::PivExtension::SetManagementKey,
                         *force,
                     )?;
+                    // The algorithm too, as the app's algorithm list does: one
+                    // the list marks unsupported on this key (a HID Crescendo
+                    // takes no AES-256) is refused here, before anything is
+                    // sent, naming the algorithms the key does take, unless
+                    // --force. That includes the AES-192 default: it is never
+                    // swapped for another algorithm silently. Unverified
+                    // algorithms run without a second note; the line above
+                    // already covers the key.
+                    let alg_extension = keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm(
+                        algorithm.to_choice(),
+                    );
+                    if s.feature_gate(alg_extension)
+                        == keyroost_piv::compat::FeatureGate::Unsupported
+                    {
+                        if *force {
+                            guard_piv_feature(s, alg_extension, true)?;
+                        } else {
+                            // Only on the road to an error: one table lookup
+                            // (and fingerprint probe) per algorithm.
+                            let takes = mgmt_algs_supported(|alg| {
+                                s.feature_gate(
+                                    keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm(alg),
+                                )
+                            });
+                            return Err(mgmt_alg_refusal(*algorithm, &takes).into());
+                        }
+                    }
                     let pin_unlock_gate =
                         s.feature_gate(keyroost_piv::compat::PivExtension::PinManagementAuth);
                     // Whether to run the PIN-protected-storage maintenance step
@@ -12756,6 +12825,66 @@ fn check_piv_feature(
             Err(msg.into())
         }
     }
+}
+
+/// The management-key algorithms `gate` (a key's table lookup) resolves
+/// `Supported`, in `--algorithm`'s order: the ones a refusal offers instead.
+fn mgmt_algs_supported(
+    mut gate: impl FnMut(keyroost_piv::compat::MgmtAlgChoice) -> keyroost_piv::compat::FeatureGate,
+) -> Vec<CliPivMgmtAlg> {
+    CliPivMgmtAlg::value_variants()
+        .iter()
+        .copied()
+        .filter(|a| gate(a.to_choice()) == keyroost_piv::compat::FeatureGate::Supported)
+        .collect()
+}
+
+/// The refusal for `piv mgmt-key change --algorithm <chosen>` on a key whose
+/// table marks `chosen` unsupported: the shared requirement sentence and
+/// suffix, then the algorithms the table marks supported on this key (`takes`)
+/// as the `--algorithm` values to pass instead, and `--force` last. When the
+/// key's table marks none supported, the list sentence is left out.
+fn mgmt_alg_refusal(chosen: CliPivMgmtAlg, takes: &[CliPivMgmtAlg]) -> String {
+    let needs = keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm(chosen.to_choice())
+        .requirement();
+    let mut msg = format!(
+        "{needs} {}",
+        keyroost_piv::compat::FeatureGate::INCOMPATIBLE_SUFFIX
+    );
+    if chosen == CliPivMgmtAlg::Aes192 {
+        msg.push_str(" AES-192 is the default when --algorithm isn't given.");
+    }
+    // "A", "A or B", "A, B or C".
+    fn or_list(items: &[String]) -> String {
+        match items.split_last() {
+            None => String::new(),
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        }
+    }
+    if !takes.is_empty() {
+        let labels: Vec<String> = takes
+            .iter()
+            .map(|a| a.to_alg().label().to_owned())
+            .collect();
+        let flags: Vec<String> = takes
+            .iter()
+            .map(|a| {
+                let value = a
+                    .to_possible_value()
+                    .map(|v| v.get_name().to_owned())
+                    .unwrap_or_default();
+                format!("--algorithm {value}")
+            })
+            .collect();
+        msg.push_str(&format!(
+            " This key takes {}: pass {}.",
+            or_list(&labels),
+            or_list(&flags)
+        ));
+    }
+    msg.push_str(" Pass --force to run anyway.");
+    msg
 }
 
 /// When [`guard_piv_feature`] is about to refuse `PivExtension::Reset` as
@@ -16330,6 +16459,7 @@ fn ctap2_json(info: &keyroost_ctap::AuthenticatorInfo) -> json_out::Ctap2InfoJso
         transports: info.transports.clone(),
         min_pin_length: info.min_pin_length,
         force_pin_change: info.force_pin_change,
+        long_touch_for_reset: info.long_touch_for_reset,
         firmware_version: info.firmware_version,
     }
 }
@@ -16513,6 +16643,9 @@ fn fido_info_rows(info: &keyroost_ctap::AuthenticatorInfo) -> Vec<(&'static str,
     if info.force_pin_change == Some(true) {
         rows.push(("Force PIN change", "yes".to_owned()));
     }
+    if info.long_touch_for_reset == Some(true) {
+        rows.push(("Reset", "needs a long touch".to_owned()));
+    }
     if let Some(v) = info.firmware_version {
         rows.push(("CTAP firmware version", v.to_string()));
     }
@@ -16560,16 +16693,19 @@ fn same_piv_card(confirmed: Option<u128>, now: Option<u128>) -> bool {
 /// `announce_touch` prints this function's own generic touch prompt; the
 /// caller sets it `false` when it already printed its own (naming its step)
 /// right before calling in, so the two never stack into two prompts for one
-/// reset ([`fido_reset_after_replug`]).
+/// reset ([`fido_reset_after_replug`]). `long_touch` makes that prompt say
+/// to touch and hold ([`fido_reset_touch_words`]).
 fn fido_reset_at(
     path: &std::path::Path,
     announce_touch: bool,
+    long_touch: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut dev, _init) = open_ctap_hid(path)?;
     if announce_touch {
         crate::prompt::touch(&format!(
-            "Resetting {} — touch the key now…",
-            path.display()
+            "Resetting {} — {}…",
+            path.display(),
+            fido_reset_touch_words(long_touch)
         ));
     }
     // Names read from keys before or during the write are stale.
@@ -17649,6 +17785,10 @@ fn cose_algorithm_name(alg: i64) -> &'static str {
     match alg {
         -7 => "ES256",
         -8 => "EdDSA",
+        -47 => "ES256K",
+        -48 => "ML-DSA-44",
+        -49 => "ML-DSA-65",
+        -50 => "ML-DSA-87",
         -35 => "ES384",
         -36 => "ES512",
         -257 => "RS256",
@@ -27691,6 +27831,7 @@ mod cli_tests {
                 transports: vec!["usb".into()],
                 min_pin_length: Some(4),
                 force_pin_change: Some(false),
+                long_touch_for_reset: None,
                 firmware_version: Some(328706),
             }),
             metadata: None,
@@ -29208,6 +29349,110 @@ mod cli_tests {
         assert_eq!(v[1]["readers"], serde_json::json!(["Y 00"]));
         assert_eq!(v[1]["hid_paths"], serde_json::json!(["/dev/hidraw1"]));
         assert_eq!(v[1]["capabilities"], serde_json::json!(["FIDO2"]));
+    }
+}
+
+#[cfg(test)]
+mod piv_mgmt_alg_gate {
+    use super::{mgmt_alg_refusal, mgmt_algs_supported, CliPivMgmtAlg};
+
+    /// A Nitrokey 3 at firmware 1.9.1 as this command sees it: the Trussed
+    /// fingerprint, the applet's dummy version 6.6.6 and firmware "1.9.1"
+    /// from the admin application. A plain `piv mgmt-key change` (the
+    /// AES-192 default) went out to such a key and got `6A80`; it is now
+    /// refused before anything is sent, with the algorithms it takes.
+    #[test]
+    fn a_nitrokey_3_on_1_9_1_refuses_the_aes_192_default_with_what_it_takes() {
+        use keyroost_piv::compat::{resolve, FeatureGate, PivExtension};
+        use keyroost_piv::fingerprint::{AppletFingerprint, TrussedVariant};
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
+        let fw = keyroost_piv::fingerprint::parse_dotted_version("1.9.1");
+        let gate = |alg| {
+            resolve(
+                PivExtension::ManagementKeyAlgorithm(alg),
+                fp,
+                Some(&[6, 6, 6]),
+                fw.as_deref(),
+            )
+        };
+        assert_eq!(
+            gate(CliPivMgmtAlg::Aes192.to_choice()),
+            FeatureGate::Unsupported
+        );
+        let takes = mgmt_algs_supported(gate);
+        assert_eq!(takes, [CliPivMgmtAlg::TripleDes, CliPivMgmtAlg::Aes256]);
+        assert!(mgmt_alg_refusal(CliPivMgmtAlg::Aes192, &takes).contains(
+            "This key takes 3DES or AES-256: pass --algorithm 3des or --algorithm aes256."
+        ));
+    }
+
+    #[test]
+    fn an_unsupported_management_key_algorithm_names_the_ones_the_key_takes() {
+        use CliPivMgmtAlg::*;
+        // The AES-192 default on a key that takes 3DES and AES-256.
+        assert_eq!(
+            mgmt_alg_refusal(Aes192, &[TripleDes, Aes256]),
+            "Not every key accepts an AES-192 management key. keyroost's list marks \
+             this key as not supporting it. AES-192 is the default when --algorithm \
+             isn't given. This key takes 3DES or AES-256: pass --algorithm 3des or \
+             --algorithm aes256. Pass --force to run anyway."
+        );
+        // One alternative, and three.
+        assert_eq!(
+            mgmt_alg_refusal(Aes256, &[TripleDes]),
+            "Not every key accepts an AES-256 management key. keyroost's list marks \
+             this key as not supporting it. This key takes 3DES: pass --algorithm \
+             3des. Pass --force to run anyway."
+        );
+        assert!(
+            mgmt_alg_refusal(TripleDes, &[Aes128, Aes192, Aes256]).contains(
+                "This key takes AES-128, AES-192 or AES-256: pass --algorithm aes128, \
+             --algorithm aes192 or --algorithm aes256."
+            )
+        );
+        // None marked supported: no list, --force still last.
+        let none = mgmt_alg_refusal(Aes128, &[]);
+        assert!(!none.contains("This key takes"), "{none}");
+        assert!(none.ends_with(" Pass --force to run anyway."), "{none}");
+    }
+
+    #[test]
+    fn each_cli_management_key_algorithm_is_gated_under_its_own_name() {
+        for alg in [
+            CliPivMgmtAlg::TripleDes,
+            CliPivMgmtAlg::Aes128,
+            CliPivMgmtAlg::Aes192,
+            CliPivMgmtAlg::Aes256,
+        ] {
+            assert_eq!(alg.to_choice().to_mgmt_alg(), Some(alg.to_alg()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod fido_reset_touch {
+    use super::fido_reset_touch_words;
+
+    #[test]
+    fn a_key_that_wants_a_long_touch_is_told_to_hold() {
+        assert_eq!(fido_reset_touch_words(false), "touch the key now");
+        assert_eq!(fido_reset_touch_words(true), "touch and hold the key now");
+    }
+}
+
+#[cfg(test)]
+mod cose_names {
+    use super::cose_algorithm_name;
+
+    #[test]
+    fn the_registered_post_quantum_and_k256_algorithms_are_named() {
+        assert_eq!(cose_algorithm_name(-7), "ES256");
+        assert_eq!(cose_algorithm_name(-47), "ES256K");
+        assert_eq!(cose_algorithm_name(-48), "ML-DSA-44");
+        assert_eq!(cose_algorithm_name(-49), "ML-DSA-65");
+        assert_eq!(cose_algorithm_name(-50), "ML-DSA-87");
+        // An unregistered ID stays unnamed.
+        assert_eq!(cose_algorithm_name(-54), "unknown");
     }
 }
 

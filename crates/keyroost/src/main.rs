@@ -1082,6 +1082,9 @@ struct ResetArm {
     /// nothing else was connected, and a re-insert fires only while that
     /// still holds ([`keyroost_resolve::serial_less_reinsert`]).
     serial_less: bool,
+    /// The key said at arm time that a reset needs a long touch
+    /// ([`fido_reset_needs_long_touch`]), so the touch prompt says to hold.
+    long_touch: bool,
 }
 
 /// One HID device's physical-connection identity at a poll, used to tell a
@@ -9215,13 +9218,13 @@ impl App {
     /// the UI frame. Used by the armed-reset flow, which targets the
     /// just-reconnected key rather than the (now stale) selection. On success
     /// the cached session and CTAP info are cleared.
-    fn submit_reset_path(&mut self, path: std::path::PathBuf) -> bool {
+    fn submit_reset_path(&mut self, path: std::path::PathBuf, long_touch: bool) -> bool {
         // The ceremony is device-bound like every other dispatcher: the key
         // being wiped is the one selected when the arm was set (selecting
         // another key disarms), and the outcome may only be written under that
         // selection.
         let for_device = self.selected_device.clone();
-        self.spawn_job("Resetting key\u{2026} (touch now)", move || {
+        self.spawn_job(fido_reset_job_label(long_touch), move || {
             let result = (|| -> Result<(), String> {
                 // A just-replugged node (especially on a fresh port) can take a
                 // moment to accept opens; retry briefly before giving up.
@@ -10822,6 +10825,7 @@ impl App {
             .as_ref()
             .and_then(|i| i.option("largeBlobs"))
             == Some(true);
+        let long_touch = fido_reset_needs_long_touch(self.security_keys.info.as_ref());
 
         let mut window_open = true;
         let mut arm = false;
@@ -10874,7 +10878,7 @@ impl App {
                         );
                     });
                     ui.label("The reset is sent the instant it reconnects \u{2014} then the");
-                    ui.label("key will blink. Touch it to finish the wipe.");
+                    ui.label(fido_reset_touch_line(long_touch));
                     ui.add_space(6.0);
                     if ui.button("Cancel").clicked() {
                         cancel = true;
@@ -11045,6 +11049,7 @@ impl App {
                 absent_scans: 0,
                 absent_since: None,
                 serial_less,
+                long_touch: fido_reset_needs_long_touch(self.security_keys.info.as_ref()),
             });
         }
     }
@@ -11437,7 +11442,8 @@ impl App {
                 // prev_devices, so the fresh connection still counts as new)
                 // and let the next poll retry instead of silently losing the
                 // reset.
-                if self.submit_reset_path(path) {
+                let long_touch = self.reset_arm.as_ref().is_some_and(|a| a.long_touch);
+                if self.submit_reset_path(path, long_touch) {
                     self.reset_arm = None;
                     self.security_keys.reset = ResetDialog::default();
                 }
@@ -16225,6 +16231,109 @@ fn duplicate_serial_note<'a>(serials: impl Iterator<Item = &'a str>) -> Option<S
     })
 }
 
+/// The rows of the FIDO2 pane's read-only "Security policy" card, from
+/// getInfo. The authenticatorConfig settings (always-UV, the minimum PIN
+/// length, a forced PIN change, enterprise attestation) only when the key
+/// supports authenticatorConfig (`supports_cfg`); the long-touch reset row
+/// whenever the key reports `longTouchForReset`, the row `fido info` shows.
+fn fido_policy_rows(
+    info: Option<&AuthenticatorInfo>,
+    supports_cfg: bool,
+) -> Vec<(&'static str, String)> {
+    let mut rows = Vec::new();
+    if supports_cfg {
+        if let Some(always_uv) = info.and_then(|i| i.option("alwaysUv")) {
+            rows.push((
+                "Always require user verification",
+                if always_uv { "On" } else { "Off" }.to_string(),
+            ));
+        }
+        rows.push((
+            "Minimum PIN length",
+            match info.and_then(|i| i.min_pin_length) {
+                Some(n) => n.to_string(),
+                None => "\u{2014}".to_string(),
+            },
+        ));
+        if info.and_then(|i| i.force_pin_change) == Some(true) {
+            rows.push(("Force PIN change", "Required on next use".to_string()));
+        }
+        if let Some(ep) = info.and_then(|i| i.option("ep")) {
+            rows.push((
+                "Enterprise attestation",
+                if ep { "Enabled" } else { "Supported" }.to_string(),
+            ));
+        }
+    }
+    if fido_reset_needs_long_touch(info) {
+        rows.push(("Reset", "Needs a long touch".to_string()));
+    }
+    rows
+}
+
+/// Whether the key says a FIDO2 reset needs a long touch (getInfo
+/// `longTouchForReset`), so the reset's touch prompts say to touch and hold.
+fn fido_reset_needs_long_touch(info: Option<&AuthenticatorInfo>) -> bool {
+    info.and_then(|i| i.long_touch_for_reset) == Some(true)
+}
+
+/// The worker job label for the armed FIDO2 reset: touch, or touch and hold
+/// when the key wants a long touch ([`fido_reset_needs_long_touch`]).
+fn fido_reset_job_label(long_touch: bool) -> &'static str {
+    if long_touch {
+        "Resetting key\u{2026} (touch and hold now)"
+    } else {
+        "Resetting key\u{2026} (touch now)"
+    }
+}
+
+/// The reset dialog's last line while armed, after "…then the".
+fn fido_reset_touch_line(long_touch: bool) -> &'static str {
+    if long_touch {
+        "key will blink. Touch and hold it to finish the wipe."
+    } else {
+        "key will blink. Touch it to finish the wipe."
+    }
+}
+
+/// Why a tab carries its "?" ([`DeviceView::tab_unverified`]), for its
+/// hover text. FIDO2 (and the Vault built on it) is unverified for one of
+/// two reasons: the key was reached only through its smart-card reader,
+/// where it answered as a U2F key without saying whether it also speaks
+/// FIDO2, or its USB FIDO interface gave no clear answer. Anything else is
+/// unverified because no reader answered for it. `non_admin` is
+/// [`App::fido_non_admin`]: only then does the reader-only text point at
+/// restarting as administrator (a card in a reader has no USB FIDO
+/// interface to check, and elsewhere no rights stand in the way).
+fn unverified_tab_hint(dev: &Device, t: CapTab, non_admin: bool) -> &'static str {
+    let fido2 = device::tab_cap(t) == Some(Caps::FIDO2);
+    match (fido2, dev.hid_path.is_some(), non_admin) {
+        (true, false, true) => {
+            "Not verified: keyroost reached this key's FIDO side only through its \
+             smart-card reader, where it answered as a U2F key without saying \
+             whether it also speaks FIDO2. Restart as administrator to let \
+             keyroost check over USB. It is offered anyway — using it gives a \
+             definite answer."
+        }
+        (true, false, false) => {
+            "Not verified: keyroost reached this key's FIDO side only through its \
+             smart-card reader, where it answered as a U2F key without saying \
+             whether it also speaks FIDO2. It is offered anyway — using it gives \
+             a definite answer."
+        }
+        (true, true, _) => {
+            "Not verified: the key's USB FIDO interface didn't say whether it \
+             speaks FIDO2 or only U2F. It is offered anyway — using it gives a \
+             definite answer."
+        }
+        (false, _, _) => {
+            "Not verified: no smart-card reader was available to confirm this \
+             feature on the key (reader missing or the smart-card service is not \
+             running). It is offered anyway — using it gives a definite answer."
+        }
+    }
+}
+
 /// Short label for a capability tab.
 fn cap_tab_label(t: CapTab) -> &'static str {
     match t {
@@ -20734,12 +20843,13 @@ impl App {
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if unverified {
-                    resp = resp.on_hover_text(
-                        "Not verified: no smart-card reader was available to \
-                         confirm this feature on the key (reader missing or the \
-                         smart-card service is not running). It is offered \
-                         anyway — using it gives a definite answer.",
-                    );
+                    // The rights check enumerates devices, so it runs only
+                    // while the "?" is hovered, and only where it can matter.
+                    let non_admin = resp.hovered()
+                        && dev.hid_path.is_none()
+                        && device::tab_cap(t) == Some(Caps::FIDO2)
+                        && self.fido_non_admin();
+                    resp = resp.on_hover_text(unverified_tab_hint(dev, t, non_admin));
                 }
                 if active {
                     let y = resp.rect.bottom() + 6.0;
@@ -21828,16 +21938,13 @@ impl App {
             }
 
             // Read-only "Security policy" summary. getInfo is unauthenticated,
-            // so the policy STATE is known without a PIN. Shown only on keys
-            // that support authenticatorConfig (the same gate as the Settings
-            // tab); the controls themselves still live in that tab post-unlock.
-            if supports_cfg {
-                let info = self.security_keys.info.as_ref();
-                let always_uv = info.and_then(|i| i.option("alwaysUv"));
-                let min_pin = info.and_then(|i| i.min_pin_length);
-                let force_change = info.and_then(|i| i.force_pin_change);
-                let ep = info.and_then(|i| i.option("ep"));
-
+            // so the policy STATE is known without a PIN. The authenticatorConfig
+            // rows show only on keys that support it (the same gate as the
+            // Settings tab; the controls themselves live in that tab
+            // post-unlock); the long-touch reset row shows on any key that
+            // reports it, as `fido info` does.
+            let rows = fido_policy_rows(self.security_keys.info.as_ref(), supports_cfg);
+            if !rows.is_empty() {
                 ui.add_space(14.0);
                 theme::card_frame(p).show(ui, |ui| {
                     ui.label(
@@ -21867,41 +21974,21 @@ impl App {
                         });
                     };
 
-                    if let Some(always_uv) = always_uv {
-                        row(
-                            ui,
-                            "Always require user verification",
-                            if always_uv { "On" } else { "Off" }.to_string(),
-                        );
-                        ui.add_space(4.0);
-                    }
-                    row(
-                        ui,
-                        "Minimum PIN length",
-                        match min_pin {
-                            Some(n) => n.to_string(),
-                            None => "\u{2014}".to_string(),
-                        },
-                    );
-                    if force_change == Some(true) {
-                        ui.add_space(4.0);
-                        row(ui, "Force PIN change", "Required on next use".to_string());
-                    }
-                    if let Some(ep) = ep {
-                        ui.add_space(4.0);
-                        row(
-                            ui,
-                            "Enterprise attestation",
-                            if ep { "Enabled" } else { "Supported" }.to_string(),
-                        );
+                    for (i, (label, value)) in rows.into_iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(4.0);
+                        }
+                        row(ui, label, value);
                     }
 
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Unlock to change these.")
-                            .font(theme::f_reg(11.5))
-                            .color(p.txt3),
-                    );
+                    if supports_cfg {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Unlock to change these.")
+                                .font(theme::f_reg(11.5))
+                                .color(p.txt3),
+                        );
+                    }
                 });
             }
         }
@@ -31901,6 +31988,7 @@ mod tests {
             absent_scans: 0,
             absent_since: None,
             serial_less: false,
+            long_touch: false,
         });
 
         app.select_device("serial:BBB".into());
@@ -31934,6 +32022,7 @@ mod tests {
             absent_scans: 0,
             absent_since: None,
             serial_less: false,
+            long_touch: false,
         }
     }
 
@@ -32399,6 +32488,40 @@ mod tests {
         assert!(app.reset_arm.is_none());
         let err = app.security_keys.error.unwrap_or_default();
         assert!(err.contains("Unplug Molto2"), "{err}");
+    }
+
+    #[test]
+    fn an_armed_reset_remembers_that_the_key_wants_a_long_touch() {
+        let path = std::path::PathBuf::from("/dev/hidraw7");
+        let key = Device {
+            hid_path: Some(path.clone()),
+            ..test_key("k", "SERIAL01", None)
+        };
+        for flag in [None, Some(false), Some(true)] {
+            let mut app = App {
+                devices: vec![key.clone()],
+                selected_device: Some("k".into()),
+                security_keys: SecurityKeysState {
+                    info: Some(AuthenticatorInfo {
+                        long_touch_for_reset: flag,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            app.arm_fido_reset_with(vec![FidoHid {
+                path: path.clone(),
+                serial: Some("SERIAL01".into()),
+                ids: (0x1050, 0x0407),
+                usb_device: None,
+            }]);
+            assert_eq!(
+                app.reset_arm.as_ref().map(|a| a.long_touch),
+                Some(flag == Some(true)),
+                "{flag:?}"
+            );
+        }
     }
 
     /// Refusing to arm (KEY-005) ends the ceremony, exactly as Cancel does. An
@@ -35777,6 +35900,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_security_policy_card_shows_a_long_touch_reset_like_fido_info() {
+        let long = AuthenticatorInfo {
+            long_touch_for_reset: Some(true),
+            min_pin_length: Some(6),
+            ..Default::default()
+        };
+        let reset_row = ("Reset", "Needs a long touch".to_string());
+        // With authenticatorConfig: after the other settings.
+        let rows = fido_policy_rows(Some(&long), true);
+        assert_eq!(rows.first().map(|r| r.0), Some("Minimum PIN length"));
+        assert_eq!(rows.last(), Some(&reset_row));
+        // Without it: the reset row alone, as `fido info` still shows it.
+        assert_eq!(fido_policy_rows(Some(&long), false), vec![reset_row]);
+        // Absent or false: no row, and no card at all without authenticatorConfig.
+        for flag in [None, Some(false)] {
+            let info = AuthenticatorInfo {
+                long_touch_for_reset: flag,
+                ..Default::default()
+            };
+            assert!(fido_policy_rows(Some(&info), true)
+                .iter()
+                .all(|r| r.0 != "Reset"));
+            assert!(fido_policy_rows(Some(&info), false).is_empty());
+            assert!(!fido_reset_needs_long_touch(Some(&info)));
+        }
+        assert!(fido_reset_needs_long_touch(Some(&long)));
+        assert!(!fido_reset_needs_long_touch(None));
+    }
+
+    #[test]
+    fn a_long_touch_reset_says_touch_and_hold() {
+        assert_eq!(
+            fido_reset_job_label(false),
+            "Resetting key\u{2026} (touch now)"
+        );
+        assert!(fido_reset_job_label(true).contains("touch and hold"));
+        // Still a touch job, so the touch banner comes up.
+        assert!(job_waits_for_touch(fido_reset_job_label(true)));
+        assert_eq!(
+            fido_reset_touch_line(false),
+            "key will blink. Touch it to finish the wipe."
+        );
+        assert!(fido_reset_touch_line(true).contains("Touch and hold it"));
+    }
+
+    #[test]
+    fn an_unverified_tab_says_why_it_is_unverified() {
+        // FIDO2 reached only through the key's reader.
+        let mut reader_only = test_key("reader:key", "12345678", None);
+        reader_only.caps.insert(Caps::FIDO2);
+        reader_only.unverified.insert(Caps::FIDO2);
+        reader_only.reader = Some("Yubico YubiKey OTP+FIDO+CCID 0".into());
+        for tab in [CapTab::Fido2, CapTab::Vault] {
+            for non_admin in [false, true] {
+                let hint = unverified_tab_hint(&reader_only, tab, non_admin);
+                assert!(
+                    hint.contains("only through its smart-card reader"),
+                    "{hint}"
+                );
+                assert!(
+                    !hint.contains("no smart-card reader was available"),
+                    "{hint}"
+                );
+                // Never a next step that can't help: no udev rules (Linux
+                // never needs them to see a USB FIDO interface).
+                assert!(!hint.contains("udev"), "{hint}");
+                // The administrator step only when the rights check says
+                // so, in the existing button's words.
+                assert_eq!(
+                    hint.contains("Restart as administrator"),
+                    non_admin,
+                    "{hint}"
+                );
+                assert!(hint.ends_with("gives a definite answer."), "{hint}");
+            }
+        }
+        // FIDO2 over USB whose interface gave no clear answer.
+        let mut usb = reader_only.clone();
+        usb.hid_path = Some(std::path::PathBuf::from("/dev/hidraw9"));
+        for non_admin in [false, true] {
+            let hint = unverified_tab_hint(&usb, CapTab::Fido2, non_admin);
+            assert!(hint.contains("USB FIDO interface"), "{hint}");
+            assert!(!hint.contains("administrator"), "{hint}");
+        }
+        // Anything else keeps the reader explanation.
+        assert!(unverified_tab_hint(&reader_only, CapTab::Otp, true)
+            .contains("no smart-card reader was available"));
+    }
+
     /// Issue #84: a FIDO2 card in a reader must take the in-place reset route,
     /// and nothing else may. The replug ceremony physically cannot complete
     /// for a card (nothing to unplug, no touch surface, and the arm's removal
@@ -38943,6 +39156,7 @@ mod tests {
             absent_scans: 0,
             absent_since: None,
             serial_less: false,
+            long_touch: false,
         }
     }
 
