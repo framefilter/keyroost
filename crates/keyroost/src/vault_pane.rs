@@ -3942,7 +3942,13 @@ pub(crate) struct ImportDialog {
     pub rows: Vec<ImportRow>,
     /// What the dialog says: a backup that didn't open, an import refused.
     pub notice: Option<String>,
+    /// The passphrase box asks for the keyboard on the next frame: once,
+    /// when the dialog opens on it.
+    pub focus_passphrase: bool,
 }
+
+/// The passphrase box's widget ID, so the dialog can hand it the keyboard.
+const IMPORT_PASSPHRASE_ID: &str = "vault-import-passphrase";
 
 impl ImportDialog {
     pub(crate) fn new(path: PathBuf, target: ImportTarget, new_name: String) -> Self {
@@ -3954,6 +3960,7 @@ impl ImportDialog {
             incoming: None,
             rows: Vec::new(),
             notice: None,
+            focus_passphrase: true,
         }
     }
 }
@@ -3969,6 +3976,7 @@ impl TypedSecrets for ImportDialog {
             incoming: _,
             rows: _,
             notice: _,
+            focus_passphrase: _,
         } = self;
         vec![passphrase]
     }
@@ -4353,10 +4361,14 @@ impl App {
                     ui.add_sized([LABEL_W, 24.0], label("Passphrase"));
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut d.passphrase)
+                            .id(egui::Id::new(IMPORT_PASSPHRASE_ID))
                             .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_width(f32::INFINITY)
                             .password(true),
                     );
+                    if std::mem::take(&mut d.focus_passphrase) {
+                        resp.request_focus();
+                    }
                     guard_secret_field(ui.ctx(), &resp);
                     open = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 });
@@ -9629,6 +9641,45 @@ mod tests {
             assert!(text.contains(line), "{line}: {text}");
         }
         assert!(!text.contains("Tick all"), "{text}");
+    }
+
+    #[test]
+    fn the_passphrase_box_takes_focus_once_when_the_dialog_opens() {
+        use crate::tests::TestFrame;
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &key_vault());
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        import_dialog_for(&mut app, Path::new("personal.t2vault"));
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let palette = Palette::new(crate::ui::theme::Mode::Dark, Palette::ACCENTS[0], false);
+        let mut frame = |app: &mut App| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.test_frame(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    app.render_vault_list(ui, &palette);
+                });
+            });
+        };
+        frame(&mut app);
+        frame(&mut app);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(egui::Id::new(IMPORT_PASSPHRASE_ID)),
+            "the passphrase box has the keyboard"
+        );
+        // Asked once: focus moved elsewhere stays there.
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new(IMPORT_PASSPHRASE_ID)));
+        frame(&mut app);
+        frame(&mut app);
+        assert_eq!(ctx.memory(|m| m.focused()), None, "not taken again");
     }
 
     #[test]
