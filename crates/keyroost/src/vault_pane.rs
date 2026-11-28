@@ -405,8 +405,14 @@ pub(crate) fn experimental_line(ui: &mut egui::Ui, p: &Palette, tail: &str) {
         };
         // The pill says "Experimental": the sentence starts after it.
         ui.add(text("Please "));
+        // Colored and underlined here, as the app's other links are colored:
+        // the theme's text-color override would otherwise paint it as
+        // plain text, and egui underlines a link only while hovered.
         ui.hyperlink_to(
-            egui::RichText::new("report problems").font(theme::f_reg(11.5)),
+            egui::RichText::new("report problems")
+                .font(theme::f_reg(11.5))
+                .color(ui.visuals().hyperlink_color)
+                .underline(),
             ISSUES_URL,
         );
         ui.add(text(tail));
@@ -10829,6 +10835,47 @@ mod tests {
             text.contains("Please report problems and keep a backup."),
             "{text}"
         );
+    }
+
+    /// "report problems" looks like a link without hovering: underlined,
+    /// in the theme's link color (the accent), though the theme overrides
+    /// every other text's color.
+    #[test]
+    fn the_report_problems_link_is_underlined_in_the_link_color() {
+        use crate::tests::TestFrame;
+        use crate::ui::theme::Mode;
+        fn find(shape: &egui::Shape, out: &mut Vec<egui::epaint::TextShape>) {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == "report problems" => out.push(t.clone()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, out)),
+                _ => {}
+            }
+        }
+        for (mode, name) in [(Mode::Dark, "dark"), (Mode::Light, "light")] {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            let palette = Palette::new(mode, Palette::ACCENTS[0], false);
+            palette.apply(&ctx, mode);
+            let output = ctx.test_frame(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| experimental_note(ui, &palette));
+            });
+            let mut links = Vec::new();
+            for clipped in &output.shapes {
+                find(&clipped.shape, &mut links);
+            }
+            let [link] = links.as_slice() else {
+                panic!("one link: {}", links.len());
+            };
+            let format = &link.galley.job.sections[0].format;
+            assert_eq!(format.color, palette.accent, "{name}");
+            assert_eq!(
+                ctx.global_style().visuals.hyperlink_color,
+                palette.accent,
+                "the accent is the link color"
+            );
+            assert!(format.underline.width > 0.0, "{name}: underlined");
+            assert_eq!(format.underline.color, palette.accent, "{name}");
+        }
     }
 
     /// The vault's questions come into view once when asked: the flag is
