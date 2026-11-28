@@ -8279,6 +8279,9 @@ fn fido_reset_after_replug(
     step_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serial_less = expected_serial.is_empty();
+    // Read while the key is surely connected, not in the post-power-up
+    // window the reset has to land in: whether its touch prompt says hold.
+    let long_touch = fido_reset_needs_long_touch_at(armed_path);
 
     // No Enter to press: the replug itself is the go-ahead. Watching the cheap
     // HID-only scan (no identity reads) keeps the poll light; a run nobody
@@ -8400,9 +8403,37 @@ fn fido_reset_after_replug(
     // Exactly one touch prompt: this step's name when there is one (factory
     // reset), else `fido_reset_at`'s own generic one (standalone `fido reset`).
     if let Some(name) = step_name {
-        crate::prompt::touch(&format!("{name}  touch the key now\u{2026}"));
+        crate::prompt::touch(&format!(
+            "{name}  {}\u{2026}",
+            fido_reset_touch_words(long_touch)
+        ));
     }
-    fido_reset_at(&path, needs_generic_touch_prompt(step_name))
+    fido_reset_at(&path, needs_generic_touch_prompt(step_name), long_touch)
+}
+
+/// Whether the FIDO key at `path` says a reset needs a long touch (getInfo
+/// `longTouchForReset`). Any failure to ask (a U2F-only key, an interface
+/// that won't open) reads as no: the prompt then keeps its usual words.
+fn fido_reset_needs_long_touch_at(path: &Path) -> bool {
+    let Ok((mut dev, init)) = open_ctap_hid(path) else {
+        return false;
+    };
+    init.supports_cbor()
+        && keyroost_ctap::get_info(&mut dev)
+            .ok()
+            .and_then(|i| i.long_touch_for_reset)
+            == Some(true)
+}
+
+/// The FIDO2 reset's touch instruction: "touch and hold" on a key that says
+/// a reset needs a long touch ([`fido_reset_needs_long_touch_at`]), else the
+/// usual one. No duration: CTAP 2.2 and 2.3 name different ones.
+fn fido_reset_touch_words(long_touch: bool) -> &'static str {
+    if long_touch {
+        "touch and hold the key now"
+    } else {
+        "touch the key now"
+    }
 }
 
 /// Whether [`fido_reset_at`] must print its own generic touch prompt: only
@@ -16656,16 +16687,19 @@ fn same_piv_card(confirmed: Option<u128>, now: Option<u128>) -> bool {
 /// `announce_touch` prints this function's own generic touch prompt; the
 /// caller sets it `false` when it already printed its own (naming its step)
 /// right before calling in, so the two never stack into two prompts for one
-/// reset ([`fido_reset_after_replug`]).
+/// reset ([`fido_reset_after_replug`]). `long_touch` makes that prompt say
+/// to touch and hold ([`fido_reset_touch_words`]).
 fn fido_reset_at(
     path: &std::path::Path,
     announce_touch: bool,
+    long_touch: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut dev, _init) = open_ctap_hid(path)?;
     if announce_touch {
         crate::prompt::touch(&format!(
-            "Resetting {} — touch the key now…",
-            path.display()
+            "Resetting {} — {}…",
+            path.display(),
+            fido_reset_touch_words(long_touch)
         ));
     }
     // Names read from keys before or during the write are stale.
@@ -29356,6 +29390,17 @@ mod piv_mgmt_alg_gate {
         ] {
             assert_eq!(alg.to_choice().to_mgmt_alg(), Some(alg.to_alg()));
         }
+    }
+}
+
+#[cfg(test)]
+mod fido_reset_touch {
+    use super::fido_reset_touch_words;
+
+    #[test]
+    fn a_key_that_wants_a_long_touch_is_told_to_hold() {
+        assert_eq!(fido_reset_touch_words(false), "touch the key now");
+        assert_eq!(fido_reset_touch_words(true), "touch and hold the key now");
     }
 }
 
