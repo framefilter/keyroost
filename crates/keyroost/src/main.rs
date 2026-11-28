@@ -149,6 +149,12 @@ fn idle_locked_msg_for(d: std::time::Duration) -> String {
     )
 }
 
+/// The idle lock in plain words: what the log says, and what is shown where
+/// there is nothing to unlock again (a first PIN being typed).
+fn idle_locked_plain_msg() -> String {
+    format!("Locked after {} of inactivity.", idle_lock_span())
+}
+
 /// What a dialog the idle lock closed says.
 fn idle_closed_msg() -> String {
     format!("Closed after {} of inactivity.", idle_lock_span())
@@ -8107,7 +8113,8 @@ impl App {
     /// ([`Self::vault_idle_lock`]); without, a vault whose form holds unsaved
     /// changes stays open. Local only — no device I/O.
     fn idle_lock(&mut self, include_vault: bool) {
-        if self.security_keys.session.is_some() {
+        let session_locked = self.security_keys.session.is_some();
+        if session_locked {
             self.lock_session();
             self.security_keys.error = Some(idle_locked_msg());
         }
@@ -8122,7 +8129,13 @@ impl App {
         if self.security_keys.change_pin.has_pin_input() {
             // Replacing the form wipes its PINs (ChangePinDialog's Drop).
             self.security_keys.change_pin = ChangePinDialog::default();
-            self.security_keys.error = Some(idle_locked_msg());
+            // A first PIN on a key with none: nothing to unlock again.
+            let first_pin = pin_support(self.security_keys.info.as_ref()) == PinSupport::NotSet;
+            self.security_keys.error = Some(if first_pin && !session_locked {
+                idle_locked_plain_msg()
+            } else {
+                idle_locked_msg()
+            });
         }
         // What a typed password opened: the dialog holding it closes, as its
         // own Close would, dropping it with its typed secrets. The import
@@ -8210,10 +8223,7 @@ impl App {
             self.ftotp.forget_codes();
             self.ftotp.info = Some(idle_hidden_msg());
         }
-        self.log(
-            Severity::Info,
-            format!("Locked after {} of inactivity.", idle_lock_span()),
-        );
+        self.log(Severity::Info, idle_locked_plain_msg());
     }
 
     /// Copy a secret (an OTP / OATH code, a generated management key) to the
@@ -38468,6 +38478,34 @@ mod tests {
             assert!(app.security_keys.change_pin.confirm.is_empty(), "{case}");
             assert_eq!(app.security_keys.error, Some(idle_locked_msg()), "{case}");
             assert!(!app.holds_unlocked_secrets(), "{case}");
+        }
+    }
+
+    /// On a key with no PIN yet there is nothing to unlock: the idle lock
+    /// that wipes a half-typed first PIN says only that it locked. A key
+    /// with a PIN keeps "unlock again".
+    #[test]
+    fn idle_lock_of_a_first_pin_says_nothing_about_unlocking() {
+        for (client_pin, want) in [
+            (false, "Locked after 5 minutes of inactivity.".to_owned()),
+            (true, idle_locked_msg()),
+        ] {
+            let mut app = App::default();
+            app.security_keys.info = Some(AuthenticatorInfo {
+                options: vec![("clientPin".into(), client_pin)],
+                ..Default::default()
+            });
+            app.security_keys.change_pin = ChangePinDialog {
+                open: true,
+                old: String::new(),
+                new: "new-pin".into(),
+                confirm: String::new(),
+            };
+            let t0 = std::time::Instant::now();
+            app.idle_lock_tick(t0, false);
+            app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+            assert!(app.security_keys.change_pin.new.is_empty(), "{client_pin}");
+            assert_eq!(app.security_keys.error, Some(want), "{client_pin}");
         }
     }
 
