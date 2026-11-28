@@ -3819,6 +3819,16 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 ///   these — unlike [`PivExtension::ResetGlobal`]'s
 ///   `Verdict::KnownUnsupportedSince` row above, which has a standing reason
 ///   (this vendor's own architecture) to expect it never comes back.
+/// * [`PivExtension::ManagementKeyAlgorithm`] — 3DES and AES-256
+///   `Verdict::KnownSupported` at the universal `[]` version; AES-128 and
+///   AES-192 `Verdict::KnownUnsupported` at firmware 1.9.1 (`[1, 9, 1]`). A
+///   live unit at 1.8.3 rejected both, a live unit at 1.9.1 answered SET
+///   MANAGEMENT KEY with AES-192 with `6A80`, and piv-authenticator 0.7.0
+///   (firmware 1.9.0/1.9.1) defines `AdministrationAlgorithm` as `Tdes` and
+///   `Aes256` only, failing any other algorithm byte with
+///   IncorrectDataParameter (v0.7.0 `src/state.rs` lines 54-60,
+///   `src/lib.rs` lines 290-293). The backward rule covers older firmware;
+///   a newer one softens to [`FeatureGate::Unverified`].
 /// * [`PivExtension::SlotPinPolicy`], [`PivExtension::SlotTouchPolicy`] —
 ///   `Verdict::KnownUnsupported` at firmware 1.9.1 (`[1, 9, 1]`), the newest
 ///   release whose source was read; the backward rule covers every older
@@ -3931,23 +3941,30 @@ const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             verdict: Verdict::KnownSupported,
         }],
     },
-    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{Aes128,Aes192})`
-    // joins this row: both are rejected on firmware 1.8.3 (the newest
-    // tested) and, per `Verdict::KnownUnsupported`'s backward-extension
-    // rule, assumed rejected on every earlier version too — a firmware newer
-    // than 1.8.3 softens to `FeatureGate::Unverified` rather than staying
-    // `Unsupported`, since a later release may have added them.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::SetPinPukRetries,
             PivExtension::MoveKey,
             PivExtension::DeleteKey,
             PivExtension::Attest,
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[1, 8, 3],
+            verdict: Verdict::KnownUnsupported,
+        }],
+    },
+    // AES-128/AES-192 management keys: rejected on firmware 1.8.3 and 1.9.1
+    // (hardware), and absent from piv-authenticator 0.7.0's
+    // `AdministrationAlgorithm` (firmware 1.9.0/1.9.1), which takes only
+    // 3DES and AES-256. Pinned to 1.9.1; the backward rule covers older
+    // firmware, a newer one softens to `FeatureGate::Unverified`.
+    ExtensionVerdicts {
+        extensions: &[
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
         ],
         verdicts: &[VersionVerdict {
-            version: &[1, 8, 3],
+            version: &[1, 9, 1],
             verdict: Verdict::KnownUnsupported,
         }],
     },
@@ -9611,7 +9628,7 @@ mod tests {
     }
 
     #[test]
-    fn nitrokey_firmware_axis_gates_mgmt_alg_by_firmware_1_8_3() {
+    fn nitrokey_firmware_axis_gates_mgmt_alg_by_firmware_1_9_1() {
         let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
         // 3DES/AES-256 supported at any reported firmware.
         for alg in [MgmtAlgChoice::TripleDes, MgmtAlgChoice::Aes256] {
@@ -9626,10 +9643,10 @@ mod tests {
                 "{alg:?}"
             );
         }
-        // AES-128/AES-192 known-unsupported up to and including 1.8.3 —
-        // extended backward to an earlier firmware too.
+        // AES-128/AES-192 known-unsupported up to and including 1.9.1 —
+        // extended backward to earlier firmware too.
         for alg in [MgmtAlgChoice::Aes128, MgmtAlgChoice::Aes192] {
-            for fw in [&[1u8, 8, 3][..], &[1, 2, 0][..]] {
+            for fw in [&[1u8, 9, 1][..], &[1, 9, 0], &[1, 8, 3][..], &[1, 2, 0][..]] {
                 assert_eq!(
                     resolve(
                         PivExtension::ManagementKeyAlgorithm(alg),
@@ -9648,12 +9665,34 @@ mod tests {
                     PivExtension::ManagementKeyAlgorithm(alg),
                     fp,
                     None,
-                    Some(&[1, 9, 0])
+                    Some(&[1, 9, 2])
                 ),
                 FeatureGate::Unverified,
                 "{alg:?}"
             );
         }
+    }
+
+    /// A Nitrokey 3 at firmware 1.9.1 as `piv mgmt-key change` sees it: the
+    /// applet's dummy version 6.6.6 (GET VERSION `06 06 06`) and the admin
+    /// application's firmware string "1.9.1". The AES-192 default resolves
+    /// Unsupported (the card answers SET MANAGEMENT KEY with `6A80`), so the
+    /// command refuses it before sending anything.
+    #[test]
+    fn a_nitrokey_3_on_firmware_1_9_1_rejects_the_aes_192_default() {
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
+        let gate = |alg| {
+            resolve(
+                PivExtension::ManagementKeyAlgorithm(alg),
+                fp,
+                Some(&[6, 6, 6]),
+                Some(&[1, 9, 1]),
+            )
+        };
+        assert_eq!(gate(MgmtAlgChoice::Aes192), FeatureGate::Unsupported);
+        assert_eq!(gate(MgmtAlgChoice::Aes128), FeatureGate::Unsupported);
+        assert_eq!(gate(MgmtAlgChoice::TripleDes), FeatureGate::Supported);
+        assert_eq!(gate(MgmtAlgChoice::Aes256), FeatureGate::Supported);
     }
     // --- import key (#174) ---
 

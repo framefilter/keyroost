@@ -6,4 +6,6 @@
   or --algorithm aes256."), with `--force` as the last resort. That
   includes the AES-192 default on keys whose list rejects it, such as a
   Nitrokey 3: the default is never swapped silently. Before, the command
-  was sent anyway. ([#297])
+  was sent anyway. keyroost's list now also marks AES-128 and AES-192
+  unsupported on Nitrokey 3 firmware 1.9.0 and 1.9.1, where it had
+  marked them unverified. ([#297])

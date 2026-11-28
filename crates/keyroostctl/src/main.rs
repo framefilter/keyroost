@@ -11540,17 +11540,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         } else {
                             // Only on the road to an error: one table lookup
                             // (and fingerprint probe) per algorithm.
-                            let takes: Vec<CliPivMgmtAlg> = CliPivMgmtAlg::value_variants()
-                                .iter()
-                                .copied()
-                                .filter(|a| {
-                                    s.feature_gate(
-                                        keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm(
-                                            a.to_choice(),
-                                        ),
-                                    ) == keyroost_piv::compat::FeatureGate::Supported
-                                })
-                                .collect();
+                            let takes = mgmt_algs_supported(|alg| {
+                                s.feature_gate(
+                                    keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm(alg),
+                                )
+                            });
                             return Err(mgmt_alg_refusal(*algorithm, &takes).into());
                         }
                     }
@@ -12831,6 +12825,18 @@ fn check_piv_feature(
             Err(msg.into())
         }
     }
+}
+
+/// The management-key algorithms `gate` (a key's table lookup) resolves
+/// `Supported`, in `--algorithm`'s order: the ones a refusal offers instead.
+fn mgmt_algs_supported(
+    mut gate: impl FnMut(keyroost_piv::compat::MgmtAlgChoice) -> keyroost_piv::compat::FeatureGate,
+) -> Vec<CliPivMgmtAlg> {
+    CliPivMgmtAlg::value_variants()
+        .iter()
+        .copied()
+        .filter(|a| gate(a.to_choice()) == keyroost_piv::compat::FeatureGate::Supported)
+        .collect()
 }
 
 /// The refusal for `piv mgmt-key change --algorithm <chosen>` on a key whose
@@ -29348,7 +29354,37 @@ mod cli_tests {
 
 #[cfg(test)]
 mod piv_mgmt_alg_gate {
-    use super::{mgmt_alg_refusal, CliPivMgmtAlg};
+    use super::{mgmt_alg_refusal, mgmt_algs_supported, CliPivMgmtAlg};
+
+    /// A Nitrokey 3 at firmware 1.9.1 as this command sees it: the Trussed
+    /// fingerprint, the applet's dummy version 6.6.6 and firmware "1.9.1"
+    /// from the admin application. A plain `piv mgmt-key change` (the
+    /// AES-192 default) went out to such a key and got `6A80`; it is now
+    /// refused before anything is sent, with the algorithms it takes.
+    #[test]
+    fn a_nitrokey_3_on_1_9_1_refuses_the_aes_192_default_with_what_it_takes() {
+        use keyroost_piv::compat::{resolve, FeatureGate, PivExtension};
+        use keyroost_piv::fingerprint::{AppletFingerprint, TrussedVariant};
+        let fp = AppletFingerprint::Trussed(TrussedVariant::Nitrokey);
+        let fw = keyroost_piv::fingerprint::parse_dotted_version("1.9.1");
+        let gate = |alg| {
+            resolve(
+                PivExtension::ManagementKeyAlgorithm(alg),
+                fp,
+                Some(&[6, 6, 6]),
+                fw.as_deref(),
+            )
+        };
+        assert_eq!(
+            gate(CliPivMgmtAlg::Aes192.to_choice()),
+            FeatureGate::Unsupported
+        );
+        let takes = mgmt_algs_supported(gate);
+        assert_eq!(takes, [CliPivMgmtAlg::TripleDes, CliPivMgmtAlg::Aes256]);
+        assert!(mgmt_alg_refusal(CliPivMgmtAlg::Aes192, &takes).contains(
+            "This key takes 3DES or AES-256: pass --algorithm 3des or --algorithm aes256."
+        ));
+    }
 
     #[test]
     fn an_unsupported_management_key_algorithm_names_the_ones_the_key_takes() {
