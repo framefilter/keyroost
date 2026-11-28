@@ -320,7 +320,11 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   hardware-verified on an ePass FIDO NFC Plus
   ([#268](https://github.com/framefilter/keyroost/pull/268)); and the
   Feitian OTP reset, the FIDO HID fallback, and a Feitian key's own serial
-  and COS version ([#273](https://github.com/framefilter/keyroost/pull/273)).
+  and COS version ([#273](https://github.com/framefilter/keyroost/pull/273));
+  and CanoKey support for firmware 3.1 (the key as one entry with its
+  serial, OATH through its Admin applet, PIV and OpenPGP, and its
+  device-wide factory reset), hardware-verified on a CanoKey Canary
+  ([#296](https://github.com/framefilter/keyroost/pull/296)).
 - **[@dlacko](https://github.com/dlacko)** — `openpgp info` cardholder name
   and public-key URL: the CLI prints the `005B` name and `5F50` URL
   (`cardholder_name` and `url` in `--json`), and the app's Card details
