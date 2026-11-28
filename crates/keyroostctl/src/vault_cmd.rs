@@ -1939,18 +1939,22 @@ pub(crate) fn write_password_only(out: &mut impl Write, p: &str) -> io::Result<(
     out.write_all(p.as_bytes())
 }
 
-/// Erases the shown password once the Enter wait is over. The reader
-/// (rpassword) writes a newline to the terminal when it returns, which
-/// leaves the cursor at the start of the line below the password: up one
-/// line, then clear that whole line.
-pub(crate) fn erase_shown_line() -> &'static str {
-    "\x1b[1A\x1b[2K"
+/// Written right before the password line: eight empty rows, back up to
+/// the first, and the cursor saved there. A long password wraps onto
+/// several rows (128 characters and the label are wider than a usual
+/// terminal), and the reader's newline adds one; with the room made first,
+/// none of that scrolls the screen, so the saved cursor still marks where
+/// the password starts.
+pub(crate) fn before_password() -> &'static str {
+    "\n\n\n\n\n\n\n\n\x1b[8A\x1b7"
 }
 
-/// Erases the password when the Enter wait failed: no newline was written,
-/// so the password is still on the cursor's own line.
-pub(crate) fn erase_current_line() -> &'static str {
-    "\r\x1b[2K"
+/// Erases the shown password once the Enter wait is over, or failed: back
+/// to the cursor [`before_password`] saved, then clear to the end of the
+/// screen, so every row the password wrapped onto goes, with or without
+/// the reader's newline.
+pub(crate) fn erase_password() -> &'static str {
+    "\x1b8\x1b[J"
 }
 
 /// Whether the terminal the Enter wait reads (and the reader writes its
@@ -1997,15 +2001,11 @@ fn show_until_enter(e: &Entry) -> Result<(), Box<dyn Error>> {
     // Shown on a terminal: no control characters reach it. (Trailing
     // spaces trimmed: invisible there anyway.)
     let shown = wiped_line(REVEAL_LABEL, &e.password);
+    out.write_all(before_password().as_bytes())?;
     out.write_all(shown.as_bytes())?;
     out.flush()?;
     let waited = rpassword::prompt_password("").map(Zeroizing::new);
-    let erase = if waited.is_ok() {
-        erase_shown_line()
-    } else {
-        erase_current_line()
-    };
-    out.write_all(erase.as_bytes())?;
+    out.write_all(erase_password().as_bytes())?;
     out.flush()?;
     waited.map(drop).map_err(|err| match err.kind() {
         io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof => {
@@ -3448,15 +3448,20 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// The reader for Enter (rpassword) writes a newline when it returns, so
-    /// the cursor is one line below the shown password: up one line, then
-    /// clear that whole line.
+    /// Room for a wrapped password first, so nothing scrolls while it is
+    /// up and the saved cursor still marks its start; the erase goes back
+    /// there and clears to the end of the screen, whatever wrapped and
+    /// whether or not the reader wrote its newline.
     #[test]
-    fn erase_sequence_after_the_readers_newline() {
-        assert_eq!(erase_shown_line(), "\x1b[1A\x1b[2K");
-        // A reader that failed wrote no newline: the password is on the
-        // cursor's own line.
-        assert_eq!(erase_current_line(), "\r\x1b[2K");
+    fn erase_sequence_clears_a_wrapped_password() {
+        let before = before_password();
+        let room = before.bytes().take_while(|&b| b == b'\n').count();
+        assert_eq!(room, 8);
+        assert_eq!(&before[room..], "\x1b[8A\x1b7", "back up as far, then save");
+        // "Password: " and the longest generated password (128) wrap onto
+        // at most 7 rows of a 20-column terminal; the newline is the 8th.
+        assert!((REVEAL_LABEL.len() + 128).div_ceil(20) < room);
+        assert_eq!(erase_password(), "\x1b8\x1b[J");
     }
 
     #[test]
