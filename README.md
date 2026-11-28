@@ -251,7 +251,12 @@ Beyond the maintainers, keyroost is grateful for community contributions:
 - **[@token2](https://github.com/token2)** — contributed on-device TOTP/HOTP
   management for Token2 FIDO keys (PIN+ / FIDO2+), and published the protocol
   reference it was built from
-  ([#24](https://github.com/framefilter/keyroost/pull/24)). Followed up with
+  ([#24](https://github.com/framefilter/keyroost/pull/24)), then OTP over a
+  smart-card reader, the key's full serial, the interface toggle and touch
+  HOTP codes in the app
+  ([#27](https://github.com/framefilter/keyroost/pull/27)), and the PIN+
+  Series capabilities in this README
+  ([#28](https://github.com/framefilter/keyroost/pull/28)). Followed up with
   fingerprint/bio enrollment, FIDO Metadata Service (MDS) display, and a
   rounding-out of the on-device OTP support — all validated on real PIN+
   hardware ([#29](https://github.com/framefilter/keyroost/issues/29),
@@ -277,7 +282,7 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   ([#96](https://github.com/framefilter/keyroost/pull/96)).
 - **[@errant253](https://github.com/errant253)** — README improvements: the
   distro-neutrality disclaimer, install-command corrections and an intro
-  rewrite ([#35](https://github.com/framefilter/keyroost/issues/35),
+  rewrite ([#35](https://github.com/framefilter/keyroost/pull/35),
   [#45](https://github.com/framefilter/keyroost/issues/45)).
 - **[@MakeShiftArtist](https://github.com/MakeShiftArtist)** — the Nix flake:
   `keyroost` and `keyroostctl` packages plus a development shell, tested on
