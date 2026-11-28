@@ -32,7 +32,8 @@ keyroost-canokey = { path = "../keyroost-canokey", version = "0.16.0" }
 keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.16.0" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.16.0" }
 keyroost-qr = { path = "../keyroost-qr", version = "0.16.0" }
-# Windows: notice a FIDO key that only an administrator may open (inert elsewhere).
+# Windows: notice a FIDO key that only an administrator may open (inert elsewhere);
+# every platform: erase a password `fido vault entry show --reveal` shows on Ctrl+C.
 keyroost-winwebauthn = { path = "../keyroost-winwebauthn", version = "0.16.0" }
 keyroost-import = { path = "../keyroost-import", version = "0.16.0", features = ["bulk", "encrypted"] }
 # Host-side RSA keygen / key-file loading for OpenPGP on-card import. Shared with

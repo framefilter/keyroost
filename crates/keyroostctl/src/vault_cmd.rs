@@ -1976,41 +1976,71 @@ fn terminal_opens() -> io::Result<()> {
     }
 }
 
+/// What a shown password's cancel says. The Ctrl+C handler writes it
+/// itself ([`INTERRUPTED_NOTE`]), as the process ends there.
+const CANCELED_SHOWN: &str = "canceled while the password was shown; it is erased";
+
+/// [`CANCELED_SHOWN`] as the CLI prints an error, for the Ctrl+C handler.
+const INTERRUPTED_NOTE: &str = "error: canceled while the password was shown; it is erased\n";
+
+/// What [`show_until_enter`] needs before anything is asked: the terminal
+/// the Enter wait reads opens, and on Windows the console can erase (VT
+/// processing, held until the erase is written, then the console mode is
+/// put back). Checked before the PIN and the touch, so nothing is asked
+/// when the password couldn't be shown.
+pub(crate) struct RevealReady {
+    #[cfg(windows)]
+    _vt: keyroost_winwebauthn::ConsoleVt,
+}
+
+/// Get [`RevealReady`], or say why the password won't be shown.
+fn reveal_ready() -> Result<RevealReady, Box<dyn Error>> {
+    terminal_opens().map_err(|err| {
+        format!("could not open the terminal to wait for Enter ({err}); the password was not shown")
+    })?;
+    // The classic console prints the erase's escape sequences as text and
+    // leaves the password up unless VT processing is on.
+    #[cfg(windows)]
+    let _vt = keyroost_winwebauthn::console_vt().ok_or(
+        "this console can't erase the password afterwards (the legacy console); \
+         the password was not shown. Use Windows Terminal",
+    )?;
+    Ok(RevealReady {
+        #[cfg(windows)]
+        _vt,
+    })
+}
+
 /// [`RevealPlan::ShowUntilEnter`]: the entry, `Password: p` with no
 /// newline, a wait for Enter at the terminal (never stdin, which may carry
-/// the PIN), then the password line erased.
-fn show_until_enter(e: &Entry) -> Result<(), Box<dyn Error>> {
+/// the PIN), then the password line erased. Ctrl+C while it is up erases
+/// it too, then the process ends as interrupted.
+fn show_until_enter(e: &Entry, _ready: RevealReady) -> Result<(), Box<dyn Error>> {
     let lines = entry_lines(e);
     let mut out = io::stdout();
     if e.password.is_empty() {
         print_lines(&mut out, &lines)?;
         return Ok(());
     }
-    terminal_opens().map_err(|err| {
-        format!("could not open the terminal to wait for Enter ({err}); the password was not shown")
-    })?;
-    // The classic console prints the erase's escape sequences as text and
-    // leaves the password up unless VT processing is on; held until the
-    // erase is written, then the console mode is put back.
-    #[cfg(windows)]
-    let _vt = keyroost_winwebauthn::console_vt().ok_or(
-        "this console can't erase the password afterwards (the legacy console); \
-         the password was not shown. Use Windows Terminal",
-    )?;
     print_lines(&mut out, &lines[..lines.len() - 1])?;
     // Shown on a terminal: no control characters reach it. (Trailing
     // spaces trimmed: invisible there anyway.)
     let shown = wiped_line(REVEAL_LABEL, &e.password);
     out.write_all(before_password().as_bytes())?;
+    out.flush()?;
+    // Armed once the cursor is saved (the erase goes back to it) and
+    // before the reader changes the terminal (the handler puts back what
+    // it finds now); removed once the erase below is written.
+    let _interrupt =
+        keyroost_winwebauthn::erase_on_interrupt(erase_password(), INTERRUPTED_NOTE)
+            .ok_or("could not arrange to erase the password on Ctrl+C; it was not shown")?;
     out.write_all(shown.as_bytes())?;
     out.flush()?;
     let waited = rpassword::prompt_password("").map(Zeroizing::new);
     out.write_all(erase_password().as_bytes())?;
     out.flush()?;
     waited.map(drop).map_err(|err| match err.kind() {
-        io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof => {
-            "canceled while the password was shown; it is erased".into()
-        }
+        io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof => CANCELED_SHOWN.into(),
         _ => format!("could not wait for Enter ({err}); the password is erased").into(),
     })
 }
@@ -2289,6 +2319,13 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             pin,
             path,
         } => {
+            let plan = reveal_plan(io::stdout().is_terminal(), json_output());
+            // Before the PIN and the touch: nothing is asked when the
+            // password couldn't be shown.
+            let ready = match (*reveal, plan) {
+                (true, RevealPlan::ShowUntilEnter) => Some(reveal_ready()?),
+                _ => None,
+            };
             let mut k = open_entry_key(
                 path.as_deref(),
                 *unlock,
@@ -2300,14 +2337,17 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             let n = pick_entry(&open.contents, title, username.as_deref(), true)?;
             let e = &open.contents.entries[n];
             let name = open.vault_ref.name.as_deref();
-            let plan = reveal_plan(io::stdout().is_terminal(), json_output());
-            match (*reveal, plan) {
-                (_, RevealPlan::Json) => {
+            match (*reveal, plan, ready) {
+                (_, RevealPlan::Json, _) => {
                     write_json_wiped(&mut io::stdout().lock(), &entry_show_json(name, e, *reveal))
                 }
-                (false, _) => Ok(print_lines(&mut io::stdout(), &entry_lines(e))?),
-                (true, RevealPlan::ShowUntilEnter) => show_until_enter(e),
-                (true, RevealPlan::PasswordOnly) => {
+                (false, _, _) => Ok(print_lines(&mut io::stdout(), &entry_lines(e))?),
+                (true, RevealPlan::ShowUntilEnter, Some(ready)) => show_until_enter(e, ready),
+                // Never: `ready` is got for this plan before the key opens.
+                (true, RevealPlan::ShowUntilEnter, None) => {
+                    Err("the terminal was not checked; the password was not shown".into())
+                }
+                (true, RevealPlan::PasswordOnly, _) => {
                     let mut out = io::stdout().lock();
                     write_password_only(&mut out, &e.password)?;
                     out.flush()?;
@@ -3452,6 +3492,11 @@ mod tests {
     /// up and the saved cursor still marks its start; the erase goes back
     /// there and clears to the end of the screen, whatever wrapped and
     /// whether or not the reader wrote its newline.
+    #[test]
+    fn the_ctrl_c_note_is_the_cancel_error() {
+        assert_eq!(INTERRUPTED_NOTE, format!("error: {CANCELED_SHOWN}\n"));
+    }
+
     #[test]
     fn erase_sequence_clears_a_wrapped_password() {
         let before = before_password();

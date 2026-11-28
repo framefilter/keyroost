@@ -2318,6 +2318,7 @@ dependencies = [
 name = "keyroost-winwebauthn"
 version = "0.16.0"
 dependencies = [
+ "libc",
  "windows-sys 0.61.2",
 ]
 

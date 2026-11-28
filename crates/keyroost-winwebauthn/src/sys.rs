@@ -387,3 +387,143 @@ pub(crate) fn console_mode_restore(mode: u32) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Ctrl+C while the CLI shows a password: erase it before the process ends.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use windows_sys::Win32::Foundation::HANDLE;
+
+/// The stdout console mode [`console_vt_on`] found, while a [`crate::ConsoleVt`]
+/// holds VT on: the Ctrl+C handler puts it back as the guard's drop would.
+static VT_PREV: AtomicU32 = AtomicU32::new(0);
+static VT_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Record that VT is held over `prev` (called by [`crate::console_vt`]).
+pub(crate) fn note_vt_held(prev: u32) {
+    VT_PREV.store(prev, Ordering::Release);
+    VT_HELD.store(true, Ordering::Release);
+}
+
+/// VT is no longer held (called when the [`crate::ConsoleVt`] drops).
+pub(crate) fn note_vt_released() {
+    VT_HELD.store(false, Ordering::Release);
+}
+
+/// What the handler writes, and the console input it puts back. Set while
+/// an [`crate::EraseOnInterrupt`] is held; `ARMED` says the rest is valid.
+static ARMED: AtomicBool = AtomicBool::new(false);
+static ERASE_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static ERASE_LEN: AtomicUsize = AtomicUsize::new(0);
+static NOTE_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static NOTE_LEN: AtomicUsize = AtomicUsize::new(0);
+static CONIN: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+static CONIN_MODE: AtomicU32 = AtomicU32::new(0);
+
+/// Write `ptr`/`len` (a `&'static str` stored above) to the console `h`.
+///
+/// # Safety
+/// `ptr`/`len` come from a `&'static str`, or are null/0.
+unsafe fn write_console(h: HANDLE, ptr: *const u8, len: usize) {
+    use windows_sys::Win32::System::Console::WriteConsoleA;
+    if ptr.is_null() || len == 0 || h.is_null() || h == INVALID_HANDLE_VALUE {
+        return;
+    }
+    let mut written = 0u32;
+    // SAFETY: the buffer is a live 'static string of `len` bytes; the
+    // count pointer is a live local; a non-console handle makes the call
+    // fail, which leaves nothing to do.
+    unsafe {
+        WriteConsoleA(
+            h,
+            ptr,
+            u32::try_from(len).unwrap_or(u32::MAX),
+            &mut written,
+            std::ptr::null(),
+        );
+    }
+}
+
+/// Runs on a thread of its own when Ctrl+C or Ctrl+Break reaches the
+/// console: writes the erase (stdout) and the note (stderr), puts the
+/// console modes back, and returns FALSE so the next handler (by default,
+/// the one that ends the process with the usual Ctrl+C status) runs.
+unsafe extern "system" fn on_ctrl(ctrl: u32) -> windows_sys::core::BOOL {
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, SetConsoleMode, CTRL_BREAK_EVENT, CTRL_C_EVENT, STD_ERROR_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+    if (ctrl == CTRL_C_EVENT || ctrl == CTRL_BREAK_EVENT) && ARMED.swap(false, Ordering::AcqRel) {
+        // SAFETY: the pointers were stored from 'static strings while armed;
+        // the handles are the process's own standard handles and the
+        // CONIN$ handle the guard keeps open until after it disarms.
+        unsafe {
+            let out = GetStdHandle(STD_OUTPUT_HANDLE);
+            write_console(
+                out,
+                ERASE_PTR.load(Ordering::Acquire),
+                ERASE_LEN.load(Ordering::Acquire),
+            );
+            if VT_HELD.load(Ordering::Acquire) && !out.is_null() && out != INVALID_HANDLE_VALUE {
+                SetConsoleMode(out, VT_PREV.load(Ordering::Acquire));
+            }
+            let conin = CONIN.load(Ordering::Acquire);
+            if !conin.is_null() && conin != INVALID_HANDLE_VALUE {
+                SetConsoleMode(conin, CONIN_MODE.load(Ordering::Acquire));
+            }
+            write_console(
+                GetStdHandle(STD_ERROR_HANDLE),
+                NOTE_PTR.load(Ordering::Acquire),
+                NOTE_LEN.load(Ordering::Acquire),
+            );
+        }
+    }
+    0
+}
+
+/// Arm the Ctrl+C handler: `conin` (the console's input, kept open by the
+/// caller) has its mode saved for the handler to put back. False when one
+/// is already armed or the handler can't be added.
+pub(crate) fn ctrl_erase_arm(erase: &'static str, note: &'static str, conin: HANDLE) -> bool {
+    use windows_sys::Win32::System::Console::{GetConsoleMode, SetConsoleCtrlHandler};
+    if ARMED.load(Ordering::Acquire) {
+        return false;
+    }
+    let mut mode = 0u32;
+    // SAFETY: GetConsoleMode writes one u32 through a pointer to a live
+    // local; a handle that is no console makes it fail (no mode to restore).
+    let have_mode = !conin.is_null() && unsafe { GetConsoleMode(conin, &mut mode) } != 0;
+    CONIN.store(
+        if have_mode {
+            conin
+        } else {
+            std::ptr::null_mut()
+        },
+        Ordering::Release,
+    );
+    CONIN_MODE.store(mode, Ordering::Release);
+    ERASE_PTR.store(erase.as_ptr().cast_mut(), Ordering::Release);
+    ERASE_LEN.store(erase.len(), Ordering::Release);
+    NOTE_PTR.store(note.as_ptr().cast_mut(), Ordering::Release);
+    NOTE_LEN.store(note.len(), Ordering::Release);
+    ARMED.store(true, Ordering::Release);
+    // SAFETY: `on_ctrl` is a plain `extern "system"` function that lives
+    // for the whole process.
+    if unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) } == 0 {
+        ARMED.store(false, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+/// Disarm and remove the handler [`ctrl_erase_arm`] added.
+pub(crate) fn ctrl_erase_disarm() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    ARMED.store(false, Ordering::Release);
+    // SAFETY: removes the same function pointer that was added.
+    unsafe {
+        SetConsoleCtrlHandler(Some(on_ctrl), 0);
+    }
+    CONIN.store(std::ptr::null_mut(), Ordering::Release);
+}

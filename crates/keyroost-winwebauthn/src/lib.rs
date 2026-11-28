@@ -20,6 +20,13 @@
 //! On non-Windows targets every function is inert, so the rest of keyroost can
 //! depend on this crate unconditionally and branch at runtime.
 //!
+//! It is also the CLI's home for the console and terminal FFI that
+//! `keyroostctl` (which forbids `unsafe`) needs while it shows a password:
+//! VT processing for the classic Windows console (`console_vt`, Windows
+//! only) and an erase when the user presses Ctrl+C
+//! ([`erase_on_interrupt`]: a console control handler on Windows, a signal
+//! handler on Unix).
+//!
 //! # Verification status
 //!
 //! The Windows code can't be compiled or run off-Windows. It is written against
@@ -180,6 +187,7 @@ pub fn parse_detail_path(buf: &[u8]) -> String {
 /// the classic console (conhost) by default. Dropping it puts the console
 /// mode back as it was. Windows only.
 #[cfg(windows)]
+#[must_use = "VT processing is turned back off when this is dropped"]
 pub struct ConsoleVt {
     prev: u32,
 }
@@ -187,6 +195,7 @@ pub struct ConsoleVt {
 #[cfg(windows)]
 impl Drop for ConsoleVt {
     fn drop(&mut self) {
+        sys::note_vt_released();
         sys::console_mode_restore(self.prev);
     }
 }
@@ -196,11 +205,147 @@ impl Drop for ConsoleVt {
 /// legacy console), so escape sequences would print as text.
 #[cfg(windows)]
 pub fn console_vt() -> Option<ConsoleVt> {
-    sys::console_vt_on().map(|prev| ConsoleVt { prev })
+    sys::console_vt_on().map(|prev| {
+        sys::note_vt_held(prev);
+        ConsoleVt { prev }
+    })
+}
+
+/// While held, an interrupt erases what the CLI shows instead of leaving
+/// it on screen: Ctrl+C (or Ctrl+Break) on Windows, Ctrl+C or `SIGTERM` on
+/// Unix. The handler writes the erase to stdout and the note to stderr,
+/// puts the terminal back as it was before the password reader changed it
+/// (Unix: the saved terminal settings; Windows: the console input mode, and
+/// the output mode a held `ConsoleVt` found), and the process ends with
+/// the usual interrupted status (Unix: 128 + the signal, 130 for Ctrl+C;
+/// Windows: the default Ctrl+C exit). Dropping it removes the handler and
+/// puts back whatever was there before.
+#[must_use = "the handler is removed when this is dropped"]
+pub struct EraseOnInterrupt {
+    #[cfg(unix)]
+    _guard: unix::Guard,
+    /// The console's input, kept open while the handler may restore it.
+    #[cfg(windows)]
+    _conin: Option<std::fs::File>,
+}
+
+#[cfg(windows)]
+impl Drop for EraseOnInterrupt {
+    fn drop(&mut self) {
+        sys::ctrl_erase_disarm();
+    }
+}
+
+/// Arm [`EraseOnInterrupt`] with `erase` (written to stdout) and `note`
+/// (to stderr). Call it right before the reader that waits changes the
+/// terminal, so the saved settings are the ones to put back. `None` when
+/// one is already held or the handler can't be installed (and on
+/// platforms that are neither Unix nor Windows).
+pub fn erase_on_interrupt(erase: &'static str, note: &'static str) -> Option<EraseOnInterrupt> {
+    #[cfg(unix)]
+    {
+        unix::arm(erase, note).map(|g| EraseOnInterrupt { _guard: g })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let conin = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+            .ok();
+        let handle = conin
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |f| f.as_raw_handle());
+        sys::ctrl_erase_arm(erase, note, handle).then(|| EraseOnInterrupt { _conin: conin })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (erase, note);
+        None
+    }
 }
 
 #[cfg(windows)]
 mod sys;
+
+#[cfg(unix)]
+mod unix;
+
+#[cfg(all(test, unix))]
+mod interrupt_tests {
+    use super::{erase_on_interrupt, unix};
+
+    const ERASE: &str = "\x1b8\x1b[J";
+    const NOTE: &str = "error: canceled; erased\n";
+    /// Set in the child run of [`a_sigint_erases_and_exits_130`].
+    const CHILD: &str = "KEYROOST_WINWEBAUTHN_SIGNAL_CHILD";
+
+    fn in_child() -> bool {
+        std::env::var_os(CHILD).is_some()
+    }
+
+    /// Installing replaces both handlers, only one guard at a time, and
+    /// dropping it puts the previous handlers back.
+    #[test]
+    fn the_handler_is_installed_only_while_held() {
+        if in_child() {
+            return;
+        }
+        let now = || -> Vec<_> {
+            unix::SIGNALS
+                .iter()
+                .map(|s| unix::current_handler(*s))
+                .collect()
+        };
+        let before = now();
+        let guard = erase_on_interrupt(ERASE, NOTE).expect("armed");
+        assert!(unix::armed());
+        assert_eq!(now(), vec![unix::handler(); 2]);
+        assert!(erase_on_interrupt(ERASE, NOTE).is_none(), "one at a time");
+        drop(guard);
+        assert!(!unix::armed());
+        assert_eq!(now(), before, "the previous handlers are back");
+    }
+
+    #[test]
+    fn interrupted_status_is_the_shells() {
+        assert_eq!(unix::interrupted_status(libc::SIGINT), 130);
+        assert_eq!(unix::interrupted_status(libc::SIGTERM), 143);
+    }
+
+    /// The real thing in a child process: armed, then a SIGINT (as the
+    /// password reader raises on Ctrl+C). The child writes the erase to
+    /// stdout and the note to stderr, and exits 130.
+    #[test]
+    fn a_sigint_erases_and_exits_130() {
+        if in_child() {
+            let _guard = erase_on_interrupt(ERASE, NOTE).expect("armed");
+            // SAFETY: raising a signal in this process; the handler ends it.
+            unsafe {
+                libc::raise(libc::SIGINT);
+            }
+            unreachable!("the handler exits");
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "interrupt_tests::a_sigint_erases_and_exits_130",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(out.status.code(), Some(130), "{:?}", out.status.signal());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stdout.ends_with(ERASE), "{stdout:?}");
+        assert!(stderr.ends_with(NOTE), "{stderr:?}");
+    }
+}
 
 #[cfg(test)]
 mod tests {
