@@ -266,8 +266,10 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   [#56](https://github.com/framefilter/keyroost/pull/56)); and OTP-PIN
   protection for R3.4+ keys, in the CLI and the GUI
   ([#107](https://github.com/framefilter/keyroost/issues/107),
-  [#108](https://github.com/framefilter/keyroost/pull/108)). Signs the Windows
-  and macOS release builds out-of-band.
+  [#108](https://github.com/framefilter/keyroost/pull/108)); and fingerprint
+  unlock of protected OTP codes on Token2 Bio3 R3.4 keys
+  ([#130](https://github.com/framefilter/keyroost/pull/130)). Signs the
+  Windows and macOS release builds out-of-band.
 - **[@Algoritter](https://github.com/Algoritter)** — the project's first
   external code contribution: found, fixed and hardware-verified two
   armed-reset replug bugs (a recycled `/dev/hidrawN` path reading as "never
@@ -299,7 +301,11 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   ([#116](https://github.com/framefilter/keyroost/pull/116)), status-word
   meanings in errors ([#118](https://github.com/framefilter/keyroost/pull/118)),
   the PIV-refresh APDU deduplication
-  ([#119](https://github.com/framefilter/keyroost/pull/119)), and PIV applet
+  ([#119](https://github.com/framefilter/keyroost/pull/119)), the
+  management-key algorithm found by probing on cards without GET METADATA
+  ([#124](https://github.com/framefilter/keyroost/pull/124)), the PIV slot
+  self-test for private-key operations
+  ([#127](https://github.com/framefilter/keyroost/pull/127)), and PIV applet
   fingerprinting with per-device feature gates, HID Crescendo management and
   ECC P-521 ([#128](https://github.com/framefilter/keyroost/pull/128)),
   Swissbit iShield serial, device name and firmware reads
