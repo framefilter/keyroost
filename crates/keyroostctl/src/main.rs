@@ -2305,8 +2305,8 @@ enum OathCmd {
         yes: bool,
         /// The CanoKey Admin PIN: env:NAME reads that environment variable,
         /// stdin reads one line (hidden when typed at a terminal). With
-        /// neither, a terminal asks. Only a CanoKey needs it; other keys
-        /// reset without one.
+        /// neither, a terminal asks when the key is a CanoKey. Only a CanoKey
+        /// needs it; other keys reset without one.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         admin_pin: Option<SecretSource>,
     },
