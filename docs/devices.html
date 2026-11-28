@@ -126,6 +126,19 @@
           name from Swissbit's own management applications (and, on the Key 1, the
           firmware version), contributed by episource. Other applets not yet
           exercised by this project.</td></tr>
+      <tr><td><strong>CanoKey</strong> (Canary)</td>
+        <td>FIDO2, OATH (incl. import), OpenPGP, PIV</td>
+        <td>Verified by Snrat on a CanoKey Canary, firmware 3.1.2, over USB on
+          Windows: the key shows as one entry with its serial in decimal, as
+          CanoKey's own tools show it; OATH codes, import and reset; PIV key
+          generation and the self-test for RSA, P-256/384/521, Ed25519 and X25519,
+          the AES-192 management key and PIV reset; OpenPGP RSA key import and
+          decryption; FIDO2 through the key's own smart-card reader and its reset
+          over the FIDO interface; and the factory reset. keyroost reads the
+          firmware version, model and serial from CanoKey's Admin applet. An HOTP
+          account that starts at counter 0 starts at 1 on a CanoKey
+          (<a href="oath.html#import">OATH</a>), and its factory reset is CanoKey's
+          own (<a href="reset.html#canokey">resetting</a>).</td></tr>
     </table>
     </div>
   </section>

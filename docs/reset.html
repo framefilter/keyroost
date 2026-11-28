@@ -79,7 +79,10 @@
         register a replacement. <a href="fido2.html">FIDO2 →</a></li>
       <li><strong>OATH</strong> — removes all stored TOTP/HOTP seeds and clears the applet
         password. It needs no password to run, which makes it the only way back from a
-        forgotten one. On a Nitrokey 3 it also asks for a touch on the key. You'll need
+        forgotten one. On a Nitrokey 3 it also asks for a touch on the key. A CanoKey
+        resets it through its Admin applet, so there it asks for the CanoKey Admin PIN
+        (<code>oath reset --admin-pin</code>); with that forgotten too, the whole-key
+        reset below is the way back. You'll need
         each service's setup secret/QR again.
         <a href="oath.html">OATH →</a></li>
       <li><strong>OpenPGP</strong> — destroys the on-card sign/encrypt/auth keys and resets
@@ -172,6 +175,17 @@ keyroostctl factory-reset --device my-key --yes  # in a script</code></pre>
       when every slot reads empty, and otherwise names the slot that still holds accounts or
       couldn't be read. On its own it is <code>keyroostctl feitian reset</code>, or
       <strong>Reset…</strong> in the app's Feitian OTP tab.</p>
+    <p id="canokey">A <strong>CanoKey</strong> on its own USB reader takes a different path:
+      instead of the applet-by-applet sweep, keyroost runs CanoKey's own device-wide reset.
+      The firmware takes that reset only while the key's Admin PIN is blocked, so keyroost
+      first blocks it on purpose, with wrong PINs (unless it is blocked already); the
+      question you confirm says so. Then the key blinks five times. Each time, give it a
+      quick tap and let go within two seconds (holding it down doesn't count); the light
+      stops when a tap counts. There is no FIDO2 replug. Everything on the key goes back to
+      its defaults, every PIN included (the Admin PIN to <code>123456</code>), and the
+      serial stays. This is also the way back from a forgotten Admin PIN. If the taps don't
+      register, nothing is erased, but the Admin PIN stays blocked until a reset goes
+      through, so run it again.</p>
     <p>The desktop app offers the same sweep as a <strong>Factory reset</strong> card on a
       key's Overview tab, with a live per-step report — including a FIDO2 row — so you can
       see exactly which applets came back clean and which need another pass.</p>
