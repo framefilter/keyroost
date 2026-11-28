@@ -1908,6 +1908,17 @@ impl ResetStep {
     }
 }
 
+/// [`factory_reset_plan`] for one device: the plan from its capabilities,
+/// except for a CanoKey on its own USB reader, which takes CanoKey's
+/// device-wide reset as its single step ([`ResetStep::CanoKey`]).
+pub fn factory_reset_plan_for(dev: &Device) -> Vec<ResetStep> {
+    if crate::canokey::takes_device_reset(dev) {
+        vec![ResetStep::CanoKey]
+    } else {
+        factory_reset_plan(dev.caps)
+    }
+}
+
 /// Ordered factory-reset steps for a key with these capabilities. Card
 /// applets first (silent wipes), FIDO last (its reset needs a replug +
 /// touch ceremony, so it ends the flow); [`ResetStep::Piv`] sits immediately
@@ -1925,17 +1936,6 @@ impl ResetStep {
 /// [`ResetStep::Piv`] is the one other case this doesn't itself resolve:
 /// `Caps::PIV` says the applet is there, not that it can be reset at all — call
 /// [`exclude_unresettable_piv`] once a live fingerprint confirms it can't.
-/// [`factory_reset_plan`] for one device: the plan from its capabilities,
-/// except for a CanoKey on its own USB reader, which takes CanoKey's
-/// device-wide reset as its single step ([`ResetStep::CanoKey`]).
-pub fn factory_reset_plan_for(dev: &Device) -> Vec<ResetStep> {
-    if crate::canokey::takes_device_reset(dev) {
-        vec![ResetStep::CanoKey]
-    } else {
-        factory_reset_plan(dev.caps)
-    }
-}
-
 pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     let mut steps = Vec::new();
     if caps.has(Caps::OATH) {

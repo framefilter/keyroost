@@ -606,10 +606,6 @@ impl OpenPgpSession {
         })
     }
 
-    /// Send a key-import PUT DATA: the single extended-length `apdu` first,
-    /// then — when the card or reader won't take an extended `Lc` — the
-    /// command-chaining form `chained` builds. Shared by the RSA and ECC
-    /// imports.
     /// Why a long command goes chained from the start, if it does:
     /// `KEYROOST_OPENPGP_FORCE_CHAINING`, or a CanoKey on its own USB
     /// reader, which answers any extended-length APDU `6700` (canokey-core
@@ -628,6 +624,10 @@ impl OpenPgpSession {
         canokey.then_some("this card takes no extended-length APDU")
     }
 
+    /// Send a key-import PUT DATA: the single extended-length `apdu` first,
+    /// then — when the card or reader won't take an extended `Lc` — the
+    /// command-chaining form `chained` builds. Shared by the RSA and ECC
+    /// imports.
     fn put_key_import(
         &mut self,
         apdu: &[u8],
