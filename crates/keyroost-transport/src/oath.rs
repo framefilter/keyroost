@@ -34,6 +34,10 @@ pub struct OathSession {
     /// [`reauthenticate`](Self::reauthenticate) can VALIDATE again without
     /// asking for the password. Wiped when the session drops.
     access_key: Option<Zeroizing<[u8; oath::ACCESS_KEY_LEN]>>,
+    /// The card is a CanoKey ([`crate::card_is_canokey`]), whose OATH
+    /// applet differs from the Yubico one in a few rules: see
+    /// [`Self::is_canokey`].
+    canokey: bool,
 }
 
 impl OathSession {
@@ -75,11 +79,15 @@ impl OathSession {
                 contact.retry_or_fail(e.into())?;
                 continue;
             }
+            // Before the OATH SELECT: telling a CanoKey held to an NFC
+            // reader may select its Admin applet.
+            let canokey = crate::card_is_canokey(&card);
             let mut session = Self {
                 card,
                 debug,
                 select_info: oath::SelectInfo::default(),
                 access_key: None,
+                canokey,
             };
             match session.select() {
                 Ok(()) => {
@@ -91,6 +99,34 @@ impl OathSession {
                     contact.retry_or_fail(e)?;
                 }
             }
+        }
+    }
+
+    /// Whether the card is a CanoKey. Its OATH applet (canokey-core 3.1.2
+    /// `applets/oath/oath.c`) speaks the Yubico protocol with these
+    /// differences, which this session applies:
+    ///
+    /// * It adds one to an HOTP account's counter *before* computing a code,
+    ///   so the counter it stores is one below the first code's. A first
+    ///   counter `n` is written as `n - 1`; a first counter of 0 can't be
+    ///   written, and the account starts at 1 instead
+    ///   ([`Self::hotp_first_counter`]).
+    /// * A name already on the key is refused (`6985`), not overwritten
+    ///   ([`TransportError::OathNameExists`]).
+    /// * Names and secrets are at most 64 bytes each.
+    /// * There is no RESET; the Admin applet resets OATH.
+    pub fn is_canokey(&self) -> bool {
+        self.canokey
+    }
+
+    /// The counter of the first code an HOTP account written with initial
+    /// counter `imf` produces: `imf` itself, except on a CanoKey, where an
+    /// account can't start below 1 (see [`Self::is_canokey`]).
+    pub fn hotp_first_counter(&self, imf: u32) -> u32 {
+        if self.canokey {
+            imf.max(1)
+        } else {
+            imf
         }
     }
 
@@ -218,6 +254,9 @@ impl OathSession {
     /// never-hide-the-recovery-action principle as the FIDO reset). The
     /// destructive confirmation is the caller's job.
     pub fn factory_reset(&mut self) -> Result<(), TransportError> {
+        if self.canokey {
+            return Err(TransportError::OathResetIsCanoKeyAdmin);
+        }
         let (_, sw) = self.transmit_full(&oath::reset())?;
         self.write_answer("oath reset", "reset its Authenticator app", sw)?;
         // The wipe cleared any password; reflect that locally so a follow-up
@@ -251,6 +290,8 @@ impl OathSession {
                     debug: false,
                     select_info: oath::SelectInfo::default(),
                     access_key: None,
+                    // Only listing readers: nothing here writes or resets.
+                    canokey: false,
                 };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
@@ -340,12 +381,22 @@ impl OathSession {
     /// Provision (add) a credential.
     pub fn put(&mut self, params: &oath::PutParams<'_>) -> Result<(), TransportError> {
         let sw = self.put_status(params)?;
+        if self.canokey && sw == CANOKEY_SW_NAME_EXISTS {
+            return Err(TransportError::OathNameExists);
+        }
         self.write_answer("oath put", "save the account", sw)
     }
 
     /// PUT and return the raw status word, for callers that read the key's
     /// answer themselves (bulk import: exists, full, needs the password).
     pub fn put_status(&mut self, params: &oath::PutParams<'_>) -> Result<u16, TransportError> {
+        let canokey_params;
+        let params = if self.canokey {
+            canokey_params = canokey_put_params(params)?;
+            &canokey_params
+        } else {
+            params
+        };
         // An over-long name/secret (e.g. from an imported otpauth:// URI)
         // surfaces as a typed error from the fallible builder.
         // The PUT body carries the raw TOTP/HOTP seed — wipe it after transmit.
@@ -427,6 +478,40 @@ fn version_of(v: &[u8]) -> Option<(u8, u8, u8)> {
         [a, b, c] => Some((*a, *b, *c)),
         _ => None,
     }
+}
+
+/// A CanoKey's answer to a PUT of a name it already holds (canokey-core
+/// `oath_put`: `SW_CONDITIONS_NOT_SATISFIED`).
+pub(crate) const CANOKEY_SW_NAME_EXISTS: u16 = 0x6985;
+
+/// Longest OATH name, and secret, a CanoKey stores (canokey-core
+/// `include/oath.h`: `MAX_NAME_LEN` 64, `MAX_KEY_LEN` 66 with the type and
+/// digits bytes).
+pub(crate) const CANOKEY_OATH_MAX: usize = 64;
+
+/// `params` as a CanoKey takes them: within its length limits, and with an
+/// HOTP counter one below the first code's, since it adds one before
+/// computing a code (see [`OathSession::is_canokey`]).
+fn canokey_put_params<'a>(
+    params: &oath::PutParams<'a>,
+) -> Result<oath::PutParams<'a>, TransportError> {
+    if params.name.len() > CANOKEY_OATH_MAX {
+        return Err(TransportError::OathTooLongForCanoKey {
+            what: "name",
+            max: CANOKEY_OATH_MAX,
+        });
+    }
+    if params.secret.len() > CANOKEY_OATH_MAX {
+        return Err(TransportError::OathTooLongForCanoKey {
+            what: "secret",
+            max: CANOKEY_OATH_MAX,
+        });
+    }
+    let mut params = params.clone();
+    if params.oath_type == oath::OathType::Hotp {
+        params.imf = params.imf.saturating_sub(1);
+    }
+    Ok(params)
 }
 
 /// Map an OATH status word to success or a labeled APDU error.
@@ -525,5 +610,57 @@ mod tests {
         for (what, apdu, cmd, resp) in cases {
             assert_eq!(trace_sensitivity(&apdu), (cmd, resp), "{what}");
         }
+    }
+
+    #[test]
+    fn a_canokey_put_stores_one_below_the_first_hotp_counter() {
+        let params = |oath_type, imf| oath::PutParams {
+            name: "A:a",
+            secret: &[1; 20],
+            oath_type,
+            algorithm: oath::Algorithm::Sha1,
+            digits: 6,
+            require_touch: false,
+            imf,
+        };
+        let put = |p| canokey_put_params(&p).unwrap();
+        assert_eq!(put(params(oath::OathType::Hotp, 5)).imf, 4);
+        // Counter 0 can't be stored below; the account starts at 1.
+        assert_eq!(put(params(oath::OathType::Hotp, 0)).imf, 0);
+        assert_eq!(put(params(oath::OathType::Totp, 0)).imf, 0);
+    }
+
+    #[test]
+    fn a_canokey_put_refuses_names_and_secrets_past_64_bytes() {
+        let name65 = "n".repeat(65);
+        let p = oath::PutParams {
+            name: &name65,
+            secret: &[1; 20],
+            oath_type: oath::OathType::Totp,
+            algorithm: oath::Algorithm::Sha1,
+            digits: 6,
+            require_touch: false,
+            imf: 0,
+        };
+        assert!(matches!(
+            canokey_put_params(&p),
+            Err(TransportError::OathTooLongForCanoKey {
+                what: "name",
+                max: 64
+            })
+        ));
+        let secret65 = [1u8; 65];
+        let p = oath::PutParams {
+            name: "A:a",
+            secret: &secret65,
+            ..p
+        };
+        assert!(matches!(
+            canokey_put_params(&p),
+            Err(TransportError::OathTooLongForCanoKey {
+                what: "secret",
+                max: 64
+            })
+        ));
     }
 }

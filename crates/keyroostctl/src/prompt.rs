@@ -467,6 +467,18 @@ pub(crate) fn confirm_typed_on(
     reverify_if_asked(d, asked)
 }
 
+/// The typed-word form of [`confirm_on_held`]: for a command that holds the
+/// key's session open across the question. No re-enumeration.
+pub(crate) fn confirm_typed_on_held(
+    d: &Device,
+    yes: bool,
+    word: &str,
+    action: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    confirm_typed(&mut RealTerm, yes, word, action, &key_label(d))?;
+    Ok(())
+}
+
 /// Whether this run already told the user to touch the key.
 static TOUCH_PROMPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

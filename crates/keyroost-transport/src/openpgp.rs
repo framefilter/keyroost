@@ -168,13 +168,47 @@ impl OpenPgpStatus {
     /// key's serial are BCD there, so the digits are the decimal serial
     /// (`37806840`); a Nitrokey's is its hex serial (`42682EF7`). `None`
     /// when the card reported neither.
+    ///
+    /// A CanoKey's serial is the one exception: CanoKey gives it as the
+    /// decimal value of the four bytes (`439041101`), as its own tools show
+    /// it, though GnuPG shows the hex digits (`1A2B3C4D`);
+    /// [`Self::serial_text_long`] adds those. A CanoKey whose serial was
+    /// never written (all zeros or all `F`) has none, as `list` says.
     #[must_use]
     pub fn serial_text(&self) -> Option<String> {
         if let Some(s) = self.otp_applet_serial {
             return Some(s.to_string());
         }
+        if self.is_canokey() {
+            return self.canokey_serial().map(|s| s.to_string());
+        }
         let b = self.aid.get(10..14)?;
         Some(b.iter().map(|x| format!("{x:02X}")).collect())
+    }
+
+    /// [`Self::serial_text`] for a line a person reads: a CanoKey's decimal
+    /// serial followed by the hex digits GnuPG shows for it
+    /// (`439041101 (0x1A2B3C4D)`, as `piv info` writes a PIV serial).
+    /// Machine-readable output keeps [`Self::serial_text`].
+    #[must_use]
+    pub fn serial_text_long(&self) -> Option<String> {
+        if self.otp_applet_serial.is_none() && self.is_canokey() {
+            return self
+                .canokey_serial()
+                .map(|s| keyroost_piv::format_serial_long(u128::from(s)));
+        }
+        self.serial_text()
+    }
+
+    /// A CanoKey's AID serial, `None` when it was never written.
+    fn canokey_serial(&self) -> Option<u32> {
+        self.serial()
+            .filter(|&s| !keyroost_canokey::serial_is_unset(s))
+    }
+
+    /// Whether the AID names CanoKey as the card's manufacturer.
+    fn is_canokey(&self) -> bool {
+        pgp::aid_manufacturer_id(&self.aid) == Some(pgp::MANUFACTURER_ID_CANOKEY)
     }
 
     /// Human label of the algorithm in `crt`'s slot (`RSA-2048`, `EdDSA
@@ -572,6 +606,24 @@ impl OpenPgpSession {
         })
     }
 
+    /// Why a long command goes chained from the start, if it does:
+    /// `KEYROOST_OPENPGP_FORCE_CHAINING`, or a CanoKey on its own USB
+    /// reader, which answers any extended-length APDU `6700` (canokey-core
+    /// 3.1.2 `ccid.c`; it takes PUT DATA of the key, the key import and PSO
+    /// DECIPHER chained). `None`: extended length first.
+    fn chain_upfront_reason(&self) -> Option<&'static str> {
+        if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_some() {
+            return Some("env override");
+        }
+        let mut names = [0u8; 256];
+        let mut atr = [0u8; pcsc::MAX_ATR_SIZE];
+        let canokey = self
+            .card
+            .status2(&mut names, &mut atr)
+            .is_ok_and(|status| crate::is_canokey_ccid_atr(status.atr()));
+        canokey.then_some("this card takes no extended-length APDU")
+    }
+
     /// Send a key-import PUT DATA: the single extended-length `apdu` first,
     /// then — when the card or reader won't take an extended `Lc` — the
     /// command-chaining form `chained` builds. Shared by the RSA and ECC
@@ -584,7 +636,8 @@ impl OpenPgpSession {
         // Setting KEYROOST_OPENPGP_FORCE_CHAINING forces the command-chaining path
         // (so the fallback can be exercised on a card that also accepts extended
         // length, e.g. for verification). Otherwise: extended length first.
-        if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_none() {
+        let upfront = self.chain_upfront_reason();
+        if upfront.is_none() {
             let (_, sw) = self.transmit_full(apdu)?;
             if sw == pgp::SW_OK {
                 return Ok(());
@@ -611,7 +664,7 @@ impl OpenPgpSession {
                 format_line(
                     Dir::Note,
                     "openpgp import",
-                    "forcing command chaining (env override)",
+                    &format!("forcing command chaining ({})", upfront.unwrap_or_default()),
                 )
             });
         }
@@ -1005,7 +1058,8 @@ impl OpenPgpSession {
     /// [`import_key`](Self::import_key). `KEYROOST_OPENPGP_FORCE_CHAINING` forces
     /// the chaining path for testing.
     fn decipher(&mut self, cipher_do: &[u8]) -> Result<Vec<u8>, TransportError> {
-        if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_none() {
+        let upfront = self.chain_upfront_reason();
+        if upfront.is_none() {
             let (plain, sw) = self.transmit_full(&pgp::pso_decipher(cipher_do))?;
             if sw == pgp::SW_OK {
                 return Ok(plain);
@@ -1030,7 +1084,7 @@ impl OpenPgpSession {
                 format_line(
                     Dir::Note,
                     "openpgp decipher",
-                    "forcing command chaining (env override)",
+                    &format!("forcing command chaining ({})", upfront.unwrap_or_default()),
                 )
             });
         }
@@ -2056,6 +2110,26 @@ mod tests {
         assert_eq!(shown(0x0006, 0x0123_4567).as_deref(), Some("01234567"));
         // Neither: nothing to show.
         assert_eq!(status_with(vec![]).serial_text(), None);
+    }
+
+    #[test]
+    fn a_canokey_serial_is_shown_in_decimal_with_gnupgs_hex_after_it() {
+        let st = status_with(aid_with(pgp::MANUFACTURER_ID_CANOKEY, 0x1A2B_3C4D));
+        assert_eq!(st.serial_text().as_deref(), Some("439041101"));
+        assert_eq!(
+            st.serial_text_long().as_deref(),
+            Some("439041101 (0x1A2B3C4D)")
+        );
+        // Every other vendor keeps the one form in both.
+        // A serial never written is no serial, as `list` has it.
+        for unset in [0, u32::MAX] {
+            let st = status_with(aid_with(pgp::MANUFACTURER_ID_CANOKEY, unset));
+            assert_eq!(st.serial_text(), None);
+            assert_eq!(st.serial_text_long(), None);
+        }
+        let other = status_with(aid_with(0x000F, 0x4268_2EF7));
+        assert_eq!(other.serial_text_long(), other.serial_text());
+        assert_eq!(status_with(vec![]).serial_text_long(), None);
     }
 
     #[test]

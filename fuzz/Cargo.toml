@@ -33,6 +33,9 @@ keyroost-piv = { path = "../crates/keyroost-piv" }
 keyroost-vault = { path = "../crates/keyroost-vault" }
 keyroost-token2otp = { path = "../crates/keyroost-token2otp" }
 keyroost-feitianotp = { path = "../crates/keyroost-feitianotp" }
+keyroost-canokey = { path = "../crates/keyroost-canokey" }
+# For the canokey_parse target: the CanoKey serial/model text parsers.
+keyroost-resolve = { path = "../crates/keyroost-resolve" }
 # winwebauthn is Windows-only for its FFI, but parse_detail_path is pure and
 # compiles/runs on Linux — the audit's KEY-020 surface, fuzzed here.
 keyroost-winwebauthn = { path = "../crates/keyroost-winwebauthn" }
@@ -193,6 +196,13 @@ bench = false
 [[bin]]
 name = "piv_cert_gzip"
 path = "fuzz_targets/piv_cert_gzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canokey_parse"
+path = "fuzz_targets/canokey_parse.rs"
 test = false
 doc = false
 bench = false

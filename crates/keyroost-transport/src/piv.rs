@@ -976,6 +976,11 @@ pub struct PivSession<'tx> {
     /// is the one constructor that can seed it from a caller-held copy
     /// instead of resolving from scratch.
     state: PivSessionState,
+    /// A CanoKey's PIV algorithm ID table, read once per session (not kept
+    /// across a reconnect like [`PivSessionState`]: another tool may change
+    /// it between sessions). `None` until read; `Some(None)` when the key
+    /// isn't a CanoKey or the read gave nothing usable.
+    canokey_algorithm_ids: Option<Option<keyroost_canokey::PivAlgorithmIds>>,
 }
 
 /// The in-session key-material cache behind `PivSession`, keyed by PIV key
@@ -1606,6 +1611,7 @@ impl<'tx> PivSession<'tx> {
             traced,
             t0,
             applet_selected: false,
+            canokey_algorithm_ids: None,
             state: PivSessionState {
                 pcsc_identity: PcscIdentity {
                     reader_name: reader_name.to_owned(),
@@ -2232,6 +2238,27 @@ impl<'tx> PivSession<'tx> {
             false,
             false,
         );
+        // A CanoKey names itself in the ATR of its USB CCID interface; held
+        // to an NFC reader it answers with no historical bytes (its ATS
+        // carries none), so only a card nothing else fingerprints *and*
+        // whose ATR has no historical bytes is asked for CanoKey's Admin
+        // applet, and taken for a CanoKey when that answers a firmware
+        // version. Other cards are not sent the extra SELECTs.
+        let mut canokey_admin = None;
+        let maybe_canokey_nfc =
+            fingerprint::atr_historical_bytes(&atr).is_some_and(<[u8]>::is_empty);
+        let id = if id == fingerprint::AppletFingerprint::Generic && maybe_canokey_nfc {
+            let admin = self.read_canokey_admin();
+            let is_canokey = admin.as_ref().is_some_and(|a| a.firmware.is_some());
+            canokey_admin = Some(admin);
+            if is_canokey {
+                fingerprint::AppletFingerprint::CanoKey
+            } else {
+                id
+            }
+        } else {
+            id
+        };
         let id = if id == fingerprint::AppletFingerprint::Generic {
             fingerprint::classify(
                 atr_identity.as_deref(),
@@ -2299,6 +2326,27 @@ impl<'tx> PivSession<'tx> {
         let result = match id {
             fingerprint::AppletFingerprint::Trussed(fingerprint::TrussedVariant::Nitrokey) => {
                 self.probe_nitrokey_admin(id, version)
+            }
+            // A CanoKey's firmware version, which its rows are keyed on, and
+            // its hardware variant come from its Admin applet; its serial
+            // from GET SERIAL, the same four bytes. The PIV version GET
+            // VERSION answers is a compatibility number, not the firmware's.
+            fingerprint::AppletFingerprint::CanoKey => {
+                let admin = canokey_admin.unwrap_or_else(|| self.read_canokey_admin());
+                self.canokey_algorithm_ids = Some(self.read_canokey_algorithm_ids());
+                let serial = self
+                    .serial()
+                    .filter(|s| !u32::try_from(*s).is_ok_and(keyroost_canokey::serial_is_unset));
+                AppletFingerprintResult {
+                    fingerprint: id,
+                    name: admin
+                        .as_ref()
+                        .and_then(|a| a.hardware.clone())
+                        .unwrap_or_default(),
+                    version,
+                    version_firmware: admin.and_then(|a| a.firmware).map(|f| f.numbers().to_vec()),
+                    serial,
+                }
             }
             fingerprint::AppletFingerprint::YubiKey => {
                 // Yubico's own GET SERIAL, resolved right here rather than
@@ -2559,6 +2607,97 @@ impl<'tx> PivSession<'tx> {
         selectable
     }
 
+    /// What a CanoKey's Admin applet reports without a PIN: its firmware
+    /// version and hardware variant. `None` when the card doesn't select
+    /// the Admin AID. Re-SELECTs PIV afterwards; run before any
+    /// authentication, since selecting another applet ends it.
+    fn read_canokey_admin(&mut self) -> Option<CanoKeyAdmin> {
+        let selected = matches!(
+            self.transmit_full_raw(&keyroost_canokey::select_admin()),
+            Ok((_, sw)) if sw == piv::SW_OK
+        );
+        let admin = if selected {
+            let firmware = self
+                .canokey_admin_text(&keyroost_canokey::read_firmware_version())
+                .and_then(|d| keyroost_canokey::parse_firmware_version(&d));
+            let hardware = self
+                .canokey_admin_text(&keyroost_canokey::read_hardware_variant())
+                .and_then(|d| keyroost_canokey::parse_text(&d));
+            Some(CanoKeyAdmin { firmware, hardware })
+        } else {
+            None
+        };
+        // Back to PIV for everything that follows. A card that won't take
+        // the PIV SELECT again would fail its next command; say why under
+        // --debug rather than leave only that later error.
+        if let Err(e) = self.select() {
+            trace::line(self.traced, || {
+                format_line(
+                    Dir::Note,
+                    "piv fingerprint",
+                    &format!("re-selecting PIV after the CanoKey Admin probe failed: {e}"),
+                )
+            });
+        }
+        admin
+    }
+
+    /// The data of one Admin applet read answered `9000`.
+    fn canokey_admin_text(&mut self, apdu: &[u8]) -> Option<Vec<u8>> {
+        self.transmit_full_raw(apdu)
+            .ok()
+            .filter(|(_, sw)| *sw == piv::SW_OK)
+            .map(|(data, _)| data)
+    }
+
+    /// A CanoKey's PIV algorithm ID table (`00 EE 01 00`), with PIV
+    /// selected. `None` when the read fails or gives a table the firmware
+    /// itself would refuse.
+    fn read_canokey_algorithm_ids(&mut self) -> Option<keyroost_canokey::PivAlgorithmIds> {
+        self.transmit_full(&keyroost_canokey::read_piv_algorithm_ids())
+            .ok()
+            .filter(|(_, sw)| *sw == piv::SW_OK)
+            .and_then(|(data, _)| keyroost_canokey::parse_piv_algorithm_ids(&data))
+    }
+
+    /// This session's CanoKey algorithm ID table: `None` for any other
+    /// card, and for a CanoKey whose table couldn't be read (its algorithms
+    /// then go by keyroost's default IDs, which are the CanoKey defaults).
+    fn canokey_algorithm_ids(&mut self) -> Option<keyroost_canokey::PivAlgorithmIds> {
+        if self.identity().fingerprint != keyroost_piv::fingerprint::AppletFingerprint::CanoKey {
+            return None;
+        }
+        if let Some(ids) = self.canokey_algorithm_ids {
+            return ids;
+        }
+        let ids = self.read_canokey_algorithm_ids();
+        self.canokey_algorithm_ids = Some(ids);
+        ids
+    }
+
+    /// `gate` for `extension`, made [`FeatureGate::Unsupported`] for a
+    /// CanoKey algorithm its table switches off: with the table's enable
+    /// byte off, a CanoKey takes none of the algorithms outside SP 800-78.
+    ///
+    /// [`FeatureGate::Unsupported`]: keyroost_piv::compat::FeatureGate::Unsupported
+    fn with_canokey_algorithms(
+        &mut self,
+        extension: keyroost_piv::compat::PivExtension,
+        gate: keyroost_piv::compat::FeatureGate,
+    ) -> keyroost_piv::compat::FeatureGate {
+        use keyroost_piv::compat::{FeatureGate, PivExtension};
+        let alg = match extension {
+            PivExtension::SlotKeyAlgorithm(alg) | PivExtension::ImportKey(alg) => alg,
+            _ => return gate,
+        };
+        match self.canokey_algorithm_ids() {
+            Some(ids) if !ids.enabled && canokey_algorithm_id(&ids, alg).is_some() => {
+                FeatureGate::Unsupported
+            }
+            _ => gate,
+        }
+    }
+
     /// SELECT [`keyroost_piv::fingerprint::NITROKEY_ADMIN_AID`] (Trussed's admin
     /// application) and, if accepted, read the hardware variant via its
     /// `GET STATUS` management command
@@ -2692,12 +2831,13 @@ impl<'tx> PivSession<'tx> {
             version_firmware,
             ..
         } = self.applet_fingerprint();
-        keyroost_piv::compat::resolve(
+        let gate = keyroost_piv::compat::resolve(
             feature,
             fingerprint,
             version.as_deref(),
             version_firmware.as_deref(),
-        )
+        );
+        self.with_canokey_algorithms(feature, gate)
     }
 
     /// [`Self::status`] plus each slot's key algorithm, certificate Subject
@@ -2966,12 +3106,13 @@ impl<'tx> PivSession<'tx> {
             version,
             version_firmware,
         } = self.identity();
-        keyroost_piv::compat::resolve(
+        let gate = keyroost_piv::compat::resolve(
             extension,
             fingerprint,
             version.as_deref(),
             version_firmware.as_deref(),
-        )
+        );
+        self.with_canokey_algorithms(extension, gate)
     }
 
     /// Send internal reads the compatibility table lists as unsupported (GET
@@ -3019,6 +3160,15 @@ impl<'tx> PivSession<'tx> {
     /// `Self::identity`, so this costs no extra round trip once the
     /// fingerprint has already been probed this session.
     pub(crate) fn slot_key_algorithm_apdu_id(&mut self, alg: KeyAlg) -> u8 {
+        // A CanoKey's IDs for the algorithms outside SP 800-78 are its own
+        // table's, which a user may have changed from the defaults.
+        if let Some(id) = self
+            .canokey_algorithm_ids()
+            .filter(|ids| ids.enabled)
+            .and_then(|ids| canokey_algorithm_id(&ids, alg))
+        {
+            return id;
+        }
         let SessionIdentity {
             fingerprint,
             version_firmware,
@@ -3038,6 +3188,9 @@ impl<'tx> PivSession<'tx> {
     /// [`keyroost_piv::compat::key_alg_from_apdu_id`] — same firmware-version
     /// pass-through as [`Self::slot_key_algorithm_apdu_id`] above.
     fn key_alg_from_apdu_id(&mut self, id: u8) -> Option<KeyAlg> {
+        if let Some(ids) = self.canokey_algorithm_ids() {
+            return canokey_key_alg(&ids, id);
+        }
         let SessionIdentity {
             fingerprint,
             version_firmware,
@@ -3087,7 +3240,8 @@ impl<'tx> PivSession<'tx> {
         ) {
             return (None, None);
         }
-        let Ok((data, sw)) = self.transmit_full(&piv::get_metadata(key_ref)) else {
+        let apdu = self.metadata_apdu(key_ref);
+        let Ok((data, sw)) = self.transmit_full(&apdu) else {
             return (None, None);
         };
         if sw != piv::SW_OK {
@@ -3112,9 +3266,15 @@ impl<'tx> PivSession<'tx> {
         ) {
             return None;
         }
-        self.transmit_full(&piv::get_metadata(key_ref))
-            .ok()
-            .map(|(_, sw)| sw)
+        let apdu = self.metadata_apdu(key_ref);
+        self.transmit_full(&apdu).ok().map(|(_, sw)| sw)
+    }
+
+    /// GET METADATA for `key_ref` in the form this card answers: with `Le`
+    /// where the card needs it ([`keyroost_piv::compat::PivQuirk::MetadataNeedsLe`]),
+    /// otherwise the four bytes every other card has been answering.
+    fn metadata_apdu(&mut self, key_ref: u8) -> Vec<u8> {
+        metadata_apdu_for(&self.quirks(), key_ref)
     }
 
     /// What keyroost can tell about `slot`'s private key ([`SlotKeyPresence`]).
@@ -4715,10 +4875,11 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// How [`send_long`] may send on this link.
-    fn long_link(&self) -> LongLink {
+    fn long_link(&mut self) -> LongLink {
+        let chain_upfront = self.chain_upfront().then(|| self.chain_reason());
         LongLink {
             traced: self.traced,
-            chain_upfront: self.chain_upfront().then(|| self.chain_reason()),
+            chain_upfront,
         }
     }
 
@@ -5343,11 +5504,12 @@ impl<'tx> PivSession<'tx> {
         chained: &[Vec<u8>],
     ) -> Result<Vec<u8>, TransportError> {
         let (data, sw) = if self.chain_upfront() {
+            let reason = self.chain_reason();
             trace::line(self.traced, || {
                 format_line(
                     Dir::Note,
                     label,
-                    &format!("command chaining up front ({})", self.chain_reason()),
+                    &format!("command chaining up front ({reason})"),
                 )
             });
             self.transmit_chain(label, chained)?
@@ -6629,6 +6791,52 @@ fn check_readback(
 /// `exmode = -254`, one byte short of the short-form `Lc` ceiling).
 const CHAIN_CHUNK: usize = 254;
 
+/// [`PivSession::metadata_apdu`] for a card with these quirks: `Le` only
+/// with [`keyroost_piv::compat::PivQuirk::MetadataNeedsLe`].
+fn metadata_apdu_for(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>, key_ref: u8) -> Vec<u8> {
+    if quirks.contains(&keyroost_piv::compat::PivQuirk::MetadataNeedsLe) {
+        piv::get_metadata_with_le(key_ref)
+    } else {
+        piv::get_metadata(key_ref)
+    }
+}
+
+/// What [`PivSession::read_canokey_admin`] read.
+struct CanoKeyAdmin {
+    firmware: Option<keyroost_canokey::FirmwareVersion>,
+    hardware: Option<String>,
+}
+
+/// The ID a CanoKey's table gives `alg`, for the algorithms outside SP
+/// 800-78; `None` for those (RSA-2048, P-256, P-384 have fixed IDs) and for
+/// RSA-1024, which a CanoKey doesn't take.
+fn canokey_algorithm_id(ids: &keyroost_canokey::PivAlgorithmIds, alg: KeyAlg) -> Option<u8> {
+    match alg {
+        KeyAlg::Ed25519 => Some(ids.ed25519),
+        KeyAlg::Rsa3072 => Some(ids.rsa3072),
+        KeyAlg::Rsa4096 => Some(ids.rsa4096),
+        KeyAlg::X25519 => Some(ids.x25519),
+        KeyAlg::EccP521 => Some(ids.secp521r1),
+        KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::EccP256 | KeyAlg::EccP384 => None,
+    }
+}
+
+/// The algorithm a CanoKey means by `id`: a fixed SP 800-78 ID, or one of
+/// its table's while the table is enabled. A table ID never collides with a
+/// fixed one (the firmware refuses such a table), and an ID the table
+/// doesn't name is no algorithm keyroost knows on this key.
+fn canokey_key_alg(ids: &keyroost_canokey::PivAlgorithmIds, id: u8) -> Option<KeyAlg> {
+    match id {
+        0x07 => Some(KeyAlg::Rsa2048),
+        0x11 => Some(KeyAlg::EccP256),
+        0x14 => Some(KeyAlg::EccP384),
+        _ if ids.enabled => KeyAlg::ALL
+            .into_iter()
+            .find(|&alg| canokey_algorithm_id(ids, alg) == Some(id)),
+        _ => None,
+    }
+}
+
 /// Whether `apdu` — built by [`piv::general_auth_sign`], [`piv::put_data`]
 /// or [`piv::import_key`], whose data field is never empty — used
 /// extended-length encoding. Both
@@ -6965,15 +7173,27 @@ fn chain_upfront_for(t0: bool, forced: bool) -> bool {
 }
 
 impl<'tx> PivSession<'tx> {
-    fn chain_upfront(&self) -> bool {
-        chain_upfront_for(self.t0, force_chaining())
+    /// Whether commands too long for one short APDU go chained from the
+    /// start: [`chain_upfront_for`]'s rule, or a card that takes no
+    /// extended-length APDU at all
+    /// ([`keyroost_piv::compat::PivQuirk::ExtendedLengthNotSupported`]),
+    /// where the extended attempt would only cost a refused round trip.
+    fn chain_upfront(&mut self) -> bool {
+        chain_upfront_for(self.t0, force_chaining()) || self.takes_no_extended_length()
     }
 
-    fn chain_reason(&self) -> &'static str {
+    fn takes_no_extended_length(&mut self) -> bool {
+        self.quirks()
+            .contains(&keyroost_piv::compat::PivQuirk::ExtendedLengthNotSupported)
+    }
+
+    fn chain_reason(&mut self) -> &'static str {
         if force_chaining() {
             "env override"
-        } else {
+        } else if self.t0 {
             "T=0 link: extended-length APDUs are not possible on this protocol"
+        } else {
+            "this card takes no extended-length APDU"
         }
     }
 }
@@ -9795,5 +10015,93 @@ mod pcsc_identity_matching {
         // `pcsc_event_count_unchanged`'s own tests), so this must not match
         // either, even though the surface fields line up.
         assert!(!PcscIdentity::default().matches(&PcscIdentity::default()));
+    }
+}
+
+#[cfg(test)]
+mod canokey_algorithms {
+    use super::*;
+    use keyroost_canokey::PivAlgorithmIds;
+
+    #[test]
+    fn only_a_canokey_is_sent_get_metadata_with_le() {
+        use keyroost_piv::compat::resolve_quirks;
+        use keyroost_piv::fingerprint::AppletFingerprint;
+        // A CanoKey 3.1.2 answers GET VERSION with 6.0.0.
+        let canokey = resolve_quirks(
+            AppletFingerprint::CanoKey,
+            Some(&[6, 0, 0]),
+            Some(&[3, 1, 2]),
+        );
+        assert_eq!(
+            metadata_apdu_for(&canokey, 0x9E),
+            vec![0x00, 0xF7, 0x00, 0x9E, 0x00]
+        );
+        // Every other fingerprint keeps the four bytes it has been answering.
+        for other in [AppletFingerprint::YubiKey, AppletFingerprint::Generic] {
+            let quirks = resolve_quirks(other, Some(&[5, 7, 0]), None);
+            assert_eq!(
+                metadata_apdu_for(&quirks, 0x9E),
+                vec![0x00, 0xF7, 0x00, 0x9E],
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_table_gives_keyroosts_own_ids() {
+        let ids = PivAlgorithmIds::DEFAULT;
+        for alg in KeyAlg::ALL {
+            if let Some(id) = canokey_algorithm_id(&ids, alg) {
+                assert_eq!(id, alg.id(), "{alg:?}");
+                assert_eq!(canokey_key_alg(&ids, id), Some(alg));
+            }
+        }
+        assert_eq!(canokey_algorithm_id(&ids, KeyAlg::Rsa2048), None);
+        assert_eq!(canokey_key_alg(&ids, 0x07), Some(KeyAlg::Rsa2048));
+        assert_eq!(canokey_key_alg(&ids, 0x11), Some(KeyAlg::EccP256));
+        assert_eq!(canokey_key_alg(&ids, 0x14), Some(KeyAlg::EccP384));
+        // RSA-1024's SP 800-78 ID is no algorithm on a CanoKey.
+        assert_eq!(canokey_key_alg(&ids, 0x06), None);
+    }
+
+    #[test]
+    fn a_changed_table_is_followed_both_ways() {
+        let ids = PivAlgorithmIds {
+            ed25519: 0x22,
+            rsa3072: 0x50,
+            ..PivAlgorithmIds::DEFAULT
+        };
+        assert_eq!(canokey_algorithm_id(&ids, KeyAlg::Ed25519), Some(0x22));
+        assert_eq!(canokey_key_alg(&ids, 0x22), Some(KeyAlg::Ed25519));
+        assert_eq!(canokey_key_alg(&ids, 0x50), Some(KeyAlg::Rsa3072));
+        // The default IDs no longer name those algorithms.
+        assert_eq!(canokey_key_alg(&ids, 0xE0), None);
+        assert_eq!(canokey_key_alg(&ids, 0x05), None);
+    }
+
+    #[test]
+    fn a_disabled_table_names_only_the_fixed_ids() {
+        let ids = PivAlgorithmIds {
+            enabled: false,
+            ..PivAlgorithmIds::DEFAULT
+        };
+        assert_eq!(canokey_key_alg(&ids, 0xE0), None);
+        assert_eq!(canokey_key_alg(&ids, 0x11), Some(KeyAlg::EccP256));
+    }
+
+    #[test]
+    fn the_canokey_ccid_atr_is_recognized() {
+        let atr = [
+            0x3B, 0xF7, 0x11, 0x00, 0x00, 0x81, 0x31, 0xFE, 0x65, 0x43, 0x61, 0x6E, 0x6F, 0x6B,
+            0x65, 0x79, 0x99,
+        ];
+        assert!(crate::is_canokey_ccid_atr(&atr));
+        let yubikey = [
+            0x3B, 0xFD, 0x13, 0x00, 0x00, 0x81, 0x31, 0xFE, 0x15, 0x80, 0x73, 0xC0, 0x21, 0xC0,
+            0x57, 0x59, 0x75, 0x62, 0x69, 0x4B, 0x65, 0x79, 0x40,
+        ];
+        assert!(!crate::is_canokey_ccid_atr(&yubikey));
+        assert!(!crate::is_canokey_ccid_atr(&[]));
     }
 }

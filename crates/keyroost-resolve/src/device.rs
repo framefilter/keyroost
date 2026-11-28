@@ -209,7 +209,15 @@ impl Device {
 /// The vendor name for a PC/SC-reader device: the OpenPGP manufacturer ID
 /// mapped through the registry when known (card-content identity, #83), else
 /// the first word of the reader name (the pre-existing guess), else "Key".
+/// A CanoKey is named as CanoKey writes it (the registry's `CanoKeys`), by
+/// its manufacturer ID or, with its OpenPGP applet switched off, by its own
+/// reader's name.
 fn card_vendor(openpgp_manufacturer: Option<u16>, reader_name: &str) -> String {
+    if openpgp_manufacturer == Some(crate::canokey::OPENPGP_MANUFACTURER)
+        || crate::canokey::is_reader_name(reader_name)
+    {
+        return crate::canokey::VENDOR.to_string();
+    }
     if let Some(name) = openpgp_manufacturer.and_then(keyroost_openpgp::manufacturer_name) {
         return name.to_string();
     }
@@ -234,6 +242,34 @@ pub fn vendor_name(vid: u16) -> &'static str {
         0x1e0d => "OpenSK",
         _ => "Security key",
     }
+}
+
+/// [`vendor_name`] for a USB vendor and product ID: a vendor ID two makers
+/// share is told apart by the product (`20A0` is Nitrokey's, and also
+/// CanoKey's at `20A0:42D4`).
+pub fn vendor_name_for(vid: u16, pid: u16) -> &'static str {
+    if crate::canokey::is_usb(vid, pid) {
+        crate::canokey::VENDOR
+    } else {
+        vendor_name(vid)
+    }
+}
+
+/// A HID node's row serial and former serial: a CanoKey's USB serial is
+/// shown in decimal, its hex form kept as the former serial (see
+/// [`crate::canokey`]); any other node's serial as it is.
+fn canokey_hid_serial(hid: &HidDevice, serial: String) -> (String, Option<String>) {
+    if crate::canokey::is_usb(hid.vendor_id, hid.product_id) {
+        crate::canokey::row_serial(&serial)
+    } else {
+        (serial, None)
+    }
+}
+
+/// The former serial of a HID node's row: a CanoKey's USB serial in hex.
+fn former_hid_serial(hid: &HidDevice) -> Option<String> {
+    let serial = hid.serial_number.clone()?;
+    canokey_hid_serial(hid, serial).1
 }
 
 /// Turn a raw PC/SC reader name or USB product name into a clean model label,
@@ -451,7 +487,7 @@ fn reader_by_vendor(
             _ => None,
         };
     }
-    let vt = vendor_name(hid.vendor_id).to_ascii_lowercase();
+    let vt = vendor_name_for(hid.vendor_id, hid.product_id).to_ascii_lowercase();
     let matches: Vec<&str> = probes
         .iter()
         .filter(|p| !p.is_molto2)
@@ -656,6 +692,8 @@ pub fn correlate_with(
                         .and_then(crate::identity::CanonicalId::row_serial)
                 })
                 .or(s)
+                .map(|serial| canokey_hid_serial(h, serial).0)
+                .filter(|serial| !serial.is_empty())
         })
         .collect();
     // Which of those serials came from the node's own identity report. Such a
@@ -784,17 +822,35 @@ pub fn correlate_with(
             .clone()
             .or_else(|| p.serial.clone())
             .unwrap_or_default();
-        let id = if serial.is_empty() {
-            format!("reader:{}", p.reader_name)
-        } else {
-            format!("serial:{serial}")
-        };
         let vendor = if p.yubikey_serial.is_some() {
             "Yubico".to_string()
         } else {
             card_vendor(p.openpgp_manufacturer, &p.reader_name)
         };
-        let mut model = reader_model(&p.reader_name, &vendor, cfg!(windows));
+        let is_canokey = vendor == crate::canokey::VENDOR;
+        // A CanoKey's serial is shown in decimal; the hex form an earlier
+        // keyroost showed stays known as the former serial.
+        let (serial, former_serial) = if is_canokey {
+            crate::canokey::row_serial(&serial)
+        } else {
+            (serial, p.former_serial.clone())
+        };
+        let id = if serial.is_empty() {
+            format!("reader:{}", p.reader_name)
+        } else {
+            format!("serial:{serial}")
+        };
+        let mut model = if is_canokey {
+            // Only CanoKey's own reader names carry its model. Held to
+            // another reader (NFC), the reader's name is that reader's, so
+            // the row says just the vendor.
+            Some(&p.reader_name)
+                .filter(|name| crate::canokey::is_reader_name(name))
+                .and_then(|name| crate::canokey::model_from_reader(name))
+                .unwrap_or_else(|| vendor.clone())
+        } else {
+            reader_model(&p.reader_name, &vendor, cfg!(windows))
+        };
         // Windows' reader name can carry no model at all (`SoloKeys
         // CCID/ICCD Interface 0` for a Solo 2), leaving only the vendor; the
         // USB product string from the device tree names it then.
@@ -823,7 +879,7 @@ pub fn correlate_with(
             hid_path: None,
             reader: Some(p.reader_name.clone()),
             hid_serial: None,
-            former_serial: p.former_serial.clone(),
+            former_serial,
             naming: Naming::default(),
             smart_card_unlisted: false,
         });
@@ -926,6 +982,9 @@ pub fn correlate_with(
             }
             if dev.serial.is_empty() {
                 dev.serial = serial.clone();
+                if dev.former_serial.is_none() {
+                    dev.former_serial = former_hid_serial(hid);
+                }
             } else if keyroost_keyring::canonical_serial(&serial)
                 != keyroost_keyring::canonical_serial(&dev.serial)
                 && !keyroost_keyring::canonical_serial(&serial).is_empty()
@@ -957,11 +1016,14 @@ pub fn correlate_with(
                 caps.insert(Caps::FEITIAN_OTP);
                 unverified.insert(Caps::FEITIAN_OTP);
             }
-            let vendor = vendor_name(hid.vendor_id).to_string();
+            let vendor = vendor_name_for(hid.vendor_id, hid.product_id).to_string();
             let model = if is_token2 {
                 keyroost_proto::token2_pid_label(hid.product_id)
                     .map(str::to_owned)
                     .unwrap_or_else(|| clean_model(&hid.product_name, &vendor))
+            } else if crate::canokey::is_usb(hid.vendor_id, hid.product_id) {
+                crate::canokey::model_from_product(&hid.product_name)
+                    .unwrap_or_else(|| vendor.clone())
             } else {
                 clean_model(&hid.product_name, &vendor)
             };
@@ -979,7 +1041,7 @@ pub fn correlate_with(
                 hid_path: Some(hid.path.clone()),
                 reader: reader_name,
                 hid_serial: None,
-                former_serial: None,
+                former_serial: former_hid_serial(hid),
                 naming: Naming::default(),
                 smart_card_unlisted: false,
             });
@@ -1820,6 +1882,14 @@ pub enum ResetStep {
     /// way [`Self::Fido`] always stays last regardless.
     Piv,
     Fido,
+    /// CanoKey's own device-wide factory reset, in place of every other
+    /// step: it wipes FIDO2, OATH, OpenPGP, PIV, NDEF and PASS and restores
+    /// the key's settings and Admin PIN, once the Admin PIN is blocked and
+    /// the key is touched each time it blinks
+    /// (`keyroost_transport::CanoKeyAdminSession::factory_reset`). The only
+    /// step [`factory_reset_plan_for`] plans for a CanoKey on its own USB
+    /// reader ([`crate::canokey::takes_device_reset`]).
+    CanoKey,
 }
 
 impl ResetStep {
@@ -1833,7 +1903,19 @@ impl ResetStep {
             ResetStep::Token2Otp => "OTP",
             ResetStep::FeitianOtp => "FEITIAN-OTP",
             ResetStep::Fido => "FIDO2",
+            ResetStep::CanoKey => "Whole device",
         }
+    }
+}
+
+/// [`factory_reset_plan`] for one device: the plan from its capabilities,
+/// except for a CanoKey on its own USB reader, which takes CanoKey's
+/// device-wide reset as its single step ([`ResetStep::CanoKey`]).
+pub fn factory_reset_plan_for(dev: &Device) -> Vec<ResetStep> {
+    if crate::canokey::takes_device_reset(dev) {
+        vec![ResetStep::CanoKey]
+    } else {
+        factory_reset_plan(dev.caps)
     }
 }
 
@@ -4505,6 +4587,236 @@ mod tests {
             InitAnswer::NotOpened
         });
         assert_eq!(asked, 1);
+    }
+
+    fn ids_of(devs: &[Device]) -> Vec<&str> {
+        devs.iter().map(|d| d.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_canokey_on_its_own_reader_takes_the_device_reset_alone() {
+        let hids = [canokey_hid(
+            "/dev/hidraw3",
+            Some("1A2B3C4D"),
+            Some(1),
+            Some(9),
+        )];
+        let probes = [canokey_reader(Some("1a2b3c4d"), Some(1), Some(9))];
+        let usb = &correlate(&hids, &probes, &Keyring::default())[0];
+        assert!(crate::canokey::takes_device_reset(usb));
+        assert_eq!(factory_reset_plan_for(usb), vec![ResetStep::CanoKey]);
+        // Its FIDO node alone (no reader to reach the Admin applet): the
+        // ordinary plan.
+        let fido_only = &correlate(&hids, &[], &Keyring::default())[0];
+        assert_eq!(factory_reset_plan_for(fido_only), vec![ResetStep::Fido]);
+        // Another key: the ordinary plan.
+        let yk = probe(
+            "Yubico YubiKey OTP+FIDO+CCID 0",
+            false,
+            true,
+            true,
+            true,
+            None,
+            None,
+            None,
+        );
+        let yk = &correlate(&[], &[yk], &Keyring::default())[0];
+        assert_eq!(
+            factory_reset_plan_for(yk),
+            vec![ResetStep::Oath, ResetStep::OpenPgp, ResetStep::Piv]
+        );
+    }
+
+    /// A CanoKey's FIDO HID node, as its USB descriptor names it.
+    fn canokey_hid(
+        path: &str,
+        serial: Option<&str>,
+        bus: Option<u8>,
+        addr: Option<u8>,
+    ) -> HidDevice {
+        let mut h = hid(0x20a0, 0x42d4, path, serial, bus, addr);
+        h.product_name = "CanoKey Canary".into();
+        h
+    }
+
+    /// A CanoKey's own reader as Windows names it, with its OpenPGP AID
+    /// serial in the lower-case hex the probe builds.
+    fn canokey_reader(serial: Option<&str>, bus: Option<u8>, addr: Option<u8>) -> ReaderProbe {
+        let mut p = probe(
+            "canokeys.org OpenPGP PIV OATH 0",
+            false,
+            true,
+            true,
+            true,
+            None,
+            bus,
+            addr,
+        );
+        p.openpgp_manufacturer = Some(0xF1D0);
+        p.serial = serial.map(str::to_owned);
+        p
+    }
+
+    #[test]
+    fn a_canokey_in_another_reader_takes_no_model_from_that_readers_name() {
+        let mut p = probe(
+            "ACS ACR1252 1S CL Reader PICC 0",
+            false,
+            true,
+            true,
+            true,
+            None,
+            None,
+            None,
+        );
+        p.openpgp_manufacturer = Some(0xF1D0);
+        p.serial = Some("1a2b3c4d".into());
+        let devs = correlate(&[], &[p], &Keyring::default());
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].vendor, "CanoKey");
+        assert_eq!(devs[0].model, "CanoKey");
+        assert_eq!(devs[0].serial, "439041101");
+    }
+
+    #[test]
+    fn a_canokey_fido_node_is_named_canokey_with_its_decimal_serial() {
+        let hids = [canokey_hid(
+            "/dev/hidraw3",
+            Some("1A2B3C4D"),
+            Some(1),
+            Some(9),
+        )];
+        let devs = correlate(&hids, &[], &Keyring::default());
+        assert_eq!(devs.len(), 1);
+        let d = &devs[0];
+        assert_eq!(d.vendor, "CanoKey");
+        assert_eq!(d.model, "Canary");
+        assert_eq!(d.serial, "439041101");
+        assert_eq!(d.id, "serial:439041101");
+        assert_eq!(d.former_serial.as_deref(), Some("1A2B3C4D"));
+        assert_eq!(d.hid_serial, None);
+    }
+
+    #[test]
+    fn a_nitrokey_under_the_same_vendor_id_keeps_its_name_and_serial() {
+        let mut h = hid(
+            0x20a0,
+            0x42b2,
+            "/dev/hidraw3",
+            Some("1A2B3C4D"),
+            Some(1),
+            Some(9),
+        );
+        h.product_name = "Nitrokey 3".into();
+        let d = &correlate(&[h], &[], &Keyring::default())[0];
+        assert_eq!(d.vendor, "Nitrokey");
+        assert_eq!(d.serial, "1A2B3C4D");
+        assert_eq!(d.former_serial, None);
+    }
+
+    #[test]
+    fn a_canokey_reader_and_fido_node_join_as_one_canokey() {
+        let hids = [canokey_hid(
+            "/dev/hidraw3",
+            Some("1A2B3C4D"),
+            Some(1),
+            Some(9),
+        )];
+        let probes = [canokey_reader(Some("1a2b3c4d"), Some(1), Some(9))];
+        let devs = correlate(&hids, &probes, &Keyring::default());
+        assert_eq!(devs.len(), 1, "{:?}", ids_of(&devs));
+        let d = &devs[0];
+        assert_eq!(d.vendor, "CanoKey");
+        // The Windows reader name carries no model; the HID product does.
+        assert_eq!(d.model, "Canary");
+        assert_eq!(d.serial, "439041101");
+        assert_eq!(d.former_serial.as_deref(), Some("1A2B3C4D"));
+        // Both sides name the same serial, so none is kept apart.
+        assert_eq!(d.hid_serial, None);
+        assert!(d.caps.has(Caps::FIDO2) && d.caps.has(Caps::PIV));
+    }
+
+    #[test]
+    fn a_canokey_with_no_usb_topology_joins_by_its_serial() {
+        // macOS reports no USB position: the reader and the FIDO node meet
+        // only through the serial, which both sides now give in decimal
+        // (before, one gave upper-case and the other lower-case hex).
+        let hids = [canokey_hid(
+            "DevSrvsID:4294970000",
+            Some("1A2B3C4D"),
+            None,
+            None,
+        )];
+        let probes = [canokey_reader(Some("1a2b3c4d"), None, None)];
+        let devs = correlate(&hids, &probes, &Keyring::default());
+        assert_eq!(devs.len(), 1, "{:?}", ids_of(&devs));
+        assert_eq!(devs[0].serial, "439041101");
+        assert!(devs[0].hid_path.is_some() && devs[0].reader.is_some());
+    }
+
+    #[test]
+    fn a_canokey_reader_names_its_model_from_a_pcsc_lite_reader_name() {
+        let mut p = canokey_reader(Some("1a2b3c4d"), Some(1), Some(9));
+        p.reader_name = "canokeys.org CanoKey Canary [OpenPGP PIV OATH] (1A2B3C4D) 00 00".into();
+        let d = &correlate(&[], &[p], &Keyring::default())[0];
+        assert_eq!((d.vendor.as_str(), d.model.as_str()), ("CanoKey", "Canary"));
+    }
+
+    #[test]
+    fn a_canokey_with_its_openpgp_applet_off_is_still_named_by_its_reader() {
+        let mut p = canokey_reader(None, Some(1), Some(9));
+        p.has_openpgp = false;
+        p.openpgp_manufacturer = None;
+        let hids = [canokey_hid(
+            "/dev/hidraw3",
+            Some("1A2B3C4D"),
+            Some(1),
+            Some(9),
+        )];
+        let d = &correlate(&hids, &[p], &Keyring::default())[0];
+        assert_eq!(d.vendor, "CanoKey");
+        // The reader gave no serial; the FIDO node's fills it, in decimal.
+        assert_eq!(d.serial, "439041101");
+        assert_eq!(d.former_serial.as_deref(), Some("1A2B3C4D"));
+    }
+
+    #[test]
+    fn a_canokey_with_no_serial_written_has_none() {
+        for unset in ["00000000", "FFFFFFFF"] {
+            let hids = [canokey_hid("/dev/hidraw3", Some(unset), Some(1), Some(9))];
+            let probes = [canokey_reader(
+                Some(&unset.to_ascii_lowercase()),
+                Some(1),
+                Some(9),
+            )];
+            let devs = correlate(&hids, &probes, &Keyring::default());
+            assert_eq!(devs.len(), 1, "{unset}: {:?}", ids_of(&devs));
+            assert_eq!(devs[0].serial, "", "{unset}");
+            assert_eq!(devs[0].former_serial, None, "{unset}");
+        }
+    }
+
+    #[test]
+    fn a_canokey_name_saved_under_its_hex_serial_still_applies() {
+        // keyroost showed a CanoKey's serial in hex before; a name saved
+        // then is found through the former serial.
+        let mut ring = Keyring::default();
+        ring.set_name(
+            "1a2b3c4d",
+            "Work",
+            keyroost_keyring::NameStore::Computer,
+            keyroost_keyring::RecordMeta::default(),
+        )
+        .unwrap();
+        let hids = [canokey_hid(
+            "/dev/hidraw3",
+            Some("1A2B3C4D"),
+            Some(1),
+            Some(9),
+        )];
+        let probes = [canokey_reader(Some("1a2b3c4d"), Some(1), Some(9))];
+        let devs = correlate(&hids, &probes, &ring);
+        assert_eq!(devs[0].name.as_deref(), Some("Work"));
     }
 }
 

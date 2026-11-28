@@ -509,11 +509,12 @@ fn to_oath(
     };
     crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
     let pw = pw.as_deref().map(String::as_str);
-    let (existing, version) = {
+    let (existing, version, canokey) = {
         let mut session = open_oath_unlocked(&reader, pw, debug)?;
-        (read_oath_existing(&mut session)?, session.version())
+        let existing = read_oath_existing(&mut session)?;
+        (existing, session.version(), session.is_canokey())
     }; // closed before the question
-    let family = OathFamily::from_vendor(&dev.vendor, version);
+    let family = OathFamily::from_session(&dev.vendor, version, canokey);
     let store = Store::Oath(family);
     let first = how.plan(file, store, existing);
     how.touch.check(&first)?;

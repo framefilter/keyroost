@@ -28,15 +28,16 @@ fn badge_line(dev: &Device) -> String {
         .join(" · ")
 }
 
-/// Short serial for the at-a-glance overview: first 8 chars, "…" if longer.
-/// (The full serial lives in `keyroostctl list`.) Sanitized: the serial is a
+/// Short serial for the at-a-glance overview: first 10 chars, "…" if longer
+/// (10 fits a 32-bit serial in decimal, as a CanoKey's is shown). (The full
+/// serial lives in `keyroostctl list`.) Sanitized: the serial is a
 /// device-supplied string.
 fn short_serial(serial: &str) -> String {
     let serial = sanitize_terminal(serial);
-    if serial.chars().count() <= 8 {
+    if serial.chars().count() <= 10 {
         serial
     } else {
-        let head: String = serial.chars().take(8).collect();
+        let head: String = serial.chars().take(10).collect();
         format!("{head}…")
     }
 }
@@ -209,7 +210,8 @@ mod tests {
     #[test]
     fn short_serial_truncates_only_when_long() {
         assert_eq!(short_serial("37806840"), "37806840");
-        assert_eq!(short_serial("07A9568FBE31"), "07A9568F…");
+        assert_eq!(short_serial("4294967294"), "4294967294");
+        assert_eq!(short_serial("07A9568FBE31"), "07A9568FBE…");
         assert_eq!(short_serial(""), "");
     }
 

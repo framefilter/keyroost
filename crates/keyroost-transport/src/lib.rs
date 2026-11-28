@@ -168,8 +168,11 @@ pub use oath::OathSession;
 mod feitianotp;
 pub use feitianotp::{FeitianOtpListing, FeitianOtpSession};
 
+mod canokey;
+pub use canokey::{AdminPinState, CanoKeyAdminSession};
+
 mod ctap_pcsc;
-pub use ctap_pcsc::{CtapPcscDevice, WINDOWS_NEEDS_ADMIN};
+pub use ctap_pcsc::{CtapPcscDevice, CANOKEY_READER_RESET, WINDOWS_NEEDS_ADMIN};
 
 mod token2prog;
 pub use token2prog::Token2ProgSession;
@@ -455,6 +458,33 @@ pub enum TransportError {
     /// or delete a touch-required account, and answers `6982` when none comes
     /// in time. `action` is what was asked ("save the account", ...).
     OathNoTouch { action: &'static str },
+    /// A CanoKey's OATH applet already holds an account of this name: it
+    /// refuses a PUT of one with `6985` rather than overwrite it.
+    OathNameExists,
+    /// A CanoKey's OATH applet stores names and secrets of at most `max`
+    /// bytes (canokey-core `include/oath.h`: `MAX_NAME_LEN`, and
+    /// `MAX_KEY_LEN` less its two type and digits bytes); `what` names which.
+    OathTooLongForCanoKey { what: &'static str, max: usize },
+    /// A CanoKey's OATH applet has no RESET of its own: it is reset through
+    /// the key's Admin applet, with the Admin PIN
+    /// ([`CanoKeyAdminSession::reset_applet`]).
+    OathResetIsCanoKeyAdmin,
+    /// The CanoKey Admin PIN was wrong; it has `tries_remaining` tries left.
+    CanoKeyAdminPinRejected { tries_remaining: u8 },
+    /// The CanoKey Admin PIN is blocked: only a factory reset unblocks it.
+    CanoKeyAdminPinBlocked,
+    /// A CanoKey Admin PIN is 6 to 64 characters.
+    CanoKeyAdminPinLength,
+    /// The command needs the CanoKey Admin PIN verified first.
+    CanoKeyAdminPinNeeded,
+    /// The Admin PIN still reported tries left after every wrong guess a
+    /// factory reset sends to block it.
+    CanoKeyAdminPinWouldNotBlock,
+    /// A CanoKey factory reset got no touch each time the key blinked.
+    CanoKeyResetNoTouch,
+    /// A CanoKey factory reset was refused: the Admin PIN isn't blocked, or
+    /// the key is held to an NFC reader (it resets over USB only).
+    CanoKeyResetNotAllowed,
     /// A Feitian OTP applet response could not be parsed.
     FeitianOtpParse(keyroost_feitianotp::ParseError),
     /// A Feitian OTP command could not be built: the name or secret does not
@@ -843,6 +873,55 @@ impl fmt::Display for TransportError {
                 f,
                 "the key would not {action} (SW=6982); it may want a touch: \
                  try again and touch the key when it blinks"
+            ),
+            TransportError::OathNameExists => write!(
+                f,
+                "an account with this name is already on the key (SW=6985)"
+            ),
+            TransportError::OathTooLongForCanoKey { what, max } => {
+                write!(f, "a CanoKey stores an OATH {what} of at most {max} bytes")
+            }
+            TransportError::OathResetIsCanoKeyAdmin => write!(
+                f,
+                "a CanoKey's OATH applet is reset through its Admin applet, \
+                 with the CanoKey Admin PIN"
+            ),
+            TransportError::CanoKeyAdminPinRejected { tries_remaining } => write!(
+                f,
+                "wrong CanoKey Admin PIN ({tries_remaining} tries left before it blocks)"
+            ),
+            TransportError::CanoKeyAdminPinBlocked => write!(
+                f,
+                "the CanoKey Admin PIN is blocked. That erases nothing: passkeys, \
+                 keys and codes keep working with their own PINs, but what needs \
+                 the Admin PIN (an OATH reset, say) can't run. Only resetting the \
+                 whole key with `keyroostctl factory-reset` unblocks it, and that \
+                 erases everything on the key"
+            ),
+            TransportError::CanoKeyAdminPinLength => {
+                write!(f, "a CanoKey Admin PIN is 6 to 64 characters")
+            }
+            TransportError::CanoKeyAdminPinNeeded => {
+                write!(f, "the key asked for its CanoKey Admin PIN first (SW=6982)")
+            }
+            TransportError::CanoKeyAdminPinWouldNotBlock => write!(
+                f,
+                "the CanoKey Admin PIN did not block after the wrong PINs sent \
+                 to block it, so the key was NOT reset"
+            ),
+            TransportError::CanoKeyResetNoTouch => write!(
+                f,
+                "the key didn't count a touch within two seconds of one of its \
+                 five blinks, so it was NOT reset (SW=6982), and its Admin PIN \
+                 stays blocked until a reset goes through. Run the reset again: \
+                 each time it blinks, give it a quick tap and let go (holding it \
+                 down doesn't count); the light stops when a tap counts"
+            ),
+            TransportError::CanoKeyResetNotAllowed => write!(
+                f,
+                "the key refused the factory reset (SW=6985): it resets only \
+                 over USB, not held to an NFC reader, and only with its Admin \
+                 PIN blocked"
             ),
             TransportError::FeitianOtpParse(e) => {
                 write!(f, "Feitian OTP response parse error: {}", e)
@@ -1500,6 +1579,42 @@ fn select_names_fido2(data: &[u8], s1: u8, s2: u8) -> bool {
     sw_ok(s1, s2) && data.starts_with(b"FIDO_2_0")
 }
 
+/// Whether the FIDO applet just selected on `card` lists a CTAP2 version
+/// (`FIDO_2_*`) in its authenticatorGetInfo, sent as `NFCCTAP_MSG` (CTAP
+/// 11.2.3) the way [`CtapPcscDevice`] sends it. Any failure is "not
+/// confirmed": the row then keeps its `FIDO2?`.
+fn get_info_names_fido2(card: &Card) -> bool {
+    const GET_INFO: [u8; 7] = [0x80, 0x10, 0x00, 0x00, 0x01, 0x04, 0x00];
+    let Ok((mut data, mut s1, mut s2)) = transmit_apdu(card, &GET_INFO) else {
+        return false;
+    };
+    // A reply longer than one frame comes in `61 xx` pieces; a getInfo is a
+    // few hundred bytes, so a handful of pieces at most.
+    for _ in 0..16 {
+        if s1 != 0x61 {
+            break;
+        }
+        let Ok((more, n1, n2)) = transmit_apdu(card, &[0x00, 0xC0, 0x00, 0x00, s2]) else {
+            return false;
+        };
+        data.extend_from_slice(&more);
+        (s1, s2) = (n1, n2);
+    }
+    sw_ok(s1, s2) && get_info_reply_names_fido2(&data)
+}
+
+/// [`get_info_names_fido2`]'s decision on the reply: CTAP status `00`, then a
+/// getInfo map whose versions include a `FIDO_2_*` entry.
+fn get_info_reply_names_fido2(reply: &[u8]) -> bool {
+    let Some((&0x00, body)) = reply.split_first() else {
+        return false;
+    };
+    keyroost_ctap::cbor::decode(body)
+        .ok()
+        .and_then(|(value, _)| keyroost_ctap::cmd::parse_authenticator_info(&value).ok())
+        .is_some_and(|info| info.versions.iter().any(|v| v.starts_with("FIDO_2_")))
+}
+
 fn probe_trace_on() -> bool {
     PROBE_TRACE.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var_os("KEYROOST_PROBE_DEBUG").is_some()
@@ -1519,6 +1634,15 @@ fn probe_note_if(trace: bool) -> impl Fn(&str) {
             probe_note(body);
         }
     }
+}
+
+/// Whether the card on `card` is a CanoKey on its own USB reader, by its
+/// ATR ([`is_canokey_ccid_atr`]). Nothing is sent to the card for it.
+pub(crate) fn card_is_canokey_ccid(card: &Card) -> bool {
+    let mut names = [0u8; 256];
+    let mut atr = [0u8; pcsc::MAX_ATR_SIZE];
+    card.status2(&mut names, &mut atr)
+        .is_ok_and(|status| is_canokey_ccid_atr(status.atr()))
 }
 
 /// Whether the card on `card` is an Identiv/Hirsch uTrust key by its ATR
@@ -2007,14 +2131,46 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
             // FIDO2/U2F: a SELECT of the FIDO applet that the card accepts means
             // a security key is reachable over this reader (NFC or contact), to
             // be driven by CtapPcscDevice.
-            if let Some((data, s1, s2)) = select(
-                "fido",
-                keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
-            ) {
+            // A CanoKey on its own USB reader answers the FIDO applet under
+            // CanoKey's private selector from firmware 3.1.2 on, and the
+            // standard AID before that ([`keyroost_canokey::FIDO_USB_AID`]).
+            let canokey_ccid = card_is_canokey_ccid(&card);
+            let fido_select = if canokey_ccid {
+                select("fido (canokey usb)", keyroost_canokey::select_fido_usb())
+                    .filter(|(_, s1, s2)| accepted(*s1, *s2))
+                    .or_else(|| {
+                        select(
+                            "fido",
+                            keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
+                        )
+                    })
+            } else {
+                select(
+                    "fido",
+                    keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
+                )
+            };
+            if let Some((data, s1, s2)) = fido_select {
                 probe.has_fido = accepted(s1, s2);
                 // U2F_V2 doesn't mean U2F only. A continuation or any other
                 // answer leaves CTAP2 unconfirmed.
                 probe.fido_ctap2_confirmed = select_names_fido2(&data, s1, s2);
+                // A CanoKey answers that SELECT with `U2F_V2` though it
+                // speaks CTAP2 too; its getInfo, read through this reader as
+                // `fido info --reader` does, settles it.
+                if canokey_ccid && probe.has_fido && !probe.fido_ctap2_confirmed {
+                    probe.fido_ctap2_confirmed = get_info_names_fido2(&card);
+                    if trace {
+                        probe_note(&format!(
+                            "fido getInfo (canokey usb) -> CTAP2 {}",
+                            if probe.fido_ctap2_confirmed {
+                                "confirmed"
+                            } else {
+                                "not confirmed"
+                            }
+                        ));
+                    }
+                }
             }
             // Token2 on-device OTP applet — select it to confirm presence,
             // rather than inferring from the reader name (which mislabels any
@@ -2079,7 +2235,7 @@ pub fn probe_readers_with(molto2: Molto2Serials) -> Result<Vec<ReaderProbe>, Tra
             let mut otp_serial_r34 = false;
             // The OTP-applet serial read was tried (and may have failed).
             let mut otp_serial_tried = false;
-            if probe.has_fido {
+            if probe.has_fido && !canokey_ccid {
                 let _ = transmit_apdu(
                     &card,
                     &keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
@@ -2475,6 +2631,68 @@ fn read_yubikey_serial(card: &Card) -> Result<String, TransportError> {
     }
     let serial = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
     Ok(serial.to_string())
+}
+
+/// Whether the card on `card` is a CanoKey: its ATR is a CanoKey's own
+/// ([`is_canokey_ccid_atr`]), or the ATR has no historical bytes (the ATR
+/// an NFC reader builds for a CanoKey, whose ATS has none, canokey-core
+/// `interfaces/NFC/fm.c`) and the card's Admin applet answers a firmware
+/// version. That last check SELECTs the Admin applet, so call this
+/// before selecting the applet a session uses.
+pub(crate) fn card_is_canokey(card: &Card) -> bool {
+    let mut names = [0u8; 256];
+    let mut atr = [0u8; pcsc::MAX_ATR_SIZE];
+    let Ok(status) = card.status2(&mut names, &mut atr) else {
+        return false;
+    };
+    match canokey_by_atr(status.atr()) {
+        CanoKeyByAtr::Ccid => return true,
+        CanoKeyByAtr::No => return false,
+        CanoKeyByAtr::AskAdmin => {}
+    }
+    let answers = |apdu: &[u8]| {
+        transmit_apdu(card, apdu)
+            .ok()
+            .filter(|(_, s1, s2)| sw_ok(*s1, *s2))
+            .map(|(data, _, _)| data)
+    };
+    answers(&keyroost_canokey::select_admin()).is_some()
+        && answers(&keyroost_canokey::read_firmware_version())
+            .is_some_and(|v| keyroost_canokey::parse_firmware_version(&v).is_some())
+}
+
+/// What a card's ATR alone says about it being a CanoKey, for
+/// [`card_is_canokey`]: only [`CanoKeyByAtr::AskAdmin`] sends the card
+/// anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanoKeyByAtr {
+    /// A CanoKey's own USB CCID ATR ([`is_canokey_ccid_atr`]).
+    Ccid,
+    /// No historical bytes, like the ATR an NFC reader builds for a
+    /// CanoKey: only its Admin applet can tell.
+    AskAdmin,
+    /// Any other ATR, or one that doesn't parse: not taken for a CanoKey.
+    No,
+}
+
+/// See [`CanoKeyByAtr`].
+pub(crate) fn canokey_by_atr(atr: &[u8]) -> CanoKeyByAtr {
+    if is_canokey_ccid_atr(atr) {
+        CanoKeyByAtr::Ccid
+    } else if keyroost_piv::fingerprint::atr_historical_bytes(atr).is_some_and(<[u8]>::is_empty) {
+        CanoKeyByAtr::AskAdmin
+    } else {
+        CanoKeyByAtr::No
+    }
+}
+
+/// Whether `atr` is the ATR a CanoKey answers over its own USB CCID
+/// interface: historical bytes `Canokey`
+/// ([`keyroost_canokey::CCID_ATR_HISTORICAL_BYTES`]). A CanoKey held to an
+/// NFC reader gets the reader's ATR and is not recognized by this.
+pub(crate) fn is_canokey_ccid_atr(atr: &[u8]) -> bool {
+    keyroost_piv::fingerprint::atr_historical_bytes(atr)
+        == Some(keyroost_canokey::CCID_ATR_HISTORICAL_BYTES)
 }
 
 /// Transmit one raw APDU, returning `(payload, sw1, sw2)`.
@@ -3052,6 +3270,56 @@ mod redaction_tests {
         assert!(select_names_fido2(b"FIDO_2_0_extra", 0x90, 0x00));
         assert!(!select_names_fido2(b"U2F_V2", 0x90, 0x00));
         assert!(!select_names_fido2(b"FIDO_2_0", 0x6A, 0x82));
+    }
+
+    #[test]
+    fn only_an_atr_without_historical_bytes_is_sent_the_canokey_admin_probe() {
+        // A CanoKey on its own USB reader: known from its ATR, nothing sent.
+        let canokey = [
+            0x3B, 0xF7, 0x11, 0x00, 0x00, 0x81, 0x31, 0xFE, 0x65, 0x43, 0x61, 0x6E, 0x6F, 0x6B,
+            0x65, 0x79, 0x99,
+        ];
+        assert_eq!(canokey_by_atr(&canokey), CanoKeyByAtr::Ccid);
+        // A contactless card whose ATS has no historical bytes, as a
+        // CanoKey's: only its Admin applet can tell.
+        assert_eq!(
+            canokey_by_atr(&[0x3B, 0x80, 0x80, 0x01, 0x01]),
+            CanoKeyByAtr::AskAdmin
+        );
+        // Cards whose ATR carries historical bytes get no Admin SELECT: a
+        // YubiKey over USB, a YubiKey NEO held to an NFC reader, and an
+        // ATR that doesn't parse.
+        let yubikey_usb = [
+            0x3B, 0xFD, 0x13, 0x00, 0x00, 0x81, 0x31, 0xFE, 0x15, 0x80, 0x73, 0xC0, 0x21, 0xC0,
+            0x57, 0x59, 0x75, 0x62, 0x69, 0x4B, 0x65, 0x79, 0x40,
+        ];
+        let yubikey_nfc = [
+            0x3B, 0x8C, 0x80, 0x01, 0x59, 0x75, 0x62, 0x69, 0x6B, 0x65, 0x79, 0x4E, 0x45, 0x4F,
+            0x72, 0x33, 0x58,
+        ];
+        for atr in [&yubikey_usb[..], &yubikey_nfc, &[], &[0x3B]] {
+            assert_eq!(canokey_by_atr(atr), CanoKeyByAtr::No, "{atr:02X?}");
+        }
+    }
+
+    #[test]
+    fn get_info_names_ctap2_by_its_versions() {
+        // Status 00, then {1: ["U2F_V2", "FIDO_2_0"]}.
+        let mut ctap2 = vec![0x00, 0xA1, 0x01, 0x82, 0x66];
+        ctap2.extend_from_slice(b"U2F_V2");
+        ctap2.push(0x68);
+        ctap2.extend_from_slice(b"FIDO_2_0");
+        assert!(get_info_reply_names_fido2(&ctap2));
+        // {1: ["U2F_V2"]}: U2F only.
+        let mut u2f = vec![0x00, 0xA1, 0x01, 0x81, 0x66];
+        u2f.extend_from_slice(b"U2F_V2");
+        assert!(!get_info_reply_names_fido2(&u2f));
+        // A CTAP error status, nothing at all, and bytes that aren't CBOR.
+        let mut failed = ctap2.clone();
+        failed[0] = 0x01;
+        assert!(!get_info_reply_names_fido2(&failed));
+        assert!(!get_info_reply_names_fido2(&[]));
+        assert!(!get_info_reply_names_fido2(&[0x00, 0xFF, 0xFF]));
     }
 
     /// The applet reassembly loop must distinguish `61xx` (more data),

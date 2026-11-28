@@ -41,6 +41,14 @@ use pcsc::{Card, Protocols, ShareMode};
 /// FIDO applet AID — `A0 00 00 06 47 2F 00 01`.
 const FIDO_AID: [u8; 8] = [0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01];
 
+/// Why a FIDO2 reset isn't sent through a CanoKey's own USB reader.
+pub const CANOKEY_READER_RESET: &str =
+    "a CanoKey takes a FIDO2 reset only within 10 seconds of being plugged in, \
+     and power-cycling its reader doesn't restart the key: reset FIDO2 over its \
+     FIDO HID interface, unplugging and replugging it when asked (on Windows that \
+     needs an administrator session), or reset the whole key with \
+     `keyroostctl factory-reset`";
+
 /// `NFCCTAP_MSG` instruction class/byte (CTAP §11.2.3).
 const NFCCTAP_CLA: u8 = 0x80;
 const NFCCTAP_INS: u8 = 0x10;
@@ -141,6 +149,14 @@ impl CtapPcscDevice {
             .map_err(|_| CtapError::Transport("reader name contains NUL".into()))?;
         let mut card = crate::connect_shared(&ctx, &cname)
             .map_err(|e| CtapError::Transport(format!("connect to reader failed: {e}")))?;
+        // A CanoKey's reader is an interface of the key itself: resetting
+        // the card powers only that interface, not the key, so the window
+        // a FIDO reset needs (10 s from power-up, canokey-core
+        // `ctap_reset_data`) never opens this way.
+        if crate::card_is_canokey_ccid(&card) {
+            let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+            return Err(CtapError::Transport(CANOKEY_READER_RESET.into()));
+        }
         card.reconnect(
             ShareMode::Shared,
             Protocols::ANY,
@@ -203,9 +219,23 @@ impl CtapPcscDevice {
     }
 
     fn select_fido_applet(&mut self) -> Result<(), CtapError> {
+        // A CanoKey on its own USB reader answers CanoKey's private
+        // selector from firmware 3.1.2 on and the standard AID before that
+        // ([`keyroost_canokey::FIDO_USB_AID`]): the private one first.
+        if self.card.as_ref().is_some_and(crate::card_is_canokey_ccid)
+            && self
+                .select_fido_aid(&keyroost_canokey::FIDO_USB_AID)
+                .is_ok()
+        {
+            return Ok(());
+        }
+        self.select_fido_aid(&FIDO_AID)
+    }
+
+    fn select_fido_aid(&mut self, aid: &[u8]) -> Result<(), CtapError> {
         // SELECT by DF name: 00 A4 04 00 Lc <AID> 00
-        let mut apdu = vec![0x00, 0xA4, 0x04, 0x00, FIDO_AID.len() as u8];
-        apdu.extend_from_slice(&FIDO_AID);
+        let mut apdu = vec![0x00, 0xA4, 0x04, 0x00, aid.len() as u8];
+        apdu.extend_from_slice(aid);
         apdu.push(0x00); // Le
         trace_line(|| {
             format_line(

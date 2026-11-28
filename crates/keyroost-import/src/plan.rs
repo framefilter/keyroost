@@ -33,6 +33,7 @@ impl Store {
             Store::Oath(OathFamily::YubiKey { .. }) => "YubiKey",
             Store::Oath(OathFamily::Solo2) => "Solo 2",
             Store::Oath(OathFamily::Nitrokey3) => "Nitrokey 3",
+            Store::Oath(OathFamily::CanoKey) => "CanoKey",
             Store::Oath(OathFamily::Other) => "this key",
             Store::Token2Otp => "this Token2 key",
             Store::FeitianOtp => "this Feitian key",
@@ -57,6 +58,8 @@ pub enum OathFamily {
     },
     Solo2,
     Nitrokey3,
+    /// CanoKey's OATH applet (canokey-core 3.1.2 `applets/oath/oath.c`).
+    CanoKey,
     /// Another vendor's OATH applet: no limits known up front (C6).
     Other,
 }
@@ -72,8 +75,22 @@ impl OathFamily {
             OathFamily::Solo2
         } else if v.eq_ignore_ascii_case("Nitrokey") {
             OathFamily::Nitrokey3
+        } else if v.eq_ignore_ascii_case("CanoKey") {
+            OathFamily::CanoKey
         } else {
             OathFamily::Other
+        }
+    }
+
+    /// [`Self::from_vendor`] for a key whose OATH session has been opened:
+    /// `canokey` is what that session found (the transport's
+    /// `OathSession::is_canokey`), which names a CanoKey whose row doesn't,
+    /// such as one held to an NFC reader with its OpenPGP applet off.
+    pub fn from_session(vendor: &str, version: Option<(u8, u8, u8)>, canokey: bool) -> Self {
+        if canokey {
+            OathFamily::CanoKey
+        } else {
+            Self::from_vendor(vendor, version)
         }
     }
 
@@ -87,6 +104,8 @@ impl OathFamily {
             OathFamily::Solo2 => Some(SOLO2_NAME_MAX),
             // Label is a Trussed `ShortData`, 128 bytes [S14][S19].
             OathFamily::Nitrokey3 => Some(128),
+            // `MAX_NAME_LEN` (canokey-core `include/oath.h`).
+            OathFamily::CanoKey => Some(64),
             OathFamily::Other => None,
         }
     }
@@ -366,6 +385,9 @@ pub enum Note {
     Hidden(usize),
     /// Molto2 slots already in use will be replaced.
     MoltoReplacesSlots,
+    /// A CanoKey adds one to an HOTP counter before computing a code, so an
+    /// account whose first code is counter 0 starts at 1 there.
+    CanoKeyHotpStartsAtOne,
 }
 
 impl core::fmt::Display for Note {
@@ -396,6 +418,7 @@ impl core::fmt::Display for Note {
                 n
             ),
             Note::MoltoReplacesSlots => f.write_str("Slots already in use will be replaced."),
+            Note::CanoKeyHotpStartsAtOne => f.write_str(CANOKEY_HOTP_STARTS_AT_ONE),
         }
     }
 }
@@ -643,6 +666,23 @@ pub fn limits(store: Store) -> Limits {
             secret_max: Some(128),
             // `SECRETS_APP_CREDENTIALS_COUNT_LIMIT = 50` [S16][S17].
             capacity: Some(50),
+        },
+        // canokey-core 3.1.2 `applets/oath/oath.c` and `include/oath.h`.
+        Store::Oath(OathFamily::CanoKey) => Limits {
+            // `MAX_NAME_LEN`, the whole stored name.
+            name_max: Some(64),
+            ascii_only: false,
+            // PUT takes SHA-1, SHA-256 and SHA-512.
+            hashes: SHA1_256_512,
+            digits: 6..=8,
+            // The period is host-side, in the name prefix, as on YubiKey.
+            totp: PeriodRule::Any,
+            // A 4-byte counter; see `Note::CanoKeyHotpStartsAtOne`.
+            hotp: HotpRule::CounterU32,
+            // `MAX_KEY_LEN` 66, less the type and digits bytes.
+            secret_max: Some(64),
+            // Records go to flash until it is full: no count.
+            capacity: None,
         },
         Store::Oath(OathFamily::Other) => Limits {
             // C6: no limits up front beyond 6–8 digits and command size.
@@ -1110,6 +1150,26 @@ fn starts_another_name(
     family.prefix_refusal(name, others).is_some()
 }
 
+/// What a person is told when an HOTP account whose first code is counter 0
+/// goes onto a CanoKey, whatever adds it (`oath add`, an import, the app).
+pub const CANOKEY_HOTP_STARTS_AT_ONE: &str =
+    "On a CanoKey an HOTP account starts at counter 1: the key adds one to the \
+     counter before it computes a code, so its first code is the service's \
+     second. Services usually accept a code a few steps ahead and catch up; if \
+     one refuses the first code, it doesn't accept codes ahead of its count.";
+
+/// Whether a row that writes is an HOTP entry with counter 0.
+fn writes_hotp_from_zero(rows: &[PlanRow], file: &ImportFile) -> bool {
+    rows.iter()
+        .filter(|r| matches!(r.verdict, Verdict::Add | Verdict::Replace))
+        .any(|r| {
+            file.items.iter().any(|i| {
+                i.index == r.index
+                    && matches!(&i.entry, Ok(e) if matches!(e.kind, OtpKind::Hotp { counter: 0 }))
+            })
+        })
+}
+
 fn notes_for(
     store: Store,
     rows: &[PlanRow],
@@ -1124,8 +1184,9 @@ fn notes_for(
     if any_replace
         && matches!(
             store,
-            Store::Oath(OathFamily::Solo2 | OathFamily::Nitrokey3 | OathFamily::Other)
-                | Store::FeitianOtp
+            Store::Oath(
+                OathFamily::Solo2 | OathFamily::Nitrokey3 | OathFamily::CanoKey | OathFamily::Other
+            ) | Store::FeitianOtp
         )
     {
         notes.push(Note::ReplaceMayLoseOld);
@@ -1146,6 +1207,9 @@ fn notes_for(
         if hotp_write {
             notes.push(Note::Solo2Hotp);
         }
+    }
+    if store == Store::Oath(OathFamily::CanoKey) && writes_hotp_from_zero(rows, file) {
+        notes.push(Note::CanoKeyHotpStartsAtOne);
     }
     if any_replace && store == Store::Oath(OathFamily::Nitrokey3) {
         notes.push(Note::Nitrokey3TouchToReplace);
@@ -2468,5 +2532,69 @@ mod tests {
                 "{n:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_canokey_is_its_own_oath_family() {
+        const CANOKEY: Store = Store::Oath(OathFamily::CanoKey);
+        assert_eq!(
+            OathFamily::from_vendor("CanoKey", None),
+            OathFamily::CanoKey
+        );
+        // A row that doesn't name it (NFC, OpenPGP applet off): the session does.
+        assert_eq!(
+            OathFamily::from_session("", None, true),
+            OathFamily::CanoKey
+        );
+        assert_eq!(
+            OathFamily::from_session("Yubico", Some((5, 7, 1)), false),
+            OathFamily::YubiKey {
+                version: Some((5, 7, 1))
+            }
+        );
+        assert_eq!(CANOKEY.device_name(), "CanoKey");
+        assert_eq!(OathFamily::CanoKey.name_limit(), Some(64));
+        let lim = limits(CANOKEY);
+        assert_eq!((lim.name_max, lim.secret_max), (Some(64), Some(64)));
+        assert_eq!(lim.hashes, SHA1_256_512);
+        assert_eq!(lim.capacity, None);
+        // A 65-byte secret is skipped up front rather than refused by the key.
+        let long = entry(Some("A"), Some("a"), 65, HashAlg::Sha1, 6, TOTP30);
+        let p = plan(&file(vec![long]), &target(CANOKEY, vec![], false));
+        assert_eq!(
+            verdicts(&p),
+            vec![Verdict::Skip(Skip::SecretLength { len: 65, max: 64 })]
+        );
+    }
+
+    #[test]
+    fn a_canokey_hotp_account_from_counter_zero_is_noted() {
+        const CANOKEY: Store = Store::Oath(OathFamily::CanoKey);
+        let hotp = |counter| {
+            entry(
+                Some("H"),
+                Some("x"),
+                20,
+                HashAlg::Sha1,
+                6,
+                OtpKind::Hotp { counter },
+            )
+        };
+        let p = plan(&file(vec![hotp(0)]), &target(CANOKEY, vec![], false));
+        assert!(p.notes.contains(&Note::CanoKeyHotpStartsAtOne));
+        // A later first counter comes out right: no note.
+        let p = plan(&file(vec![hotp(5)]), &target(CANOKEY, vec![], false));
+        assert!(!p.notes.contains(&Note::CanoKeyHotpStartsAtOne));
+        // Another key: no note.
+        let p = plan(&file(vec![hotp(0)]), &target(YK57, vec![], false));
+        assert!(!p.notes.contains(&Note::CanoKeyHotpStartsAtOne));
+        // A CanoKey refuses a name it holds, so a replace removes it first.
+        let f = file(vec![simple("A", "a")]);
+        let p = plan(&f, &target(CANOKEY, vec![oath("A:a")], true));
+        assert!(p.notes.contains(&Note::ReplaceMayLoseOld));
+        assert_eq!(
+            Note::CanoKeyHotpStartsAtOne.to_string(),
+            CANOKEY_HOTP_STARTS_AT_ONE
+        );
     }
 }

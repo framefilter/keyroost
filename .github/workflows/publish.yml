@@ -106,6 +106,9 @@ jobs:
           # keyroost-feitianotp (new after 0.16.0) depends only on
           # keyroost-proto and keyroost-transport depends on it, so it sits
           # next to keyroost-token2otp; same one-time hand publish first.
+          # keyroost-canokey (new after 0.16.0) depends only on
+          # keyroost-proto and keyroost-transport depends on it, so it sits
+          # next to keyroost-feitianotp; same one-time hand publish first.
           # keyroost-vault (new after 0.16.0) has no in-tree deps;
           # keyroost-ctap names it only as a path-only dev-dependency that
           # cargo strips, and keyroost-transport depends on it (for its vault
@@ -115,7 +118,8 @@ jobs:
                        keyroost-keyring keyroost-rsakey keyroost-vault \
                        keyroost-ctap keyroost-oath keyroost-openpgp keyroost-piv \
                        keyroost-pivtest keyroost-p12 \
-                       keyroost-token2otp keyroost-feitianotp keyroost-token2prog \
+                       keyroost-token2otp keyroost-feitianotp keyroost-canokey \
+                       keyroost-token2prog \
                        keyroost-import \
                        keyroost-transport keyroost-pgpkey keyroost-resolve keyroost-qr \
                        keyroost-winwebauthn keyroost-screengrab \

@@ -2305,12 +2305,21 @@ enum OathCmd {
     /// clear the access password. Irreversible: asks first (`--yes` to skip).
     ///
     /// Needs no password — this is the recovery path for a forgotten one.
+    /// A CanoKey resets OATH through its Admin applet and asks for its
+    /// Admin PIN; with that forgotten too, `factory-reset` resets the whole
+    /// key.
     Reset {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
+        /// The CanoKey Admin PIN: env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal). With
+        /// neither, a terminal asks when the key is a CanoKey. Only a CanoKey
+        /// needs it; other keys reset without one.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        admin_pin: Option<SecretSource>,
     },
 }
 
@@ -7518,6 +7527,107 @@ fn open_oath_unlocked(
     Ok(session)
 }
 
+/// The action a CanoKey factory reset confirms, worded for whether its Admin
+/// PIN is blocked already (the key takes a factory reset only then).
+fn canokey_factory_reset_action(admin_pin_blocked: bool) -> String {
+    let pin = if admin_pin_blocked {
+        "Its Admin PIN is blocked already, as the key requires"
+    } else {
+        "Its Admin PIN is blocked first, as the key requires"
+    };
+    format!(
+        "factory-reset the whole CanoKey: every FIDO2 passkey, OATH code, OpenPGP \
+         and PIV key, the NDEF message, both PASS slots and the key's settings are \
+         erased, and every PIN goes back to its default (the serial stays). {pin}"
+    )
+}
+
+/// The touch a CanoKey factory reset waits for. The key blinks five times
+/// and counts only a short touch made within two seconds of each blink; it
+/// stops blinking once a touch counts (canokey-core `strong_user_presence_test`).
+const CANOKEY_FACTORY_RESET_TOUCH: &str =
+    "Resetting \u{2014} the key blinks five times. Each time, give it a quick tap \
+     and let go within two seconds (holding it down doesn't count); the light stops \
+     when a tap counts and blinks again about two seconds later\u{2026}";
+
+/// `factory-reset` on a CanoKey on its own USB reader: CanoKey's device-wide
+/// reset ([`keyroost_resolve::canokey::takes_device_reset`]) in place of the
+/// applet-by-applet plan. It needs no PIN and no replug: the Admin PIN is
+/// blocked with wrong guesses, then the key resets everything once it is
+/// touched each time it blinks.
+fn run_canokey_factory_reset(
+    dev: &keyroost_resolve::Device,
+    yes: bool,
+    debug: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let reader = crate::target::reader_of(dev)?;
+    let mut admin = keyroost_transport::CanoKeyAdminSession::open_traced(&reader, debug)?;
+    // The session stays open across the question, which ties the run to the
+    // key the user saw; re-finding the key then would SELECT other applets on
+    // this held card.
+    canokey_factory_reset_steps(&mut admin, |action| {
+        crate::prompt::confirm_typed_on_held(dev, yes, "reset", action)
+    })?;
+    outln!(
+        "factory reset: the whole CanoKey was reset; every PIN is back to its default \
+         (Admin PIN 123456)."
+    );
+    Ok(())
+}
+
+/// The Admin applet calls a CanoKey factory reset makes, so the order of
+/// [`canokey_factory_reset_steps`] is testable without a key.
+trait CanoKeyDeviceReset {
+    fn admin_pin_blocked(&mut self) -> Result<bool, keyroost_transport::TransportError>;
+    fn block_admin_pin(&mut self) -> Result<(), keyroost_transport::TransportError>;
+    fn reset_device(&mut self) -> Result<(), keyroost_transport::TransportError>;
+}
+
+impl CanoKeyDeviceReset for keyroost_transport::CanoKeyAdminSession {
+    fn admin_pin_blocked(&mut self) -> Result<bool, keyroost_transport::TransportError> {
+        Ok(self.pin_state()? == keyroost_transport::AdminPinState::Blocked)
+    }
+    fn block_admin_pin(&mut self) -> Result<(), keyroost_transport::TransportError> {
+        self.block_pin()
+    }
+    fn reset_device(&mut self) -> Result<(), keyroost_transport::TransportError> {
+        self.factory_reset()
+    }
+}
+
+/// Read the Admin PIN's state, ask (`ask` gets the action to confirm), then
+/// block the PIN unless it already is and reset. The state is read before the
+/// question so it says what will happen: a reset that didn't get its touches
+/// leaves the Admin PIN blocked. Nothing is sent after a "no".
+fn canokey_factory_reset_steps(
+    admin: &mut impl CanoKeyDeviceReset,
+    ask: impl FnOnce(&str) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let blocked = admin.admin_pin_blocked()?;
+    ask(&canokey_factory_reset_action(blocked))?;
+    if !blocked {
+        errln!("factory reset: blocking the CanoKey Admin PIN\u{2026}");
+        admin.block_admin_pin()?;
+    }
+    crate::prompt::touch(CANOKEY_FACTORY_RESET_TOUCH);
+    admin.reset_device()?;
+    Ok(())
+}
+
+/// The warning for `--mgmt-key` / `--pin` given to a CanoKey's factory
+/// reset, which uses neither; `None` when neither was given.
+fn canokey_unused_reset_flags(mgmt_key: bool, pin: bool) -> Option<String> {
+    let flags = match (mgmt_key, pin) {
+        (true, true) => "--mgmt-key and --pin are",
+        (true, false) => "--mgmt-key is",
+        (false, true) => "--pin is",
+        (false, false) => return None,
+    };
+    Some(format!(
+        "{flags} not used: a CanoKey's factory reset needs no PIN or management key"
+    ))
+}
+
 /// What the user confirms before a whole-device wipe, given the plan's
 /// applet labels ("OATH, OpenPGP, PIV, FIDO2").
 ///
@@ -7557,6 +7667,12 @@ fn run_factory_reset(
     // row with no capabilities — nothing to plan the steps from.
     if dev.id.starts_with("override:") {
         return Err("factory-reset needs a detected key; check `keyroostctl list`".into());
+    }
+    if keyroost_resolve::canokey::takes_device_reset(&dev) {
+        if let Some(unused) = canokey_unused_reset_flags(mgmt_key.is_some(), pin.is_some()) {
+            output::warn(&unused);
+        }
+        return run_canokey_factory_reset(&dev, yes, debug);
     }
     // Pin the target's identity now, while it is still the key the user
     // confirmed against: the FIDO step below has to re-find it after a replug,
@@ -8731,6 +8847,7 @@ fn reset_one_card_applet(
                 s.reset()?;
             }
             ResetStep::Fido => unreachable!("FIDO handled by the interactive path"),
+            ResetStep::CanoKey => unreachable!("a CanoKey takes run_canokey_factory_reset"),
         }
         Ok(())
     };
@@ -8965,6 +9082,11 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 oath_type_str(oath_type.to_oath()),
                 name
             );
+            if params.oath_type == keyroost_oath::OathType::Hotp
+                && session.hotp_first_counter(params.imf) != params.imf
+            {
+                output::warn(keyroost_import::plan::CANOKEY_HOTP_STARTS_AT_ONE);
+            }
         }
         OathCmd::Import {
             file,
@@ -9058,13 +9180,40 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             session.clear_password()?;
             outln!("OATH password cleared.");
         }
-        OathCmd::Reset { reader, yes } => {
+        OathCmd::Reset {
+            reader,
+            yes,
+            admin_pin,
+        } => {
             let dev = crate::target::select(Need::Oath, reader.as_deref(), None)?;
-            crate::prompt::confirm_on(&dev, *yes, "wipe the OATH applet")?;
+            let mut sec = Secrets::real();
+            let src = Source::from_flag(admin_pin.as_ref());
+            sec.check(&CANOKEY_ADMIN_PIN, src)?;
+            let asked = crate::prompt::confirm_then_read(&dev, *yes, "wipe the OATH applet")?;
             // Deliberately NOT open_oath(): reset must work on a
             // password-protected applet whose password is lost — that's its
             // entire purpose — so no unlock is attempted.
             let name = crate::target::reader_of(&dev)?;
+            // A CanoKey has no OATH RESET: its Admin applet resets OATH, with
+            // the Admin PIN. Named so by the scan, or, held to an NFC reader
+            // with its OpenPGP applet off, by the OATH session itself.
+            let canokey = dev.vendor == keyroost_resolve::canokey::VENDOR
+                || keyroost_transport::OathSession::open_traced(&name, debug)?.is_canokey();
+            if canokey {
+                let pin = sec.read(&CANOKEY_ADMIN_PIN, src)?;
+                crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
+                let mut admin = keyroost_transport::CanoKeyAdminSession::open_traced(&name, debug)?;
+                admin.verify_pin(pin.as_bytes())?;
+                admin.reset_applet(keyroost_canokey::Applet::Oath)?;
+                outln!("OATH applet reset: all credentials wiped, access password cleared.");
+                return Ok(());
+            }
+            if admin_pin.is_some() {
+                output::warn(
+                    "--admin-pin is not used: this key resets its OATH applet without one",
+                );
+            }
+            crate::prompt::reverify_if_asked(&dev, asked)?;
             let mut session = keyroost_transport::OathSession::open_traced(&name, debug)?;
             // A Nitrokey 3 asks for a touch to reset; a YubiKey doesn't.
             if session.asks_touch_to_reset() {
@@ -10771,6 +10920,7 @@ const PGP_USER_PIN: Spec = Spec::current("user PIN (PW1)", "pin");
 const PGP_SIGN_PIN: Spec = Spec::current("signing PIN (PW1)", "pin");
 const PGP_ADMIN_PIN_VERIFY: Spec = Spec::current("admin PIN (PW3)", "pin");
 const PGP_ADMIN_PIN: Spec = Spec::current("admin PIN (PW3)", "admin-pin");
+const CANOKEY_ADMIN_PIN: Spec = Spec::current("CanoKey Admin PIN", "admin-pin");
 const PGP_OLD_USER_PIN: Spec = Spec::current("current user PIN (PW1)", "pin");
 const PGP_NEW_USER_PIN: Spec = Spec::new_secret("new user PIN (PW1)", "new-pin");
 const PGP_OLD_ADMIN_PIN: Spec = Spec::current("current admin PIN (PW3)", "pin");
@@ -10828,8 +10978,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             outln!("AID:            {}", hex_encode(&status.aid));
             // The serial as GnuPG shows it (a YubiKey's equals its serial
             // elsewhere); a Token2 key's full serial from its OTP applet is
-            // shown as printed on the key.
-            if let Some(serial) = status.serial_text() {
+            // shown as printed on the key; a CanoKey's in decimal, with the
+            // hex digits GnuPG shows after it.
+            if let Some(serial) = status.serial_text_long() {
                 outln!("Serial:         {serial}");
             }
             outln!(
@@ -15009,6 +15160,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
                 // the question, with the error `fido info --reader` gives (on
                 // Windows without administrator rights, that one says so).
                 FidoRoute::Card { reader } => {
+                    refuse_canokey_reader_reset(reader)?;
                     drop(keyroost_transport::CtapPcscDevice::open(reader)?)
                 }
             }
@@ -16714,6 +16866,17 @@ fn fido_reset_at(
     Ok(())
 }
 
+/// A CanoKey's own USB reader can't take a FIDO2 reset: power-cycling it
+/// doesn't restart the key, so the window a reset needs never opens
+/// ([`keyroost_transport::CANOKEY_READER_RESET`]). Refused up front, before
+/// anything is asked or sent; the transport refuses it too.
+fn refuse_canokey_reader_reset(reader: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if keyroost_resolve::canokey::is_reader_name(reader) {
+        return Err(keyroost_transport::CANOKEY_READER_RESET.into());
+    }
+    Ok(())
+}
+
 /// Reset the FIDO2 applet of a card in the exact PC/SC reader `exact_reader`.
 ///
 /// A card has no replug and no touch surface, so the "reset within ~10 s of
@@ -16721,6 +16884,7 @@ fn fido_reset_at(
 /// reader and the reset is sent the moment the applet answers (issue #84 —
 /// the replug ceremony can never complete for a card).
 fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::Error>> {
+    refuse_canokey_reader_reset(exact_reader)?;
     // Check that the FIDO applet answers before power-cycling the card, with
     // the same error `fido info --reader` gives (on Windows without
     // administrator rights, that one says so).
@@ -30022,5 +30186,111 @@ mod feitian_tests {
             "a"
         ])
         .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod canokey_resets {
+    use super::{
+        canokey_factory_reset_action, canokey_factory_reset_steps, canokey_unused_reset_flags,
+        refuse_canokey_reader_reset, CanoKeyDeviceReset,
+    };
+    use keyroost_transport::TransportError;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A stand-in Admin session that logs each call, shared with `ask`.
+    struct FakeAdmin {
+        blocked: bool,
+        log: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl CanoKeyDeviceReset for FakeAdmin {
+        fn admin_pin_blocked(&mut self) -> Result<bool, TransportError> {
+            self.log.borrow_mut().push("pin state");
+            Ok(self.blocked)
+        }
+        fn block_admin_pin(&mut self) -> Result<(), TransportError> {
+            self.log.borrow_mut().push("block");
+            Ok(())
+        }
+        fn reset_device(&mut self) -> Result<(), TransportError> {
+            self.log.borrow_mut().push("reset");
+            Ok(())
+        }
+    }
+
+    fn run(blocked: bool, answer_yes: bool) -> (Vec<&'static str>, Option<String>, bool) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut admin = FakeAdmin {
+            blocked,
+            log: Rc::clone(&log),
+        };
+        let mut asked = None;
+        let ok = canokey_factory_reset_steps(&mut admin, |action| {
+            log.borrow_mut().push("ask");
+            asked = Some(action.to_owned());
+            if answer_yes {
+                Ok(())
+            } else {
+                Err("not confirmed".into())
+            }
+        })
+        .is_ok();
+        let calls = log.borrow().clone();
+        (calls, asked, ok)
+    }
+
+    #[test]
+    fn the_factory_reset_asks_after_reading_the_pin_and_before_blocking_it() {
+        let (calls, asked, ok) = run(false, true);
+        assert!(ok);
+        assert_eq!(calls, ["pin state", "ask", "block", "reset"]);
+        assert!(asked.unwrap().contains("blocked first"));
+
+        // Blocked already: nothing to block, and the question says so.
+        let (calls, asked, ok) = run(true, true);
+        assert!(ok);
+        assert_eq!(calls, ["pin state", "ask", "reset"]);
+        assert!(asked.unwrap().contains("blocked already"));
+    }
+
+    #[test]
+    fn a_declined_factory_reset_sends_nothing_after_the_question() {
+        let (calls, _, ok) = run(false, false);
+        assert!(!ok);
+        assert_eq!(calls, ["pin state", "ask"]);
+    }
+
+    #[test]
+    fn unused_reset_flags_are_named_on_a_canokey() {
+        assert_eq!(canokey_unused_reset_flags(false, false), None);
+        assert!(canokey_unused_reset_flags(true, false)
+            .unwrap()
+            .starts_with("--mgmt-key is not used"));
+        assert!(canokey_unused_reset_flags(false, true)
+            .unwrap()
+            .starts_with("--pin is not used"));
+        assert!(canokey_unused_reset_flags(true, true)
+            .unwrap()
+            .starts_with("--mgmt-key and --pin are not used"));
+    }
+
+    #[test]
+    fn the_factory_reset_question_says_whether_the_admin_pin_is_blocked_yet() {
+        let fresh = canokey_factory_reset_action(false);
+        assert!(fresh.contains("blocked first"), "{fresh}");
+        let blocked = canokey_factory_reset_action(true);
+        assert!(blocked.contains("blocked already"), "{blocked}");
+        assert!(!blocked.contains("blocked first"), "{blocked}");
+    }
+
+    #[test]
+    fn only_a_canokeys_own_reader_is_refused_a_fido_reset() {
+        let err = refuse_canokey_reader_reset("canokeys.org OpenPGP PIV OATH 0")
+            .expect_err("a CanoKey's own reader is refused");
+        assert!(err.to_string().contains("CanoKey"), "{err}");
+        assert!(refuse_canokey_reader_reset("Yubico YubiKey OTP+FIDO+CCID 0").is_ok());
+        assert!(refuse_canokey_reader_reset("ACS ACR1252 1S CL Reader PICC 0").is_ok());
     }
 }

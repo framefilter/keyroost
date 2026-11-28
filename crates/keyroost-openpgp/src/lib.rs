@@ -68,6 +68,11 @@ pub fn may_ask_touch_to_write(manufacturer: Option<u16>) -> bool {
 /// this ID must BCD-decode the serial rather than read it as a plain integer.
 pub const MANUFACTURER_ID_TOKEN2: u16 = 0x0011;
 
+/// OpenPGP manufacturer ID assigned to CanoKeys (bytes 8..10 of the AID).
+/// The four AID serial bytes are the device serial, which CanoKey shows as
+/// their big-endian decimal value.
+pub const MANUFACTURER_ID_CANOKEY: u16 = 0xF1D0;
+
 /// The 2-byte manufacturer ID (big-endian) from an OpenPGP card AID, i.e.
 /// bytes 8..10 of `D2 76 00 01 24 01 <version:2> <manufacturer:2>
 /// <serial:4> 00 00`. `None` when `aid` doesn't begin with [`AID_PREFIX`] or
@@ -125,7 +130,7 @@ pub fn manufacturer_name(id: u16) -> Option<&'static str> {
         0xBA53 => "c-base e.V.",
         0xBD0E => "Paranoidlabs",
         0xCA05 => "Atos CardOS",
-        0xF1D0 => "CanoKeys",
+        MANUFACTURER_ID_CANOKEY => "CanoKeys",
         0xF517 => "FSIJ",
         0xF5EC => "F-Secure",
         _ => return None, // unknown, test (0x0000/0xFFFF), or unmanaged range

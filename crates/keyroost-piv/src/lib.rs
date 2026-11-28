@@ -2222,6 +2222,14 @@ pub fn get_metadata(key_ref: u8) -> Vec<u8> {
     vec![0x00, Instruction::GetMetadata.code(), 0x00, key_ref]
 }
 
+/// [`get_metadata`] with `Le` `00` (ISO 7816-4 case 2), for a card that
+/// answers a long reply only when the command asks for one
+/// ([`compat::PivQuirk::MetadataNeedsLe`]).
+#[must_use]
+pub fn get_metadata_with_le(key_ref: u8) -> Vec<u8> {
+    vec![0x00, Instruction::GetMetadata.code(), 0x00, key_ref, 0x00]
+}
+
 /// Yubico RESET: wipe the PIV application back to factory defaults. Only
 /// succeeds when **both** the PIN and PUK are blocked.
 #[must_use]
@@ -3314,6 +3322,10 @@ mod tests {
         assert_eq!(set_pin_retries(5, 3), vec![0x00, 0xFA, 0x05, 0x03]);
         assert_eq!(reset(), vec![0x00, 0xFB, 0x00, 0x00]);
         assert_eq!(get_metadata(0x9B), vec![0x00, 0xF7, 0x00, 0x9B]);
+        assert_eq!(
+            get_metadata_with_le(0x9E),
+            vec![0x00, 0xF7, 0x00, 0x9E, 0x00]
+        );
     }
 
     #[test]

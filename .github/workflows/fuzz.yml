@@ -33,6 +33,7 @@ jobs:
           - aegis_encrypted
           - token2otp_parse
           - feitianotp_parse
+          - canokey_parse
           - molto_parse
           - winhid_detail
           - otp_apdu_retry

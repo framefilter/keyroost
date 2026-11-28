@@ -2014,6 +2014,7 @@ dependencies = [
  "base64",
  "eframe",
  "egui",
+ "keyroost-canokey",
  "keyroost-ctap",
  "keyroost-feitianotp",
  "keyroost-hid",
@@ -2043,6 +2044,14 @@ dependencies = [
  "wgpu",
  "winresource",
  "x11rb 0.14.0",
+ "zeroize",
+]
+
+[[package]]
+name = "keyroost-canokey"
+version = "0.16.0"
+dependencies = [
+ "keyroost-proto",
  "zeroize",
 ]
 
@@ -2263,6 +2272,7 @@ dependencies = [
  "des",
  "getrandom 0.4.3",
  "hidapi",
+ "keyroost-canokey",
  "keyroost-ctap",
  "keyroost-feitianotp",
  "keyroost-hid",
@@ -2318,6 +2328,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "keyroost-canokey",
  "keyroost-ctap",
  "keyroost-feitianotp",
  "keyroost-hid",

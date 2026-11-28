@@ -1606,9 +1606,18 @@ struct OathState {
     /// the password by design — it is the recovery for a forgotten one — so
     /// this is reachable from the locked view too.
     confirm_reset: Option<DeviceId>,
+    /// The CanoKey Admin PIN typed into the reset confirmation: a CanoKey
+    /// resets OATH through its Admin applet. Wiped on send, on cancel and by
+    /// the idle lock.
+    reset_admin_pin: zeroize::Zeroizing<String>,
     /// The selected key's applet asks for a touch on every delete (a
     /// Nitrokey 3), not only for touch accounts. Learned by the listing.
     delete_asks_touch: bool,
+    /// The selected key's OATH session says it is a CanoKey, which the key's
+    /// row may not (a CanoKey held to an NFC reader with its OpenPGP applet
+    /// off). Learned by the listing, or by a reset the key refused for want
+    /// of its Admin PIN.
+    canokey: bool,
 }
 
 /// One credential row in the OATH pane: its stored name and the last code we
@@ -2476,6 +2485,24 @@ fn key_firmware(
 const FIDO_RELOCKED: &str =
     "the key re-locked (PIN or session changed) \u{2014} unlock again to continue.";
 
+/// Why the FIDO2 tab won't reset a CanoKey through its own USB reader, in
+/// the app's words ([`keyroost_transport::CANOKEY_READER_RESET`] names the
+/// CLI command).
+const CANOKEY_READER_RESET_APP: &str =
+    "A CanoKey takes a FIDO2 reset only within 10 seconds of being plugged in, and \
+     power-cycling its reader doesn't restart the key, so it can't be reset here. \
+     Reset FIDO2 over its FIDO interface, unplugging and replugging it when asked \
+     (on Windows that needs an administrator session), or reset the whole key with \
+     Factory reset on the Overview tab.";
+
+/// [`keyroost_transport::TransportError::CanoKeyAdminPinBlocked`] in the
+/// app's words.
+const CANOKEY_ADMIN_PIN_BLOCKED_APP: &str =
+    "the CanoKey Admin PIN is blocked. That erases nothing: passkeys, keys and codes \
+     keep working with their own PINs, but what needs the Admin PIN (this reset) \
+     can't run. Only Factory reset on the Overview tab unblocks it, and that erases \
+     everything on the key.";
+
 /// The permissions of the FIDO2 tab's session token: credential management,
 /// plus bio enrollment when the key supports it, so the one cached token
 /// authorizes both passkey management and fingerprint operations. Only
@@ -3072,6 +3099,18 @@ fn factory_reset_confirm_summary(
     if plan.contains(&ResetStep::Fido) {
         msg.push_str("\n\nFinishes with a step to unplug the key, plug it back in, and touch it.");
     }
+    if plan.contains(&ResetStep::CanoKey) {
+        msg = format!(
+            "Factory-reset {model} (serial {serial})?\n\nWipes everything on the key: \
+             every FIDO2 passkey, OATH code, OpenPGP and PIV key, the NDEF message \
+             and both PASS slots, and restores its settings. Every PIN goes back to \
+             its default (the CanoKey Admin PIN to 123456).\n\nThe key takes this \
+             only with its Admin PIN blocked, so it is blocked first unless it \
+             already is. Then the key blinks five times: each time, give it a quick \
+             tap and let go within two seconds (holding it down doesn't count). The \
+             light stops when a tap counts and blinks again about two seconds later."
+        );
+    }
     msg
 }
 
@@ -3559,6 +3598,17 @@ fn run_card_reset_step(
                 s.reset().map_err(|e| e.to_string())?;
             }
             ResetStep::Fido => {}
+            ResetStep::CanoKey => {
+                // The key takes the reset only with its Admin PIN blocked
+                // (`block_pin` returns at once when it already is); it then
+                // blinks five times and wants a short touch each time.
+                let name = reader.ok_or("no PC/SC reader for the CanoKey")?;
+                let mut admin = keyroost_transport::CanoKeyAdminSession::open_traced(name, false)
+                    .map_err(|e| e.to_string())?;
+                admin.block_pin().map_err(|e| e.to_string())?;
+                KEY_WANTS_TOUCH.store(true, std::sync::atomic::Ordering::Relaxed);
+                admin.factory_reset().map_err(|e| e.to_string())?;
+            }
         }
         Ok(())
     };
@@ -3574,7 +3624,12 @@ fn run_card_reset_step(
 /// (Nitrokey 3); that step raises the touch banner itself once it knows.
 fn factory_reset_busy_label(card_steps: &[keyroost_resolve::ResetStep]) -> &'static str {
     use keyroost_resolve::ResetStep;
-    if card_steps.contains(&ResetStep::Token2Otp) || card_steps.contains(&ResetStep::FeitianOtp) {
+    if card_steps.contains(&ResetStep::CanoKey) {
+        "Factory-resetting key \u{2014} touch the key each time it blinks (five times): \
+         a quick tap, not a press-and-hold\u{2026}"
+    } else if card_steps.contains(&ResetStep::Token2Otp)
+        || card_steps.contains(&ResetStep::FeitianOtp)
+    {
         "Factory-resetting key \u{2014} touch the key if it blinks\u{2026}"
     } else {
         "Factory-resetting key\u{2026}"
@@ -8012,6 +8067,11 @@ impl App {
         if include_vault {
             self.vault_idle_lock();
         }
+        if !self.oath.reset_admin_pin.is_empty() {
+            // The reset confirmation goes, and the Admin PIN typed into it.
+            self.oath.confirm_reset = None;
+            self.oath.reset_admin_pin = Default::default();
+        }
         if self.security_keys.change_pin.has_pin_input() {
             // Replacing the form wipes its PINs (ChangePinDialog's Drop).
             self.security_keys.change_pin = ChangePinDialog::default();
@@ -9612,7 +9672,8 @@ impl App {
         self.spawn_job("Reading OATH codes\u{2026}", move || {
             let result = Self::oath_open_unlock(&name, &password).and_then(|mut session| {
                 let asks = session.asks_touch_to_delete();
-                Self::oath_list_rows(&mut session, &touch).map(|rows| (rows, asks))
+                let canokey = session.is_canokey();
+                Self::oath_list_rows(&mut session, &touch).map(|rows| (rows, asks, canokey))
             });
             Box::new(move |app: &mut App| {
                 // Discard if the user switched devices while the read (which
@@ -9620,7 +9681,10 @@ impl App {
                 // not show device A's codes.
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     match &result {
-                        Ok((_, asks)) => app.oath.delete_asks_touch = *asks,
+                        Ok((_, asks, canokey)) => {
+                            app.oath.delete_asks_touch = *asks;
+                            app.oath.canokey = *canokey;
+                        }
                         // An automatic read: logged once, in the background.
                         Err(e) => {
                             if let Some(line) = oath_failure_line(e, !password.is_empty()) {
@@ -9632,7 +9696,7 @@ impl App {
                             }
                         }
                     }
-                    Self::apply_oath_rows(app, result.map(|(rows, _)| rows), password);
+                    Self::apply_oath_rows(app, result.map(|(rows, _, _)| rows), password);
                 }
             })
         });
@@ -9646,10 +9710,13 @@ impl App {
             return;
         };
         // Validate before dispatch; the modal surfaces the reason on failure.
+        // `oath.canokey` is what the pane's last OATH session found on this
+        // key; it names a CanoKey whose row doesn't.
+        let canokey = self.oath.canokey;
         let family = self
             .selected_device()
             .map_or(keyroost_import::plan::OathFamily::Other, |d| {
-                keyroost_import::plan::OathFamily::from_vendor(&d.vendor, None)
+                keyroost_import::plan::OathFamily::from_session(&d.vendor, None, canokey)
             });
         let (cred_name, secret) = match self.oath.add.validate(family) {
             Ok((n, s)) => (n, zeroize::Zeroizing::new(s)),
@@ -9691,11 +9758,17 @@ impl App {
             let mut asks = false;
             // The account was written, whatever the re-list after it says.
             let mut wrote = false;
+            let mut starts_at_one = false;
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&name, &password)?;
                 asks = session.asks_touch_to_delete();
-                let family =
-                    keyroost_import::plan::OathFamily::from_vendor(&vendor, session.version());
+                starts_at_one = oath_type == keyroost_oath::OathType::Hotp
+                    && session.hotp_first_counter(0) != 0;
+                let family = keyroost_import::plan::OathFamily::from_session(
+                    &vendor,
+                    session.version(),
+                    session.is_canokey(),
+                );
                 if family.prefix_issue() {
                     let listing = session.list()?;
                     refused = family.prefix_refusal(
@@ -9732,6 +9805,12 @@ impl App {
                 }
                 if wrote {
                     app.log(Severity::Ok, "Authenticator account added");
+                    if starts_at_one {
+                        app.log(
+                            Severity::Warn,
+                            keyroost_import::plan::CANOKEY_HOTP_STARTS_AT_ONE,
+                        );
+                    }
                 }
                 if let Some(why) = &refused {
                     app.log(
@@ -10141,6 +10220,13 @@ impl App {
             return;
         }
         let mut decision: Option<bool> = None;
+        let canokey = self.oath.canokey
+            || self
+                .devices
+                .iter()
+                .any(|d| d.id == for_device && d.vendor == keyroost_resolve::canokey::VENDOR);
+        let p = self.palette();
+        let pin = &mut self.oath.reset_admin_pin;
         egui::Window::new("Reset OATH applet?")
             .collapsible(false)
             .resizable(false)
@@ -10150,6 +10236,18 @@ impl App {
                     "Permanently wipe EVERY authenticator credential on this key \
                      and clear its password? This cannot be undone.",
                 );
+                if canokey {
+                    ui.add_space(6.0);
+                    ui.label(
+                        "A CanoKey resets its Authenticator through its Admin applet: \
+                         enter the key's CanoKey Admin PIN (123456 until changed). \
+                         Only the Authenticator is reset. Without the Admin PIN the \
+                         one way left is Factory reset on the Overview tab, which \
+                         erases everything on the key.",
+                    );
+                    ui.add_space(4.0);
+                    pin_field(ui, &p, "Admin PIN", pin);
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if theme::key_egui_button(ui, "Reset applet", waiting.as_deref()).clicked() {
@@ -10163,9 +10261,13 @@ impl App {
         match decision {
             Some(true) => {
                 self.oath.confirm_reset = None;
-                self.reset_oath_applet();
+                let pin = std::mem::take(&mut self.oath.reset_admin_pin);
+                self.reset_oath_applet(canokey.then_some(pin));
             }
-            Some(false) => self.oath.confirm_reset = None,
+            Some(false) => {
+                self.oath.confirm_reset = None;
+                self.oath.reset_admin_pin = Default::default();
+            }
             None => {}
         }
     }
@@ -10174,7 +10276,10 @@ impl App {
     /// unlocking — the applet's RESET requires no password (it is the
     /// recovery path for a forgotten one) — then rebuilds the pane state
     /// from scratch, which now shows an empty, unprotected applet.
-    fn reset_oath_applet(&mut self) {
+    ///
+    /// A CanoKey's OATH applet has no RESET of its own: with `canokey_pin`
+    /// (its Admin PIN) the reset goes through its Admin applet instead.
+    fn reset_oath_applet(&mut self, canokey_pin: Option<zeroize::Zeroizing<String>>) {
         self.oath.error = None;
         let Some(reader) = self.selected_oath_reader() else {
             self.oath.error = Some("no OATH key selected".into());
@@ -10186,6 +10291,12 @@ impl App {
         let label = "Resetting OATH applet\u{2026}";
         self.spawn_job(label, move || {
             let result = (|| -> Result<(), TransportError> {
+                if let Some(pin) = canokey_pin {
+                    let mut admin =
+                        keyroost_transport::CanoKeyAdminSession::open_traced(&reader, false)?;
+                    admin.verify_pin(pin.as_bytes())?;
+                    return admin.reset_applet(keyroost_canokey::Applet::Oath);
+                }
                 let mut session = keyroost_transport::OathSession::open(&reader)?;
                 KEY_WANTS_TOUCH.store(
                     session.asks_touch_to_reset(),
@@ -10205,6 +10316,23 @@ impl App {
                         // clearing oath_tried lets the pane re-list on its own.
                         app.oath = OathState::default();
                         app.oath_tried = false;
+                    }
+                    // The key turned out to be a CanoKey its row didn't name:
+                    // nothing was reset; ask again, now with the Admin PIN.
+                    Err(TransportError::OathResetIsCanoKeyAdmin) => {
+                        app.log(
+                            Severity::Warn,
+                            "This key is a CanoKey: its Authenticator resets with its \
+                             CanoKey Admin PIN. Nothing was reset.",
+                        );
+                        app.oath.canokey = true;
+                        app.oath.confirm_reset = for_device;
+                    }
+                    // The transport's wording names the CLI command.
+                    Err(TransportError::CanoKeyAdminPinBlocked) => {
+                        let msg = CANOKEY_ADMIN_PIN_BLOCKED_APP;
+                        app.log(Severity::Err, format!("Authenticator reset failed: {msg}"));
+                        app.oath.error = Some(format!("reset failed: {msg}"));
                     }
                     Err(e) => {
                         app.log(Severity::Err, format!("Authenticator reset failed: {e}"));
@@ -10242,7 +10370,7 @@ impl App {
             return;
         };
         self.factory_reset_confirm_typed.clear();
-        let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        let plan = keyroost_resolve::factory_reset_plan_for(&dev);
         if !plan.contains(&keyroost_resolve::ResetStep::Piv) {
             self.factory_reset_confirm = Some(FactoryResetConfirmState {
                 for_device: dev.id,
@@ -10336,7 +10464,7 @@ impl App {
         }
         let (summary, fido_replug) = match self.selected_device() {
             Some(dev) => {
-                let mut plan = keyroost_resolve::factory_reset_plan(dev.caps);
+                let mut plan = keyroost_resolve::factory_reset_plan_for(dev);
                 if factory_reset_piv_unresettable(piv_preview) {
                     keyroost_resolve::exclude_unresettable_piv(&mut plan);
                 }
@@ -10649,6 +10777,15 @@ impl App {
                         app.ftotp_tried = false;
                     }
                     ResetStep::Fido => {}
+                    // Everything on the key went: each card pane re-reads.
+                    ResetStep::CanoKey => {
+                        app.oath = OathState::default();
+                        app.oath_tried = false;
+                        app.openpgp = OpenPgpState::default();
+                        app.pgp_tried = false;
+                        app.piv = PivState::default();
+                        app.piv_tried = false;
+                    }
                 }
             }
         }
@@ -10737,7 +10874,7 @@ impl App {
         let Some(dev) = self.selected_device().cloned() else {
             return false;
         };
-        let mut plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        let mut plan = keyroost_resolve::factory_reset_plan_for(&dev);
         let piv_preview = self
             .factory_reset_confirm
             .as_ref()
@@ -10834,6 +10971,11 @@ impl App {
         // reset, no replug and no touch. `None` for USB keys, which keep the
         // armed replug ceremony.
         let card_reader = Self::card_reset_reader(self.selected_device());
+        // A CanoKey's own USB reader can't take a FIDO2 reset (the transport
+        // refuses it too): say so before the question, in the app's words.
+        let canokey_reader = card_reader
+            .as_deref()
+            .is_some_and(keyroost_resolve::canokey::is_reader_name);
         let blockers = self.serial_less_reset_blockers();
         // Device-scoped, not app-global: this dialog may belong to a different
         // key than the armed one, and telling the user to "unplug the key, then
@@ -10881,6 +11023,15 @@ impl App {
                     ui.label(fido_reset_touch_line(long_touch));
                     ui.add_space(6.0);
                     if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                } else if canokey_reader {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 160, 80),
+                        CANOKEY_READER_RESET_APP,
+                    );
+                    ui.add_space(6.0);
+                    if ui.button("Close").clicked() {
                         cancel = true;
                     }
                 } else {
@@ -12865,14 +13016,20 @@ impl App {
                                     caps.insert(Caps::FIDO2);
                                     let vid = k.vendor_id.unwrap_or(0);
                                     let pid = k.product_id.unwrap_or(0);
-                                    let model = k
-                                        .product
-                                        .clone()
-                                        .unwrap_or_else(|| "Security key".to_string());
+                                    let vendor = keyroost_resolve::vendor_name_for(vid, pid);
+                                    let product = k.product.clone();
+                                    let model = if keyroost_resolve::canokey::is_usb(vid, pid) {
+                                        product
+                                            .as_deref()
+                                            .and_then(keyroost_resolve::canokey::model_from_product)
+                                            .unwrap_or_else(|| vendor.to_string())
+                                    } else {
+                                        product.unwrap_or_else(|| "Security key".to_string())
+                                    };
                                     devices.push(Device {
                                         id: format!("winfido:{vid:04x}:{pid:04x}:{i}"),
                                         name: None,
-                                        vendor: keyroost_resolve::vendor_name(vid).to_string(),
+                                        vendor: vendor.to_string(),
                                         model,
                                         serial: String::new(),
                                         transport: "USB · FIDO HID (admin required)".into(),
@@ -13086,6 +13243,7 @@ impl App {
         self.oath.notice = None;
         self.oath.unlocked_password = None;
         self.oath.delete_asks_touch = false;
+        self.oath.canokey = false;
         self.openpgp.status = None;
         self.openpgp.key_present = [None; 3];
         self.openpgp.loaded = false;
@@ -21464,7 +21622,7 @@ impl App {
             // its own reset in its pane; a bare ProgToken has no resettable
             // applet, so its plan is empty and no card renders).
             if dev.kind == DeviceKind::Key {
-                let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+                let plan = keyroost_resolve::factory_reset_plan_for(dev);
                 if !plan.is_empty() {
                     ui.add_space(14.0);
                     let mut arm = false;
@@ -26876,8 +27034,9 @@ impl App {
             // The three per-key algorithm+fingerprint rows live under the sub-tab
             // strip now, not here.
             if let Some(status) = &self.openpgp.status {
+                // With the hex GnuPG shows for a CanoKey, as `openpgp info`.
                 let serial = status
-                    .serial_text()
+                    .serial_text_long()
                     .unwrap_or_else(|| "\u{2014}".to_string());
                 let sigs = status
                     .signature_count

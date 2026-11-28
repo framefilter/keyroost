@@ -96,7 +96,9 @@
       <p>The OATH applet can be protected by a password that must be presented before codes
         can be listed or computed — a useful extra gate if the key is shared or lost. Forget
         it and the only way back is <code>keyroostctl oath reset</code>, which needs no
-        password but wipes every stored seed with it.
+        password but wipes every stored seed with it. On a CanoKey, <code>oath reset</code>
+        asks for the key's CanoKey Admin PIN instead (<code>--admin-pin</code> in a
+        script), because a CanoKey resets its Authenticator through its Admin applet.
         <a href="reset.html">See resetting →</a></p>
     </div>
   </section>
@@ -191,6 +193,11 @@ keyroostctl oath import -i export.json --touch-for GitHub:alice     # only this 
         doesn't store the period. No SHA-512 codes. The key asks for a touch to reset its
         Authenticator, to delete any account, and to save or read one that requires a
         touch; keyroost says so each time.</li>
+      <li><strong>CanoKey:</strong> names and secrets up to 64 bytes each; a longer one is
+        refused with a message before it is sent. A CanoKey adds one to an HOTP counter
+        before it computes a code, so keyroost writes one less and the first code is the
+        one the service expects. An HOTP account that starts at counter 0 starts at 1
+        there, and <code>oath add</code>, the import and the app say so.</li>
       <li><strong>Other keys:</strong> keyroost knows no limits up front; the key's own
         refusal is reported.</li>
     </ul>
