@@ -312,10 +312,10 @@ pub struct AuthenticatorInfo {
     /// including the 16-byte checksum trailer. Spec minimum is 1024 when the
     /// `largeBlobs` option is supported; absent on keys without large blobs.
     pub max_serialized_large_blob_array: Option<u64>,
-    /// `longTouchForReset` (getInfo key 0x18, CTAP 2.2): the key wants a
-    /// long touch, not a short one, to confirm `authenticatorReset`. Set by
-    /// the `enableLongTouchForReset` configuration, which CanoKey 3.1 offers
-    /// and which only a reset clears.
+    /// `longTouchForReset` (getInfo key 0x18, CTAP 2.2 §6.4): when true, the
+    /// key wants a long touch, not a short one, to confirm
+    /// `authenticatorReset`. CTAP 2.3's `enableLongTouchForReset`
+    /// authenticatorConfig subcommand is what controls it.
     pub long_touch_for_reset: Option<bool>,
 }
 
