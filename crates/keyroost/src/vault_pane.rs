@@ -4367,7 +4367,7 @@ impl App {
                     ui.add_sized([LABEL_W, 24.0], label("Passphrase"));
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut d.passphrase)
-                            .id(egui::Id::new(IMPORT_PASSPHRASE_ID))
+                            .id(egui::Id::unique(IMPORT_PASSPHRASE_ID))
                             .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_width(f32::INFINITY)
                             .password(true),
@@ -9703,7 +9703,7 @@ mod tests {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         let palette = Palette::new(crate::ui::theme::Mode::Dark, Palette::ACCENTS[0], false);
-        let mut frame = |app: &mut App| {
+        let frame = |app: &mut App| {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -9721,11 +9721,11 @@ mod tests {
         frame(&mut app);
         assert_eq!(
             ctx.memory(|m| m.focused()),
-            Some(egui::Id::new(IMPORT_PASSPHRASE_ID)),
+            Some(egui::Id::unique(IMPORT_PASSPHRASE_ID)),
             "the passphrase box has the keyboard"
         );
         // Asked once: focus moved elsewhere stays there.
-        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new(IMPORT_PASSPHRASE_ID)));
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique(IMPORT_PASSPHRASE_ID)));
         frame(&mut app);
         frame(&mut app);
         assert_eq!(ctx.memory(|m| m.focused()), None, "not taken again");
