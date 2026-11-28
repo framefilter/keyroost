@@ -7551,21 +7551,70 @@ fn run_canokey_factory_reset(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let reader = crate::target::reader_of(dev)?;
     let mut admin = keyroost_transport::CanoKeyAdminSession::open_traced(&reader, debug)?;
-    // Asked before the question, so it says what will happen: a reset that
-    // didn't get its touches leaves the Admin PIN blocked.
-    let blocked = admin.pin_state()? == keyroost_transport::AdminPinState::Blocked;
-    crate::prompt::confirm_typed_on(dev, yes, "reset", &canokey_factory_reset_action(blocked))?;
-    if !blocked {
-        errln!("factory reset: blocking the CanoKey Admin PIN\u{2026}");
-        admin.block_pin()?;
-    }
-    crate::prompt::touch(CANOKEY_FACTORY_RESET_TOUCH);
-    admin.factory_reset()?;
+    // The session stays open across the question, which ties the run to the
+    // key the user saw; re-finding the key then would SELECT other applets on
+    // this held card.
+    canokey_factory_reset_steps(&mut admin, |action| {
+        crate::prompt::confirm_typed_on_held(dev, yes, "reset", action)
+    })?;
     outln!(
         "factory reset: the whole CanoKey was reset; every PIN is back to its default \
          (Admin PIN 123456)."
     );
     Ok(())
+}
+
+/// The Admin applet calls a CanoKey factory reset makes, so the order of
+/// [`canokey_factory_reset_steps`] is testable without a key.
+trait CanoKeyDeviceReset {
+    fn admin_pin_blocked(&mut self) -> Result<bool, keyroost_transport::TransportError>;
+    fn block_admin_pin(&mut self) -> Result<(), keyroost_transport::TransportError>;
+    fn reset_device(&mut self) -> Result<(), keyroost_transport::TransportError>;
+}
+
+impl CanoKeyDeviceReset for keyroost_transport::CanoKeyAdminSession {
+    fn admin_pin_blocked(&mut self) -> Result<bool, keyroost_transport::TransportError> {
+        Ok(self.pin_state()? == keyroost_transport::AdminPinState::Blocked)
+    }
+    fn block_admin_pin(&mut self) -> Result<(), keyroost_transport::TransportError> {
+        self.block_pin()
+    }
+    fn reset_device(&mut self) -> Result<(), keyroost_transport::TransportError> {
+        self.factory_reset()
+    }
+}
+
+/// Read the Admin PIN's state, ask (`ask` gets the action to confirm), then
+/// block the PIN unless it already is and reset. The state is read before the
+/// question so it says what will happen: a reset that didn't get its touches
+/// leaves the Admin PIN blocked. Nothing is sent after a "no".
+fn canokey_factory_reset_steps(
+    admin: &mut impl CanoKeyDeviceReset,
+    ask: impl FnOnce(&str) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let blocked = admin.admin_pin_blocked()?;
+    ask(&canokey_factory_reset_action(blocked))?;
+    if !blocked {
+        errln!("factory reset: blocking the CanoKey Admin PIN\u{2026}");
+        admin.block_admin_pin()?;
+    }
+    crate::prompt::touch(CANOKEY_FACTORY_RESET_TOUCH);
+    admin.reset_device()?;
+    Ok(())
+}
+
+/// The warning for `--mgmt-key` / `--pin` given to a CanoKey's factory
+/// reset, which uses neither; `None` when neither was given.
+fn canokey_unused_reset_flags(mgmt_key: bool, pin: bool) -> Option<String> {
+    let flags = match (mgmt_key, pin) {
+        (true, true) => "--mgmt-key and --pin are",
+        (true, false) => "--mgmt-key is",
+        (false, true) => "--pin is",
+        (false, false) => return None,
+    };
+    Some(format!(
+        "{flags} not used: a CanoKey's factory reset needs no PIN or management key"
+    ))
 }
 
 /// What the user confirms before a whole-device wipe, given the plan's
@@ -7609,6 +7658,9 @@ fn run_factory_reset(
         return Err("factory-reset needs a detected key; check `keyroostctl list`".into());
     }
     if keyroost_resolve::canokey::takes_device_reset(&dev) {
+        if let Some(unused) = canokey_unused_reset_flags(mgmt_key.is_some(), pin.is_some()) {
+            output::warn(&unused);
+        }
         return run_canokey_factory_reset(&dev, yes, debug);
     }
     // Pin the target's identity now, while it is still the key the user
@@ -29895,7 +29947,90 @@ mod feitian_tests {
 
 #[cfg(test)]
 mod canokey_resets {
-    use super::{canokey_factory_reset_action, refuse_canokey_reader_reset};
+    use super::{
+        canokey_factory_reset_action, canokey_factory_reset_steps, canokey_unused_reset_flags,
+        refuse_canokey_reader_reset, CanoKeyDeviceReset,
+    };
+    use keyroost_transport::TransportError;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A stand-in Admin session that logs each call, shared with `ask`.
+    struct FakeAdmin {
+        blocked: bool,
+        log: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl CanoKeyDeviceReset for FakeAdmin {
+        fn admin_pin_blocked(&mut self) -> Result<bool, TransportError> {
+            self.log.borrow_mut().push("pin state");
+            Ok(self.blocked)
+        }
+        fn block_admin_pin(&mut self) -> Result<(), TransportError> {
+            self.log.borrow_mut().push("block");
+            Ok(())
+        }
+        fn reset_device(&mut self) -> Result<(), TransportError> {
+            self.log.borrow_mut().push("reset");
+            Ok(())
+        }
+    }
+
+    fn run(blocked: bool, answer_yes: bool) -> (Vec<&'static str>, Option<String>, bool) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut admin = FakeAdmin {
+            blocked,
+            log: Rc::clone(&log),
+        };
+        let mut asked = None;
+        let ok = canokey_factory_reset_steps(&mut admin, |action| {
+            log.borrow_mut().push("ask");
+            asked = Some(action.to_owned());
+            if answer_yes {
+                Ok(())
+            } else {
+                Err("not confirmed".into())
+            }
+        })
+        .is_ok();
+        let calls = log.borrow().clone();
+        (calls, asked, ok)
+    }
+
+    #[test]
+    fn the_factory_reset_asks_after_reading_the_pin_and_before_blocking_it() {
+        let (calls, asked, ok) = run(false, true);
+        assert!(ok);
+        assert_eq!(calls, ["pin state", "ask", "block", "reset"]);
+        assert!(asked.unwrap().contains("blocked first"));
+
+        // Blocked already: nothing to block, and the question says so.
+        let (calls, asked, ok) = run(true, true);
+        assert!(ok);
+        assert_eq!(calls, ["pin state", "ask", "reset"]);
+        assert!(asked.unwrap().contains("blocked already"));
+    }
+
+    #[test]
+    fn a_declined_factory_reset_sends_nothing_after_the_question() {
+        let (calls, _, ok) = run(false, false);
+        assert!(!ok);
+        assert_eq!(calls, ["pin state", "ask"]);
+    }
+
+    #[test]
+    fn unused_reset_flags_are_named_on_a_canokey() {
+        assert_eq!(canokey_unused_reset_flags(false, false), None);
+        assert!(canokey_unused_reset_flags(true, false)
+            .unwrap()
+            .starts_with("--mgmt-key is not used"));
+        assert!(canokey_unused_reset_flags(false, true)
+            .unwrap()
+            .starts_with("--pin is not used"));
+        assert!(canokey_unused_reset_flags(true, true)
+            .unwrap()
+            .starts_with("--mgmt-key and --pin are not used"));
+    }
 
     #[test]
     fn the_factory_reset_question_says_whether_the_admin_pin_is_blocked_yet() {
