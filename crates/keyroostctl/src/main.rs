@@ -2303,12 +2303,12 @@ enum OathCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
-        /// The CanoKey Admin PIN, used only on a CanoKey (it is not the
-        /// OpenPGP admin PIN): env:NAME reads that environment variable, stdin
-        /// reads one line (hidden when typed at a terminal). With neither, a
-        /// terminal asks when the key is a CanoKey.
+        /// The CanoKey Admin PIN: env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal). With
+        /// neither, a terminal asks. Only a CanoKey needs it; other keys
+        /// reset without one.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        canokey_admin_pin: Option<SecretSource>,
+        admin_pin: Option<SecretSource>,
     },
 }
 
@@ -9141,11 +9141,11 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         OathCmd::Reset {
             reader,
             yes,
-            canokey_admin_pin,
+            admin_pin,
         } => {
             let dev = crate::target::select(Need::Oath, reader.as_deref(), None)?;
             let mut sec = Secrets::real();
-            let src = Source::from_flag(canokey_admin_pin.as_ref());
+            let src = Source::from_flag(admin_pin.as_ref());
             sec.check(&CANOKEY_ADMIN_PIN, src)?;
             let asked = crate::prompt::confirm_then_read(&dev, *yes, "wipe the OATH applet")?;
             // Deliberately NOT open_oath(): reset must work on a
@@ -9166,10 +9166,9 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 outln!("OATH applet reset: all credentials wiped, access password cleared.");
                 return Ok(());
             }
-            if canokey_admin_pin.is_some() {
+            if admin_pin.is_some() {
                 output::warn(
-                    "--canokey-admin-pin is not used: this key is not a CanoKey, so its \
-                     OATH applet resets without one",
+                    "--admin-pin is not used: this key resets its OATH applet without one",
                 );
             }
             crate::prompt::reverify_if_asked(&dev, asked)?;
@@ -10879,7 +10878,7 @@ const PGP_USER_PIN: Spec = Spec::current("user PIN (PW1)", "pin");
 const PGP_SIGN_PIN: Spec = Spec::current("signing PIN (PW1)", "pin");
 const PGP_ADMIN_PIN_VERIFY: Spec = Spec::current("admin PIN (PW3)", "pin");
 const PGP_ADMIN_PIN: Spec = Spec::current("admin PIN (PW3)", "admin-pin");
-const CANOKEY_ADMIN_PIN: Spec = Spec::current("CanoKey Admin PIN", "canokey-admin-pin");
+const CANOKEY_ADMIN_PIN: Spec = Spec::current("CanoKey Admin PIN", "admin-pin");
 const PGP_OLD_USER_PIN: Spec = Spec::current("current user PIN (PW1)", "pin");
 const PGP_NEW_USER_PIN: Spec = Spec::new_secret("new user PIN (PW1)", "new-pin");
 const PGP_OLD_ADMIN_PIN: Spec = Spec::current("current admin PIN (PW3)", "pin");

@@ -282,11 +282,6 @@ pub(crate) const SECRET_FLAGS: &[SecretFlag] = &[
         default_ok: false,
     },
     SecretFlag {
-        long: "canokey-admin-pin",
-        what: "the CanoKey Admin PIN",
-        default_ok: false,
-    },
-    SecretFlag {
         long: "mgmt-key",
         what: "the management key",
         default_ok: true,
