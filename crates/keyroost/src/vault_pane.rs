@@ -9644,6 +9644,49 @@ mod tests {
     }
 
     #[test]
+    fn backup_dialogs_start_in_the_last_folder_chosen() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let dir_of_next = |app: &mut App, export: bool| {
+            if export {
+                app.vault_export_start();
+            } else {
+                app.vault_import_start();
+            }
+            app.file_dialog_queue.pop().expect("a dialog").directory
+        };
+        app.vault_import_start();
+        let first = app.file_dialog_queue.pop().expect("an open dialog");
+        assert_eq!(first.directory, None, "nothing chosen yet");
+        choose_backup(&mut app, Some(PathBuf::from("/backups/a/personal.t2vault")));
+        app.vault_import_cancel();
+        assert_eq!(
+            dir_of_next(&mut app, true),
+            Some(PathBuf::from("/backups/a")),
+            "Export starts where Import chose"
+        );
+        choose_file(
+            &mut app,
+            Some(PathBuf::from("/elsewhere/b/personal.t2vault")),
+        );
+        app.vault_export_cancel();
+        app.vault_import_start();
+        let request = app.file_dialog_queue.pop().expect("an open dialog");
+        assert_eq!(request.directory, Some(PathBuf::from("/elsewhere/b")));
+        // A cancelled dialog leaves the folder as it was.
+        choose_backup(&mut app, None);
+        assert_eq!(
+            dir_of_next(&mut app, false),
+            Some(PathBuf::from("/elsewhere/b"))
+        );
+        // Other file dialogs keep the platform's start.
+        app.spawn_file_dialog(FileTarget::PivCert, false, &[], None);
+        assert_eq!(app.file_dialog_queue.pop().unwrap().directory, None);
+    }
+
+    #[test]
     fn the_passphrase_box_takes_focus_once_when_the_dialog_opens() {
         use crate::tests::TestFrame;
         let mut key = FakeKey::new();

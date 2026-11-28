@@ -6050,6 +6050,10 @@ struct App {
     /// selection change): an id must not be reused while a dialog opened for
     /// the previous key is still on screen.
     ssh_cert_next_id: u64,
+    /// The folder of the last vault backup file chosen (Export backup… or
+    /// Import backup…): the next of those dialogs starts there. For this
+    /// run only; never saved.
+    vault_backup_dir: Option<std::path::PathBuf>,
 }
 
 /// Which path text field a resolved file-chooser result should populate. Keeps
@@ -6184,6 +6188,15 @@ struct FileDialogRequest {
     save: bool,
     filters: Vec<(String, Vec<String>)>,
     default_name: Option<String>,
+    /// The folder the dialog starts in; `None`, the platform's choice.
+    directory: Option<std::path::PathBuf>,
+}
+
+impl FileTarget {
+    /// A vault backup's dialog: these share one remembered folder.
+    fn is_vault_backup(&self) -> bool {
+        matches!(self, Self::VaultExport { .. } | Self::VaultImport)
+    }
 }
 
 impl App {
@@ -6207,11 +6220,17 @@ impl App {
                 )
             })
             .collect();
+        let directory = if target.is_vault_backup() {
+            self.vault_backup_dir.clone()
+        } else {
+            None
+        };
         self.file_dialog_queue.push(FileDialogRequest {
             target,
             save,
             filters,
             default_name: default_name.map(str::to_owned),
+            directory,
         });
     }
 
@@ -6233,6 +6252,7 @@ impl App {
                 save,
                 filters,
                 default_name,
+                directory,
             } = request;
             let mut dialog = rfd::AsyncFileDialog::new();
             for (name, exts) in &filters {
@@ -6241,6 +6261,9 @@ impl App {
             }
             if let Some(name) = &default_name {
                 dialog = dialog.set_file_name(name);
+            }
+            if let Some(dir) = &directory {
+                dialog = dialog.set_directory(dir);
             }
             if cfg!(windows) {
                 dialog = dialog.set_parent(frame);
@@ -6276,6 +6299,11 @@ impl App {
                 Ok(result) => {
                     let (target, _) = self.pending_files.remove(i);
                     if let Some(path) = result {
+                        if target.is_vault_backup() {
+                            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                                self.vault_backup_dir = Some(dir.to_path_buf());
+                            }
+                        }
                         let text = path.display().to_string();
                         match target {
                             FileTarget::OpenpgpImport => self.openpgp.import_path = text,
