@@ -76,9 +76,12 @@ integrity") are the trust boundary for what ships.
 - [ ] Maintainer-side fixups (fmt, fuzz-target repairs) land as a separate
       commit or PR under the maintainer's name, not pushed onto the
       contributor's branch before the squash.
-- [ ] User-facing changes get a `changelog.d/` fragment (or a CHANGELOG
-      entry — pre-fragment PRs) crediting the contributor; a first
-      contribution adds them to the README Contributors section.
+- [ ] Verify the PR carries its own credit: a `changelog.d/` fragment for a
+      user-facing change, and this PR's number on the contributor's line in
+      the README Contributors section (a new line on a first PR; CI's
+      "Contributor credit in README" job checks the number). A missing
+      credit is a must-fix for the contributor, listed first in the review,
+      not something the maintainer adds at merge.
 - [ ] Merge comment: what was reviewed, what was fixed maintainer-side, what
       follow-ups went into TODO.md. Issue closes are the maintainer's,
       separately.

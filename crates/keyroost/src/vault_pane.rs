@@ -177,9 +177,7 @@ pub(crate) fn overview_line(
 ) -> String {
     match offer {
         VaultOffer::Unknown => fido_unread_line(false, read_failed).to_owned(),
-        VaultOffer::NeedsAdmin => "Open the FIDO2 tab to manage this key via Windows settings \
-                                   or restart as administrator."
-            .to_owned(),
+        VaultOffer::NeedsAdmin => "The vault needs administrator rights on Windows.".to_owned(),
         VaultOffer::No(what) => format!(
             "{}.",
             sentence(&VaultKeyError::Unsupported(what).to_string())
@@ -244,23 +242,11 @@ pub(crate) fn space_line(cap: &BlobCapacity) -> String {
     }
 }
 
-/// When an entry last changed, as an opened entry says it: `modified` and
-/// `now` in minutes since the Unix epoch. Recent changes in days, older (or
-/// clock-skewed) ones as a date; `None` for an entry with no time.
+/// When an entry last changed, as an opened entry says it: `changed `
+/// and [`keyroost_vault::changed_ago`]'s words, which the CLI's `Changed:`
+/// line shows too; `None` for an entry with no time.
 pub(crate) fn changed_ago(modified: i64, now: i64) -> Option<String> {
-    if modified <= 0 {
-        return None;
-    }
-    let days = now.saturating_sub(modified) / (24 * 60);
-    Some(match days {
-        0 if now >= modified => "changed today".to_owned(),
-        1 => "changed yesterday".to_owned(),
-        2..=59 => format!("changed {days} days ago"),
-        _ => {
-            let (y, m, d) = keyroost_pgpkey::cert::civil_from_days(modified.div_euclid(24 * 60));
-            format!("changed on {y:04}-{m:02}-{d:02}")
-        }
-    })
+    keyroost_vault::changed_ago(modified, now).map(|w| format!("changed {w}"))
 }
 
 /// Whether `hay` holds `needle` (already lower-cased), ignoring case,
@@ -407,8 +393,14 @@ pub(crate) fn experimental_line(ui: &mut egui::Ui, p: &Palette, tail: &str) {
         };
         // The pill says "Experimental": the sentence starts after it.
         ui.add(text("Please "));
+        // Colored and underlined here, as the app's other links are colored:
+        // the theme's text-color override would otherwise paint it as
+        // plain text, and egui underlines a link only while hovered.
         ui.hyperlink_to(
-            egui::RichText::new("report problems").font(theme::f_reg(11.5)),
+            egui::RichText::new("report problems")
+                .font(theme::f_reg(11.5))
+                .color(ui.visuals().hyperlink_color)
+                .underline(),
             ISSUES_URL,
         );
         ui.add(text(tail));
@@ -2163,6 +2155,12 @@ impl App {
     /// The Vault tab.
     pub(crate) fn cap_vault(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let offer = self.vault_offer();
+        self.cap_vault_for(ui, p, offer);
+    }
+
+    /// [`Self::cap_vault`] for a given offer (tests pass the Windows
+    /// non-administrator one, which can't arise elsewhere).
+    fn cap_vault_for(&mut self, ui: &mut egui::Ui, p: &Palette, offer: VaultOffer) {
         let unlocked = offer == VaultOffer::Ready && self.vault_session().is_some();
         let by_finger = self
             .vault_session()
@@ -2228,7 +2226,14 @@ impl App {
                     p.txt2
                 }),
             );
-            if matches!(offer, VaultOffer::NeedsAdmin | VaultOffer::NeedsPin) {
+            if offer == VaultOffer::NeedsAdmin {
+                ui.add_space(8.0);
+                if theme::button(ui, p, BtnKind::Default, "Restart as administrator").clicked() {
+                    if let Some(err) = crate::relaunch_as_admin_or_error() {
+                        self.vault.error = Some(err);
+                    }
+                }
+            } else if offer == VaultOffer::NeedsPin {
                 ui.add_space(8.0);
                 open_fido2 = theme::button(ui, p, BtnKind::Default, "Open FIDO2").clicked();
             }
@@ -3809,6 +3814,25 @@ fn preview_rows(current: Option<&Vault>, incoming: &Vault) -> Vec<ImportRow> {
         .collect()
 }
 
+/// `new` (fresh rows, default ticks) with the tick of each `old` row of
+/// the same backup entry and comparison kept: the user's choice stands
+/// wherever the plan it was made for is unchanged. A row new or of another
+/// comparison takes its default. Whether any row changed.
+fn keep_unchanged_ticks(old: &[ImportRow], new: Vec<ImportRow>) -> (Vec<ImportRow>, bool) {
+    let mut changed = new.len() != old.len();
+    let merged = new
+        .into_iter()
+        .map(|new| match old.iter().find(|r| r.index == new.index) {
+            Some(old) if old.status == new.status => *old,
+            _ => {
+                changed = true;
+                new
+            }
+        })
+        .collect();
+    (merged, changed)
+}
+
 /// A backup entry as its preview row names it: `title (username) · host`,
 /// empty parts left out (the code imports' `title (username)`, with the
 /// URL's host so two entries titled alike can be told apart). Never an ID.
@@ -3912,7 +3936,13 @@ pub(crate) struct ImportDialog {
     pub rows: Vec<ImportRow>,
     /// What the dialog says: a backup that didn't open, an import refused.
     pub notice: Option<String>,
+    /// The passphrase box asks for the keyboard on the next frame: once,
+    /// when the dialog opens on it.
+    pub focus_passphrase: bool,
 }
+
+/// The passphrase box's widget ID, so the dialog can hand it the keyboard.
+const IMPORT_PASSPHRASE_ID: &str = "vault-import-passphrase";
 
 impl ImportDialog {
     pub(crate) fn new(path: PathBuf, target: ImportTarget, new_name: String) -> Self {
@@ -3924,6 +3954,7 @@ impl ImportDialog {
             incoming: None,
             rows: Vec::new(),
             notice: None,
+            focus_passphrase: true,
         }
     }
 }
@@ -3939,6 +3970,7 @@ impl TypedSecrets for ImportDialog {
             incoming: _,
             rows: _,
             notice: _,
+            focus_passphrase: _,
         } = self;
         vec![passphrase]
     }
@@ -4122,42 +4154,43 @@ impl App {
         }
     }
 
-    /// After a Refresh: rows whose comparison changed take their new plan
-    /// and default tick, and the dialog says so; the others keep the
-    /// user's ticks.
-    fn vault_import_refreshed(&mut self) {
-        let Some(now) = self.vault_import_rows_now() else {
-            return;
-        };
-        let Some(d) = self.vault.import.as_mut() else {
-            return;
-        };
+    /// The preview against the target as the session holds it now, keeping
+    /// the user's tick on every row whose comparison is unchanged (see
+    /// [`keep_unchanged_ticks`]); whether any row changed. `None` before
+    /// the backup is opened or without the dialog; on `Err` the rows empty
+    /// and the dialog says why.
+    fn vault_import_remerge(&mut self) -> Option<bool> {
+        let now = self.vault_import_rows_now()?;
+        let d = self.vault.import.as_mut()?;
         match now {
             Ok(rows) => {
-                let mut changed = rows.len() != d.rows.len();
-                let merged = rows
-                    .into_iter()
-                    .map(|new| match d.rows.iter().find(|r| r.index == new.index) {
-                        Some(old) if old.status == new.status => *old,
-                        _ => {
-                            changed = true;
-                            new
-                        }
-                    })
-                    .collect();
+                let (merged, changed) = keep_unchanged_ticks(&d.rows, rows);
                 d.rows = merged;
-                if changed {
-                    d.notice = Some(IMPORT_REFRESHED.to_owned());
-                }
+                Some(changed)
             }
             Err(e) => {
                 d.rows = Vec::new();
                 d.notice = Some(e);
+                None
             }
         }
     }
 
-    /// Into vault: another target, and the preview against it.
+    /// After a Refresh: rows whose comparison changed take their new plan
+    /// and default tick, and the dialog says so; the others keep the
+    /// user's ticks.
+    fn vault_import_refreshed(&mut self) {
+        if self.vault_import_remerge() == Some(true) {
+            if let Some(d) = self.vault.import.as_mut() {
+                d.notice = Some(IMPORT_REFRESHED.to_owned());
+            }
+        }
+    }
+
+    /// Into vault: another target, and the preview against it. As after a
+    /// Refresh, a row whose comparison is the same against the new target
+    /// keeps the user's tick; one whose comparison changed takes its
+    /// default.
     pub(crate) fn vault_import_set_target(&mut self, target: ImportTarget) {
         let Some(d) = self.vault.import.as_mut() else {
             return;
@@ -4167,7 +4200,7 @@ impl App {
         }
         d.target = target;
         d.notice = None;
-        self.vault_import_classify();
+        self.vault_import_remerge();
     }
 
     /// Tick or untick row `i`; a row with no box stays as it is.
@@ -4322,10 +4355,14 @@ impl App {
                     ui.add_sized([LABEL_W, 24.0], label("Passphrase"));
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut d.passphrase)
+                            .id(egui::Id::unique(IMPORT_PASSPHRASE_ID))
                             .margin(theme::TEXT_EDIT_MARGIN)
                             .desired_width(f32::INFINITY)
                             .password(true),
                     );
+                    if std::mem::take(&mut d.focus_passphrase) {
+                        resp.request_focus();
+                    }
                     guard_secret_field(ui.ctx(), &resp);
                     open = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 });
@@ -5076,8 +5113,7 @@ mod tests {
         );
         assert_eq!(
             overview_line(VaultOffer::NeedsAdmin, false, None, false),
-            "Open the FIDO2 tab to manage this key via Windows settings or restart as \
-             administrator."
+            "The vault needs administrator rights on Windows."
         );
         assert_eq!(
             overview_line(VaultOffer::No("largeBlobKey"), false, None, false),
@@ -9025,9 +9061,13 @@ mod tests {
         app.vault_lock(None);
         let file = path.display().to_string();
         app.vault_apply_export(Some(KEY.into()), "Personal".into(), file.clone(), Ok(2));
+        // The log shows the home folder as `~`; the temp folder is under it
+        // on Windows.
         assert_eq!(
             app.log.last().unwrap().text,
-            format!("Vault: backup of vault \"Personal\" written to {file}")
+            crate::without_home(&format!(
+                "Vault: backup of vault \"Personal\" written to {file}"
+            ))
         );
         assert!(app.vault.info.is_none() && app.vault.export.is_none());
         app.vault_apply_export(
@@ -9598,6 +9638,88 @@ mod tests {
     }
 
     #[test]
+    fn backup_dialogs_start_in_the_last_folder_chosen() {
+        let mut key = FakeKey::new();
+        two_vaults(&mut key);
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        let dir_of_next = |app: &mut App, export: bool| {
+            if export {
+                app.vault_export_start();
+            } else {
+                app.vault_import_start();
+            }
+            app.file_dialog_queue.pop().expect("a dialog").directory
+        };
+        app.vault_import_start();
+        let first = app.file_dialog_queue.pop().expect("an open dialog");
+        assert_eq!(first.directory, None, "nothing chosen yet");
+        choose_backup(&mut app, Some(PathBuf::from("/backups/a/personal.t2vault")));
+        app.vault_import_cancel();
+        assert_eq!(
+            dir_of_next(&mut app, true),
+            Some(PathBuf::from("/backups/a")),
+            "Export starts where Import chose"
+        );
+        choose_file(
+            &mut app,
+            Some(PathBuf::from("/elsewhere/b/personal.t2vault")),
+        );
+        app.vault_export_cancel();
+        app.vault_import_start();
+        let request = app.file_dialog_queue.pop().expect("an open dialog");
+        assert_eq!(request.directory, Some(PathBuf::from("/elsewhere/b")));
+        // A cancelled dialog leaves the folder as it was.
+        choose_backup(&mut app, None);
+        assert_eq!(
+            dir_of_next(&mut app, false),
+            Some(PathBuf::from("/elsewhere/b"))
+        );
+        // Other file dialogs keep the platform's start.
+        app.spawn_file_dialog(FileTarget::PivCert, false, &[], None);
+        assert_eq!(app.file_dialog_queue.pop().unwrap().directory, None);
+    }
+
+    #[test]
+    fn the_passphrase_box_takes_focus_once_when_the_dialog_opens() {
+        use crate::tests::TestFrame;
+        let mut key = FakeKey::new();
+        key.add_vault("Personal", &key_vault());
+        let mut app = app();
+        unlock_into(&mut app, &mut key);
+        import_dialog_for(&mut app, Path::new("personal.t2vault"));
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let palette = Palette::new(crate::ui::theme::Mode::Dark, Palette::ACCENTS[0], false);
+        let frame = |app: &mut App| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.test_frame(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    app.render_vault_list(ui, &palette);
+                });
+            });
+        };
+        frame(&mut app);
+        frame(&mut app);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(egui::Id::unique(IMPORT_PASSPHRASE_ID)),
+            "the passphrase box has the keyboard"
+        );
+        // Asked once: focus moved elsewhere stays there.
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique(IMPORT_PASSPHRASE_ID)));
+        frame(&mut app);
+        frame(&mut app);
+        assert_eq!(ctx.memory(|m| m.focused()), None, "not taken again");
+    }
+
+    #[test]
     fn changing_the_target_reclassifies() {
         let mut key = FakeKey::new();
         key.add_vault("Personal", &key_vault());
@@ -9610,17 +9732,32 @@ mod tests {
         app.vault_import_tick(0, false);
         app.vault_import_set_target(ImportTarget::New);
         assert_eq!(statuses(&mut app), vec![New; 5]);
-        assert_eq!(ticks(&mut app), vec![true; 5], "the default ticks again");
+        assert_eq!(
+            ticks(&mut app),
+            vec![false, true, true, true, true],
+            "the unticked new row stays unticked; changed rows take their default"
+        );
+        app.vault_import_tick(1, false);
         let work = app.vault_session().unwrap().unlocked.vaults[1]
             .vault_ref
             .clone();
         assert_eq!(work.name.as_deref(), Some("Work"));
         app.vault_import_set_target(ImportTarget::Existing(work));
         assert_eq!(statuses(&mut app), vec![New; 5]);
+        assert_eq!(
+            ticks(&mut app),
+            vec![false, false, true, true, true],
+            "every row's plan is unchanged: every tick kept"
+        );
+        assert_eq!(
+            import_dialog(&mut app).notice,
+            None,
+            "a switch says nothing"
+        );
         let text = list_text(&mut app);
         assert!(text.contains("for vault \"Work\":"), "{text}");
         assert!(
-            text.contains("0 entries in the vault; 5 will be added"),
+            text.contains("0 entries in the vault; 3 will be added"),
             "{text}"
         );
     }
@@ -9919,6 +10056,39 @@ mod tests {
     }
 
     // ----- Final review fixes -----
+
+    #[test]
+    fn the_vault_tab_without_admin_rights_offers_a_restart() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            texts = frame_texts(&ctx, Vec::new(), |ui, p| {
+                app.cap_vault_for(ui, p, VaultOffer::NeedsAdmin);
+            });
+        }
+        let all: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(all.contains(&"The vault needs administrator rights on Windows."));
+        assert!(all.contains(&"Restart as administrator"));
+        assert!(!all.contains(&"Open FIDO2"));
+    }
+
+    /// Off Windows the relaunch is inert, so a click is safe: it reports
+    /// the failure instead of exiting. (On Windows it would really exit.)
+    #[cfg(not(windows))]
+    #[test]
+    fn restart_as_administrator_reports_a_failed_relaunch() {
+        let mut app = app();
+        click_text("Restart as administrator", |ui, p| {
+            app.cap_vault_for(ui, p, VaultOffer::NeedsAdmin);
+        });
+        let err = app.vault.error.as_deref().unwrap_or_default();
+        assert!(
+            err.starts_with("Couldn't restart as administrator: "),
+            "{err}"
+        );
+    }
 
     /// Every text shape of one headless 900 x 700 frame drawn by `render`,
     /// with where it was drawn.
@@ -10653,6 +10823,47 @@ mod tests {
             text.contains("Please report problems and keep a backup."),
             "{text}"
         );
+    }
+
+    /// "report problems" looks like a link without hovering: underlined,
+    /// in the theme's link color (the accent), though the theme overrides
+    /// every other text's color.
+    #[test]
+    fn the_report_problems_link_is_underlined_in_the_link_color() {
+        use crate::tests::TestFrame;
+        use crate::ui::theme::Mode;
+        fn find(shape: &egui::Shape, out: &mut Vec<egui::epaint::TextShape>) {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == "report problems" => out.push(t.clone()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, out)),
+                _ => {}
+            }
+        }
+        for (mode, name) in [(Mode::Dark, "dark"), (Mode::Light, "light")] {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            let palette = Palette::new(mode, Palette::ACCENTS[0], false);
+            palette.apply(&ctx, mode);
+            let output = ctx.test_frame(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| experimental_note(ui, &palette));
+            });
+            let mut links = Vec::new();
+            for clipped in &output.shapes {
+                find(&clipped.shape, &mut links);
+            }
+            let [link] = links.as_slice() else {
+                panic!("one link: {}", links.len());
+            };
+            let format = &link.galley.job.sections[0].format;
+            assert_eq!(format.color, palette.accent, "{name}");
+            assert_eq!(
+                ctx.global_style().visuals.hyperlink_color,
+                palette.accent,
+                "the accent is the link color"
+            );
+            assert!(format.underline.width > 0.0, "{name}: underlined");
+            assert_eq!(format.underline.color, palette.accent, "{name}");
+        }
     }
 
     /// The vault's questions come into view once when asked: the flag is

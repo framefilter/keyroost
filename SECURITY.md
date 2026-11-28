@@ -91,13 +91,16 @@ What keyroost does **not** defend against:
   (keyroost makes no connection itself), and the Wayland screenshot path
   talks to `xdg-desktop-portal` over the session bus, which is local IPC.
 - **`unsafe` only in three scoped FFI shims.** `unsafe_code = "forbid"` is
-  the workspace-wide default; the sole exceptions are the Windows-only
-  `keyroost-winwebauthn` (HID enumeration / shell launch),
+  the workspace-wide default; the sole exceptions are
+  `keyroost-winwebauthn` (HID enumeration / shell launch / console modes on
+  Windows, and the CLI's Ctrl+C erase of a shown password: a console
+  control handler on Windows, a signal handler over `libc` on Unix),
   `keyroost-screengrab` (GDI screen capture) and `keyroost-windevtree`
-  (read-only device-tree lookups) crates, which set
-  `unsafe_code = "allow"` to confine their thin `windows-sys` FFI. All
-  three are inert on non-Windows targets. No `unsafe` appears in any
-  cross-platform crate.
+  (read-only device-tree lookups), which set `unsafe_code = "allow"` to
+  confine their thin FFI. `keyroost-screengrab` and `keyroost-windevtree`
+  are inert on non-Windows targets; `keyroost-winwebauthn`'s only
+  non-Windows code is that signal handler. No `unsafe` appears in any
+  other crate.
 - **Vendored protocol code, scoped dependencies.** SM4, SHA-1/256/512, the
   OATH HMAC, base32/hex, and the APDU/TLV/CBOR and `otpauth://` parsers are
   implemented in-tree with no external crate; `keyroost-proto` carries no

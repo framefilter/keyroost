@@ -44,6 +44,27 @@ jobs:
         run: python3 packaging/assemble-changelog.py --check
       - name: changelog assembler self-test
         run: bash packaging/test-assemble-changelog.sh
+      - name: contributor credit check self-test
+        run: bash packaging/check-contributor-credit.sh --self-test
+
+  # An outside contributor's PR credits itself in README.md's Contributors
+  # section, alongside its changelog.d fragment (CONTRIBUTING.md, "How a PR
+  # lands"). The maintainer's and Dependabot's PRs pass without one. The PR
+  # number and author login reach the script through env:, never interpolated
+  # into the shell command.
+  contributor-credit:
+    name: Contributor credit in README
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: README Contributors section credits this PR
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: bash packaging/check-contributor-credit.sh "$PR_NUMBER" "$PR_AUTHOR"
 
   # One source tree, compiled and tested three ways. This matrix is what keeps
   # the macOS/Windows code (the cfg-gated hidapi HID backend) from rotting: a
@@ -178,6 +199,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
         with:
           toolchain: stable
+          targets: x86_64-pc-windows-gnu
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
@@ -185,6 +207,13 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --locked
+
+      # The Windows-only code (cfg(windows) / cfg(not(unix))) is invisible to
+      # the Linux build above; document it for the Windows target too.
+      - name: cargo doc (workspace, Windows target, deny warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked --target x86_64-pc-windows-gnu
 
   # Surface dependencies the compiler will reject in a future Rust release.
   # Builds `--all-features` so every opt-in dep is covered — including the `qr`

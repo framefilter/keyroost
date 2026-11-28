@@ -5,17 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Windows-only helper: detect a FIDO key and open Windows' security-key settings, without admin."
+description = "Windows helper: detect a FIDO key and open Windows' security-key settings, without admin; plus the CLI's console and terminal guards for showing a password."
 
-# This crate is the one deliberate exception to the workspace-wide
-# forbid(unsafe_code): it is a thin FFI shim over Windows' HID enumeration and
-# the shell. The unsafe is confined to src/sys.rs and to this crate.
+# This crate is a deliberate exception to the workspace-wide
+# forbid(unsafe_code): it is a thin FFI shim over Windows' HID enumeration,
+# the shell and the console, and over the Unix signal and terminal calls the
+# CLI needs to erase a shown password on Ctrl+C. The unsafe is confined to
+# src/sys.rs (Windows) and src/unix.rs (Unix), and to this crate.
 [lints.rust]
 unsafe_code = "allow"
 
-# Windows-only. On other platforms the crate still builds but every entry point
-# is inert (returns empty / Unsupported), so callers can depend on it
-# unconditionally and gate behaviour at runtime.
+# Unix: sigaction / tcsetattr / write / _exit for the Ctrl+C erase. Already in
+# the tree (rpassword and rtoolbox use it); the lock file's version.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows-only. On other platforms the Windows entry points are inert (return
+# empty / Unsupported), so callers can depend on the crate unconditionally and
+# gate behavior at runtime; the Unix Ctrl+C erase is the one non-Windows part.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -25,4 +32,5 @@ windows-sys = { version = "0.61", features = [
     "Win32_Devices_DeviceAndDriverInstallation", # SetupDi* (HID enumeration)
     "Win32_Devices_HumanInterfaceDevice",        # HidD_* / HidP_GetCaps (usage page)
     "Win32_Storage_FileSystem",                  # CreateFileW (open HID for caps)
+    "Win32_System_Console",                      # Get/SetConsoleMode (VT for the CLI's erase)
 ] }

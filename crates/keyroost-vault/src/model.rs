@@ -38,6 +38,80 @@ impl Drop for Entry {
 
 impl ZeroizeOnDrop for Entry {}
 
+/// When an entry last changed, in the words the app and the CLI both use:
+/// `modified` and `now` in minutes since the Unix epoch. A change within
+/// the last day is `today`, then `yesterday` and `N days ago` up to 59
+/// days; older (or from a clock ahead of this one) it is `on YYYY-MM-DD`
+/// (UTC). `None` for an entry with no time. The words count elapsed days,
+/// so they need no time zone.
+#[must_use]
+pub fn changed_ago(modified: i64, now: i64) -> Option<String> {
+    if modified <= 0 {
+        return None;
+    }
+    const DAY: i64 = 24 * 60;
+    let days = now.saturating_sub(modified) / DAY;
+    Some(match days {
+        0 if now >= modified => "today".to_owned(),
+        1 => "yesterday".to_owned(),
+        2..=59 => format!("{days} days ago"),
+        _ => {
+            let (y, m, d) = civil_from_days(modified.div_euclid(DAY));
+            format!("on {y:04}-{m:02}-{d:02}")
+        }
+    })
+}
+
+/// The date for a day count since 1970-01-01 (Howard Hinnant's
+/// `civil_from_days`; the same algorithm as `keyroost-pgpkey`'s, kept here
+/// so this crate stays free of the OpenPGP one).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m as u32, d as u32)
+}
+
+#[cfg(test)]
+mod changed_tests {
+    use super::changed_ago;
+
+    const DAY: i64 = 24 * 60;
+
+    #[test]
+    fn changed_ago_words() {
+        // 2026-11-26, noon UTC.
+        let now = 20_783 * DAY + 12 * 60;
+        let w = |m: i64| changed_ago(m, now);
+        assert_eq!(w(now).as_deref(), Some("today"));
+        assert_eq!(w(now - DAY + 5).as_deref(), Some("today"));
+        assert_eq!(w(now - DAY).as_deref(), Some("yesterday"));
+        assert_eq!(w(now - 3 * DAY).as_deref(), Some("3 days ago"));
+        assert_eq!(w(now - 59 * DAY).as_deref(), Some("59 days ago"));
+        assert_eq!(w(now - 60 * DAY).as_deref(), Some("on 2026-09-27"));
+        // A time from a clock ahead of this one: the date.
+        assert_eq!(w(now + 2 * DAY).as_deref(), Some("on 2026-11-28"));
+        assert_eq!(w(now + 5).as_deref(), Some("on 2026-11-26"));
+        assert_eq!(w(0), None, "no time recorded");
+        assert_eq!(w(-5), None);
+    }
+
+    #[test]
+    fn dates_across_eras_and_leap_days() {
+        let on = |days: i64| changed_ago(days * DAY + 1, i64::MAX / 2).unwrap();
+        assert_eq!(on(0), "on 1970-01-01");
+        assert_eq!(on(19_417), "on 2023-03-01");
+        assert_eq!(on(11_016), "on 2000-02-29");
+        assert_eq!(on(10_956), "on 1999-12-31");
+    }
+}
+
 // Debug never prints the password.
 impl std::fmt::Debug for Entry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

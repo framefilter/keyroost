@@ -1,6 +1,7 @@
 # keyroost-winwebauthn
 
-Windows-only helper for keyroost's **non-admin FIDO2 tab**. Reviewed skeleton —
+Helper for keyroost's **non-admin FIDO2 tab** on Windows, plus the CLI's
+console and terminal guards for showing a password (Windows and Unix). Reviewed skeleton —
 the Windows code can't be compiled or run off-Windows; build and verify it there.
 
 ## Scope (deliberately small)
@@ -15,7 +16,14 @@ provides just enough for an informational tab:
   Accounts > Sign-in options > Security Key page, which does PIN / reset /
   biometrics WITHOUT admin (Settings is itself the privileged component).
 
-That's all. No passkey enumeration, no PIN/reset via API. The `webauthn.dll` API
+It also holds the console and terminal FFI the CLI needs while
+`fido vault entry show --reveal` shows a password (the CLI forbids `unsafe`):
+`console_vt()` turns on VT processing in the classic Windows console, and
+`erase_on_interrupt()` erases the password if the user presses Ctrl+C (a
+console control handler on Windows; a SIGINT/SIGTERM handler on Unix, in
+`src/unix.rs`, over `libc`).
+
+No passkey enumeration, no PIN/reset via API. The `webauthn.dll` API
 was investigated and proved a dead end for **external** keys: its credential
 list/delete only cover Windows Hello / TPM credentials, and it has no PIN or
 reset function at all. So the design is: detect + inform + link out to Windows.
@@ -42,5 +50,6 @@ Windows security-key page. Risky FFI spots are marked `VERIFY:` in `src/sys.rs`
 
 ## Status
 
-- Non-Windows (inert) path: compiles clean.
+- Non-Windows: the Windows entry points are inert; the Unix Ctrl+C erase is
+  built and tested on Linux.
 - Windows path: NOT compiled in CI (no Windows toolchain). Reviewed against docs.

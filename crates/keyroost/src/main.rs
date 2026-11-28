@@ -60,6 +60,25 @@ struct ClipboardClear {
 }
 
 /// The clear for `text` copied at `now`: [`CLIPBOARD_CLEAR_AFTER_SECS`] out.
+/// Ask Windows to relaunch keyroost elevated and exit this instance on
+/// success; on failure return the message to show.
+#[cfg(windows)]
+pub(crate) fn relaunch_as_admin_or_error() -> Option<String> {
+    match keyroost_winwebauthn::relaunch_as_admin() {
+        // Elevated instance requested: exit this non-elevated one so only
+        // the admin process remains.
+        Ok(()) => std::process::exit(0),
+        Err(e) => Some(format!("Couldn't restart as administrator: {e}")),
+    }
+}
+
+/// Off Windows nothing offers the restart; the same failure shape keeps
+/// the callers (and their tests) platform-neutral.
+#[cfg(not(windows))]
+pub(crate) fn relaunch_as_admin_or_error() -> Option<String> {
+    Some("Couldn't restart as administrator: only available on Windows".to_owned())
+}
+
 fn clipboard_clear_for(text: String, now: f64, from_vault: bool) -> ClipboardClear {
     ClipboardClear {
         text: zeroize::Zeroizing::new(text),
@@ -128,6 +147,12 @@ fn idle_locked_msg_for(d: std::time::Duration) -> String {
         "Locked after {} of inactivity \u{2014} unlock again to continue.",
         span_words(d)
     )
+}
+
+/// The idle lock in plain words: what the log says, and what is shown where
+/// there is nothing to unlock again (a first PIN being typed).
+fn idle_locked_plain_msg() -> String {
+    format!("Locked after {} of inactivity.", idle_lock_span())
 }
 
 /// What a dialog the idle lock closed says.
@@ -6031,6 +6056,10 @@ struct App {
     /// selection change): an id must not be reused while a dialog opened for
     /// the previous key is still on screen.
     ssh_cert_next_id: u64,
+    /// The folder of the last vault backup file chosen (Export backup… or
+    /// Import backup…): the next of those dialogs starts there. For this
+    /// run only; never saved.
+    vault_backup_dir: Option<std::path::PathBuf>,
 }
 
 /// Which path text field a resolved file-chooser result should populate. Keeps
@@ -6165,6 +6194,15 @@ struct FileDialogRequest {
     save: bool,
     filters: Vec<(String, Vec<String>)>,
     default_name: Option<String>,
+    /// The folder the dialog starts in; `None`, the platform's choice.
+    directory: Option<std::path::PathBuf>,
+}
+
+impl FileTarget {
+    /// A vault backup's dialog: these share one remembered folder.
+    fn is_vault_backup(&self) -> bool {
+        matches!(self, Self::VaultExport { .. } | Self::VaultImport)
+    }
 }
 
 impl App {
@@ -6188,11 +6226,17 @@ impl App {
                 )
             })
             .collect();
+        let directory = if target.is_vault_backup() {
+            self.vault_backup_dir.clone()
+        } else {
+            None
+        };
         self.file_dialog_queue.push(FileDialogRequest {
             target,
             save,
             filters,
             default_name: default_name.map(str::to_owned),
+            directory,
         });
     }
 
@@ -6214,6 +6258,7 @@ impl App {
                 save,
                 filters,
                 default_name,
+                directory,
             } = request;
             let mut dialog = rfd::AsyncFileDialog::new();
             for (name, exts) in &filters {
@@ -6222,6 +6267,9 @@ impl App {
             }
             if let Some(name) = &default_name {
                 dialog = dialog.set_file_name(name);
+            }
+            if let Some(dir) = &directory {
+                dialog = dialog.set_directory(dir);
             }
             if cfg!(windows) {
                 dialog = dialog.set_parent(frame);
@@ -6257,6 +6305,11 @@ impl App {
                 Ok(result) => {
                     let (target, _) = self.pending_files.remove(i);
                     if let Some(path) = result {
+                        if target.is_vault_backup() {
+                            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                                self.vault_backup_dir = Some(dir.to_path_buf());
+                            }
+                        }
                         let text = path.display().to_string();
                         match target {
                             FileTarget::OpenpgpImport => self.openpgp.import_path = text,
@@ -8060,7 +8113,8 @@ impl App {
     /// ([`Self::vault_idle_lock`]); without, a vault whose form holds unsaved
     /// changes stays open. Local only — no device I/O.
     fn idle_lock(&mut self, include_vault: bool) {
-        if self.security_keys.session.is_some() {
+        let session_locked = self.security_keys.session.is_some();
+        if session_locked {
             self.lock_session();
             self.security_keys.error = Some(idle_locked_msg());
         }
@@ -8075,7 +8129,13 @@ impl App {
         if self.security_keys.change_pin.has_pin_input() {
             // Replacing the form wipes its PINs (ChangePinDialog's Drop).
             self.security_keys.change_pin = ChangePinDialog::default();
-            self.security_keys.error = Some(idle_locked_msg());
+            // A first PIN on a key with none: nothing to unlock again.
+            let first_pin = pin_support(self.security_keys.info.as_ref()) == PinSupport::NotSet;
+            self.security_keys.error = Some(if first_pin && !session_locked {
+                idle_locked_plain_msg()
+            } else {
+                idle_locked_msg()
+            });
         }
         // What a typed password opened: the dialog holding it closes, as its
         // own Close would, dropping it with its typed secrets. The import
@@ -8163,10 +8223,7 @@ impl App {
             self.ftotp.forget_codes();
             self.ftotp.info = Some(idle_hidden_msg());
         }
-        self.log(
-            Severity::Info,
-            format!("Locked after {} of inactivity.", idle_lock_span()),
-        );
+        self.log(Severity::Info, idle_locked_plain_msg());
     }
 
     /// Copy a secret (an OTP / OATH code, a generated management key) to the
@@ -21760,14 +21817,8 @@ impl App {
                     }
                 }
                 if theme::button(ui, p, BtnKind::Default, "Restart as administrator").clicked() {
-                    match keyroost_winwebauthn::relaunch_as_admin() {
-                        // Elevated instance requested: exit this non-elevated one
-                        // so only the admin process remains.
-                        Ok(()) => std::process::exit(0),
-                        Err(e) => {
-                            self.security_keys.error =
-                                Some(format!("Couldn't restart as administrator: {e}"));
-                        }
+                    if let Some(err) = relaunch_as_admin_or_error() {
+                        self.security_keys.error = Some(err);
                     }
                 }
             });
@@ -38427,6 +38478,34 @@ mod tests {
             assert!(app.security_keys.change_pin.confirm.is_empty(), "{case}");
             assert_eq!(app.security_keys.error, Some(idle_locked_msg()), "{case}");
             assert!(!app.holds_unlocked_secrets(), "{case}");
+        }
+    }
+
+    /// On a key with no PIN yet there is nothing to unlock: the idle lock
+    /// that wipes a half-typed first PIN says only that it locked. A key
+    /// with a PIN keeps "unlock again".
+    #[test]
+    fn idle_lock_of_a_first_pin_says_nothing_about_unlocking() {
+        for (client_pin, want) in [
+            (false, "Locked after 5 minutes of inactivity.".to_owned()),
+            (true, idle_locked_msg()),
+        ] {
+            let mut app = App::default();
+            app.security_keys.info = Some(AuthenticatorInfo {
+                options: vec![("clientPin".into(), client_pin)],
+                ..Default::default()
+            });
+            app.security_keys.change_pin = ChangePinDialog {
+                open: true,
+                old: String::new(),
+                new: "new-pin".into(),
+                confirm: String::new(),
+            };
+            let t0 = std::time::Instant::now();
+            app.idle_lock_tick(t0, false);
+            app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+            assert!(app.security_keys.change_pin.new.is_empty(), "{client_pin}");
+            assert_eq!(app.security_keys.error, Some(want), "{client_pin}");
         }
     }
 

@@ -1834,7 +1834,8 @@ fn pick_entry(
     )
 }
 
-/// An entry's `modified_minutes` as a date, `YYYY-MM-DD` (UTC).
+/// An entry's `modified_minutes` as a date, `YYYY-MM-DD` (UTC): the
+/// `--json` documents' `changed` (text output says it in words).
 pub(crate) fn changed_date(minutes: i64) -> String {
     let (y, m, d) = keyroost_pgpkey::cert::civil_from_days(minutes.div_euclid(24 * 60));
     format!("{y:04}-{m:02}-{d:02}")
@@ -1864,7 +1865,8 @@ fn wiped_line(head: &str, value: &str) -> Zeroizing<String> {
     line
 }
 
-/// `entry show` as text: Title, Username, URL, Notes, Changed, then
+/// `entry show` as text: Title, Username, URL, Notes, Changed (in the
+/// app's words: `today`, `3 days ago`, `on 2023-11-14`), then
 /// `Password: (hidden)` or `(none)`. Never the password, never the ID.
 ///
 /// Laid out like [`crate::output::kv_block`] (each value one space after the
@@ -1872,6 +1874,11 @@ fn wiped_line(head: &str, value: &str) -> Zeroizing<String> {
 /// lines, and `kv_block` joins plain `String`s, so every line here is its
 /// own wiped buffer and a note's later lines stay under its column.
 pub(crate) fn entry_lines(e: &Entry) -> Vec<Zeroizing<String>> {
+    entry_lines_at(e, keyroost_transport::vault::now_minutes())
+}
+
+/// [`entry_lines`] with the time now, `now`, in minutes since the epoch.
+pub(crate) fn entry_lines_at(e: &Entry, now: i64) -> Vec<Zeroizing<String>> {
     let head = |name: &str| format!("{:<w$}", format!("{name}:"), w = REVEAL_LABEL.len());
     let field =
         |name: &str, v: &str| wiped_line(&head(name), if v.is_empty() { "(none)" } else { v });
@@ -1893,7 +1900,9 @@ pub(crate) fn entry_lines(e: &Entry) -> Vec<Zeroizing<String>> {
             lines.push(wiped_line(&h, l));
         }
     }
-    lines.push(field("Changed", &changed_date(e.modified_minutes)));
+    // No time recorded: `(none)`, as an empty field.
+    let changed = keyroost_vault::changed_ago(e.modified_minutes, now).unwrap_or_default();
+    lines.push(field("Changed", &changed));
     let password = if e.password.is_empty() {
         "(none)"
     } else {
@@ -1939,18 +1948,22 @@ pub(crate) fn write_password_only(out: &mut impl Write, p: &str) -> io::Result<(
     out.write_all(p.as_bytes())
 }
 
-/// Erases the shown password once the Enter wait is over. The reader
-/// (rpassword) writes a newline to the terminal when it returns, which
-/// leaves the cursor at the start of the line below the password: up one
-/// line, then clear that whole line.
-pub(crate) fn erase_shown_line() -> &'static str {
-    "\x1b[1A\x1b[2K"
+/// Written right before the password line: eight empty rows, back up to
+/// the first, and the cursor saved there. A long password wraps onto
+/// several rows (128 characters and the label are wider than a usual
+/// terminal), and the reader's newline adds one; with the room made first,
+/// none of that scrolls the screen, so the saved cursor still marks where
+/// the password starts.
+pub(crate) fn before_password() -> &'static str {
+    "\n\n\n\n\n\n\n\n\x1b[8A\x1b7"
 }
 
-/// Erases the password when the Enter wait failed: no newline was written,
-/// so the password is still on the cursor's own line.
-pub(crate) fn erase_current_line() -> &'static str {
-    "\r\x1b[2K"
+/// Erases the shown password once the Enter wait is over, or failed: back
+/// to the cursor [`before_password`] saved, then clear to the end of the
+/// screen, so every row the password wrapped onto goes, with or without
+/// the reader's newline.
+pub(crate) fn erase_password() -> &'static str {
+    "\x1b8\x1b[J"
 }
 
 /// Whether the terminal the Enter wait reads (and the reader writes its
@@ -1972,37 +1985,71 @@ fn terminal_opens() -> io::Result<()> {
     }
 }
 
+/// What a shown password's cancel says. The Ctrl+C handler writes it
+/// itself ([`INTERRUPTED_NOTE`]), as the process ends there.
+const CANCELED_SHOWN: &str = "canceled while the password was shown; it is erased";
+
+/// [`CANCELED_SHOWN`] as the CLI prints an error, for the Ctrl+C handler.
+const INTERRUPTED_NOTE: &str = "error: canceled while the password was shown; it is erased\n";
+
+/// What [`show_until_enter`] needs before anything is asked: the terminal
+/// the Enter wait reads opens, and on Windows the console can erase (VT
+/// processing, held until the erase is written, then the console mode is
+/// put back). Checked before the PIN and the touch, so nothing is asked
+/// when the password couldn't be shown.
+pub(crate) struct RevealReady {
+    #[cfg(windows)]
+    _vt: keyroost_winwebauthn::ConsoleVt,
+}
+
+/// Get [`RevealReady`], or say why the password won't be shown.
+fn reveal_ready() -> Result<RevealReady, Box<dyn Error>> {
+    terminal_opens().map_err(|err| {
+        format!("could not open the terminal to wait for Enter ({err}); the password was not shown")
+    })?;
+    // The classic console prints the erase's escape sequences as text and
+    // leaves the password up unless VT processing is on.
+    #[cfg(windows)]
+    let _vt = keyroost_winwebauthn::console_vt().ok_or(
+        "this console can't erase the password afterwards (the legacy console); \
+         the password was not shown. Use Windows Terminal",
+    )?;
+    Ok(RevealReady {
+        #[cfg(windows)]
+        _vt,
+    })
+}
+
 /// [`RevealPlan::ShowUntilEnter`]: the entry, `Password: p` with no
 /// newline, a wait for Enter at the terminal (never stdin, which may carry
-/// the PIN), then the password line erased.
-fn show_until_enter(e: &Entry) -> Result<(), Box<dyn Error>> {
+/// the PIN), then the password line erased. Ctrl+C while it is up erases
+/// it too, then the process ends as interrupted.
+fn show_until_enter(e: &Entry, _ready: RevealReady) -> Result<(), Box<dyn Error>> {
     let lines = entry_lines(e);
     let mut out = io::stdout();
     if e.password.is_empty() {
         print_lines(&mut out, &lines)?;
         return Ok(());
     }
-    terminal_opens().map_err(|err| {
-        format!("could not open the terminal to wait for Enter ({err}); the password was not shown")
-    })?;
     print_lines(&mut out, &lines[..lines.len() - 1])?;
     // Shown on a terminal: no control characters reach it. (Trailing
     // spaces trimmed: invisible there anyway.)
     let shown = wiped_line(REVEAL_LABEL, &e.password);
+    out.write_all(before_password().as_bytes())?;
+    out.flush()?;
+    // Armed once the cursor is saved (the erase goes back to it) and
+    // before the reader changes the terminal (the handler puts back what
+    // it finds now); removed once the erase below is written.
+    let _interrupt =
+        keyroost_winwebauthn::erase_on_interrupt(erase_password(), INTERRUPTED_NOTE)
+            .ok_or("could not arrange to erase the password on Ctrl+C; it was not shown")?;
     out.write_all(shown.as_bytes())?;
     out.flush()?;
     let waited = rpassword::prompt_password("").map(Zeroizing::new);
-    let erase = if waited.is_ok() {
-        erase_shown_line()
-    } else {
-        erase_current_line()
-    };
-    out.write_all(erase.as_bytes())?;
+    out.write_all(erase_password().as_bytes())?;
     out.flush()?;
     waited.map(drop).map_err(|err| match err.kind() {
-        io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof => {
-            "canceled while the password was shown; it is erased".into()
-        }
+        io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof => CANCELED_SHOWN.into(),
         _ => format!("could not wait for Enter ({err}); the password is erased").into(),
     })
 }
@@ -2281,6 +2328,13 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             pin,
             path,
         } => {
+            let plan = reveal_plan(io::stdout().is_terminal(), json_output());
+            // Before the PIN and the touch: nothing is asked when the
+            // password couldn't be shown.
+            let ready = match (*reveal, plan) {
+                (true, RevealPlan::ShowUntilEnter) => Some(reveal_ready()?),
+                _ => None,
+            };
             let mut k = open_entry_key(
                 path.as_deref(),
                 *unlock,
@@ -2292,14 +2346,17 @@ fn run_vault_entry(cmd: &FidoVaultEntryCmd) -> Result<(), Box<dyn Error>> {
             let n = pick_entry(&open.contents, title, username.as_deref(), true)?;
             let e = &open.contents.entries[n];
             let name = open.vault_ref.name.as_deref();
-            let plan = reveal_plan(io::stdout().is_terminal(), json_output());
-            match (*reveal, plan) {
-                (_, RevealPlan::Json) => {
+            match (*reveal, plan, ready) {
+                (_, RevealPlan::Json, _) => {
                     write_json_wiped(&mut io::stdout().lock(), &entry_show_json(name, e, *reveal))
                 }
-                (false, _) => Ok(print_lines(&mut io::stdout(), &entry_lines(e))?),
-                (true, RevealPlan::ShowUntilEnter) => show_until_enter(e),
-                (true, RevealPlan::PasswordOnly) => {
+                (false, _, _) => Ok(print_lines(&mut io::stdout(), &entry_lines(e))?),
+                (true, RevealPlan::ShowUntilEnter, Some(ready)) => show_until_enter(e, ready),
+                // Never: `ready` is got for this plan before the key opens.
+                (true, RevealPlan::ShowUntilEnter, None) => {
+                    Err("the terminal was not checked; the password was not shown".into())
+                }
+                (true, RevealPlan::PasswordOnly, _) => {
                     let mut out = io::stdout().lock();
                     write_password_only(&mut out, &e.password)?;
                     out.flush()?;
@@ -3380,7 +3437,7 @@ mod tests {
                 "Username: alice@example.com",
                 "URL:      https://mail.google.com",
                 "Notes:    recovery codes in the safe",
-                "Changed:  2023-11-14",
+                "Changed:  on 2023-11-14",
                 "Password: (hidden)",
             ]
         );
@@ -3399,7 +3456,7 @@ mod tests {
                 "Username: (none)",
                 "URL:      (none)",
                 "Notes:    (none)",
-                "Changed:  2023-11-14",
+                "Changed:  on 2023-11-14",
                 "Password: (none)",
             ]
         );
@@ -3410,6 +3467,33 @@ mod tests {
         let lines = entry_lines(&multi);
         assert_eq!(lines[3].as_str(), "Notes:    one");
         assert_eq!(lines[4].as_str(), "          two");
+    }
+
+    /// The Changed line says it as the app does (`today`, `N days ago`,
+    /// `on` a date); no time recorded is `(none)`.
+    #[test]
+    fn entry_lines_say_when_in_the_apps_words() {
+        const DAY: i64 = 24 * 60;
+        let mut e = ent("id", "X", "u", "");
+        let changed = |e: &Entry, now: i64| {
+            entry_lines_at(e, now)
+                .iter()
+                .find(|l| l.starts_with("Changed:"))
+                .map(|l| l.to_string())
+                .unwrap()
+        };
+        let m = e.modified_minutes;
+        assert_eq!(changed(&e, m + 5), "Changed:  today");
+        assert_eq!(changed(&e, m + DAY), "Changed:  yesterday");
+        assert_eq!(changed(&e, m + 3 * DAY), "Changed:  3 days ago");
+        assert_eq!(changed(&e, m + 60 * DAY), "Changed:  on 2023-11-14");
+        assert_eq!(
+            changed(&e, m + 5).trim_start_matches("Changed:  "),
+            keyroost_vault::changed_ago(m, m + 5).unwrap(),
+            "the app's words"
+        );
+        e.modified_minutes = 0;
+        assert_eq!(changed(&e, m), "Changed:  (none)");
     }
 
     #[test]
@@ -3440,15 +3524,25 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// The reader for Enter (rpassword) writes a newline when it returns, so
-    /// the cursor is one line below the shown password: up one line, then
-    /// clear that whole line.
+    /// Room for a wrapped password first, so nothing scrolls while it is
+    /// up and the saved cursor still marks its start; the erase goes back
+    /// there and clears to the end of the screen, whatever wrapped and
+    /// whether or not the reader wrote its newline.
     #[test]
-    fn erase_sequence_after_the_readers_newline() {
-        assert_eq!(erase_shown_line(), "\x1b[1A\x1b[2K");
-        // A reader that failed wrote no newline: the password is on the
-        // cursor's own line.
-        assert_eq!(erase_current_line(), "\r\x1b[2K");
+    fn the_ctrl_c_note_is_the_cancel_error() {
+        assert_eq!(INTERRUPTED_NOTE, format!("error: {CANCELED_SHOWN}\n"));
+    }
+
+    #[test]
+    fn erase_sequence_clears_a_wrapped_password() {
+        let before = before_password();
+        let room = before.bytes().take_while(|&b| b == b'\n').count();
+        assert_eq!(room, 8);
+        assert_eq!(&before[room..], "\x1b[8A\x1b7", "back up as far, then save");
+        // "Password: " and the longest generated password (128) wrap onto
+        // at most 7 rows of a 20-column terminal; the newline is the 8th.
+        assert!((REVEAL_LABEL.len() + 128).div_ceil(20) < room);
+        assert_eq!(erase_password(), "\x1b8\x1b[J");
     }
 
     #[test]
