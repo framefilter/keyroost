@@ -177,9 +177,7 @@ pub(crate) fn overview_line(
 ) -> String {
     match offer {
         VaultOffer::Unknown => fido_unread_line(false, read_failed).to_owned(),
-        VaultOffer::NeedsAdmin => "Open the FIDO2 tab to manage this key via Windows settings \
-                                   or restart as administrator."
-            .to_owned(),
+        VaultOffer::NeedsAdmin => "The vault needs administrator rights on Windows.".to_owned(),
         VaultOffer::No(what) => format!(
             "{}.",
             sentence(&VaultKeyError::Unsupported(what).to_string())
@@ -2163,6 +2161,12 @@ impl App {
     /// The Vault tab.
     pub(crate) fn cap_vault(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let offer = self.vault_offer();
+        self.cap_vault_for(ui, p, offer);
+    }
+
+    /// [`Self::cap_vault`] for a given offer (tests pass the Windows
+    /// non-administrator one, which can't arise elsewhere).
+    fn cap_vault_for(&mut self, ui: &mut egui::Ui, p: &Palette, offer: VaultOffer) {
         let unlocked = offer == VaultOffer::Ready && self.vault_session().is_some();
         let by_finger = self
             .vault_session()
@@ -2228,7 +2232,14 @@ impl App {
                     p.txt2
                 }),
             );
-            if matches!(offer, VaultOffer::NeedsAdmin | VaultOffer::NeedsPin) {
+            if offer == VaultOffer::NeedsAdmin {
+                ui.add_space(8.0);
+                if theme::button(ui, p, BtnKind::Default, "Restart as administrator").clicked() {
+                    if let Some(err) = crate::relaunch_as_admin_or_error() {
+                        self.vault.error = Some(err);
+                    }
+                }
+            } else if offer == VaultOffer::NeedsPin {
                 ui.add_space(8.0);
                 open_fido2 = theme::button(ui, p, BtnKind::Default, "Open FIDO2").clicked();
             }
@@ -5076,8 +5087,7 @@ mod tests {
         );
         assert_eq!(
             overview_line(VaultOffer::NeedsAdmin, false, None, false),
-            "Open the FIDO2 tab to manage this key via Windows settings or restart as \
-             administrator."
+            "The vault needs administrator rights on Windows."
         );
         assert_eq!(
             overview_line(VaultOffer::No("largeBlobKey"), false, None, false),
@@ -9923,6 +9933,39 @@ mod tests {
     }
 
     // ----- Final review fixes -----
+
+    #[test]
+    fn the_vault_tab_without_admin_rights_offers_a_restart() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            texts = frame_texts(&ctx, Vec::new(), |ui, p| {
+                app.cap_vault_for(ui, p, VaultOffer::NeedsAdmin);
+            });
+        }
+        let all: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(all.contains(&"The vault needs administrator rights on Windows."));
+        assert!(all.contains(&"Restart as administrator"));
+        assert!(!all.contains(&"Open FIDO2"));
+    }
+
+    /// Off Windows the relaunch is inert, so a click is safe: it reports
+    /// the failure instead of exiting. (On Windows it would really exit.)
+    #[cfg(not(windows))]
+    #[test]
+    fn restart_as_administrator_reports_a_failed_relaunch() {
+        let mut app = app();
+        click_text("Restart as administrator", |ui, p| {
+            app.cap_vault_for(ui, p, VaultOffer::NeedsAdmin);
+        });
+        let err = app.vault.error.as_deref().unwrap_or_default();
+        assert!(
+            err.starts_with("Couldn't restart as administrator: "),
+            "{err}"
+        );
+    }
 
     /// Every text shape of one headless 900 x 700 frame drawn by `render`,
     /// with where it was drawn.

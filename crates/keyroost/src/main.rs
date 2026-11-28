@@ -60,6 +60,25 @@ struct ClipboardClear {
 }
 
 /// The clear for `text` copied at `now`: [`CLIPBOARD_CLEAR_AFTER_SECS`] out.
+/// Ask Windows to relaunch keyroost elevated and exit this instance on
+/// success; on failure return the message to show.
+#[cfg(windows)]
+pub(crate) fn relaunch_as_admin_or_error() -> Option<String> {
+    match keyroost_winwebauthn::relaunch_as_admin() {
+        // Elevated instance requested: exit this non-elevated one so only
+        // the admin process remains.
+        Ok(()) => std::process::exit(0),
+        Err(e) => Some(format!("Couldn't restart as administrator: {e}")),
+    }
+}
+
+/// Off Windows nothing offers the restart; the same failure shape keeps
+/// the callers (and their tests) platform-neutral.
+#[cfg(not(windows))]
+pub(crate) fn relaunch_as_admin_or_error() -> Option<String> {
+    Some("Couldn't restart as administrator: only available on Windows".to_owned())
+}
+
 fn clipboard_clear_for(text: String, now: f64, from_vault: bool) -> ClipboardClear {
     ClipboardClear {
         text: zeroize::Zeroizing::new(text),
@@ -21760,14 +21779,8 @@ impl App {
                     }
                 }
                 if theme::button(ui, p, BtnKind::Default, "Restart as administrator").clicked() {
-                    match keyroost_winwebauthn::relaunch_as_admin() {
-                        // Elevated instance requested: exit this non-elevated one
-                        // so only the admin process remains.
-                        Ok(()) => std::process::exit(0),
-                        Err(e) => {
-                            self.security_keys.error =
-                                Some(format!("Couldn't restart as administrator: {e}"));
-                        }
+                    if let Some(err) = relaunch_as_admin_or_error() {
+                        self.security_keys.error = Some(err);
                     }
                 }
             });
