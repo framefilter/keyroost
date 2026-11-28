@@ -442,7 +442,16 @@ impl PivExtension {
                     .to_string()
             }
             PivExtension::ManagementKeyAlgorithm(alg) => {
-                format!("Not every key accepts a {} management key.", alg.label())
+                // "an AES-192", "a 3DES": the article follows the label's sound.
+                let article = if alg.label().starts_with("AES") {
+                    "an"
+                } else {
+                    "a"
+                };
+                format!(
+                    "Not every key accepts {article} {} management key.",
+                    alg.label()
+                )
             }
         }
     }
@@ -5078,6 +5087,25 @@ mod tests {
     ];
 
     // --- User-facing wording: requirement() + a suffix -------------------
+
+    #[test]
+    fn a_management_key_algorithm_requirement_takes_the_right_article() {
+        let req = |alg| PivExtension::ManagementKeyAlgorithm(alg).requirement();
+        assert_eq!(
+            req(MgmtAlgChoice::TripleDes),
+            "Not every key accepts a 3DES management key."
+        );
+        for (alg, label) in [
+            (MgmtAlgChoice::Aes128, "AES-128"),
+            (MgmtAlgChoice::Aes192, "AES-192"),
+            (MgmtAlgChoice::Aes256, "AES-256"),
+        ] {
+            assert_eq!(
+                req(alg),
+                format!("Not every key accepts an {label} management key.")
+            );
+        }
+    }
 
     #[test]
     fn requirement_is_distinct_per_extension_and_composes_with_a_suffix() {
