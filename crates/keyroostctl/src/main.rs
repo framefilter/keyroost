@@ -436,7 +436,7 @@ impl CliPivKeyAlg {
 }
 
 /// Management-key cipher algorithm.
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum CliPivMgmtAlg {
     #[value(name = "3des")]
     TripleDes,
@@ -11491,17 +11491,37 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         *force,
                     )?;
                     // The algorithm too, as the app's algorithm list does: one
-                    // the list marks unsupported on this key (a CanoKey 3.1
-                    // takes only AES-192) is refused here, before anything is
-                    // sent, unless --force. Unverified algorithms run without
-                    // a second note; the line above already covers the key.
+                    // the list marks unsupported on this key (a HID Crescendo
+                    // takes no AES-256) is refused here, before anything is
+                    // sent, naming the algorithms the key does take, unless
+                    // --force. That includes the AES-192 default: it is never
+                    // swapped for another algorithm silently. Unverified
+                    // algorithms run without a second note; the line above
+                    // already covers the key.
                     let alg_extension = keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm(
                         algorithm.to_choice(),
                     );
                     if s.feature_gate(alg_extension)
                         == keyroost_piv::compat::FeatureGate::Unsupported
                     {
-                        guard_piv_feature(s, alg_extension, *force)?;
+                        if *force {
+                            guard_piv_feature(s, alg_extension, true)?;
+                        } else {
+                            // Only on the road to an error: one table lookup
+                            // (and fingerprint probe) per algorithm.
+                            let takes: Vec<CliPivMgmtAlg> = CliPivMgmtAlg::value_variants()
+                                .iter()
+                                .copied()
+                                .filter(|a| {
+                                    s.feature_gate(
+                                        keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm(
+                                            a.to_choice(),
+                                        ),
+                                    ) == keyroost_piv::compat::FeatureGate::Supported
+                                })
+                                .collect();
+                            return Err(mgmt_alg_refusal(*algorithm, &takes).into());
+                        }
                     }
                     let pin_unlock_gate =
                         s.feature_gate(keyroost_piv::compat::PivExtension::PinManagementAuth);
@@ -12780,6 +12800,54 @@ fn check_piv_feature(
             Err(msg.into())
         }
     }
+}
+
+/// The refusal for `piv mgmt-key change --algorithm <chosen>` on a key whose
+/// table marks `chosen` unsupported: the shared requirement sentence and
+/// suffix, then the algorithms the table marks supported on this key (`takes`)
+/// as the `--algorithm` values to pass instead, and `--force` last. When the
+/// key's table marks none supported, the list sentence is left out.
+fn mgmt_alg_refusal(chosen: CliPivMgmtAlg, takes: &[CliPivMgmtAlg]) -> String {
+    let needs = keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm(chosen.to_choice())
+        .requirement();
+    let mut msg = format!(
+        "{needs} {}",
+        keyroost_piv::compat::FeatureGate::INCOMPATIBLE_SUFFIX
+    );
+    if chosen == CliPivMgmtAlg::Aes192 {
+        msg.push_str(" AES-192 is the default when --algorithm isn't given.");
+    }
+    // "A", "A or B", "A, B or C".
+    fn or_list(items: &[String]) -> String {
+        match items.split_last() {
+            None => String::new(),
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        }
+    }
+    if !takes.is_empty() {
+        let labels: Vec<String> = takes
+            .iter()
+            .map(|a| a.to_alg().label().to_owned())
+            .collect();
+        let flags: Vec<String> = takes
+            .iter()
+            .map(|a| {
+                let value = a
+                    .to_possible_value()
+                    .map(|v| v.get_name().to_owned())
+                    .unwrap_or_default();
+                format!("--algorithm {value}")
+            })
+            .collect();
+        msg.push_str(&format!(
+            " This key takes {}: pass {}.",
+            or_list(&labels),
+            or_list(&flags)
+        ));
+    }
+    msg.push_str(" Pass --force to run anyway.");
+    msg
 }
 
 /// When [`guard_piv_feature`] is about to refuse `PivExtension::Reset` as
@@ -29246,7 +29314,37 @@ mod cli_tests {
 
 #[cfg(test)]
 mod piv_mgmt_alg_gate {
-    use super::CliPivMgmtAlg;
+    use super::{mgmt_alg_refusal, CliPivMgmtAlg};
+
+    #[test]
+    fn an_unsupported_management_key_algorithm_names_the_ones_the_key_takes() {
+        use CliPivMgmtAlg::*;
+        // The AES-192 default on a key that takes 3DES and AES-256.
+        assert_eq!(
+            mgmt_alg_refusal(Aes192, &[TripleDes, Aes256]),
+            "Not every key accepts an AES-192 management key. keyroost's list marks \
+             this key as not supporting it. AES-192 is the default when --algorithm \
+             isn't given. This key takes 3DES or AES-256: pass --algorithm 3des or \
+             --algorithm aes256. Pass --force to run anyway."
+        );
+        // One alternative, and three.
+        assert_eq!(
+            mgmt_alg_refusal(Aes256, &[TripleDes]),
+            "Not every key accepts an AES-256 management key. keyroost's list marks \
+             this key as not supporting it. This key takes 3DES: pass --algorithm \
+             3des. Pass --force to run anyway."
+        );
+        assert!(
+            mgmt_alg_refusal(TripleDes, &[Aes128, Aes192, Aes256]).contains(
+                "This key takes AES-128, AES-192 or AES-256: pass --algorithm aes128, \
+             --algorithm aes192 or --algorithm aes256."
+            )
+        );
+        // None marked supported: no list, --force still last.
+        let none = mgmt_alg_refusal(Aes128, &[]);
+        assert!(!none.contains("This key takes"), "{none}");
+        assert!(none.ends_with(" Pass --force to run anyway."), "{none}");
+    }
 
     #[test]
     fn each_cli_management_key_algorithm_is_gated_under_its_own_name() {
